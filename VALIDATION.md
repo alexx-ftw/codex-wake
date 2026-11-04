@@ -8,9 +8,10 @@ PR-comment rules, explicit file/HTTP/flock/systemd probes, and native Codex turn
 metadata. No model is started to perform these observations. Public ingress is
 optional and disabled by default; existing explicit producers remain supported.
 
-The locked suite passed 146 unit tests and the normal integration suites
+Rust 1.98.0 passed the locked suite of 146 unit tests and the normal integrations
 (eight hooks/launcher, one native matcher self-check, one background service,
-one packaging and five telemetry tests). Clippy passed with warnings denied.
+one packaging and five telemetry tests). Pinned Clippy passed with warnings denied.
+The Linux x86_64 musl release binary built successfully and was packaged locally.
 Focused regressions cover failed-page cursor preservation, cached pagination
 with HTTP 304, global rate limits longer than the ordinary backoff, historical
 review exclusion, pending-to-submitted reviews, PR head/base changes, PR identity
@@ -30,6 +31,11 @@ repository. Only its registered attempt and SHA became ready; a different SHA
 and nonexistent attempt stayed waiting. Two existing signed HTTP integration
 tests also passed against the verified receiver binary. These checks did not
 change the host's existing subscriptions or start a GitHub workflow.
+
+The static candidate also armed a private subscription through the actual native
+controller's metadata API. It persisted the correct source UUID and in-progress
+baseline, remained waiting and published nothing on an immediate poll. No model
+was started and the host business database was not used by that fixture.
 
 The previously qualified clean-VM install, lifecycle and native model tests below
 predate this polling implementation and were not rerun for it. Polling cannot
