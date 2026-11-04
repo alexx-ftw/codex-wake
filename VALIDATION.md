@@ -1,5 +1,33 @@
 # Validation
 
+## Real MCP actions, 2026-11-04
+
+All twelve tools beyond get_status were invoked through the installed MCP.
+Catalog calls returned the real models and projects, including a temporary
+project rooted in an isolated Jujutsu workspace. Goal create/read/edit/resume
+changed native saved metadata; queued edit and resume templates produced exact
+assistant final replies. Queue-only and explicit-resume inputs both produced
+their rendered replies; Codex can consume queued input automatically.
+An available file was published to an artifact subscription, producing its
+expected final reply. Repeating publication matched zero subscriptions.
+
+The temporary [PR #1](https://github.com/alexx-ftw/codex-wake/pull/1) completed
+[real CI](https://github.com/alexx-ftw/codex-wake/actions/runs/41868952301).
+Its real workflow_run completion payload, obtained from GitHub's delivery API
+with HTTP 200 evidence, was ingested with CODEX_WAKE_DEFER=1. recover_ready
+dispatched one pending wait and the recipient replied with the run ID and
+success conclusion; a subsequent recovery attempted zero deliveries. This is
+an explicit replay of an authentic completion, not a fresh webhook recovery.
+A nonmatching PR comment created no rule delivery. A matching comment arrived
+over the signed HTTPS webhook, created a new chat in the temporary project and
+workspace, and produced the expected assistant final reply containing the
+GitHub comment ID. Native stored metadata confirmed Sol/low for all recipients.
+
+The run also disproved the previous usage-accounting description: editing the
+paused goal retained its token/time counters. Descriptions now leave accounting
+to Codex instead of promising a reset. Active-writer preset rejection was
+observed; the test did not bypass it. No budgets were set.
+
 Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
 
 - Stable Tailscale Funnel ingress passed

@@ -108,7 +108,7 @@ struct CreateGoalInput {
 #[serde(deny_unknown_fields)]
 struct EditGoalInput {
     thread: String,
-    /// Replacing the objective resets its usage accounting. Omit to preserve it.
+    /// Omit to preserve the objective. Codex controls usage accounting.
     objective: Option<String>,
     token_budget: Option<i64>,
     message_template: Option<String>,
@@ -388,7 +388,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Edit a saved goal; Codex may continue active goals automatically. Optional presets apply first; input is queued. Omitted fields stay unchanged; a new objective resets usage.",
+        description = "Edit a saved goal; Codex may continue active goals automatically. Optional presets apply first; input is queued. Omitted fields stay unchanged; Codex controls usage accounting.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn edit_goal(&self, Parameters(input): Parameters<EditGoalInput>) -> CallToolResult {

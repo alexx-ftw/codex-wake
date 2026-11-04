@@ -281,7 +281,7 @@ pub fn create(
     })
 }
 
-/// Change only the supplied fields; replacing the objective resets usage on the server.
+/// Change only the supplied fields; Codex controls usage accounting.
 pub fn edit(
     codex: &Path,
     thread: &str,

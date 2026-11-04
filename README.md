@@ -205,7 +205,7 @@ cargo run --locked -- configure-rule --file examples/pr-bot-review.json
 Goal and project operations use the local Codex app-server API; they don't edit
 Codex databases directly or impersonate user-origin mutations. Creating a goal
 refuses to overwrite an existing one. Omitted edit fields retain their values;
-replacing an objective resets its usage accounting. All RPC mutations preserve
+Codex controls usage accounting, and editing an objective does not guarantee a reset. All RPC mutations preserve
 server restrictions. Creating, editing or activating an active goal can make
 Codex continue automatically. Execution presets are applied before the mutation;
 optional input is then queued without a separate resume request. The installed
