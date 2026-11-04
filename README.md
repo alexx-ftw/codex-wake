@@ -25,6 +25,13 @@ Automatic receiver installation currently supports Linux x86_64.
 No usage skill or injected usage instructions are bundled. MCP descriptions,
 parameter schemas and structured results provide the agent interface.
 
+Reviewed MCP-only updates can keep a running receiver: an operator may add the exact new source
+digest to `runtime.json`'s `compatible_sources` after verifying the diff. The
+original source and binary pins remain unchanged; binary and hook-template
+checks still apply. This is an explicit compatibility declaration, not an
+automatic compatibility check for arbitrary functional updates. Open MCP
+connections retain their tool descriptions until they reconnect.
+
 MCP startup runs deterministic code that:
 
 1. Acquires a process-shared installation lock.

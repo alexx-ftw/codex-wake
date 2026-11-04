@@ -197,7 +197,13 @@ pub(crate) fn source_digest() -> String {
 fn runtime_matches(config: &Config) -> bool {
     (|| -> Result<bool> {
         let stamp: Value = serde_json::from_slice(&fs::read(config.runtime.join("runtime.json"))?)?;
-        Ok(stamp["source"] == source_digest()
+        let source = source_digest();
+        // Explicit aliases allow reviewed MCP-only updates without replacing a live receiver.
+        let compatible = stamp["source"] == source
+            || stamp["compatible_sources"]
+                .as_array()
+                .is_some_and(|sources| sources.contains(&json!(source)));
+        Ok(compatible
             && stamp["binary"]
                 == format!(
                     "{:x}",
@@ -1427,6 +1433,43 @@ mod tests {
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         assert!(load_secret(&link).is_err());
+    }
+    #[test]
+    fn compatible_runtime_still_requires_exact_source_binary_and_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.runtime = temp.path().to_path_buf();
+        let binary = b"verified receiver";
+        fs::write(config.runtime.join("codex-wake"), binary).unwrap();
+        fs::write(config.runtime.join("hooks.json.tmpl"), HOOKS).unwrap();
+        let mut stamp =
+            json!({"source":"previous-source","binary":format!("{:x}",Sha256::digest(binary))});
+        let save = |stamp: &Value| {
+            fs::write(config.runtime.join("runtime.json"), stamp.to_string()).unwrap();
+        };
+        save(&stamp);
+        assert!(!runtime_matches(&config));
+        stamp["compatible_sources"] = json!(["different-source"]);
+        save(&stamp);
+        assert!(!runtime_matches(&config));
+        stamp["compatible_sources"] = json!([source_digest()]);
+        save(&stamp);
+        assert!(runtime_matches(&config));
+        assert_eq!(stamp["source"], "previous-source");
+        fs::write(config.runtime.join("codex-wake"), b"altered receiver").unwrap();
+        assert!(!runtime_matches(&config));
+        fs::write(config.runtime.join("codex-wake"), binary).unwrap();
+        fs::write(config.runtime.join("hooks.json.tmpl"), "altered hooks").unwrap();
+        assert!(!runtime_matches(&config));
+        fs::write(config.runtime.join("hooks.json.tmpl"), HOOKS).unwrap();
+        stamp = json!({"source":source_digest(),"binary":format!("{:x}",Sha256::digest(binary))});
+        save(&stamp);
+        assert!(runtime_matches(&config));
+        fs::write(config.runtime.join("codex-wake"), b"altered receiver").unwrap();
+        assert!(!runtime_matches(&config));
+        fs::write(config.runtime.join("codex-wake"), binary).unwrap();
+        fs::write(config.runtime.join("hooks.json.tmpl"), "altered hooks").unwrap();
+        assert!(!runtime_matches(&config));
     }
     #[test]
     fn installed_codex_survives_a_different_path() {

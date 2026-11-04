@@ -2,6 +2,16 @@
 
 ## Real MCP actions, 2026-11-04
 
+The goal-description correction was subsequently installed without stopping the
+shared receiver. A reviewed exact source alias retained the original runtime
+source/binary pins; the receiver PID, executable inode/checksum and both child
+PIDs stayed unchanged. All four subscription rows present during installation
+(three existing plus a continuity probe) were byte-for-byte unchanged. Both an
+already-open MCP and a fresh installed MCP reported healthy; the fresh one
+advertised the corrected descriptions and delivered an artifact to the probe
+registered before installation. Its actual assistant final reply confirmed
+delivery. The host's three hook approvals were revalidated after review.
+
 All twelve tools beyond get_status were invoked through the installed MCP.
 Catalog calls returned the real models and projects, including a temporary
 project rooted in an isolated Jujutsu workspace. Goal create/read/edit/resume
