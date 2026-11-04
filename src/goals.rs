@@ -30,7 +30,12 @@ fn matched_response(message: Value, id: &str) -> Result<Option<Value>> {
 }
 
 #[cfg(unix)]
-fn socket_rpc(socket: &Path, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+pub(crate) fn socket_rpc(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     use std::os::unix::net::UnixStream;
     use tungstenite::{Message, WebSocket};
 

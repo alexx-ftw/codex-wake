@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 hmac = "0.12"
+libc = "0.2"
 regex = "1"
 rmcp = { version = "3.8.0", features = ["server", "transport-io", "schemars"] }
 rusqlite = { version = "0.38", features = ["bundled"] }

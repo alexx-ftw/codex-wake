@@ -68,6 +68,12 @@ pub fn connect(path: &Path) -> Result<Connection> {
     db.busy_timeout(Duration::from_secs(15))?;
     db.execute_batch("BEGIN IMMEDIATE")?;
     let migration = (|| -> Result<()> {
+        let application_id: i32 =
+            db.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries')", [], |row| row.get(0))?;
+        if application_id == 0 && unrelated == 0 {
+            db.pragma_update(None, "application_id", crate::uninstall::DATABASE_ID)?;
+        }
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS waits (
             repo TEXT NOT NULL, run_id INTEGER NOT NULL, attempt INTEGER NOT NULL,

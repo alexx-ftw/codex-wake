@@ -33,6 +33,7 @@ MCP startup runs deterministic code that:
 4. Creates a persistent private webhook secret and a managed user service.
 5. Starts the receiver and verifies service identity, configuration and signed
    HTTP filtering before accepting MCP calls.
+6. Arms user-manager cleanup for the installed plugin's cache identity.
 
 Concurrent MCP sessions reuse the same receiver without restarting it. An
 unrelated service or conflicting active runtime is left untouched and reported.
@@ -48,16 +49,27 @@ An explicit external control socket can be selected with `CODEX_WAKE_RPC_SOCKET`
 
 The receiver remains active after all MCP sessions close so it can wake their
 chats later. It is enabled under the user's service manager, not installed as
-root. Disabling or uninstalling the plugin does **not** remove this service.
+root. Disabling the plugin preserves the service and subscriptions.
+
+Uninstalling the plugin automatically stops the receiver, its controller and
+registered MCP processes. It removes subscriptions, secrets, workspaces, runtime,
+build cache, owned hook bookkeeping, and the generated local marketplace. The
+cleanup service and path watcher remove their own units too. Codex's native
+uninstall removes the package cache; the user manager completes external cleanup
+after that removal, so cleanup may briefly outlive the uninstall command.
+The watcher also works with the receiver stopped, and checks once when the user
+manager starts if removal happened while it was offline. No agent or onboarding
+skill is involved. Source repositories, user chats and unrelated resources are
+not installation artifacts. Shared host/system historical logs are not erased.
 
 ```sh
 systemctl --user status codex-wake.service
 cargo run --locked -- remove-service
 ```
 
-Run `remove-service` before uninstalling when you want to stop receiving events.
-It refuses to remove a unit owned by another configuration. It keeps state and
-the secret, and another MCP session can recreate the service on its next startup.
+`remove-service` is a maintenance stop, retaining state and the secret. The
+uninstall watcher remains armed; another MCP session can recreate the receiver
+while the plugin is still installed. It refuses to remove an unrelated unit.
 Stopping this service also stops its controller and any turns that controller
 owns. Finish those turns before a planned removal or runtime upgrade.
 

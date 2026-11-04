@@ -19,6 +19,8 @@ use std::{
 use wait_timeout::ChildExt;
 
 const UNIT: &str = "codex-wake.service";
+const CLEANUP_UNIT: &str = "codex-wake-cleanup.service";
+const CLEANUP_PATH: &str = "codex-wake-cleanup.path";
 const MARKER: &str = "# Managed by codex-wake v1\n";
 const HOOKS: &str = include_str!("../hooks.json.tmpl");
 const ARCHIVE_SHA: &str = "3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b";
@@ -36,6 +38,8 @@ fn source_digest() -> String {
         include_bytes!("templates.rs").as_slice(),
         include_bytes!("execution.rs").as_slice(),
         include_bytes!("rules.rs").as_slice(),
+        include_bytes!("uninstall.rs").as_slice(),
+        include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("../Cargo.lock").as_slice(),
         HOOKS.as_bytes(),
     ] {
@@ -69,6 +73,8 @@ pub struct Config {
     pub codex: PathBuf,
     pub codex_home: PathBuf,
     pub rpc_socket: PathBuf,
+    pub cache: PathBuf,
+    pub plugin_base: Option<PathBuf>,
 }
 
 fn xdg(name: &str, default: PathBuf) -> Result<PathBuf> {
@@ -101,6 +107,29 @@ impl Config {
             .unwrap_or_else(|| find_program("codex").unwrap_or_else(|_| PathBuf::from("codex")));
         let codex_home = xdg("CODEX_HOME", home.join(".codex"))?;
         let rpc_socket = xdg("CODEX_WAKE_RPC_SOCKET", state.join("app-server.sock"))?;
+        let cache = xdg("XDG_CACHE_HOME", home.join(".cache"))?.join("codex-wake");
+        let saved = fs::read(state.join("installation.json"))
+            .ok()
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes))
+            .transpose()?;
+        let base = env::var_os("CODEX_WAKE_PLUGIN_BASE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                saved
+                    .as_ref()?
+                    .get("plugin_base")?
+                    .as_str()
+                    .map(PathBuf::from)
+            });
+        let plugin_base = if let Some(root) = env::var_os("CODEX_WAKE_PLUGIN_ROOT")
+            .map(PathBuf::from)
+            .filter(|root| root.starts_with(codex_home.join("plugins/cache")))
+        {
+            Some(crate::uninstall::plugin_base(&codex_home, &root)?)
+        } else {
+            base.map(|base| crate::uninstall::plugin_base(&codex_home, &base.join("installed")))
+                .transpose()?
+        };
         Ok(Self {
             state,
             runtime,
@@ -110,6 +139,8 @@ impl Config {
             codex,
             codex_home,
             rpc_socket,
+            cache,
+            plugin_base,
         })
     }
 }
@@ -239,7 +270,7 @@ fn unit(config: &Config) -> Result<String> {
     let codex = quote(&format!("CODEX_WAKE_CODEX={}", config.codex.display()))?;
     let cfg_home = config.config.parent().context("Missing config parent")?;
     let cfg_home = quote(&format!("XDG_CONFIG_HOME={}", cfg_home.display()))?;
-    let extra = [
+    let mut extra = [
         ("CODEX_HOME", config.codex_home.as_path()),
         ("CODEX_WAKE_RPC_SOCKET", config.rpc_socket.as_path()),
         (
@@ -254,6 +285,10 @@ fn unit(config: &Config) -> Result<String> {
                 .and_then(Path::parent)
                 .context("Missing data root")?,
         ),
+        (
+            "XDG_CACHE_HOME",
+            config.cache.parent().context("Missing cache root")?,
+        ),
     ]
     .iter()
     .map(|(key, value)| {
@@ -261,6 +296,12 @@ fn unit(config: &Config) -> Result<String> {
     })
     .collect::<Result<Vec<_>>>()?
     .join("");
+    if let Some(base) = &config.plugin_base {
+        extra.push_str(&format!(
+            "Environment={}\n",
+            quote(&format!("CODEX_WAKE_PLUGIN_BASE={}", base.display()))?
+        ));
+    }
     Ok(format!(
         "{MARKER}[Unit]\nDescription=Codex Wake shared webhook receiver\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={runtime}\nExecStart=:{exe} receiver\nEnvironment={db}\nEnvironment={codex}\nEnvironment={cfg_home}\n{extra}Restart=on-failure\nRestartSec=5\nUMask=0077\nNoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n"
     ))
@@ -432,7 +473,9 @@ pub fn status(config: &Config) -> Result<Value> {
 }
 
 pub fn ensure_receiver(config: &Config) -> Result<Value> {
+    require_installed(config)?;
     let _guard = lock(config)?;
+    require_installed(config)?;
     ensure!(
         config.db.is_absolute() && config.codex.is_absolute(),
         "Service database and Codex executable must be absolute paths"
@@ -495,6 +538,7 @@ pub fn ensure_receiver(config: &Config) -> Result<Value> {
         atomic_write(&config.unit, expected_unit.as_bytes(), 0o600)?;
         systemctl(&["daemon-reload"])?;
     }
+    install_cleanup(config)?;
     systemctl(&["enable", UNIT])?;
     if !active {
         systemctl(&["start", UNIT])?;
@@ -548,6 +592,7 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
 }
 
 pub fn run_receiver(config: &Config) -> Result<()> {
+    require_installed(config)?;
     let root = env::current_exe()?
         .parent()
         .context("Executable has no directory")?
@@ -614,6 +659,323 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     }
 }
 
+pub fn require_installed(config: &Config) -> Result<()> {
+    if let Some(base) = &config.plugin_base {
+        ensure!(
+            base.is_dir(),
+            "Plugin was uninstalled; refusing to recreate its resources"
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_units(config: &Config) -> Result<(String, String)> {
+    let base = config
+        .plugin_base
+        .as_ref()
+        .context("Missing installed plugin identity")?;
+    let parent = base
+        .parent()
+        .context("Missing plugin cache parent")?
+        .to_str()
+        .context("Non-UTF8 plugin path")?;
+    ensure!(!parent.chars().any(char::is_control), "Invalid plugin path");
+    let environment = unit(config)?
+        .lines()
+        .filter(|line| line.starts_with("Environment="))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    let executable = quote(
+        config
+            .runtime
+            .join("codex-wake")
+            .to_str()
+            .context("Non-UTF8 runtime")?,
+    )?;
+    Ok((
+        format!(
+            "{MARKER}[Unit]\nDescription=Remove uninstalled Codex Wake resources\nStartLimitIntervalSec=0\n\n[Service]\nType=oneshot\nWorkingDirectory=/\nExecStart=:{executable} cleanup-uninstalled\n{environment}TimeoutStartSec=120\nRestart=on-failure\nRestartSec=5\nUMask=0077\nNoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n"
+        ),
+        format!(
+            "{MARKER}[Unit]\nDescription=Observe Codex Wake plugin removal\n\n[Path]\nPathChanged={}\nUnit={CLEANUP_UNIT}\n\n[Install]\nWantedBy=default.target\n",
+            parent.replace('%', "%%")
+        ),
+    ))
+}
+
+fn install_cleanup(config: &Config) -> Result<()> {
+    let Some(base) = &config.plugin_base else {
+        return Ok(());
+    };
+    let (service, path) = cleanup_units(config)?;
+    let directory = config.unit.parent().context("Missing unit directory")?;
+    let mut changed = false;
+    for (name, contents) in [(CLEANUP_UNIT, service), (CLEANUP_PATH, path)] {
+        let destination = directory.join(name);
+        match fs::symlink_metadata(&destination) {
+            Ok(meta) => {
+                ensure!(
+                    meta.is_file() && meta.uid() == fs::metadata("/proc/self")?.uid(),
+                    "Cleanup unit is not an owned regular file"
+                );
+                ensure!(
+                    fs::read_to_string(&destination)? == contents,
+                    "Cleanup unit belongs to another configuration"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                atomic_write(&destination, contents.as_bytes(), 0o600)?;
+                changed = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    atomic_write(
+        &config.state.join("installation.json"),
+        serde_json::to_vec(&json!({"plugin_base":base}))?.as_slice(),
+        0o600,
+    )?;
+    if changed {
+        systemctl(&["daemon-reload"])?;
+    }
+    systemctl(&["enable", "--now", CLEANUP_PATH, CLEANUP_UNIT])?;
+    Ok(())
+}
+
+pub struct ClientRegistration(PathBuf);
+impl Drop for ClientRegistration {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn process_start(pid: u32) -> Result<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    Ok(stat
+        .rsplit_once(") ")
+        .context("Invalid process identity")?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .context("Missing process start time")?
+        .to_owned())
+}
+
+pub fn register_client(config: &Config) -> Result<Option<ClientRegistration>> {
+    if config.plugin_base.is_none() {
+        return Ok(None);
+    }
+    let _guard = lock(config)?;
+    require_installed(config)?;
+    let clients = config.state.join("clients");
+    private_dir(&clients)?;
+    let pid = std::process::id();
+    let executable = fs::metadata("/proc/self/exe")?;
+    let path = clients.join(format!("{pid}.json"));
+    atomic_write(
+        &path,
+        &serde_json::to_vec(
+            &json!({"pid":pid,"start":process_start(pid)?,"dev":executable.dev(),"ino":executable.ino()}),
+        )?,
+        0o600,
+    )?;
+    Ok(Some(ClientRegistration(path)))
+}
+
+fn stop_clients(config: &Config) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let clients = config.state.join("clients");
+    let entries = match fs::read_dir(clients) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        ensure!(entry.file_type()?.is_file(), "Invalid client registration");
+        let record: Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+        let pid = record["pid"]
+            .as_u64()
+            .filter(|pid| *pid > 1 && *pid <= i32::MAX as u64)
+            .context("Invalid client PID")? as u32;
+        // A pidfd cannot be redirected to a different process if a PID gets reused.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(error.into());
+        }
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+        let Ok(meta) = fs::metadata(format!("/proc/{pid}/exe")) else {
+            continue;
+        };
+        if process_start(pid).ok().as_deref() != record["start"].as_str()
+            || record["dev"].as_u64() != Some(meta.dev())
+            || record["ino"].as_u64() != Some(meta.ino())
+        {
+            continue;
+        }
+        let signal = |signal: libc::c_int| -> Result<()> {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    descriptor.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        };
+        signal(libc::SIGTERM)?;
+        thread::sleep(Duration::from_millis(100));
+        signal(libc::SIGKILL)?;
+    }
+    Ok(())
+}
+
+pub fn cleanup_uninstalled(config: &Config) -> Result<()> {
+    let Some(base) = &config.plugin_base else {
+        return Ok(());
+    };
+    if base.try_exists()? {
+        return Ok(());
+    }
+    let _guard = lock(config)?;
+    if base.try_exists()? {
+        return Ok(());
+    }
+    let directory = config.unit.parent().context("Missing unit directory")?;
+    let (cleanup_service, cleanup_path) = cleanup_units(config)?;
+    // Validate every unit before stopping or deleting anything.
+    for (path, contents) in [
+        (config.unit.clone(), unit(config)?),
+        (directory.join(CLEANUP_UNIT), cleanup_service.clone()),
+        (directory.join(CLEANUP_PATH), cleanup_path.clone()),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                ensure!(
+                    meta.is_file() && meta.uid() == fs::metadata("/proc/self")?.uid(),
+                    "Unrelated unit path; cleanup refused"
+                );
+                ensure!(
+                    fs::read_to_string(path)? == contents,
+                    "Unrelated service configuration; cleanup refused"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let properties = systemctl(&[
+        "show",
+        UNIT,
+        "--property=FragmentPath,DropInPaths,ActiveState",
+    ])?;
+    for property in properties.lines() {
+        if let Some(fragment) = property.strip_prefix("FragmentPath=") {
+            ensure!(
+                fragment.is_empty() || Path::new(fragment) == config.unit,
+                "Another service owns this name"
+            );
+        }
+        if let Some(overrides) = property.strip_prefix("DropInPaths=") {
+            ensure!(
+                overrides.is_empty(),
+                "Service has unrelated overrides; cleanup refused"
+            );
+        }
+    }
+    let marketplace = base
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .context("Missing marketplace identity")?;
+    let plugin_id = format!("codex-wake@{marketplace}");
+    let plugin_data = config
+        .codex_home
+        .join("plugins/data")
+        .join(marketplace)
+        .join("codex-wake");
+    let trees = [
+        config.cache.as_path(),
+        config.config.as_path(),
+        config.runtime.parent().context("Missing runtime root")?,
+        plugin_data.as_path(),
+        config.state.as_path(),
+    ];
+    for path in trees {
+        crate::uninstall::validate_owned_tree(path)?;
+    }
+    let external_db = config.db.try_exists()?
+        && !config
+            .db
+            .canonicalize()?
+            .starts_with(config.state.canonicalize()?);
+    if external_db {
+        crate::uninstall::validate_external_database(&config.db)?;
+    }
+    let metadata_socket = config.state.join("cleanup.sock");
+    remove_stale_socket(&metadata_socket)?;
+    let mut metadata = ChildGuard(
+        Command::new(&config.codex)
+            .args(["app-server", "--listen"])
+            .arg(format!("unix://{}", metadata_socket.display()))
+            .env("CODEX_HOME", &config.codex_home)
+            .stdin(Stdio::null())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !metadata_socket.exists() {
+        ensure!(
+            metadata.0.try_wait()?.is_none(),
+            "Metadata controller exited"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "Metadata controller did not start"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    crate::host_cleanup::clear_records(&config.codex, &metadata_socket, &plugin_id, &config.cache)?;
+    drop(metadata);
+    if base.try_exists()? {
+        return Ok(());
+    }
+    systemctl(&["disable", "--now", CLEANUP_PATH])?;
+    if config.unit.try_exists()? {
+        systemctl(&["disable", "--now", UNIT])?;
+    }
+    systemctl(&["disable", CLEANUP_UNIT])?;
+    stop_clients(config)?;
+    crate::uninstall::remove_unit_file(&config.unit, &unit(config)?)?;
+    crate::uninstall::remove_unit_file(&directory.join(CLEANUP_PATH), &cleanup_path)?;
+    crate::uninstall::remove_unit_file(&directory.join(CLEANUP_UNIT), &cleanup_service)?;
+    systemctl(&["daemon-reload"])?;
+    if external_db {
+        crate::uninstall::remove_external_database(&config.db)?;
+    }
+    for path in trees {
+        crate::uninstall::remove_owned_tree(path)?;
+    }
+    for parent in [base.parent(), plugin_data.parent()].into_iter().flatten() {
+        match fs::remove_dir(parent) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 pub fn remove_service(config: &Config) -> Result<()> {
     let _guard = lock(config)?;
     let contents = fs::read_to_string(&config.unit)?;
@@ -630,6 +992,26 @@ pub fn remove_service(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleanup_stops_only_clients_with_matching_process_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.state = temp.path().join("codex-wake");
+        let clients = config.state.join("clients");
+        fs::create_dir_all(&clients).unwrap();
+        let mut child = ChildGuard(Command::new("sleep").arg("60").spawn().unwrap());
+        let pid = child.0.id();
+        let executable = fs::metadata(format!("/proc/{pid}/exe")).unwrap();
+        let path = clients.join(format!("{pid}.json"));
+        let mut record = json!({"pid":pid,"start":"wrong-start-time","dev":executable.dev(),"ino":executable.ino()});
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        stop_clients(&config).unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        record["start"] = json!(process_start(pid).unwrap());
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        stop_clients(&config).unwrap();
+        assert!(!child.0.wait().unwrap().success());
+    }
     #[test]
     fn socket_cleanup_preserves_active_and_unrelated_paths() {
         use std::os::unix::net::UnixListener;

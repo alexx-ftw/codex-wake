@@ -1,11 +1,13 @@
 mod bridge;
 mod execution;
 mod goals;
+mod host_cleanup;
 mod manager;
 mod probe;
 mod rules;
 mod subscriptions;
 mod templates;
+mod uninstall;
 
 use anyhow::{Context, Result, bail};
 use rmcp::{
@@ -162,6 +164,7 @@ fn goal_input_result(
 }
 
 fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
+    manager::require_installed(config)?;
     let db = bridge::connect(&config.db)?;
     subscriptions::initialize(&db)?;
     rules::initialize(&db)?;
@@ -523,6 +526,7 @@ async fn main() -> Result<()> {
         "mcp" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             manager::ensure_receiver(&config)?;
+            let _client = manager::register_client(&config)?;
             let service = WakeTools { config }.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
         }
@@ -538,6 +542,10 @@ async fn main() -> Result<()> {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             manager::remove_service(&config)?;
             println!("{}", json!({"removed":true,"state_preserved":true}));
+        }
+        "cleanup-uninstalled" => {
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            manager::cleanup_uninstalled(&config)?;
         }
         "register" => {
             let repo = required(&mut args, "--repo")?;

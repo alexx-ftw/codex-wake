@@ -1,0 +1,233 @@
+use anyhow::{Context, Result, ensure};
+use std::{
+    fs,
+    os::unix::fs::MetadataExt,
+    path::{Component, Path, PathBuf},
+};
+
+pub const DATABASE_ID: i32 = 0x43574b45;
+
+pub fn validate_external_database(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_file() && metadata.uid() == current_uid()?,
+        "Database is not an owned regular file"
+    );
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries')", [], |row| row.get(0))?;
+    ensure!(
+        id == DATABASE_ID && unrelated == 0,
+        "Database ownership could not be verified; unrelated data was preserved"
+    );
+    Ok(())
+}
+
+pub fn remove_external_database(path: &Path) -> Result<()> {
+    validate_external_database(path)?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    fs::remove_file(path)?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        match fs::remove_file(sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn current_uid() -> Result<u32> {
+    Ok(fs::metadata("/proc/self")?.uid())
+}
+
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component == Component::ParentDir)
+}
+
+/// Remove an owned codex-wake directory without following links inside it.
+pub fn validate_owned_tree(path: &Path) -> Result<()> {
+    ensure!(path.is_absolute(), "Cleanup path must be absolute");
+    ensure!(
+        !has_parent_component(path),
+        "Cleanup path cannot contain '..'"
+    );
+    ensure!(
+        path.file_name().is_some_and(|name| name == "codex-wake"),
+        "Cleanup path must end in 'codex-wake'"
+    );
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.file_type().is_dir(),
+        "Cleanup root must be a nonsymlink directory"
+    );
+    ensure!(
+        metadata.uid() == current_uid()?,
+        "Cleanup root is not owned by this user"
+    );
+    Ok(())
+}
+
+pub fn remove_owned_tree(path: &Path) -> Result<()> {
+    validate_owned_tree(path)?;
+    if !path.try_exists()? {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).with_context(|| format!("Removing owned tree {}", path.display()))
+}
+
+/// Return the marketplace directory for an exact installed plugin root.
+pub fn plugin_base(codex_home: &Path, root: &Path) -> Result<PathBuf> {
+    ensure!(codex_home.is_absolute(), "CODEX_HOME must be absolute");
+    ensure!(root.is_absolute(), "Plugin root must be absolute");
+    ensure!(
+        !has_parent_component(codex_home) && !has_parent_component(root),
+        "Plugin paths cannot contain '..'"
+    );
+    let relative = root
+        .strip_prefix(codex_home)
+        .context("Plugin root is outside CODEX_HOME")?;
+    let components: Vec<_> = relative.components().collect();
+    ensure!(
+        components.len() == 5
+            && components[0] == Component::Normal("plugins".as_ref())
+            && components[1] == Component::Normal("cache".as_ref())
+            && matches!(components[2], Component::Normal(_))
+            && components[3] == Component::Normal("codex-wake".as_ref())
+            && matches!(components[4], Component::Normal(_)),
+        "Plugin root must be CODEX_HOME/plugins/cache/<marketplace>/codex-wake/<version>"
+    );
+    Ok(codex_home
+        .join("plugins/cache")
+        .join(components[2].as_os_str())
+        .join("codex-wake"))
+}
+
+/// Remove a unit file only when it is an owned regular file with exact contents.
+pub fn remove_unit_file(path: &Path, expected: &str) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.file_type().is_file(),
+        "Unit path must be a nonsymlink regular file"
+    );
+    ensure!(
+        metadata.uid() == current_uid()?,
+        "Unit file is not owned by this user"
+    );
+    ensure!(
+        fs::read(path)? == expected.as_bytes(),
+        "Unit file contents do not match"
+    );
+    fs::remove_file(path).with_context(|| format!("Removing unit file {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    #[test]
+    fn external_database_cleanup_preserves_foreign_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE personal(value TEXT)")
+            .unwrap();
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE personal; CREATE TABLE waits(value TEXT)")
+            .unwrap();
+        db.pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        drop(db);
+        remove_external_database(&path).unwrap();
+        assert!(!path.exists());
+        remove_external_database(&path).unwrap();
+    }
+
+    #[test]
+    fn removes_owned_tree_and_unlinks_nested_symlinks_without_following() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codex-wake");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file"), "owned").unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "keep").unwrap();
+        symlink(&outside, root.join("nested/link")).unwrap();
+
+        remove_owned_tree(&root).unwrap();
+
+        assert!(!root.exists());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "keep");
+    }
+
+    #[test]
+    fn missing_tree_and_unit_are_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        remove_owned_tree(&temp.path().join("codex-wake")).unwrap();
+        remove_unit_file(&temp.path().join("codex-wake.service"), "expected").unwrap();
+    }
+
+    #[test]
+    fn rejects_unowned_tree_names_and_root_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        assert!(remove_owned_tree(&unrelated).is_err());
+        assert!(unrelated.is_dir());
+
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let root = temp.path().join("codex-wake");
+        symlink(&target, &root).unwrap();
+        assert!(remove_owned_tree(&root).is_err());
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn accepts_only_the_exact_plugin_install_layout() {
+        let home = Path::new("/tmp/codex");
+        assert_eq!(
+            plugin_base(home, &home.join("plugins/cache/example/codex-wake/1.2.3")).unwrap(),
+            home.join("plugins/cache/example/codex-wake")
+        );
+        assert!(plugin_base(home, &home.join("plugins/cache/other/1.2.3")).is_err());
+        assert!(plugin_base(home, &home.join("plugins/cache/../codex-wake/1")).is_err());
+    }
+
+    #[test]
+    fn preserves_foreign_or_linked_unit_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let unit = temp.path().join("codex-wake.service");
+        fs::write(&unit, "foreign").unwrap();
+        assert!(remove_unit_file(&unit, "expected").is_err());
+        assert_eq!(fs::read_to_string(&unit).unwrap(), "foreign");
+
+        let target = temp.path().join("target");
+        fs::write(&target, "expected").unwrap();
+        fs::remove_file(&unit).unwrap();
+        symlink(&target, &unit).unwrap();
+        assert!(remove_unit_file(&unit, "expected").is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "expected");
+    }
+}

@@ -4,7 +4,8 @@ Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
 
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- Binary unit tests: 70 passed.
+- Binary unit tests: 83 passed, including cleanup ownership, nested links,
+  external database identity, process identity, and host-config isolation.
 - Native-test reply matcher self-check: passed; a marker in the user prompt alone is rejected.
 - Real HTTP tests: 2 passed with verified adnanh/webhook 2.8.3 and fake Codex.
   They cover authentication, duplicate delivery, deferred PR-comment rules and artifact events.
@@ -15,16 +16,17 @@ Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
   both clients closed. TCP inspection confirmed one listener on 127.0.0.1:9000.
   The MCP handshake assertion confirms no usage instructions are injected;
   native plugin inspection reports no onboarding skill or bundled skills.
-- Administrative lifecycle qualification: passed against the real installation.
-  Persistently disabling the plugin and then uninstalling it preserved the
-  receiver PID and signed HTTP health. Uninstall removed the plugin cache.
-  Explicit `remove-service` removed the unit, stopped the receiver and its
-  supervised processes, and closed TCP port 9000. Database rows and webhook
-  secret were unchanged throughout; SQLite integrity remained `ok`.
-  `ensure` recreated the enabled service and ready native controller.
-  Reinstalling the plugin and starting its installed launcher reused that new
-  service without another restart. Final state: plugin installed/enabled,
-  receiver active, persisted data retained. No model turns were started.
+- Automatic uninstall qualification: passed twice in an isolated native Codex
+  installation, with the receiver active and with it deliberately stopped.
+  Two MCP sessions were left open and a subscription was stored. Native
+  `codex plugin remove` automatically triggered user-manager cleanup in both
+  cases. Both MCP processes exited; state/database, secrets, runtime, build/package
+  cache, all three unit files and enablement links were removed. TCP port 9000
+  was closed. Owned hook records and the generated marketplace registration were
+  removed while an unrelated host-config sentinel remained unchanged.
+  Disabling alone preserved the receiver and stored subscription in both runs.
+  No model turns were started. The existing user's subscriptions were outside
+  the isolated state roots and were preserved.
 - Opt-in native qualification: passed. A signed loopback PR-comment event
   created a projectless chat and one requested model turn. The assistant returned
   the exact expected reply; persisted settings were `gpt-6.1-sol` / `low`.
@@ -54,5 +56,6 @@ The shared receiver and its persistent native controller report ready. Public
 HTTPS ingress is not configured or qualified. Real GitHub-to-Desktop delivery,
 automatic host hook execution, and ChatGPT Desktop compatibility are not claimed.
 The hooks require host trust review. Remote repository recreation/publication
-remains pending GitHub's interactive access verification; remote CI has not run
-for this Rust revision. Local history was recreated from a Rust-only root.
+was unblocked after the old repository was removed. The repository was recreated
+empty for publication of this Rust revision. Local history was recreated from a
+Rust-only root; remote CI is qualified separately after publication.
