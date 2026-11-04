@@ -119,6 +119,11 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `edit_goal` | Edit an existing objective or explicitly requested budget |
 | `resume_goal` | Resume an authorized existing goal and separately report queue acceptance |
 
+Stored subscriptions and CI waits with a model preset remain ready when the target
+is active or `thread/resume` definitively rejects its active writer before input
+submission. They retry after 15 seconds, preserving the preset. An uncertain
+`turn/start` result still requires inspection and is never automatically replayed.
+
 Every subscription is independent and one-shot. Completing one doesn't cancel
 the others. Re-registering the same subscription is idempotent; it does not rearm
 a consumed subscription. Source events received before registration aren't replayed.

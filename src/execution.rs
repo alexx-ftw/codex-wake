@@ -2,8 +2,36 @@ use anyhow::{Context, Result, ensure};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, path::Path, time::Duration};
+use std::{collections::HashSet, error::Error, fmt, path::Path, time::Duration};
 use uuid::Uuid;
+
+#[derive(Debug)]
+pub(crate) struct TargetBusyBeforeSend;
+
+impl fmt::Display for TargetBusyBeforeSend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Target thread has an active writer; input was not sent")
+    }
+}
+
+impl Error for TargetBusyBeforeSend {}
+
+pub(crate) fn is_target_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TargetBusyBeforeSend>().is_some()
+}
+
+fn is_active_writer_resume_error(error: &anyhow::Error, thread: &str) -> bool {
+    let text = error.to_string();
+    let Some(response) = text.strip_prefix("Codex app-server RPC failed: ") else {
+        return false;
+    };
+    let Ok(response) = serde_json::from_str::<Value>(response) else {
+        return false;
+    };
+    response["code"].as_i64() == Some(-32600)
+        && response["message"].as_str()
+            == Some(format!("thread {thread} already has an active writer").as_str())
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -100,10 +128,9 @@ fn prepare_with(
         .pointer("/thread/status/type")
         .and_then(Value::as_str)
         .context("Thread read response has no status")?;
-    ensure!(
-        status != "active",
-        "Thread has an active writer; configured execution options cannot be applied"
-    );
+    if status == "active" {
+        return Err(TargetBusyBeforeSend.into());
+    }
     ensure!(
         matches!(status, "idle" | "notLoaded"),
         "Thread cannot apply execution options in status {status}"
@@ -112,7 +139,7 @@ fn prepare_with(
     if status == "idle" && !persist {
         return Ok(thread);
     }
-    call(
+    if let Err(error) = call(
         "thread/resume",
         json!({
             "threadId":thread,
@@ -120,7 +147,13 @@ fn prepare_with(
             "config":{"model_reasoning_effort":options.reasoning_effort},
             "excludeTurns":true
         }),
-    )?;
+    ) {
+        return Err(if is_active_writer_resume_error(&error, &thread) {
+            TargetBusyBeforeSend.into()
+        } else {
+            error
+        });
+    }
     let read = call(
         "thread/read",
         json!({"threadId":thread,"includeTurns":false}),
@@ -354,7 +387,9 @@ mod tests {
     #[test]
     fn active_thread_is_rejected_without_resume_or_turn_start() {
         let options = ExecutionOptions::default();
+        let mut methods = Vec::new();
         let error = deliver_with(THREAD, "run", &options, &mut |method, _| {
+            methods.push(method.to_owned());
             Ok(match method {
                 "model/list" => catalog_page("gpt-6.1-sol", "sol", "low", None),
                 "thread/read" => json!({"thread":{"status":{"type":"active"}}}),
@@ -362,7 +397,70 @@ mod tests {
             })
         })
         .unwrap_err();
-        assert!(error.to_string().contains("active writer"));
+        assert!(is_target_busy(&error));
+        assert_eq!(methods, ["model/list", "thread/read"]);
+    }
+
+    #[test]
+    fn exact_resume_active_writer_rejection_is_typed_before_turn_start() {
+        let options = ExecutionOptions::default();
+        let mut methods = Vec::new();
+        let error = deliver_with(THREAD, "run", &options, &mut |method, _| {
+            methods.push(method.to_owned());
+            match method {
+                "model/list" => Ok(catalog_page("gpt-6.1-sol", "sol", "low", None)),
+                "thread/read" => Ok(json!({"thread":{"status":{"type":"notLoaded"}}})),
+                "thread/resume" => Err(anyhow::anyhow!(
+                    "Codex app-server RPC failed: {}",
+                    json!({
+                        "code":-32600,
+                        "message":format!("thread {THREAD} already has an active writer")
+                    })
+                )),
+                _ => panic!("busy rejection must stop before {method}"),
+            }
+        })
+        .unwrap_err();
+        assert!(is_target_busy(&error));
+        assert_eq!(methods, ["model/list", "thread/read", "thread/resume"]);
+    }
+
+    #[test]
+    fn unrelated_resume_errors_are_not_typed_as_target_busy() {
+        let other_thread = "22222222-2222-4222-8222-222222222222";
+        let cases = [
+            (
+                format!(
+                    "Codex app-server RPC failed: {}",
+                    json!({"code":-32600,"message":format!("thread {other_thread} already has an active writer")})
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "Codex app-server RPC failed: {}",
+                    json!({"code":-32000,"message":format!("thread {THREAD} already has an active writer")})
+                ),
+                false,
+            ),
+            ("transport reset".to_owned(), false),
+        ];
+        for (rpc_error, expected_busy) in cases {
+            let options = ExecutionOptions::default();
+            let mut methods = Vec::new();
+            let error = deliver_with(THREAD, "run", &options, &mut |method, _| {
+                methods.push(method.to_owned());
+                match method {
+                    "model/list" => Ok(catalog_page("gpt-6.1-sol", "sol", "low", None)),
+                    "thread/read" => Ok(json!({"thread":{"status":{"type":"notLoaded"}}})),
+                    "thread/resume" => Err(anyhow::anyhow!("{rpc_error}")),
+                    _ => panic!("resume error must stop before {method}"),
+                }
+            })
+            .unwrap_err();
+            assert_eq!(is_target_busy(&error), expected_busy);
+            assert_eq!(methods, ["model/list", "thread/read", "thread/resume"]);
+        }
     }
 
     #[test]

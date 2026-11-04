@@ -2,6 +2,20 @@
 
 ## Real MCP actions, 2026-11-04
 
+A dedicated real Codex chat verified the preset-delivery busy path: dispatch while
+the chat was active retained `ready/target_busy_before_send`; immediate recovery
+attempted zero deliveries. After the seed turn finished and the cooldown elapsed,
+recovery submitted exactly one input and the agent returned `WAKE_BUSY_DELIVERED`.
+The fixture chat was archived and deleted. Unit coverage also checks the exact
+pre-send RPC rejection, different-thread/code errors, ambiguous turn-start errors,
+and cooldown eligibility for both source subscriptions and CI waits.
+
+The obsolete historical V2 notification was retired only after its owner confirmed
+it was superseded, preserving a private receipt and sending no input. A separate
+V3 notification was found in its destination history despite an old MCP client
+recording `needs_attention`: upgrading the receiver does not replace MCP processes
+already loaded by Desktop. Those connections must reconnect to use new dispatch code.
+
 An enqueue previously reported needs_attention despite the exact original input
 being consumed and acknowledged in the destination chat. Its historical CLI
 output was not retained, so the precise original warning is unproven. A separate
