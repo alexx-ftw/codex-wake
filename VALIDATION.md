@@ -1,5 +1,43 @@
 # Validation
 
+## Linux alpha packaging and clean VM qualification, 2026-11-04
+
+Rust 1.98.0 built the locked Linux x86_64 musl binary. The pinned toolchain
+passed 115 unit tests, eight hook/launcher tests, five telemetry tests, one
+packaging test, both real HTTP tests and Clippy. Launcher regressions cover
+bundled binaries, checked downloads with a fake curl transport, concurrent
+installation, an installation lock released before a long-lived MCP starts,
+bad checksums, unsupported platforms and separate source-build caches.
+Two archives built from identical committed source and binary bytes compared
+identically. This proves archive repeatability, not compiler reproducibility.
+
+A fresh Ubuntu 24.04 minimal KVM guest had no Cargo, a working systemd user
+manager and the official Codex 0.166.0 CLI. Native marketplace/plugin commands
+installed the packaged binary. Two simultaneous real MCP clients exposed all
+13 tools, shared one receiver and left it running after both disconnected.
+Two independent waiting subscriptions survived client closure. A maintenance
+transition from the previously built 0.1.0 runtime to the alpha runtime
+preserved their exact records and the webhook secret. The old runtime was
+launched explicitly from its built binary under the same installed plugin
+identity; this was not an end-to-end old source-launcher installation test.
+
+A local publication and an HMAC-signed PR webhook fixture each reached the
+real native Codex chat history exactly once. Duplicate webhook submission
+matched zero subscriptions; an unsigned request returned HTTP 403. Both inputs
+still occurred once after runtime upgrade and service restart. The guest had
+no model credentials: model turns failed, so these checks prove native input
+delivery, not successful model inference or agent completion. The webhook
+fixture used the real loopback HTTP receiver, not GitHub's external network.
+
+Native plugin removal triggered automatic cleanup. Plugin-owned config, state,
+runtime, cache, installed package, user units and Wake processes disappeared.
+Downloaded archives and the source checkout remained user-owned artifacts.
+The host's active Wake runtime and subscriptions were not updated by these tests.
+Fresh Desktop hook approval and automatic hook execution were not exercised in
+this headless guest; prior host qualification below is separate evidence.
+Treat this as a limited Linux alpha, not broad production or cross-platform
+qualification.
+
 ## Durable recovery after prolonged telemetry contention, 2026-11-04
 
 With SQLite reader and writer locks held for seven seconds, eight real CLI

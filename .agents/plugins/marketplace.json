@@ -3,7 +3,7 @@
   "plugins": [
     {
       "name": "codex-wake",
-      "source": {"source": "url", "url": "https://github.com/alexx-ftw/codex-wake.git", "ref": "main"},
+      "source": {"source": "local", "path": "./"},
       "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
       "category": "Productivity"
     }

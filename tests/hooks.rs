@@ -4,6 +4,13 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[cfg(unix)]
+fn executable(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn invoke(payload: Value) -> std::process::Output {
     let temp = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -100,6 +107,7 @@ fn launcher_does_not_execute_another_plugins_cached_binary() {
             .arg(roots[index].join("scripts/run-mcp.sh"))
             .arg("probe")
             .env("XDG_CACHE_HOME", &cache)
+            .env("CODEX_WAKE_BUILD_FROM_SOURCE", "1")
             .output()
             .unwrap();
         assert!(
@@ -109,4 +117,318 @@ fn launcher_does_not_execute_another_plugins_cached_binary() {
         );
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
     }
+}
+
+#[cfg(unix)]
+fn release_fixture(temp: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = temp.path().join("plugin");
+    let tools = temp.path().join("tools");
+    let source = temp.path().join("release");
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::create_dir_all(source.join("codex-wake-0.2.0-alpha.1/bin")).unwrap();
+    std::fs::create_dir_all(source.join("codex-wake-0.2.0-alpha.1/src")).unwrap();
+    std::fs::write(
+        root.join("scripts/run-mcp.sh"),
+        include_str!("../scripts/run-mcp.sh"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"codex-wake\"\nversion = \"0.2.0-alpha.1\"\n",
+    )
+    .unwrap();
+    let binary = source.join("codex-wake-0.2.0-alpha.1/bin/codex-wake");
+    executable(
+        &binary,
+        "#!/bin/sh\nif [ -n \"${HOLD_MARKER:-}\" ]; then : > \"$HOLD_MARKER\"; sleep 3; fi\nprintf '%s|%s\\n' \"$CODEX_WAKE_PLUGIN_ROOT\" \"$*\"\n",
+    );
+    let output = Command::new("sha256sum")
+        .arg("codex-wake")
+        .current_dir(binary.parent().unwrap())
+        .output()
+        .unwrap();
+    let inner = String::from_utf8(output.stdout).unwrap();
+    std::fs::write(binary.parent().unwrap().join("codex-wake.sha256"), inner).unwrap();
+    std::fs::write(
+        source.join("codex-wake-0.2.0-alpha.1/src/main.rs"),
+        "packaged source\n",
+    )
+    .unwrap();
+    let archive_name = "codex-wake-0.2.0-alpha.1-linux-x86_64.tar.gz";
+    let archive = temp.path().join(archive_name);
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("codex-wake-0.2.0-alpha.1")
+            .current_dir(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let digest = Command::new("sha256sum").arg(&archive).output().unwrap();
+    std::fs::write(
+        temp.path().join("SHA256SUMS"),
+        format!(
+            "{}  {archive_name}\n",
+            String::from_utf8(digest.stdout)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+        ),
+    )
+    .unwrap();
+    let calls = temp.path().join("curl.calls");
+    executable(
+        &tools.join("curl"),
+        &format!(
+            "#!/bin/sh\nurl= out=\nwhile [ $# -gt 0 ]; do case \"$1\" in https://*) url=$1 ;; -o) shift; out=$1 ;; esac; shift; done\nprintf '%s\\n' \"$url\" >> '{}'\ncase \"$url\" in *SHA256SUMS) cp '{}' \"$out\" ;; *) cp '{}' \"$out\" ;; esac\n",
+            calls.display(),
+            temp.path().join("SHA256SUMS").display(),
+            archive.display()
+        ),
+    );
+    (root, tools)
+}
+
+#[cfg(unix)]
+#[test]
+fn launcher_downloads_once_concurrently_and_uses_private_verified_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root, tools) = release_fixture(&temp);
+    let cache = temp.path().join("cache");
+    let script = root.join("scripts/run-mcp.sh");
+    let path = format!("{}:/usr/bin:/bin", tools.display());
+    let cache_for_run = cache.clone();
+    let cache_for_second = cache.clone();
+    let script_for_run = script.clone();
+    let path_for_run = path.clone();
+    let a = std::thread::spawn(move || {
+        Command::new("sh")
+            .arg(script_for_run)
+            .arg("probe")
+            .env("PATH", path_for_run)
+            .env("XDG_CACHE_HOME", cache_for_run)
+            .output()
+            .unwrap()
+    });
+    let b = std::thread::spawn(move || {
+        Command::new("sh")
+            .arg(script)
+            .arg("probe")
+            .env("PATH", path)
+            .env("XDG_CACHE_HOME", cache_for_second)
+            .output()
+            .unwrap()
+    });
+    for output in [a.join().unwrap(), b.join().unwrap()] {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8(output.stdout).unwrap().contains("|probe"));
+    }
+    assert!(
+        Command::new("sh")
+            .arg(root.join("scripts/run-mcp.sh"))
+            .arg("probe")
+            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .env("XDG_CACHE_HOME", &cache)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("curl.calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let installed = cache.join("codex-wake/releases/0.2.0-alpha.1/linux-x86_64/bin/codex-wake");
+    assert!(installed.is_file());
+    assert!(!root.join("bin/codex-wake").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn launcher_prefers_verified_bundled_binary_without_cargo_or_network() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root, tools) = release_fixture(&temp);
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    let binary = root.join("bin/codex-wake");
+    executable(
+        &binary,
+        "#!/bin/sh\nprintf 'bundled:%s:%s\\n' \"$CODEX_WAKE_PLUGIN_ROOT\" \"$*\"\n",
+    );
+    let digest = Command::new("sha256sum")
+        .arg("codex-wake")
+        .current_dir(root.join("bin"))
+        .output()
+        .unwrap();
+    std::fs::write(root.join("bin/codex-wake.sha256"), digest.stdout).unwrap();
+    executable(&tools.join("cargo"), "#!/bin/sh\nexit 90\n");
+    executable(&tools.join("curl"), "#!/bin/sh\nexit 91\n");
+    let output = Command::new("sh")
+        .arg(root.join("scripts/run-mcp.sh"))
+        .arg("probe")
+        .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("bundled:")
+    );
+    let checksum = root.join("bin/codex-wake.sha256");
+    let original = std::fs::read_to_string(&checksum).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&checksum)
+        .unwrap()
+        .write_all(original.as_bytes())
+        .unwrap();
+    let duplicate = Command::new("sh")
+        .arg(root.join("scripts/run-mcp.sh"))
+        .arg("probe")
+        .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        !duplicate.status.success(),
+        "duplicate checksum rows must be rejected"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn launcher_releases_cache_lock_before_long_lived_binary_exec() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root, tools) = release_fixture(&temp);
+    let cache = temp.path().join("cache");
+    let script = root.join("scripts/run-mcp.sh");
+    let path = format!("{}:/usr/bin:/bin", tools.display());
+    let prime = Command::new("sh")
+        .arg(&script)
+        .env("PATH", &path)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .unwrap();
+    assert!(
+        prime.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prime.stderr)
+    );
+
+    let marker = temp.path().join("first-running");
+    let mut first = Command::new("sh")
+        .arg(&script)
+        .env("PATH", &path)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("HOLD_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "first cached process did not start");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{}/fd/9", first.id())).exists(),
+        "cache lock descriptor 9 must be closed in the live MCP process"
+    );
+
+    let mut second = Command::new("sh")
+        .arg(&script)
+        .env("PATH", &path)
+        .env("XDG_CACHE_HOME", &cache)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut completed = false;
+    for _ in 0..100 {
+        if second.try_wait().unwrap().is_some() {
+            completed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !completed {
+        let _ = second.kill();
+    }
+    assert!(
+        completed,
+        "second launch waited for first MCP process to exit"
+    );
+    let second_output = second.wait_with_output().unwrap();
+    assert!(
+        second_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert!(first.wait().unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn launcher_rejects_bad_checksum_without_executing_or_installing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root, tools) = release_fixture(&temp);
+    std::fs::write(
+        temp.path().join("SHA256SUMS"),
+        format!(
+            "{}  codex-wake-0.2.0-alpha.1-linux-x86_64.tar.gz\n",
+            "0".repeat(64)
+        ),
+    )
+    .unwrap();
+    let output = Command::new("sh")
+        .arg(root.join("scripts/run-mcp.sh"))
+        .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !temp
+            .path()
+            .join("cache/codex-wake/releases/0.2.0-alpha.1/linux-x86_64/bin/codex-wake")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn launcher_rejects_unsupported_platform_before_download() {
+    let temp = tempfile::tempdir().unwrap();
+    let (root, tools) = release_fixture(&temp);
+    executable(
+        &tools.join("uname"),
+        "#!/bin/sh\ncase \"$1\" in -s) echo Darwin ;; *) echo arm64 ;; esac\n",
+    );
+    executable(&tools.join("curl"), "#!/bin/sh\nexit 92\n");
+    let output = Command::new("sh")
+        .arg(root.join("scripts/run-mcp.sh"))
+        .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Linux x86_64 only"));
 }

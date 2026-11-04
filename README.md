@@ -16,22 +16,30 @@ codex plugin marketplace add /absolute/path/to/codex-wake
 codex plugin add codex-wake@codex-wake-local
 ```
 
-The host launches `scripts/run-mcp.sh`, which builds the locked Cargo project
-into a directory scoped to the absolute plugin path below
-`$XDG_CACHE_HOME/codex-wake/build` (default `~/.cache/codex-wake/build`).
-Diagnostics go to stderr; stdout is reserved for MCP messages. Rust/Cargo,
-`codex`, `curl`, `tar` and a working Linux systemd user manager are required.
-Automatic receiver installation currently supports Linux x86_64.
+The host launches `scripts/run-mcp.sh`. Release packages include a static binary
+and its checksum; the launcher verifies it before execution. A source checkout
+without that binary downloads the matching versioned GitHub release, verifies
+its checksum, and caches it under `$XDG_CACHE_HOME/codex-wake/releases`
+(default `~/.cache/codex-wake/releases`). Rust and Cargo are not required for
+release installs. Development builds require `CODEX_WAKE_BUILD_FROM_SOURCE=1`
+and use a build cache scoped to the absolute plugin path.
+
+Diagnostics go to stderr; stdout is reserved for MCP messages. `codex`, `curl`,
+GNU `tar`, `sha256sum`, `flock` and a working Linux systemd user manager are
+required. Automatic receiver installation supports Linux x86_64. Codex 0.166.0
+is the qualification baseline; other versions and platforms are not yet
+qualified. See [release qualification](RELEASING.md) for the publication gates.
+
+Binary packages include
+[dependency notices](THIRD_PARTY_NOTICES.md) and Rust standard library notices;
+those third-party components retain their own licenses.
+The bootstrap cache retains its downloaded archive containing those notices.
 
 No usage skill or injected usage instructions are bundled. MCP descriptions,
 parameter schemas and structured results provide the agent interface.
 
-Reviewed MCP-only updates can keep a running receiver: an operator may add the exact new source
-digest to `runtime.json`'s `compatible_sources` after verifying the diff. The
-original source and binary pins remain unchanged; binary and hook-template
-checks still apply. This is an explicit compatibility declaration, not an
-automatic compatibility check for arbitrary functional updates. Open MCP
-connections retain their tool descriptions until they reconnect.
+Open MCP connections retain their tool descriptions until they reconnect.
+Use the maintenance upgrade procedure below for runtime changes.
 
 MCP startup runs deterministic code that:
 
@@ -72,7 +80,7 @@ not installation artifacts. Shared host/system historical logs are not erased.
 
 ```sh
 systemctl --user status codex-wake.service
-cargo run --locked -- remove-service
+sh /absolute/path/to/installed/codex-wake/scripts/run-mcp.sh remove-service
 ```
 
 `remove-service` is a maintenance stop, retaining state and the secret. The
@@ -80,6 +88,23 @@ uninstall watcher remains armed; another MCP session can recreate the receiver
 while the plugin is still installed. It refuses to remove an unrelated unit.
 Stopping this service also stops its controller and any turns that controller
 owns. Finish those turns before a planned removal or runtime upgrade.
+
+### Maintenance upgrade
+
+1. Finish controller-owned turns, disable Wake and close clients using its MCP.
+2. Run the old installed package's launcher with `remove-service`, as above.
+   Do not uninstall the plugin: uninstall deliberately deletes its state.
+3. Verify the new archive with its `SHA256SUMS`, then unpack it into a fresh
+   directory. Add that directory with `codex plugin marketplace add` and run
+   `codex plugin add codex-wake@codex-wake-local` to refresh the installed copy.
+4. Re-enable Wake and reopen the client. Review and approve the updated hooks.
+   The next MCP startup installs the new runtime using the existing state and
+   webhook secret. Reconnect other clients so they load the new MCP interface.
+
+The receiver is offline during this maintenance window. Source systems may
+retry webhook requests according to their own delivery policy; check their
+delivery records and redeliver missed events when needed. This is not a
+zero-downtime updater.
 
 ## Agent interface
 

@@ -1,6 +1,6 @@
 {
   "name": "codex-wake",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.1",
   "description": "Resume Codex chats when their registered event subscriptions are fulfilled.",
   "requires_local_executor": true,
   "mcpServers": "./mcp.json",
