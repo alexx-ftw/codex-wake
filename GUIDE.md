@@ -35,8 +35,15 @@ Binary packages include
 those third-party components retain their own licenses.
 The bootstrap cache retains its downloaded archive containing those notices.
 
-No usage skill or injected usage instructions are bundled. MCP descriptions,
-parameter schemas and structured results provide the agent interface.
+MCP descriptions, parameter schemas and structured results provide the agent
+interface. Optional command skills in `skills/` map directly to the 13 MCP tools,
+for example `$codex-wake:register-wait`, `$codex-wake:subscribe`,
+`$codex-wake:configure-rule`, `$codex-wake:queue-thread` and `$codex-wake:status`.
+Goal commands are `$codex-wake:create-goal`, `$codex-wake:get-goal`,
+`$codex-wake:edit-goal` and `$codex-wake:resume-goal`. The remaining commands are
+`$codex-wake:publish-result`, `$codex-wake:recover-ready`,
+`$codex-wake:list-models` and `$codex-wake:list-projects`.
+No onboarding skill or usage instructions are injected by MCP startup.
 
 Open MCP connections retain their tool descriptions until they reconnect.
 Use the maintenance upgrade procedure below for runtime changes.

@@ -1,5 +1,15 @@
 # Validation
 
+## Command skills, 2026-11-04
+
+The manifest now exposes 13 short command skills, one per MCP tool. An isolated
+native Codex installation loaded the source plugin and `skills/list` returned
+all 13 `codex-wake:*` names enabled, with no skill parse errors. No model turn,
+Docker workload or host runtime transition was needed. Independent static review
+found no mismatch between the skill instructions and current tool contracts.
+The installed host plugin was unchanged by this check. This verifies discovery,
+not live execution of every skill or Desktop picker rendering.
+
 ## Background source polling, 2026-11-04
 
 The source revision adds deterministic polling in the existing user service:

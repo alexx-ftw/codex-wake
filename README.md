@@ -30,7 +30,8 @@ Release installs need no Rust toolchain. They require `codex`, `gh`, `curl`, GNU
 
 Review and approve the bundled `SessionStart`, `Stop` and `SubagentStop` hooks
 in Codex. MCP startup automatically sets up one private receiver shared by all
-sessions. Tools describe their parameters directly; no usage skill is needed.
+sessions. Tools describe their parameters directly; optional [command skills](skills/)
+provide shortcuts such as `$codex-wake:subscribe` and `$codex-wake:status`.
 
 For GitHub, sign in with `gh auth login`. The service polls subscribed resources;
 no public endpoint, Funnel or repository webhook is required.
