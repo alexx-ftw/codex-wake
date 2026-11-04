@@ -123,6 +123,27 @@ fn rpc_socket(
 /// The receiver owns the persistent server; this client never starts or stops a process.
 /// The executable argument is retained for API compatibility and is unused.
 pub fn rpc(_codex: &Path, method: &str, params: Value) -> Result<Value> {
+    let operation = match method {
+        "model/list" => "rpc.model_list",
+        "project/list" => "rpc.project_list",
+        "project/read" => "rpc.project_read",
+        "thread/start" => "rpc.thread_start",
+        "thread/resume" => "rpc.thread_resume",
+        "thread/read" => "rpc.thread_read",
+        "thread/loaded/list" => "rpc.loaded_list",
+        "thread/goal/get" => "rpc.goal_get",
+        "thread/goal/set" => "rpc.goal_set",
+        "thread/queue/add" => "rpc.queue_add",
+        "turn/start" => "rpc.turn_start",
+        _ => "rpc.other",
+    };
+    let span = crate::observability::Span::new(operation, params["threadId"].as_str());
+    let result = rpc_inner(method, params);
+    span.result(&result);
+    result
+}
+
+fn rpc_inner(method: &str, params: Value) -> Result<Value> {
     let socket = rpc_socket(
         std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
         std::env::var_os("XDG_STATE_HOME"),

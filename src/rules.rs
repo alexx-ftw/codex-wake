@@ -168,6 +168,14 @@ pub fn configure(db: &Connection, mut input: RuleInput) -> Result<String> {
         "INSERT INTO rules(id,input) VALUES(?1,?2)",
         params![id, serde_json::to_string(&input)?],
     )?;
+    crate::observability::emit(
+        "rule.configure",
+        "created",
+        "",
+        Some(&id),
+        Duration::ZERO,
+        1,
+    );
     Ok(id)
 }
 
@@ -202,6 +210,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
         "issue_comment" | "pull_request_review_comment"
     ) || !matches!(payload["action"].as_str(), Some("created" | "edited"))
     {
+        crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
         return Ok(0);
     }
     if event_header == "issue_comment"
@@ -209,6 +218,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
             .pointer("/issue/pull_request")
             .is_some_and(Value::is_object)
     {
+        crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
         return Ok(0);
     }
     let pr = payload
@@ -253,6 +263,15 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
         }
     }
     transaction.commit()?;
+    let subject = format!("{event_header}/{id}");
+    crate::observability::emit(
+        "event.accept",
+        if count > 0 { "matched" } else { "no_new_match" },
+        "",
+        Some(&subject),
+        Duration::ZERO,
+        count as u64,
+    );
     Ok(count)
 }
 
@@ -297,6 +316,9 @@ fn dispatch_with(
         };
         tx.execute("UPDATE rule_deliveries SET state='creating',updated=CURRENT_TIMESTAMP WHERE rule_id=?1 AND event_header=?2 AND comment_id=?3 AND state='ready'", params![rule_id,header,comment_id])?;
         tx.commit()?;
+        let subject = format!("{rule_id}/{header}/{comment_id}");
+        let _trace = crate::observability::TraceGuard::new();
+        let span = crate::observability::Span::new("dispatch.rule", Some(&subject));
         let mut stage = "invalid_configuration";
         let result = (|| -> Result<(String, Option<String>)> {
             let mut input: RuleInput = serde_json::from_str(&raw)?;
@@ -367,6 +389,14 @@ fn dispatch_with(
                 .to_string()
             };
             db.execute("UPDATE rule_deliveries SET thread_id=?1,updated=CURRENT_TIMESTAMP WHERE rule_id=?2 AND event_header=?3 AND comment_id=?4", params![thread,rule_id,header,comment_id])?;
+            crate::observability::emit(
+                "delivery.target",
+                "observed",
+                "",
+                Some(&thread),
+                Duration::ZERO,
+                0,
+            );
             stage = "prompt_template_failed";
             context["target"]["thread"] = json!(thread);
             let rendered_prompt = crate::templates::render(&input.prompt, &context)?;
@@ -392,6 +422,15 @@ fn dispatch_with(
             ),
         };
         db.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5",params![state,reason,rule_id,header,comment_id])?;
+        span.finish(
+            if state == "queued" {
+                "queued"
+            } else {
+                "needs_attention"
+            },
+            crate::observability::reason(reason.as_deref()),
+            1,
+        );
         count += 1;
     }
 }

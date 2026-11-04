@@ -229,7 +229,7 @@ pub fn subscribe_with_delivery(
     let execution_json = delivery.execution.map(serde_json::to_string).transpose()?;
     let message_template = delivery.message_template.map(str::to_owned);
 
-    immediate(db, || {
+    let (id, created) = immediate(db, || {
         let existing = {
             let mut statement = db.prepare(
                 "SELECT id,thread,message_template,execution_json FROM subscriptions \
@@ -254,7 +254,7 @@ pub fn subscribe_with_delivery(
                     && options == &execution_json
             })
         {
-            return Ok(id.clone());
+            return Ok((id.clone(), false));
         }
         ensure!(
             existing.is_empty(),
@@ -266,8 +266,18 @@ pub fn subscribe_with_delivery(
 			 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
 			params![id, kind, repo, resource, event, thread, message_template, execution_json],
 		)?;
-        Ok(id)
-    })
+        Ok((id, true))
+    })?;
+    let subject = format!("{kind}/{repo}/{resource}/{event}");
+    crate::observability::emit(
+        "subscribe",
+        if created { "created" } else { "unchanged" },
+        "",
+        Some(&subject),
+        Duration::ZERO,
+        u64::from(created),
+    );
+    Ok(id)
 }
 
 fn field<'a>(payload: &'a Value, name: &str) -> Result<&'a str> {
@@ -296,13 +306,27 @@ fn ready(
 ) -> Result<usize> {
     ensure!(valid_kind_event(kind, event), "Unsupported event");
     let source_json = serde_json::to_string(source)?;
-    Ok(db.execute(
+    let changed = db.execute(
         "UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL, \
          source_json=CASE WHEN message_template IS NOT NULL THEN ?2 ELSE source_json END, \
          updated=CURRENT_TIMESTAMP \
          WHERE kind=?3 AND repo=?4 AND resource=?5 AND event=?6 AND state='waiting'",
         params![outcome, source_json, kind, repo, resource, event],
-    )?)
+    )?;
+    let subject = format!("{kind}/{repo}/{resource}/{event}");
+    crate::observability::emit(
+        "event.accept",
+        if changed > 0 {
+            "matched"
+        } else {
+            "no_new_match"
+        },
+        "",
+        Some(&subject),
+        Duration::ZERO,
+        changed as u64,
+    );
+    Ok(changed)
 }
 
 fn custom_outcome(kind: &str, event: &str, outcome: &str) -> bool {
@@ -663,6 +687,16 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
         else {
             return Ok(attempted);
         };
+        let _trace = crate::observability::TraceGuard::new();
+        let span = crate::observability::Span::new("dispatch.subscription", Some(&id));
+        crate::observability::emit(
+            "delivery.target",
+            "observed",
+            "",
+            Some(&thread),
+            Duration::ZERO,
+            0,
+        );
         let message = delivery_message(DeliveryEvent {
             kind: &kind,
             repo: &repo,
@@ -712,6 +746,15 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
             "UPDATE subscriptions SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='sending'",
             params![state, reason, id],
         )?;
+        span.finish(
+            match state.as_str() {
+                "queued" => "queued",
+                "ready" => "ready",
+                _ => "needs_attention",
+            },
+            crate::observability::reason(reason.as_deref()),
+            1,
+        );
         attempted += 1;
         if state == "ready" {
             return Ok(attempted);

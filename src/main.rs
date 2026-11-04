@@ -3,9 +3,11 @@ mod execution;
 mod goals;
 mod host_cleanup;
 mod manager;
+mod observability;
 mod probe;
 mod rules;
 mod subscriptions;
+mod telemetry;
 mod templates;
 mod uninstall;
 
@@ -158,6 +160,14 @@ fn goal_input_result(
     match result {
         Ok(delivery) => json!({"goal":goal,"delivery":delivery,"turn_execution_verified":false}),
         Err(error) => {
+            observability::emit(
+                "goal.input",
+                "needs_attention",
+                observability::error_class(&error),
+                Some(thread),
+                Duration::ZERO,
+                1,
+            );
             json!({"goal":goal,"delivery_error":error.to_string(),"turn_execution_verified":false})
         }
     }
@@ -197,6 +207,24 @@ fn lifecycle_output(event: &str, matched: usize, states: &[String]) -> Value {
 }
 
 fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
+    let operation = match payload["hook_event_name"].as_str() {
+        Some("SessionStart") => "hook.session_start",
+        Some("Stop") => "hook.stop",
+        Some("SubagentStop") => "hook.subagent_stop",
+        _ => "hook.unsupported",
+    };
+    let span = observability::Span::new(
+        operation,
+        payload["agent_id"]
+            .as_str()
+            .or(payload["session_id"].as_str()),
+    );
+    let result = run_hook_inner(config, payload);
+    span.result(&result);
+    result
+}
+
+fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
     if payload["hook_event_name"] == "SessionStart" {
         let status = manager::ensure_receiver(config)?;
         return Ok(
@@ -215,6 +243,18 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
     let resource = uuid::Uuid::parse_str(resource.context("Hook source ID missing")?)?.to_string();
     let db = database(config)?;
     let matched = subscriptions::publish_with_source(&db, kind, "", &resource, event, payload)?;
+    observability::emit(
+        "hook.matches",
+        if matched > 0 {
+            "matched"
+        } else {
+            "no_new_match"
+        },
+        "",
+        Some(&resource),
+        Duration::ZERO,
+        matched as u64,
+    );
     recover(config)?;
     let mut statement = db.prepare(
         "SELECT state FROM subscriptions WHERE kind=?1 AND repo='' AND resource=?2 AND event=?3",
@@ -231,77 +271,24 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
     ))
 }
 
-#[cfg(test)]
-mod hook_output_tests {
-    use super::*;
-
-    #[test]
-    fn no_new_subscription_is_quiet() {
-        assert_eq!(lifecycle_output("Stop", 0, &["queued".into()]), json!({}));
-    }
-
-    #[test]
-    fn useful_results_are_not_context_or_continuation_instructions() {
-        let output = lifecycle_output(
-            "SubagentStop",
-            4,
-            &[
-                "queued".into(),
-                "ready".into(),
-                "sending".into(),
-                "needs_attention".into(),
-            ],
-        );
-        let text = output["systemMessage"].as_str().unwrap();
-        assert!(text.contains("4 newly matched"));
-        assert!(text.contains("1 queue acceptance(s), 2 pending, 1 requiring attention"));
-        assert!(text.contains("does not verify execution"));
-        assert_eq!(output.as_object().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn hook_reports_real_delivery_states_and_duplicate_is_quiet() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut config = manager::Config::from_env().unwrap();
-        config.plugin_base = None;
-        config.state = temp.path().join("state");
-        config.db = config.state.join("state.sqlite3");
-        config.codex = temp.path().join("missing-codex");
-        let db = database(&config).unwrap();
-        let source = "11111111-1111-4111-8111-111111111111";
-        subscriptions::subscribe_with_delivery(
-            &db,
-            "thread",
-            "",
-            source,
-            "turn_completed",
-            "22222222-2222-4222-8222-222222222222",
-            subscriptions::DeliveryConfig {
-                message_template: None,
-                execution: None,
-            },
-        )
-        .unwrap();
-        let payload = json!({"hook_event_name":"Stop","session_id":source,"last_assistant_message":"PRIVATE_TEXT_NOT_FOR_HOOK_OUTPUT"});
-        let output = run_hook(&config, &payload).unwrap();
-        let text = output["systemMessage"].as_str().unwrap();
-        assert!(text.contains("1 newly matched"));
-        assert!(text.contains("0 queue acceptance(s), 1 pending"));
-        assert!(!text.contains("PRIVATE_TEXT"));
-        assert_eq!(run_hook(&config, &payload).unwrap(), json!({}));
-    }
-}
-
 fn tool_result(result: Result<Value>) -> CallToolResult {
     match result {
         Ok(value) => CallToolResult::structured(value),
         Err(error) => {
+            observability::emit(
+                "mcp.result",
+                "error",
+                observability::error_class(&error),
+                None,
+                Duration::ZERO,
+                1,
+            );
             CallToolResult::error(vec![rmcp::model::ContentBlock::text(error.to_string())])
         }
     }
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl WakeTools {
     #[tool(
         description = "List available models and supported reasoning efforts.",
@@ -555,7 +542,7 @@ impl WakeTools {
         tool_result((|| {
             let db = database(&self.config)?;
             Ok(
-                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"supported_events":subscriptions::ALLOWED_EVENTS}),
+                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
             )
         })())
     }
@@ -572,6 +559,69 @@ impl WakeTools {
     }
 }
 
+#[rmcp::tool_handler(router = Self::tool_router())]
+impl rmcp::ServerHandler for WakeTools {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let operation = match request.name.as_ref() {
+            "list_models" => "mcp.list_models",
+            "list_projects" => "mcp.list_projects",
+            "configure_rule" => "mcp.configure_rule",
+            "queue_thread" => "mcp.queue_thread",
+            "get_goal" => "mcp.get_goal",
+            "create_goal" => "mcp.create_goal",
+            "edit_goal" => "mcp.edit_goal",
+            "resume_goal" => "mcp.resume_goal",
+            "subscribe" => "mcp.subscribe",
+            "publish_result" => "mcp.publish_result",
+            "register_wait" => "mcp.register_wait",
+            "get_status" => "mcp.get_status",
+            "recover_ready" => "mcp.recover_ready",
+            _ => "mcp.unknown_tool",
+        };
+        observability::TRACE
+            .scope(uuid::Uuid::new_v4().to_string(), async {
+                let span = observability::Span::new(operation, None);
+                let result = Self::tool_router()
+                    .call(rmcp::handler::server::tool::ToolCallContext::new(
+                        self, request, context,
+                    ))
+                    .await;
+                match &result {
+                    Ok(rmcp::model::CallToolResponse::Complete(value))
+                        if value.is_error == Some(true) =>
+                    {
+                        span.finish("error", "tool_error", 1)
+                    }
+                    Err(_) => span.finish("rejected", "invalid_tool_request", 1),
+                    Ok(rmcp::model::CallToolResponse::Complete(value)) => {
+                        let value = value.structured_content.as_ref();
+                        let partial = value.is_some_and(|v| {
+                            v.get("delivery_error").is_some()
+                                || v["state"] == "needs_attention"
+                                || v.pointer("/delivery/state") == Some(&json!("needs_attention"))
+                        });
+                        span.finish(
+                            if partial { "needs_attention" } else { "ok" },
+                            if partial {
+                                "delivery_not_confirmed"
+                            } else {
+                                ""
+                            },
+                            1,
+                        );
+                    }
+                    _ => span.finish("ok", "", 1),
+                }
+                result
+            })
+            .await
+    }
+}
+
 fn option(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
     let Some(index) = args.iter().position(|s| s == name) else {
         return Ok(None);
@@ -585,6 +635,43 @@ fn option(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
 
 fn required(args: &mut Vec<String>, name: &str) -> Result<String> {
     option(args, name)?.with_context(|| format!("Missing {name}"))
+}
+
+fn diagnostics(config: &manager::Config, days: u32) -> Result<Value> {
+    anyhow::ensure!((1..=90).contains(&days), "days must be between 1 and 90");
+    let mut report = telemetry::report(&config.state.join("telemetry.sqlite3"), days)
+        .unwrap_or_else(
+            |error| json!({"enabled":false,"error_class":observability::error_class(&error)}),
+        );
+    report["telemetry_write_failures_this_process"] = json!(observability::failures());
+    let queues = (|| -> Result<Value> {
+        if !config.db.exists() {
+            return Ok(json!({}));
+        }
+        let db = rusqlite::Connection::open_with_flags(
+            &config.db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        db.busy_timeout(Duration::from_millis(250))?;
+        let mut queues = serde_json::Map::new();
+        for table in ["waits", "subscriptions", "rule_deliveries"] {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                continue;
+            }
+            let mut stmt = db.prepare(&format!("SELECT state,count(*),max(max(0,unixepoch()-unixepoch(updated))) FROM {table} GROUP BY state"))?;
+            let groups = stmt.query_map([], |r| Ok(json!({"state":r.get::<_,String>(0)?,"count":r.get::<_,i64>(1)?,"oldest_seconds":r.get::<_,Option<i64>>(2)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            queues.insert(table.into(), json!(groups));
+        }
+        Ok(json!(queues))
+    })();
+    report["queues"] =
+        queues.unwrap_or_else(|error| json!({"error_class":observability::error_class(&error)}));
+    Ok(report)
 }
 
 fn cli_execution(args: &mut Vec<String>) -> Result<Option<execution::ExecutionOptions>> {
@@ -615,7 +702,53 @@ async fn main() -> Result<()> {
         "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|register|subscribe|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
     );
     let command = args.remove(0);
+    // Cleanup must never recreate state after removing the plugin.
+    if command != "cleanup-uninstalled" && command != "diagnostics" {
+        observability::configure(config.state.join("telemetry.sqlite3"));
+    }
+    let operation = match command.as_str() {
+        "mcp" => "cli.mcp",
+        "ensure" => "cli.ensure",
+        "receiver" => "cli.receiver",
+        "register" => "cli.register",
+        "subscribe" => "cli.subscribe",
+        "publish" => "cli.publish",
+        "handle" => "cli.handle",
+        "hook" => "cli.hook",
+        "status" => "cli.status",
+        "subscriptions" => "cli.subscriptions",
+        "recover" => "cli.recover",
+        "configure-rule" => "cli.configure_rule",
+        "goal-get" => "cli.goal_get",
+        "remove-service" => "cli.remove_service",
+        "cleanup-uninstalled" => "cli.cleanup",
+        "smoke-live" | "smoke-github" => "cli.probe",
+        "diagnostics" => "cli.diagnostics",
+        _ => "cli.unknown_command",
+    };
+    observability::TRACE
+        .scope(uuid::Uuid::new_v4().to_string(), async {
+            let span = observability::Span::new(operation, None);
+            let result = run_command(config, command, args).await;
+            span.result(&result);
+            result
+        })
+        .await
+}
+
+async fn run_command(
+    config: manager::Config,
+    command: String,
+    mut args: Vec<String>,
+) -> Result<()> {
     match command.as_str() {
+        "diagnostics" => {
+            let days = option(&mut args, "--days")?
+                .unwrap_or_else(|| "42".into())
+                .parse::<u32>()?;
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            println!("{}", diagnostics(&config, days)?);
+        }
         "configure-rule" => {
             let path = required(&mut args, "--file")?;
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
@@ -807,4 +940,65 @@ async fn main() -> Result<()> {
         _ => bail!("Unknown command {command}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_output_tests {
+    use super::*;
+
+    #[test]
+    fn no_new_subscription_is_quiet() {
+        assert_eq!(lifecycle_output("Stop", 0, &["queued".into()]), json!({}));
+    }
+
+    #[test]
+    fn useful_results_are_not_context_or_continuation_instructions() {
+        let output = lifecycle_output(
+            "SubagentStop",
+            4,
+            &[
+                "queued".into(),
+                "ready".into(),
+                "sending".into(),
+                "needs_attention".into(),
+            ],
+        );
+        let text = output["systemMessage"].as_str().unwrap();
+        assert!(text.contains("4 newly matched"));
+        assert!(text.contains("1 queue acceptance(s), 2 pending, 1 requiring attention"));
+        assert!(text.contains("does not verify execution"));
+        assert_eq!(output.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hook_reports_real_delivery_states_and_duplicate_is_quiet() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let db = database(&config).unwrap();
+        let source = "11111111-1111-4111-8111-111111111111";
+        subscriptions::subscribe_with_delivery(
+            &db,
+            "thread",
+            "",
+            source,
+            "turn_completed",
+            "22222222-2222-4222-8222-222222222222",
+            subscriptions::DeliveryConfig {
+                message_template: None,
+                execution: None,
+            },
+        )
+        .unwrap();
+        let payload = json!({"hook_event_name":"Stop","session_id":source,"last_assistant_message":"PRIVATE_TEXT_NOT_FOR_HOOK_OUTPUT"});
+        let output = run_hook(&config, &payload).unwrap();
+        let text = output["systemMessage"].as_str().unwrap();
+        assert!(text.contains("1 newly matched"));
+        assert!(text.contains("0 queue acceptance(s), 1 pending"));
+        assert!(!text.contains("PRIVATE_TEXT"));
+        assert_eq!(run_hook(&config, &payload).unwrap(), json!({}));
+    }
 }

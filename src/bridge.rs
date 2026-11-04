@@ -229,12 +229,12 @@ pub fn register_with_template(
     let execution_json = execution.map(serde_json::to_string).transpose()?;
 
     db.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<()> {
-        db.execute(
+    let result = (|| -> Result<bool> {
+        let inserted = db.execute(
             "INSERT OR IGNORE INTO waits(repo,run_id,attempt,thread,sha,message_template,execution_json) \
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![repo, run_id, attempt, thread, sha, message_template, execution_json],
-        )?;
+        )? != 0;
         let existing: (String, String, Option<String>, Option<String>) = db.query_row(
             "SELECT thread,sha,message_template,execution_json FROM waits WHERE repo=?1 AND run_id=?2 AND attempt=?3",
             params![repo, run_id, attempt],
@@ -247,9 +247,19 @@ pub fn register_with_template(
                 && existing.3 == execution_json,
             "Registration conflicts with existing destination, SHA, message template, or execution options"
         );
-        Ok(())
+        Ok(inserted)
     })();
-    finish_transaction(db, result)
+    let created = finish_transaction(db, result)?;
+    let subject = format!("{repo}/{run_id}/{attempt}");
+    crate::observability::emit(
+        "register.wait",
+        if created { "created" } else { "unchanged" },
+        "",
+        Some(&subject),
+        Duration::ZERO,
+        u64::from(created),
+    );
+    Ok(())
 }
 
 /// Store a completion only for an explicitly registered run/attempt and matching SHA.
@@ -259,6 +269,7 @@ pub fn accept(db: &Connection, payload: &Value) -> Result<&'static str> {
         "Payload exceeds 1 MiB"
     );
     if payload.get("action").and_then(Value::as_str) != Some("completed") {
+        crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
         return Ok("ignored");
     }
     let run = payload
@@ -311,7 +322,7 @@ pub fn accept(db: &Connection, payload: &Value) -> Result<&'static str> {
     );
 
     db.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<&'static str> {
+    let result = (|| -> Result<Option<bool>> {
         let registered: Option<(String, Option<String>)> = db
             .query_row(
                 "SELECT sha,message_template FROM waits WHERE repo=?1 AND run_id=?2 AND attempt=?3",
@@ -320,7 +331,7 @@ pub fn accept(db: &Connection, payload: &Value) -> Result<&'static str> {
             )
             .optional()?;
         let Some((registered_sha, message_template)) = registered else {
-            return Ok("unregistered");
+            return Ok(None);
         };
         ensure!(
             registered_sha == sha,
@@ -330,14 +341,32 @@ pub fn accept(db: &Connection, payload: &Value) -> Result<&'static str> {
             .as_ref()
             .map(|_| serde_json::to_string(payload))
             .transpose()?;
-        db.execute(
+        let updated = db.execute(
             "UPDATE waits SET state='ready', conclusion=?1, source_json=?2, updated=CURRENT_TIMESTAMP \
              WHERE repo=?3 AND run_id=?4 AND attempt=?5 AND state='waiting'",
             params![conclusion, source_json, repo, run_id, attempt],
         )?;
-        Ok("recorded")
+        Ok(Some(updated != 0))
     })();
-    finish_transaction(db, result)
+    let accepted = finish_transaction(db, result)?;
+    let subject = format!("{repo}/{run_id}/{attempt}");
+    crate::observability::emit(
+        "event.accept",
+        match accepted {
+            Some(true) => "accepted",
+            Some(false) => "duplicate",
+            None => "unregistered",
+        },
+        "",
+        Some(&subject),
+        Duration::ZERO,
+        u64::from(accepted == Some(true)),
+    );
+    Ok(if accepted.is_some() {
+        "recorded"
+    } else {
+        "unregistered"
+    })
 }
 
 fn finish_transaction<T>(db: &Connection, result: Result<T>) -> Result<T> {
@@ -404,6 +433,17 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
         else {
             return Ok(count);
         };
+        let subject = format!("{repo}/{run_id}/{attempt}");
+        let _trace = crate::observability::TraceGuard::new();
+        let span = crate::observability::Span::new("dispatch.wait", Some(&subject));
+        crate::observability::emit(
+            "delivery.target",
+            "observed",
+            "",
+            Some(&thread),
+            Duration::ZERO,
+            0,
+        );
 
         let message = match message_template {
             Some(template) => (|| -> Result<String> {
@@ -477,6 +517,15 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
              WHERE repo=?3 AND run_id=?4 AND attempt=?5",
             params![state, reason, repo, run_id, attempt],
         )?;
+        span.finish(
+            match state.as_str() {
+                "queued" => "queued",
+                "ready" => "ready",
+                _ => "needs_attention",
+            },
+            crate::observability::reason(reason.as_deref()),
+            1,
+        );
         count += 1;
         if state == "ready" {
             return Ok(count);

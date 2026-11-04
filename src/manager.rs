@@ -26,7 +26,7 @@ const HOOKS: &str = include_str!("../hooks.json.tmpl");
 const ARCHIVE_SHA: &str = "3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b";
 const WEBHOOK_SHA: &str = "12c895f29250cbc4289ca45838235d334b39af6cf49d8e17fb43d8efed10372d";
 
-fn source_digest() -> String {
+pub(crate) fn source_digest() -> String {
     let mut digest = Sha256::new();
     for source in [
         include_bytes!("main.rs").as_slice(),
@@ -40,6 +40,8 @@ fn source_digest() -> String {
         include_bytes!("rules.rs").as_slice(),
         include_bytes!("uninstall.rs").as_slice(),
         include_bytes!("host_cleanup.rs").as_slice(),
+        include_bytes!("observability.rs").as_slice(),
+        include_bytes!("telemetry.rs").as_slice(),
         include_bytes!("../Cargo.lock").as_slice(),
         HOOKS.as_bytes(),
     ] {
@@ -610,6 +612,8 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 .arg(format!("unix://{}", config.rpc_socket.display()))
                 .env("CODEX_HOME", &config.codex_home)
                 .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()?,
         ))
     } else {
@@ -619,17 +623,43 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     };
     let mut receiver = ChildGuard(
         Command::new(binary)
-            .args(["-ip", "127.0.0.1", "-port", "9000", "-template", "-hooks"])
+            .args([
+                "-verbose",
+                "-ip",
+                "127.0.0.1",
+                "-port",
+                "9000",
+                "-template",
+                "-hooks",
+            ])
             .arg(root.join("hooks.json.tmpl"))
             .env("GITHUB_WEBHOOK_SECRET", secret)
             .env("CODEX_WAKE_EXECUTABLE", env::current_exe()?)
             .env("CODEX_WAKE_DB", &config.db)
             .env("CODEX_WAKE_CODEX", &config.codex)
             .env("CODEX_WAKE_DEFER", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?,
     );
+    if let Some(child) = &mut controller {
+        if let Some(pipe) = child.0.stdout.take() {
+            crate::observability::capture(pipe, "controller");
+        }
+        if let Some(pipe) = child.0.stderr.take() {
+            crate::observability::capture(pipe, "controller");
+        }
+    }
+    if let Some(pipe) = receiver.0.stdout.take() {
+        crate::observability::capture(pipe, "webhook");
+    }
+    if let Some(pipe) = receiver.0.stderr.take() {
+        crate::observability::capture(pipe, "webhook");
+    }
+    crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     let config = config.clone();
     thread::spawn(move || {
+        let mut heartbeat = Instant::now() - Duration::from_secs(60);
         loop {
             let result = (|| -> Result<()> {
                 let mut db = crate::bridge::connect(&config.db)?;
@@ -641,7 +671,41 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 Ok(())
             })();
             if let Err(error) = result {
-                eprintln!("codex-wake dispatch error: {error}");
+                crate::observability::emit(
+                    "receiver.dispatch",
+                    "error",
+                    crate::observability::error_class(&error),
+                    None,
+                    Duration::ZERO,
+                    1,
+                );
+            }
+            if heartbeat.elapsed() >= Duration::from_secs(60) {
+                if let Err(error) = observe_queues(&config) {
+                    crate::observability::emit(
+                        "queue.snapshot",
+                        "error",
+                        crate::observability::error_class(&error),
+                        None,
+                        Duration::ZERO,
+                        1,
+                    );
+                }
+                let started = Instant::now();
+                let result = crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}));
+                crate::observability::emit(
+                    "receiver.heartbeat",
+                    if result.is_ok() { "ok" } else { "error" },
+                    result
+                        .as_ref()
+                        .err()
+                        .map(crate::observability::error_class)
+                        .unwrap_or(""),
+                    None,
+                    started.elapsed(),
+                    1,
+                );
+                heartbeat = Instant::now();
             }
             thread::sleep(Duration::from_secs(1));
         }
@@ -650,13 +714,68 @@ pub fn run_receiver(config: &Config) -> Result<()> {
         if let Some(controller) = &mut controller
             && let Some(status) = controller.0.try_wait()?
         {
+            crate::observability::emit(
+                "controller.exit",
+                "error",
+                "child_exited",
+                None,
+                Duration::ZERO,
+                status.code().unwrap_or(255) as u64,
+            );
             bail!("Codex controller exited with {status}");
         }
         if let Some(status) = receiver.0.try_wait()? {
+            crate::observability::emit(
+                "webhook.exit",
+                "error",
+                "child_exited",
+                None,
+                Duration::ZERO,
+                status.code().unwrap_or(255) as u64,
+            );
             bail!("Webhook receiver exited with {status}");
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn observe_queues(config: &Config) -> Result<()> {
+    let db = crate::bridge::connect(&config.db)?;
+    for (table, operation) in [
+        ("waits", "queue.waits"),
+        ("subscriptions", "queue.subscriptions"),
+        ("rule_deliveries", "queue.rules"),
+    ] {
+        let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table} GROUP BY state"))?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (state, count, age) = row?;
+            let state = match state.as_str() {
+                "waiting" => "waiting",
+                "ready" => "ready",
+                "sending" => "sending",
+                "creating" => "creating",
+                "queued" => "queued",
+                "needs_attention" => "needs_attention",
+                _ => "unknown_state",
+            };
+            crate::observability::emit(
+                operation,
+                "snapshot",
+                state,
+                None,
+                Duration::from_secs(age.max(0) as u64),
+                count.max(0) as u64,
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn require_installed(config: &Config) -> Result<()> {

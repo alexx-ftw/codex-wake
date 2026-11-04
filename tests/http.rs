@@ -50,6 +50,10 @@ impl Drop for Receiver {
 }
 
 fn cli(db: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
+    let root = db.parent().unwrap();
+    let state = root.join("codex-wake");
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     Command::new(env!("CARGO_BIN_EXE_codex-wake"))
         .args([
             "--db",
@@ -58,6 +62,10 @@ fn cli(db: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
             codex.to_str().unwrap(),
         ])
         .args(args)
+        .env("XDG_STATE_HOME", root)
+        .env("CODEX_HOME", root.join("codex-home"))
+        .env_remove("CODEX_WAKE_PLUGIN_BASE")
+        .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .output()
         .unwrap()
 }
@@ -169,6 +177,10 @@ fn start_receiver(
         .env("CAPTURE", temp.path().join("codex-calls"))
         .env("GITHUB_WEBHOOK_SECRET", SECRET)
         .env("CODEX_WAKE_DEFER", if defer { "1" } else { "0" })
+        .env("XDG_STATE_HOME", temp.path())
+        .env("CODEX_HOME", temp.path().join("codex-home"))
+        .env_remove("CODEX_WAKE_PLUGIN_BASE")
+        .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .stdout(Stdio::from(logfile.try_clone().unwrap()))
         .stderr(Stdio::from(logfile));
     #[cfg(unix)]

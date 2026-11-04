@@ -230,6 +230,7 @@ cargo run --locked -- subscribe --kind artifact --repo release-pipeline \
 cargo run --locked -- status
 cargo run --locked -- subscriptions
 cargo run --locked -- recover
+cargo run --locked -- diagnostics --days 42
 ```
 
 The database is `$XDG_STATE_HOME/codex-wake/state.sqlite3` (default
@@ -246,6 +247,48 @@ CLI cannot be guaranteed without an idempotent acknowledgement protocol.
 Every continuation contains fixed routing metadata rather than webhook message
 text. It grants no new authority. The receiving agent verifies the event at its
 source and continues only the existing authorized task.
+
+## Operational diagnostics
+
+Operational metadata is stored locally in
+`$XDG_STATE_HOME/codex-wake/telemetry.sqlite3` (default
+`~/.local/state/codex-wake/telemetry.sqlite3`). `diagnostics --days 1..90` and
+MCP `get_status` expose daily counts, latency totals/maxima, recent problems,
+observation timestamps and queue counts/oldest ages. No model turn is needed.
+
+Records cover CLI/MCP calls (including invalid tool arguments), hooks, event
+matching and deduplication, registrations, delivery claims/results, controller
+RPCs, process exits and a controller-readiness heartbeat every minute. The
+receiver's HTTP access records include status classes and durations; a 403 means
+signature or trigger mismatch, not necessarily an authentication attack.
+Controller warnings and connection failures are categorized before storage.
+
+Each record includes a timestamp, process/build identity, correlation trace,
+operation, outcome, reason category, duration and count. Source/delivery/thread
+identifiers are hashed. Prompts, goals, templates, webhook bodies, credentials,
+headers, URLs and raw child/error output are excluded from this telemetry.
+The operational database still retains original source data where templates
+require it; it is separate from the telemetry database.
+
+Detailed records retain up to 42 days or 100,000 entries, whichever is reached
+first; daily aggregates retain 90 days. Pruned detail is counted explicitly.
+SQLite is limited to 64 MiB and reuses freed pages. Files are private (0600,
+directory 0700) and removed with the plugin's state on uninstall. Telemetry
+failures emit a fixed diagnostic to stderr and do not stop event processing.
+Child output is drained independently through a bounded nonblocking queue;
+overflow is counted when the writer catches up. Repeated storage warnings are
+rate-limited. If storage stays unavailable or a process is killed, some records
+can be missing; a stale heartbeat and incomplete spans are diagnostic signals,
+not proof that the underlying work failed.
+
+`ok` means that operation succeeded. `queued` means queue/turn-start acceptance,
+not verified execution or completion. A `started` record without a terminal
+record is an unfinished observation, not proof of failure. Queue snapshots use
+duration for the oldest record's age, not request latency. No external analytics
+service or automatic model probes are used.
+Count completed `mcp.*` operations to measure agent calls, and `dispatch.*`
+outcomes to measure deliveries. Starts, nested RPCs and queue snapshots are
+separate observations and must not be summed as independent user actions.
 
 ## Validation
 

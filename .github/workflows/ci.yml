@@ -46,4 +46,5 @@ jobs:
         run: |
           cargo +stable test --locked --bin codex-wake
           cargo +stable test --locked --test hooks
+          cargo +stable test --locked --test telemetry
           cargo +stable test --locked --test http -- --include-ignored

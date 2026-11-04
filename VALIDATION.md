@@ -2,6 +2,17 @@
 
 Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
 
+- Operational telemetry qualification: 96 binary tests, 3 isolated telemetry CLI
+  tests, 2 hook CLI tests and the native reply-matcher self-check passed; format
+  and Clippy with warnings denied passed. Eight simultaneous CLI processes
+  retained every expected terminal record. Retention/cap pruning, daily
+  aggregates, private files, missing-state read-only diagnostics, first-write
+  migration and logging failures that preserve hook processing were exercised.
+  These tests do not start model turns or manipulate the desktop.
+  Telemetry distinguishes request success, queue acceptance and unfinished
+  observations. Child log capture uses a bounded nonblocking queue; overflow
+  counts are emitted when its writer catches up. Operational metadata is local.
+
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - Binary unit tests: 86 passed, including hook result summaries, duplicate
