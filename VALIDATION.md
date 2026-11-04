@@ -2,6 +2,14 @@
 
 ## Real MCP actions, 2026-11-04
 
+A post-restart audit also found two SessionStart failures while a newer binary
+was being prepared in the shared Cargo target before its source alias was
+installed. An isolated reproduction with two copies of the same package showed
+the launcher executing copy A's cached binary when launching copy B. The launcher
+now scopes its Cargo target to the absolute plugin path. The real-Cargo
+regression in tests/hooks.rs failed with A instead of B before the fix and passed
+A/B/A afterwards, including checkout and cache paths containing spaces.
+
 The goal-description correction was subsequently installed without stopping the
 shared receiver. A reviewed exact source alias retained the original runtime
 source/binary pins; the receiver PID, executable inode/checksum and both child

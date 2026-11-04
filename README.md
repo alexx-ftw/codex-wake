@@ -17,7 +17,8 @@ codex plugin add codex-wake@codex-wake-local
 ```
 
 The host launches `scripts/run-mcp.sh`, which builds the locked Cargo project
-into `$XDG_CACHE_HOME/codex-wake/build` (default `~/.cache/codex-wake/build`).
+into a directory scoped to the absolute plugin path below
+`$XDG_CACHE_HOME/codex-wake/build` (default `~/.cache/codex-wake/build`).
 Diagnostics go to stderr; stdout is reserved for MCP messages. Rust/Cargo,
 `codex`, `curl`, `tar` and a working Linux systemd user manager are required.
 Automatic receiver installation currently supports Linux x86_64.
