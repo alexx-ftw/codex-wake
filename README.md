@@ -75,6 +75,23 @@ owns. Finish those turns before a planned removal or runtime upgrade.
 
 ## Agent interface
 
+For a stable public HTTPS endpoint without a custom domain, enable Tailscale
+Funnel for the machine, then mount only the webhook route in the background:
+
+```sh
+tailscale funnel --bg --yes --https=443 --set-path=/hooks/codex-wake \
+  http://127.0.0.1:9000/hooks/codex-wake
+cargo run --locked -- record-funnel
+```
+
+`record-funnel` explicitly adopts that exact route into the plugin's private
+installation state. `get_status` reports its configured URL. Tailscale manages
+HTTPS and persistence across restarts; GitHub HMAC authentication remains in
+the receiver. Uninstall removes the adopted path if its proxy is unchanged,
+preserving other Tailscale routes and the shared Tailscale installation. A
+replaced path is left to its new owner. This does not create repository webhooks
+or change tailnet-wide policies automatically.
+
 | MCP tool | Action |
 |---|---|
 | `register_wait` | Register exact CI repo/run/attempt/SHA and destination chat |

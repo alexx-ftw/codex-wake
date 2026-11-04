@@ -709,6 +709,7 @@ async fn main() -> Result<()> {
     let operation = match command.as_str() {
         "mcp" => "cli.mcp",
         "ensure" => "cli.ensure",
+        "record-funnel" => "cli.record_funnel",
         "receiver" => "cli.receiver",
         "register" => "cli.register",
         "subscribe" => "cli.subscribe",
@@ -742,6 +743,10 @@ async fn run_command(
     mut args: Vec<String>,
 ) -> Result<()> {
     match command.as_str() {
+        "record-funnel" => {
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            println!("{}", manager::record_funnel(&config)?);
+        }
         "diagnostics" => {
             let days = option(&mut args, "--days")?
                 .unwrap_or_else(|| "42".into())

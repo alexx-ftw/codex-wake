@@ -25,6 +25,149 @@ const MARKER: &str = "# Managed by codex-wake v1\n";
 const HOOKS: &str = include_str!("../hooks.json.tmpl");
 const ARCHIVE_SHA: &str = "3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b";
 const WEBHOOK_SHA: &str = "12c895f29250cbc4289ca45838235d334b39af6cf49d8e17fb43d8efed10372d";
+const FUNNEL_PATH: &str = "/hooks/codex-wake";
+const FUNNEL_PROXY: &str = "http://127.0.0.1:9000/hooks/codex-wake";
+
+fn tailscale(args: &[&str]) -> Result<Value> {
+    let out = run(
+        Command::new(find_program("tailscale")?).args(args),
+        Duration::from_secs(20),
+    )?;
+    ensure!(
+        out.status.success(),
+        "Tailscale command failed; inspect tailscaled status"
+    );
+    if args.contains(&"status") {
+        Ok(serde_json::from_slice(&out.stdout)?)
+    } else {
+        Ok(Value::Null)
+    }
+}
+
+fn read_funnel(config: &Config) -> Result<Option<String>> {
+    let path = config.state.join("funnel.json");
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        meta.is_file()
+            && meta.uid() == fs::metadata("/proc/self")?.uid()
+            && meta.permissions().mode() & 0o077 == 0
+            && meta.len() <= 4096,
+        "Funnel ownership record is not private"
+    );
+    let record: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let server = record["server"].as_str().context("Missing Funnel server")?;
+    ensure!(
+        record["version"] == 1
+            && server.ends_with(".ts.net:443")
+            && server
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-:".contains(&b)),
+        "Invalid Funnel ownership record"
+    );
+    Ok(Some(server.to_owned()))
+}
+
+fn funnel_proxy<'a>(status: &'a Value, server: &str) -> Option<&'a str> {
+    status
+        .get("Web")?
+        .get(server)?
+        .get("Handlers")?
+        .get(FUNNEL_PATH)?
+        .get("Proxy")?
+        .as_str()
+}
+
+fn current_funnel_server(status: &Value) -> Result<String> {
+    let dns = status
+        .pointer("/Self/DNSName")
+        .and_then(Value::as_str)
+        .context("Missing current Tailscale DNS name")?
+        .trim_end_matches('.');
+    Ok(format!("{dns}:443"))
+}
+
+pub fn record_funnel(config: &Config) -> Result<Value> {
+    require_installed(config)?;
+    let _guard = lock(config)?;
+    require_installed(config)?;
+    let status = tailscale(&["funnel", "status", "--json"])?;
+    let servers: Vec<_> = status["Web"]
+        .as_object()
+        .context("No configured Funnel route")?
+        .keys()
+        .filter(|server| {
+            funnel_proxy(&status, server) == Some(FUNNEL_PROXY)
+                && status["AllowFunnel"][server.as_str()] == true
+        })
+        .collect();
+    ensure!(
+        servers.len() == 1 && status["TCP"]["443"]["HTTPS"] == true,
+        "Expected exactly one HTTPS Funnel route for codex-wake"
+    );
+    let server = servers[0];
+    ensure!(
+        *server == current_funnel_server(&tailscale(&["status", "--json"])?)?,
+        "Funnel route belongs to another node name"
+    );
+    ensure!(
+        server.ends_with(".ts.net:443")
+            && server
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-:".contains(&b)),
+        "Invalid Funnel server"
+    );
+    if let Some(existing) = read_funnel(config)? {
+        ensure!(&existing == server, "Another Funnel route is already owned");
+    }
+    atomic_write(
+        &config.state.join("funnel.json"),
+        serde_json::to_vec(&json!({"version":1,"server":server}))?.as_slice(),
+        0o600,
+    )?;
+    Ok(
+        json!({"provider":"tailscale","url":format!("https://{}{FUNNEL_PATH}",server.trim_end_matches(":443")),"configured":true,"persistent":true}),
+    )
+}
+
+fn funnel_status(config: &Config) -> Result<Value> {
+    let Some(server) = read_funnel(config)? else {
+        return Ok(Value::Null);
+    };
+    let status = tailscale(&["funnel", "status", "--json"])?;
+    let current = current_funnel_server(&tailscale(&["status", "--json"])?)?;
+    Ok(
+        json!({"provider":"tailscale","url":format!("https://{}{FUNNEL_PATH}",server.trim_end_matches(":443")),"configured":current==server && funnel_proxy(&status,&server)==Some(FUNNEL_PROXY) && status["AllowFunnel"][&server]==true,"persistent":true}),
+    )
+}
+
+fn remove_funnel_with(server: &str, call: &mut impl FnMut(&[&str]) -> Result<Value>) -> Result<()> {
+    let status = call(&["funnel", "status", "--json"])?;
+    // A changed target belongs to its new owner; never reset shared Tailscale config.
+    if funnel_proxy(&status, server) != Some(FUNNEL_PROXY) {
+        return Ok(());
+    }
+    if current_funnel_server(&call(&["status", "--json"])?)? != server {
+        return Ok(());
+    }
+    call(&[
+        "funnel",
+        "--bg",
+        "--yes",
+        "--https=443",
+        "--set-path=/hooks/codex-wake",
+        "off",
+    ])?;
+    let after = call(&["funnel", "status", "--json"])?;
+    ensure!(
+        funnel_proxy(&after, server) != Some(FUNNEL_PROXY),
+        "Owned Funnel route was not removed"
+    );
+    Ok(())
+}
 
 pub(crate) fn source_digest() -> String {
     let mut digest = Sha256::new();
@@ -467,10 +610,12 @@ pub fn status(config: &Config) -> Result<Value> {
         );
         Ok(())
     })();
+    let ingress = funnel_status(config)
+        .unwrap_or_else(|error| json!({"error_class":crate::observability::error_class(&error)}));
     Ok(
         json!({"service":fields, "local_ready":health.is_ok(), "health_error":health.err().map(|e|e.to_string()),
         "controller_ready":controller.is_ok(),"controller_error":controller.err().map(|e|e.to_string()),
-        "public_ingress_verified":false,"lifecycle":"shared persistent user service; closing MCP does not stop it"}),
+        "ingress":ingress,"public_ingress_verified":false,"lifecycle":"shared persistent user service; closing MCP does not stop it"}),
     )
 }
 
@@ -1041,6 +1186,9 @@ pub fn cleanup_uninstalled(config: &Config) -> Result<()> {
         crate::uninstall::validate_external_database(&config.db)?;
     }
     let metadata_socket = config.state.join("cleanup.sock");
+    if let Some(server) = read_funnel(config)? {
+        remove_funnel_with(&server, &mut tailscale)?;
+    }
     remove_stale_socket(&metadata_socket)?;
     let mut metadata = ChildGuard(
         Command::new(&config.codex)
@@ -1111,6 +1259,106 @@ pub fn remove_service(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn funnel_cleanup_removes_only_unchanged_owned_path() {
+        let server = "test.tail123.ts.net:443";
+        let before = json!({"Web":{server:{"Handlers":{
+            FUNNEL_PATH:{"Proxy":FUNNEL_PROXY},"/unrelated":{"Proxy":"http://127.0.0.1:1234"}
+        }}}});
+        let after =
+            json!({"Web":{server:{"Handlers":{"/unrelated":{"Proxy":"http://127.0.0.1:1234"}}}}});
+        let mut commands = Vec::new();
+        remove_funnel_with(server, &mut |args| {
+            commands.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            Ok(match commands.len() {
+                1 => before.clone(),
+                2 => json!({"Self":{"DNSName":"test.tail123.ts.net."}}),
+                3 => Value::Null,
+                _ => after.clone(),
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            commands[2],
+            vec![
+                "funnel",
+                "--bg",
+                "--yes",
+                "--https=443",
+                "--set-path=/hooks/codex-wake",
+                "off"
+            ]
+        );
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            after["Web"][server]["Handlers"]["/unrelated"]["Proxy"],
+            "http://127.0.0.1:1234"
+        );
+    }
+
+    #[test]
+    fn funnel_cleanup_preserves_changed_or_missing_target() {
+        let server = "test.tail123.ts.net:443";
+        for status in [
+            json!({}),
+            json!({"Web":{server:{"Handlers":{FUNNEL_PATH:{"Proxy":"http://127.0.0.1:1234"}}}}}),
+        ] {
+            let mut calls = 0;
+            remove_funnel_with(server, &mut |args| {
+                calls += 1;
+                assert_eq!(args, ["funnel", "status", "--json"]);
+                Ok(status.clone())
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn funnel_cleanup_checks_removal_and_rejects_untrusted_record() {
+        let server = "test.tail123.ts.net:443";
+        let status = json!({"Web":{server:{"Handlers":{FUNNEL_PATH:{"Proxy":FUNNEL_PROXY}}}}});
+        assert!(
+            remove_funnel_with(server, &mut |args| {
+                Ok(if args == ["status", "--json"] {
+                    json!({"Self":{"DNSName":"test.tail123.ts.net."}})
+                } else {
+                    status.clone()
+                })
+            })
+            .is_err()
+        );
+        let mut calls = 0;
+        remove_funnel_with(server, &mut |args| {
+            calls += 1;
+            Ok(if args == ["status", "--json"] {
+                json!({"Self":{"DNSName":"renamed.tail123.ts.net."}})
+            } else {
+                status.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            calls, 2,
+            "A renamed node must not remove another server's path"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.state = temp.path().to_path_buf();
+        assert!(read_funnel(&config).unwrap().is_none());
+        atomic_write(
+            &temp.path().join("funnel.json"),
+            br#"{"version":1,"server":"invalid;command.ts.net:443"}"#,
+            0o600,
+        )
+        .unwrap();
+        assert!(read_funnel(&config).is_err());
+        fs::remove_file(temp.path().join("funnel.json")).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("missing"), temp.path().join("funnel.json"))
+            .unwrap();
+        assert!(read_funnel(&config).is_err());
+    }
     #[test]
     fn cleanup_stops_only_clients_with_matching_process_identity() {
         let temp = tempfile::tempdir().unwrap();
