@@ -45,4 +45,5 @@ jobs:
           CODEX_WAKE_WEBHOOK: ${{ github.workspace }}/.tools/webhook-linux-amd64/webhook
         run: |
           cargo +stable test --locked --bin codex-wake
+          cargo +stable test --locked --test hooks
           cargo +stable test --locked --test http -- --include-ignored

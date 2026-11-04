@@ -180,6 +180,118 @@ fn recover(config: &manager::Config) -> Result<usize> {
     )
 }
 
+fn lifecycle_output(event: &str, matched: usize, states: &[String]) -> Value {
+    if matched == 0 {
+        return json!({});
+    }
+    let count = |state: &str| {
+        states
+            .iter()
+            .filter(|value| value.as_str() == state)
+            .count()
+    };
+    json!({"systemMessage":format!(
+        "codex-wake {event}: {matched} newly matched subscription(s). Current subscriptions for this source: {} queue acceptance(s), {} pending, {} requiring attention. Queue acceptance does not verify execution.",
+        count("queued"), count("ready") + count("sending"), count("needs_attention")
+    )})
+}
+
+fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
+    if payload["hook_event_name"] == "SessionStart" {
+        let status = manager::ensure_receiver(config)?;
+        return Ok(
+            json!({"systemMessage":if status["controller_ready"] == true {
+                "codex-wake: shared receiver and Codex controller are available."
+            } else {
+                "codex-wake: shared receiver is available; Codex controller is not ready."
+            }}),
+        );
+    }
+    let (kind, event, resource) = match payload["hook_event_name"].as_str() {
+        Some("Stop") => ("thread", "turn_completed", payload["session_id"].as_str()),
+        Some("SubagentStop") => ("subagent", "completed", payload["agent_id"].as_str()),
+        _ => bail!("Unsupported lifecycle hook"),
+    };
+    let resource = uuid::Uuid::parse_str(resource.context("Hook source ID missing")?)?.to_string();
+    let db = database(config)?;
+    let matched = subscriptions::publish_with_source(&db, kind, "", &resource, event, payload)?;
+    recover(config)?;
+    let mut statement = db.prepare(
+        "SELECT state FROM subscriptions WHERE kind=?1 AND repo='' AND resource=?2 AND event=?3",
+    )?;
+    let states = statement
+        .query_map(rusqlite::params![kind, resource, event], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(lifecycle_output(
+        payload["hook_event_name"].as_str().unwrap_or_default(),
+        matched,
+        &states,
+    ))
+}
+
+#[cfg(test)]
+mod hook_output_tests {
+    use super::*;
+
+    #[test]
+    fn no_new_subscription_is_quiet() {
+        assert_eq!(lifecycle_output("Stop", 0, &["queued".into()]), json!({}));
+    }
+
+    #[test]
+    fn useful_results_are_not_context_or_continuation_instructions() {
+        let output = lifecycle_output(
+            "SubagentStop",
+            4,
+            &[
+                "queued".into(),
+                "ready".into(),
+                "sending".into(),
+                "needs_attention".into(),
+            ],
+        );
+        let text = output["systemMessage"].as_str().unwrap();
+        assert!(text.contains("4 newly matched"));
+        assert!(text.contains("1 queue acceptance(s), 2 pending, 1 requiring attention"));
+        assert!(text.contains("does not verify execution"));
+        assert_eq!(output.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hook_reports_real_delivery_states_and_duplicate_is_quiet() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let db = database(&config).unwrap();
+        let source = "11111111-1111-4111-8111-111111111111";
+        subscriptions::subscribe_with_delivery(
+            &db,
+            "thread",
+            "",
+            source,
+            "turn_completed",
+            "22222222-2222-4222-8222-222222222222",
+            subscriptions::DeliveryConfig {
+                message_template: None,
+                execution: None,
+            },
+        )
+        .unwrap();
+        let payload = json!({"hook_event_name":"Stop","session_id":source,"last_assistant_message":"PRIVATE_TEXT_NOT_FOR_HOOK_OUTPUT"});
+        let output = run_hook(&config, &payload).unwrap();
+        let text = output["systemMessage"].as_str().unwrap();
+        assert!(text.contains("1 newly matched"));
+        assert!(text.contains("0 queue acceptance(s), 1 pending"));
+        assert!(!text.contains("PRIVATE_TEXT"));
+        assert_eq!(run_hook(&config, &payload).unwrap(), json!({}));
+    }
+}
+
 fn tool_result(result: Result<Value>) -> CallToolResult {
     match result {
         Ok(value) => CallToolResult::structured(value),
@@ -614,26 +726,17 @@ async fn main() -> Result<()> {
             io::stdin().take(1024 * 1024 + 1).read_to_end(&mut raw)?;
             anyhow::ensure!(raw.len() <= 1024 * 1024, "Hook payload exceeds 1 MiB");
             let payload: Value = serde_json::from_slice(&raw)?;
-            if payload["hook_event_name"] == "SessionStart" {
-                manager::ensure_receiver(&config)?;
-                println!("{{}}");
-                return Ok(());
+            match run_hook(&config, &payload) {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("codex-wake hook error: {error:#}");
+                    println!(
+                        "{}",
+                        json!({"systemMessage":"codex-wake: hook processing failed; event delivery is not confirmed. See hook diagnostics."})
+                    );
+                    return Err(error);
+                }
             }
-            let (kind, event, resource) = match payload["hook_event_name"].as_str() {
-                Some("Stop") => ("thread", "turn_completed", payload["session_id"].as_str()),
-                Some("SubagentStop") => ("subagent", "completed", payload["agent_id"].as_str()),
-                _ => bail!("Unsupported lifecycle hook"),
-            };
-            subscriptions::publish_with_source(
-                &database(&config)?,
-                kind,
-                "",
-                resource.context("Hook source ID missing")?,
-                event,
-                &payload,
-            )?;
-            recover(&config)?;
-            println!("{{}}");
         }
         "smoke-live" | "smoke-github" => {
             let thread = required(&mut args, "--test-thread")?;

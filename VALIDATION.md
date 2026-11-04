@@ -4,9 +4,17 @@ Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
 
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- Binary unit tests: 83 passed, including cleanup ownership, nested links,
+- Binary unit tests: 86 passed, including hook result summaries, duplicate
+  quieting, payload privacy, cleanup ownership, nested links,
   external database identity, process identity, and host-config isolation.
 - Native-test reply matcher self-check: passed; a marker in the user prompt alone is rejected.
+- Hook CLI tests: 2 passed. Stop/SubagentStop emit one valid JSON object;
+  failures retain a failing exit code and emit a supported warning shape.
+  The installed SessionStart command was invoked against the real service:
+  it recreated the removed receiver and returned a `systemMessage` confirming
+  receiver/controller availability. No context or continuation fields were emitted.
+  Useful output uses Codex's documented common hook output contract; automatic
+  host invocation still requires the user's hook trust review.
 - Real HTTP tests: 2 passed with verified adnanh/webhook 2.8.3 and fake Codex.
   They cover authentication, duplicate delivery, deferred PR-comment rules and artifact events.
 - Real lifecycle test: passed. Concurrent MCP processes used one enabled user

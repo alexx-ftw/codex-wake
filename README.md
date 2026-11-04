@@ -205,6 +205,14 @@ completed` when the task itself is done. Consumers must verify the source's
 result before acting. Interruptions, closing a window, and idle status aren't
 treated as task success. Self-subscription to a thread's own stop is rejected.
 
+Hook stdout follows Codex's JSON contract. `SessionStart` reports receiver and
+controller readiness through `systemMessage`. `Stop` and `SubagentStop` report
+newly matched subscriptions and current delivery states for that source; no new
+matches produce `{}`. Accepted queue input is explicitly distinguished from
+verified execution. Hook failures retain a failing exit code and diagnostics.
+These messages surface in the UI/event stream, not as model instructions.
+No `additionalContext`, stop decision or forced continuation is emitted.
+
 Hooks are supported by manually installed desktop plugins; this package isn't
 currently eligible for the public directory while it bundles them. The resume
 transport targets Codex chats through the installed `codex queue --resume` CLI;
