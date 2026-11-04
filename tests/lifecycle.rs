@@ -22,6 +22,26 @@ fn pid() -> String {
 }
 
 #[test]
+#[ignore = "uses the real shared user service; run explicitly"]
+fn mcp_environment_can_reuse_the_installed_service() {
+    let initial_pid = pid();
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-wake"))
+        .arg("ensure")
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("CODEX_WAKE_CODEX")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(pid(), initial_pid);
+}
+
+#[test]
 #[ignore = "creates/reuses the real shared user service; run explicitly"]
 fn concurrent_mcp_sessions_share_receiver_and_closing_them_preserves_it() {
     // Start both OS processes before either handshake: their startup paths contend.

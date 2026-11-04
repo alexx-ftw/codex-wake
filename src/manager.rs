@@ -247,9 +247,6 @@ impl Config {
         let db = env::var_os("CODEX_WAKE_DB")
             .map(PathBuf::from)
             .unwrap_or_else(|| state.join("state.sqlite3"));
-        let codex = env::var_os("CODEX_WAKE_CODEX")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| find_program("codex").unwrap_or_else(|_| PathBuf::from("codex")));
         let codex_home = xdg("CODEX_HOME", home.join(".codex"))?;
         let rpc_socket = xdg("CODEX_WAKE_RPC_SOCKET", state.join("app-server.sock"))?;
         let cache = xdg("XDG_CACHE_HOME", home.join(".cache"))?.join("codex-wake");
@@ -257,6 +254,10 @@ impl Config {
             .ok()
             .map(|bytes| serde_json::from_slice::<Value>(&bytes))
             .transpose()?;
+        let codex = env::var_os("CODEX_WAKE_CODEX")
+            .map(PathBuf::from)
+            .or_else(|| saved.as_ref()?.get("codex")?.as_str().map(PathBuf::from))
+            .unwrap_or_else(|| find_program("codex").unwrap_or_else(|_| PathBuf::from("codex")));
         let base = env::var_os("CODEX_WAKE_PLUGIN_BASE")
             .map(PathBuf::from)
             .or_else(|| {
@@ -333,10 +334,19 @@ pub fn run(command: &mut Command, timeout: Duration) -> Result<Output> {
 }
 
 fn systemctl(args: &[&str]) -> Result<String> {
-    let out = run(
-        Command::new("systemctl").arg("--user").args(args),
-        Duration::from_secs(20),
-    )?;
+    let mut command = Command::new("systemctl");
+    command.arg("--user").args(args);
+    if env::var_os("XDG_RUNTIME_DIR").is_none() {
+        let uid = fs::metadata("/proc/self")?.uid();
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        let meta = fs::symlink_metadata(&runtime)?;
+        ensure!(
+            meta.is_dir() && meta.uid() == uid,
+            "Invalid user runtime directory"
+        );
+        command.env("XDG_RUNTIME_DIR", runtime);
+    }
+    let out = run(&mut command, Duration::from_secs(20))?;
     ensure!(
         out.status.success(),
         "systemctl {} failed: {}",
@@ -996,7 +1006,7 @@ fn install_cleanup(config: &Config) -> Result<()> {
     }
     atomic_write(
         &config.state.join("installation.json"),
-        serde_json::to_vec(&json!({"plugin_base":base}))?.as_slice(),
+        serde_json::to_vec(&json!({"plugin_base":base,"codex":config.codex}))?.as_slice(),
         0o600,
     )?;
     if changed {
@@ -1417,6 +1427,38 @@ mod tests {
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         assert!(load_secret(&link).is_err());
+    }
+    #[test]
+    fn installed_codex_survives_a_different_path() {
+        const CHILD: &str = "CODEX_WAKE_CONFIG_TEST_CHILD";
+        if env::var_os(CHILD).is_some() {
+            assert_eq!(
+                Config::from_env().unwrap().codex,
+                PathBuf::from("/installed/codex")
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("codex-wake")).unwrap();
+        fs::write(
+            temp.path().join("codex-wake/installation.json"),
+            br#"{"codex":"/installed/codex"}"#,
+        )
+        .unwrap();
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "manager::tests::installed_codex_survives_a_different_path",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_STATE_HOME", temp.path())
+            .env("PATH", "/nonexistent")
+            .env_remove("CODEX_WAKE_CODEX")
+            .env_remove("CODEX_WAKE_PLUGIN_ROOT")
+            .env_remove("CODEX_WAKE_PLUGIN_BASE")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
     #[test]
     fn unit_values_are_quoted_without_line_injection() {

@@ -126,6 +126,17 @@ does not prove execution or the model that processed a particular turn.
 The local plugin is installed and enabled from a clean source archive. Its
 installed launcher exposes 13 MCP tools and reuses the existing service. The
 archive contains no VCS metadata, private test reports or chat transcript.
+An additional native MCP discovery check on 2026-11-04 found that Codex 0.166.0
+treated `${PLUGIN_ROOT}` literally in this manifest's MCP arguments and working
+directory. The package now uses a relative script path and `cwd: "."`.
+Startup also persists the installed Codex executable across different MCP PATHs
+and supplies the owned user runtime directory to systemctl when the host omits
+XDG_RUNTIME_DIR. A regression reuses the same live receiver with only
+`/usr/bin:/bin` on PATH and no D-Bus/runtime environment variables.
+The native app-server discovered all 13 tools, called get_status successfully,
+and a fresh ephemeral Sol/low agent independently called that MCP tool and
+finished with `WAKE_MCP_OK`. Existing desktop chats with a cached failed
+connection were not restarted or proven refreshed by this check.
 The installed Codex 0.166.0 runtime detected MCP configuration but ignored hooks
 from the portable root manifest, including its compatibility overlay. Using the
 Codex manifest alone made all three hooks discoverable; `hooks/list` confirms

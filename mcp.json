@@ -4,8 +4,8 @@
     "codex-wake": {
       "type": "stdio",
       "command": "sh",
-      "args": ["${PLUGIN_ROOT}/scripts/run-mcp.sh"],
-      "cwd": "${PLUGIN_ROOT}"
+      "args": ["scripts/run-mcp.sh"],
+      "cwd": "."
     }
   }
 }
