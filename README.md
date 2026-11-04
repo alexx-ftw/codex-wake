@@ -91,6 +91,9 @@ the receiver. Uninstall removes the adopted path if its proxy is unchanged,
 preserving other Tailscale routes and the shared Tailscale installation. A
 replaced path is left to its new owner. This does not create repository webhooks
 or change tailnet-wide policies automatically.
+The status call checks local ingress configuration, not a fresh external
+delivery. Its conservative `public_ingress_verified` flag is not a substitute
+for the dated external delivery evidence in `VALIDATION.md`.
 
 | MCP tool | Action |
 |---|---|

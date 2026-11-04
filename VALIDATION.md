@@ -2,6 +2,25 @@
 
 Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
 
+- Stable Tailscale Funnel ingress passed
+  [real GitHub qualification 41860250112](https://github.com/alexx-ftw/codex-wake/actions/runs/41860250112)
+  at revision `a73d40601c91f95db085edf9302cae58db5cdf88`. GitHub's exact delivery
+  record confirmed HTTP 200, four exact native assistant replies were observed,
+  and SessionStart, Stop and SubagentStop completed automatically after the user
+  trusted the updated plugin bundle. The endpoint is mounted only at
+  `/hooks/codex-wake` with a loopback proxy and HMAC verification; public GET
+  returned 405 at that path and 404 at the root. Tailscale's background serve
+  configuration remains active, tailscaled is enabled and user linger was
+  already enabled. No machine or Tailscale daemon restart was performed.
+  The temporary repository webhook and fixture rows were removed; the stable
+  ingress remains configured. No permanent repository webhook was created.
+  Funnel ownership is stored privately outside the plugin bundle. Three focused
+  mocked-CLI tests cover selective route removal, preservation of changed or
+  missing targets, node renaming, unsuccessful removal and unsafe state files;
+  all 99 unit tests, integration tests and
+  [CI](https://github.com/alexx-ftw/codex-wake/actions/runs/41859647580) passed.
+  Live uninstall of the active Funnel route was not performed.
+
 - Real GitHub end-to-end qualification passed with
   [Actions run 41854888860](https://github.com/alexx-ftw/codex-wake/actions/runs/41854888860)
   at revision `466e046af53ece277a92d0bdf89190b2f8398476`.
@@ -112,9 +131,9 @@ from the portable root manifest, including its compatibility overlay. Using the
 Codex manifest alone made all three hooks discoverable; `hooks/list` confirms
 SessionStart, Stop and SubagentStop are enabled and `trusted` after host review.
 
-The shared receiver and its persistent native controller report ready. A
-temporary HTTPS ingress and real GitHub-to-native-Codex delivery are qualified
-above; permanent public ingress remains unconfigured. Pixel rendering of hook
+The shared receiver and its persistent native controller report ready. Both
+temporary HTTPS ingress and stable Tailscale Funnel ingress with real
+GitHub-to-native-Codex delivery are qualified above. Pixel rendering of hook
 results and ChatGPT Desktop compatibility are not claimed. The GitHub repository was
 recreated with Rust-only history and published; the functional revision's
 [CI passed](https://github.com/alexx-ftw/codex-wake/actions/runs/41852198562).
