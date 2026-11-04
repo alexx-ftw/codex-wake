@@ -14,7 +14,29 @@ Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
   it recreated the removed receiver and returned a `systemMessage` confirming
   receiver/controller availability. No context or continuation fields were emitted.
   Useful output uses Codex's documented common hook output contract; automatic
-  host invocation still requires the user's hook trust review.
+  host invocation requires the user's hook trust review.
+- After that review, automatic runtime qualification passed. `hooks/list`
+  confirmed all three enabled hooks were `trusted`. A normal Desktop test turn
+  spawned one Luna/low subagent; its completion and the parent turn's completion
+  triggered their subscribed Sol/low recipient turns, which returned the exact
+  expected delivery markers. A second probe used temporary native threads and
+  captured real `hook/completed` notifications for SessionStart, Stop and
+  SubagentStop: all were `completed`, and useful results were classified as
+  `warning` entries. The two completion hooks each reported one newly matched
+  subscription, one queue acceptance, zero pending and zero requiring attention.
+  The probe verified two further recipient replies, five warning entries and
+  zero plugin model-context entries. Hooks were never invoked manually in either
+  automatic test. Fixture subscriptions were removed and reused test chats were
+  archived after the test; the source chat was subsequently reopened for inspection.
+  This verifies native execution and event-stream output, not visual rendering.
+  Read-only inspection of the installed Desktop bundle confirms the presentation
+  path: `hook/completed` updates the turn's `hookRuns`; completed runs retain
+  `warning` entries in `hookStats`; the response action labelled `Hook stats`
+  opens the run-history dialog, which renders their text under `Message` and
+  displays the run status separately. Informational messages do not indicate a
+  failed run. These are code-level findings, not a visual qualification of the
+  live dialog. Desktop capture worked, but pointer automation did not reliably
+  operate the interface; no claim of successful visual verification is made.
 - Real HTTP tests: 2 passed with verified adnanh/webhook 2.8.3 and fake Codex.
   They cover authentication, duplicate delivery, deferred PR-comment rules and artifact events.
 - Real lifecycle test: passed. Concurrent MCP processes used one enabled user
@@ -58,12 +80,10 @@ archive contains no VCS metadata, private test reports or chat transcript.
 The installed Codex 0.166.0 runtime detected MCP configuration but ignored hooks
 from the portable root manifest, including its compatibility overlay. Using the
 Codex manifest alone made all three hooks discoverable; `hooks/list` confirms
-SessionStart, Stop and SubagentStop are enabled but `untrusted` pending host review.
+SessionStart, Stop and SubagentStop are enabled and `trusted` after host review.
 
 The shared receiver and its persistent native controller report ready. Public
-HTTPS ingress is not configured or qualified. Real GitHub-to-Desktop delivery,
-automatic host hook execution, and ChatGPT Desktop compatibility are not claimed.
-The hooks require host trust review. Remote repository recreation/publication
-was unblocked after the old repository was removed. The repository was recreated
-empty for publication of this Rust revision. Local history was recreated from a
-Rust-only root; remote CI is qualified separately after publication.
+HTTPS ingress is not configured or qualified. Real GitHub-to-Desktop delivery
+and ChatGPT Desktop compatibility are not claimed. The GitHub repository was
+recreated with Rust-only history and published; the functional revision's
+[CI passed](https://github.com/alexx-ftw/codex-wake/actions/runs/41838531726).
