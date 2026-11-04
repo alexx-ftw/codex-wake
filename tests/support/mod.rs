@@ -68,6 +68,12 @@ impl Client {
             "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"codex-wake-test","version":"1"}}}));
         let reply = self.response(1, Duration::from_secs(15));
         assert!(reply.get("error").is_none(), "MCP initialize failed");
+        assert!(
+            reply["result"]["instructions"]
+                .as_str()
+                .is_none_or(str::is_empty),
+            "MCP must expose its tools without injected usage instructions"
+        );
         self.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         self.next_id = 2;
     }

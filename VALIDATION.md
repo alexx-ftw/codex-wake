@@ -10,6 +10,11 @@ Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
   They cover authentication, duplicate delivery, deferred PR-comment rules and artifact events.
 - Real lifecycle test: passed. Concurrent MCP processes used one enabled user
   service; closing all test clients preserved its PID.
+  This also passed after explicitly removing the unit: two concurrent MCP
+  startups recreated it and shared one receiver, which remained active after
+  both clients closed. TCP inspection confirmed one listener on 127.0.0.1:9000.
+  The MCP handshake assertion confirms no usage instructions are injected;
+  native plugin inspection reports no onboarding skill or bundled skills.
 - Administrative lifecycle qualification: passed against the real installation.
   Persistently disabling the plugin and then uninstalling it preserved the
   receiver PID and signed HTTP health. Uninstall removed the plugin cache.
