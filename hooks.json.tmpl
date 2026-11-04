@@ -1,0 +1,35 @@
+[
+  {
+    "id": "codex-wake",
+    "execute-command": "{{ getenv "CODEX_WAKE_EXECUTABLE" | js }}",
+    "http-methods": ["POST"],
+    "include-command-output-in-response": true,
+    "include-command-output-in-response-on-error": false,
+    "pass-arguments-to-command": [
+      {"source": "string", "name": "handle"},
+      {"source": "string", "name": "--event-env"},
+      {"source": "string", "name": "CODEX_WAKE_EVENT"},
+      {"source": "string", "name": "--payload-env"},
+      {"source": "string", "name": "CODEX_WAKE_PAYLOAD"}
+    ],
+    "pass-environment-to-command": [
+      {"source": "header", "name": "X-GitHub-Event", "envname": "CODEX_WAKE_EVENT"}
+    ],
+    "pass-file-to-command": [
+      {"source": "entire-payload", "envname": "CODEX_WAKE_PAYLOAD"}
+    ],
+    "trigger-rule-mismatch-http-response-code": 403,
+    "trigger-rule": {
+      "and": [
+        {"match": {"type": "payload-hmac-sha256", "secret": "{{ getenv "GITHUB_WEBHOOK_SECRET" | js }}", "parameter": {"source": "header", "name": "X-Hub-Signature-256"}}},
+        {"or": [
+          {"and": [
+            {"match": {"type": "value", "value": "workflow_run", "parameter": {"source": "header", "name": "X-GitHub-Event"}}},
+            {"match": {"type": "value", "value": "completed", "parameter": {"source": "payload", "name": "action"}}}
+          ]},
+          {"match": {"type": "regex", "regex": "^(pull_request|pull_request_review|pull_request_review_comment|issue_comment|deployment_status|push|codex_wake)$", "parameter": {"source": "header", "name": "X-GitHub-Event"}}}
+        ]}
+      ]
+    }
+  }
+]

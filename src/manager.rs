@@ -1,0 +1,680 @@
+use anyhow::{Context, Result, bail, ensure};
+use hmac::{Hmac, Mac};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    env,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    net::TcpStream,
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        net::UnixStream,
+    },
+    path::{Path, PathBuf},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+use wait_timeout::ChildExt;
+
+const UNIT: &str = "codex-wake.service";
+const MARKER: &str = "# Managed by codex-wake v1\n";
+const HOOKS: &str = include_str!("../hooks.json.tmpl");
+const ARCHIVE_SHA: &str = "3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b";
+const WEBHOOK_SHA: &str = "12c895f29250cbc4289ca45838235d334b39af6cf49d8e17fb43d8efed10372d";
+
+fn source_digest() -> String {
+    let mut digest = Sha256::new();
+    for source in [
+        include_bytes!("main.rs").as_slice(),
+        include_bytes!("manager.rs").as_slice(),
+        include_bytes!("bridge.rs").as_slice(),
+        include_bytes!("subscriptions.rs").as_slice(),
+        include_bytes!("probe.rs").as_slice(),
+        include_bytes!("goals.rs").as_slice(),
+        include_bytes!("templates.rs").as_slice(),
+        include_bytes!("execution.rs").as_slice(),
+        include_bytes!("rules.rs").as_slice(),
+        include_bytes!("../Cargo.lock").as_slice(),
+        HOOKS.as_bytes(),
+    ] {
+        digest.update(source.len().to_le_bytes());
+        digest.update(source);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn runtime_matches(config: &Config) -> bool {
+    (|| -> Result<bool> {
+        let stamp: Value = serde_json::from_slice(&fs::read(config.runtime.join("runtime.json"))?)?;
+        Ok(stamp["source"] == source_digest()
+            && stamp["binary"]
+                == format!(
+                    "{:x}",
+                    Sha256::digest(fs::read(config.runtime.join("codex-wake"))?)
+                )
+            && fs::read_to_string(config.runtime.join("hooks.json.tmpl"))? == HOOKS)
+    })()
+    .unwrap_or(false)
+}
+
+#[derive(Clone)]
+pub struct Config {
+    pub state: PathBuf,
+    pub runtime: PathBuf,
+    pub config: PathBuf,
+    pub unit: PathBuf,
+    pub db: PathBuf,
+    pub codex: PathBuf,
+    pub codex_home: PathBuf,
+    pub rpc_socket: PathBuf,
+}
+
+fn xdg(name: &str, default: PathBuf) -> Result<PathBuf> {
+    let path = env::var_os(name).map(PathBuf::from).unwrap_or(default);
+    ensure!(path.is_absolute(), "{name} must be absolute");
+    Ok(path)
+}
+
+pub fn find_program(name: &str) -> Result<PathBuf> {
+    env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join(name))
+        .find(|path| {
+            path.is_file() && fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        })
+        .with_context(|| format!("Executable {name} is required on PATH"))
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        let home = PathBuf::from(env::var_os("HOME").context("HOME is missing")?);
+        ensure!(home.is_absolute(), "HOME must be absolute");
+        let state = xdg("XDG_STATE_HOME", home.join(".local/state"))?.join("codex-wake");
+        let config_home = xdg("XDG_CONFIG_HOME", home.join(".config"))?;
+        let runtime = xdg("XDG_DATA_HOME", home.join(".local/share"))?.join("codex-wake/runtime");
+        let db = env::var_os("CODEX_WAKE_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state.join("state.sqlite3"));
+        let codex = env::var_os("CODEX_WAKE_CODEX")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| find_program("codex").unwrap_or_else(|_| PathBuf::from("codex")));
+        let codex_home = xdg("CODEX_HOME", home.join(".codex"))?;
+        let rpc_socket = xdg("CODEX_WAKE_RPC_SOCKET", state.join("app-server.sock"))?;
+        Ok(Self {
+            state,
+            runtime,
+            config: config_home.join("codex-wake"),
+            unit: config_home.join("systemd/user").join(UNIT),
+            db,
+            codex,
+            codex_home,
+            rpc_socket,
+        })
+    }
+}
+
+pub fn private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_dir() && meta.uid() == fs::metadata("/proc/self")?.uid(),
+        "Directory is not owned by this user"
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub fn run(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let stdout = tempfile::tempfile()?;
+    let stderr = tempfile::tempfile()?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .spawn()?;
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
+        None => {
+            child.kill()?;
+            child.wait()?;
+            bail!("Command timed out; inspect state before retrying");
+        }
+    };
+    use std::io::{Seek, SeekFrom};
+    let mut stdout = stdout;
+    let mut stderr = stderr;
+    stdout.seek(SeekFrom::Start(0))?;
+    stderr.seek(SeekFrom::Start(0))?;
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout.take(1024 * 1024).read_to_end(&mut output.stdout)?;
+    stderr.take(1024 * 1024).read_to_end(&mut output.stderr)?;
+    Ok(output)
+}
+
+fn systemctl(args: &[&str]) -> Result<String> {
+    let out = run(
+        Command::new("systemctl").arg("--user").args(args),
+        Duration::from_secs(20),
+    )?;
+    ensure!(
+        out.status.success(),
+        "systemctl {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8(out.stdout)?)
+}
+
+fn lock(config: &Config) -> Result<File> {
+    private_dir(&config.state)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(config.state.join("service.lock"))?;
+    let meta = fs::symlink_metadata(config.state.join("service.lock"))?;
+    ensure!(
+        meta.is_file()
+            && meta.permissions().mode() & 0o077 == 0
+            && meta.uid() == fs::metadata("/proc/self")?.uid(),
+        "Service lock is not a private owned file"
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50))
+            }
+            Err(error) => bail!("Cannot acquire service lock: {error}"),
+        }
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("Missing parent")?)?;
+    temp.as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+fn quote(value: &str) -> Result<String> {
+    ensure!(
+        !value.chars().any(|c| c.is_control()),
+        "Invalid control character in service configuration"
+    );
+    Ok(format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    ))
+}
+
+fn unit(config: &Config) -> Result<String> {
+    let exe = quote(
+        config
+            .runtime
+            .join("codex-wake")
+            .to_str()
+            .context("Non-UTF8 path")?,
+    )?;
+    let runtime = config
+        .runtime
+        .to_str()
+        .context("Non-UTF8 path")?
+        .replace('%', "%%");
+    let db = quote(&format!("CODEX_WAKE_DB={}", config.db.display()))?;
+    let codex = quote(&format!("CODEX_WAKE_CODEX={}", config.codex.display()))?;
+    let cfg_home = config.config.parent().context("Missing config parent")?;
+    let cfg_home = quote(&format!("XDG_CONFIG_HOME={}", cfg_home.display()))?;
+    let extra = [
+        ("CODEX_HOME", config.codex_home.as_path()),
+        ("CODEX_WAKE_RPC_SOCKET", config.rpc_socket.as_path()),
+        (
+            "XDG_STATE_HOME",
+            config.state.parent().context("Missing state root")?,
+        ),
+        (
+            "XDG_DATA_HOME",
+            config
+                .runtime
+                .parent()
+                .and_then(Path::parent)
+                .context("Missing data root")?,
+        ),
+    ]
+    .iter()
+    .map(|(key, value)| {
+        quote(&format!("{key}={}", value.display())).map(|value| format!("Environment={value}\n"))
+    })
+    .collect::<Result<Vec<_>>>()?
+    .join("");
+    Ok(format!(
+        "{MARKER}[Unit]\nDescription=Codex Wake shared webhook receiver\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={runtime}\nExecStart=:{exe} receiver\nEnvironment={db}\nEnvironment={codex}\nEnvironment={cfg_home}\n{extra}Restart=on-failure\nRestartSec=5\nUMask=0077\nNoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n"
+    ))
+}
+
+fn obtain_webhook(runtime: &Path) -> Result<()> {
+    let target = runtime.join("webhook");
+    if target.is_file() {
+        ensure!(
+            format!("{:x}", Sha256::digest(fs::read(&target)?)) == WEBHOOK_SHA,
+            "Managed receiver binary checksum mismatch"
+        );
+        return Ok(());
+    }
+    ensure!(
+        env::consts::OS == "linux" && env::consts::ARCH == "x86_64",
+        "Automatic receiver installation currently supports Linux x86_64"
+    );
+    let staging = tempfile::tempdir_in(runtime)?;
+    let archive = staging.path().join("webhook.tar.gz");
+    let output = run(Command::new("curl").args(["--fail", "--location", "--silent", "--show-error", "--max-time", "60", "--output"])
+        .arg(&archive).arg("https://github.com/adnanh/webhook/releases/download/2.8.3/webhook-linux-amd64.tar.gz"), Duration::from_secs(65))?;
+    ensure!(
+        output.status.success(),
+        "Could not download the verified webhook release"
+    );
+    ensure!(
+        format!("{:x}", Sha256::digest(fs::read(&archive)?)) == ARCHIVE_SHA,
+        "Receiver archive checksum mismatch"
+    );
+    let output = run(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(staging.path())
+            .arg("webhook-linux-amd64/webhook"),
+        Duration::from_secs(10),
+    )?;
+    ensure!(
+        output.status.success(),
+        "Could not extract verified receiver"
+    );
+    atomic_write(
+        &target,
+        &fs::read(staging.path().join("webhook-linux-amd64/webhook"))?,
+        0o700,
+    )
+}
+
+pub fn load_secret(path: &Path) -> Result<String> {
+    private_dir(path.parent().context("Missing config directory")?)?;
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(mut file) => {
+            write!(
+                file,
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )?;
+            file.sync_all()?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e.into()),
+    }
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file()
+            && meta.permissions().mode() & 0o077 == 0
+            && meta.uid() == fs::metadata("/proc/self")?.uid(),
+        "Webhook secret must be a private file owned by this user"
+    );
+    let secret = fs::read_to_string(path)?.trim().to_owned();
+    ensure!(!secret.is_empty(), "Webhook secret is empty");
+    Ok(secret)
+}
+
+fn healthy(config: &Config) -> Result<()> {
+    let pid = systemctl(&["show", UNIT, "--property=MainPID", "--value"])?;
+    let pid: u32 = pid.trim().parse()?;
+    ensure!(pid != 0, "Receiver has no running process");
+    ensure!(
+        fs::read_link(format!("/proc/{pid}/exe"))? == config.runtime.join("codex-wake"),
+        "Service executable differs from the managed receiver"
+    );
+    let body = b"{\"action\":\"started\"}";
+    let secret = load_secret(&config.config.join("webhook.secret"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+    mac.update(body);
+    let sig = format!("{:x}", mac.finalize().into_bytes());
+    let mut socket =
+        TcpStream::connect_timeout(&"127.0.0.1:9000".parse()?, Duration::from_secs(1))?;
+    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+    write!(
+        socket,
+        "POST /hooks/codex-wake HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-GitHub-Event: workflow_run\r\nX-Hub-Signature-256: sha256={sig}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    socket.write_all(body)?;
+    let mut response = String::new();
+    socket.take(16384).read_to_string(&mut response)?;
+    ensure!(
+        response.starts_with("HTTP/1.1 403 "),
+        "Receiver health signature/filter check failed"
+    );
+    Ok(())
+}
+
+pub fn status(config: &Config) -> Result<Value> {
+    let properties = systemctl(&[
+        "show",
+        UNIT,
+        "--property=ActiveState,SubState,MainPID,UnitFileState,FragmentPath,DropInPaths",
+    ])?;
+    let fields: serde_json::Map<String, Value> = properties
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), json!(value)))
+        .collect();
+    let health = (|| {
+        ensure!(
+            fs::read_to_string(&config.unit)? == unit(config)?,
+            "Service configuration differs from this runtime"
+        );
+        ensure!(
+            fields.get("FragmentPath") == Some(&json!(config.unit.to_string_lossy())),
+            "Unexpected systemd service owner"
+        );
+        ensure!(
+            fields.get("DropInPaths") == Some(&json!("")),
+            "Service has overrides"
+        );
+        ensure!(
+            runtime_matches(config),
+            "Receiver runtime differs from MCP source or its binary was altered"
+        );
+        ensure!(
+            fs::read_to_string(config.runtime.join("hooks.json.tmpl"))? == HOOKS,
+            "Receiver hook configuration differs"
+        );
+        ensure!(
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(config.runtime.join("webhook"))?)
+            ) == WEBHOOK_SHA,
+            "Receiver binary checksum mismatch"
+        );
+        healthy(config)
+    })();
+    let controller = (|| -> Result<()> {
+        let reply = crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}))?;
+        ensure!(
+            reply["data"].is_array(),
+            "Invalid controller readiness response"
+        );
+        Ok(())
+    })();
+    Ok(
+        json!({"service":fields, "local_ready":health.is_ok(), "health_error":health.err().map(|e|e.to_string()),
+        "controller_ready":controller.is_ok(),"controller_error":controller.err().map(|e|e.to_string()),
+        "public_ingress_verified":false,"lifecycle":"shared persistent user service; closing MCP does not stop it"}),
+    )
+}
+
+pub fn ensure_receiver(config: &Config) -> Result<Value> {
+    let _guard = lock(config)?;
+    ensure!(
+        config.db.is_absolute() && config.codex.is_absolute(),
+        "Service database and Codex executable must be absolute paths"
+    );
+    let expected_unit = unit(config)?;
+    let executable = fs::read(env::current_exe()?)?;
+    let existing_unit = fs::read_to_string(&config.unit).unwrap_or_default();
+    ensure!(
+        existing_unit.is_empty() || existing_unit == expected_unit,
+        "Existing service configuration is not this plugin's managed configuration; it was left untouched"
+    );
+    let properties = systemctl(&[
+        "show",
+        UNIT,
+        "--property=ActiveState,FragmentPath,DropInPaths",
+    ])?;
+    ensure!(
+        !properties
+            .lines()
+            .any(|l| l.starts_with("DropInPaths=") && l != "DropInPaths="),
+        "Service has overrides; left untouched"
+    );
+    if let Some(fragment) = properties
+        .lines()
+        .find_map(|l| l.strip_prefix("FragmentPath="))
+    {
+        ensure!(
+            fragment.is_empty() || Path::new(fragment) == config.unit,
+            "Another service unit owns this name"
+        );
+    }
+    let active = properties
+        .lines()
+        .any(|l| l == "ActiveState=active" || l == "ActiveState=activating");
+    let runtime_matches = runtime_matches(config);
+    ensure!(
+        !active || (!existing_unit.is_empty() && runtime_matches),
+        "Active receiver uses a different runtime; no files were changed or service restarted"
+    );
+    private_dir(&config.runtime)?;
+    if !runtime_matches {
+        atomic_write(&config.runtime.join("codex-wake"), &executable, 0o700)?;
+        atomic_write(
+            &config.runtime.join("hooks.json.tmpl"),
+            HOOKS.as_bytes(),
+            0o600,
+        )?;
+        let stamp =
+            json!({"source":source_digest(),"binary":format!("{:x}",Sha256::digest(&executable))});
+        atomic_write(
+            &config.runtime.join("runtime.json"),
+            stamp.to_string().as_bytes(),
+            0o600,
+        )?;
+    }
+    obtain_webhook(&config.runtime)?;
+    load_secret(&config.config.join("webhook.secret"))?;
+    fs::create_dir_all(config.unit.parent().context("Missing unit directory")?)?;
+    if existing_unit.is_empty() {
+        atomic_write(&config.unit, expected_unit.as_bytes(), 0o600)?;
+        systemctl(&["daemon-reload"])?;
+    }
+    systemctl(&["enable", UNIT])?;
+    if !active {
+        systemctl(&["start", UNIT])?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match healthy(config) {
+            Ok(()) => {
+                let result = status(config)?;
+                ensure!(
+                    result["local_ready"] == true,
+                    "Receiver runtime verification failed: {}",
+                    result["health_error"]
+                );
+                return Ok(result);
+            }
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error.context("Receiver did not become ready"));
+            }
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+struct ChildGuard(Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        meta.file_type().is_socket() && meta.uid() == fs::metadata("/proc/self")?.uid(),
+        "Controller path is not an owned socket"
+    );
+    match UnixStream::connect(path) {
+        Ok(_) => bail!("Controller socket is already active; it was left untouched"),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(path)?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub fn run_receiver(config: &Config) -> Result<()> {
+    let root = env::current_exe()?
+        .parent()
+        .context("Executable has no directory")?
+        .to_path_buf();
+    let secret = load_secret(&config.config.join("webhook.secret"))?;
+    let binary = env::var_os("CODEX_WAKE_WEBHOOK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("webhook"));
+    private_dir(&config.state)?;
+    let mut controller = if config.rpc_socket == config.state.join("app-server.sock") {
+        remove_stale_socket(&config.rpc_socket)?;
+        Some(ChildGuard(
+            Command::new(&config.codex)
+                .args(["app-server", "--listen"])
+                .arg(format!("unix://{}", config.rpc_socket.display()))
+                .env("CODEX_HOME", &config.codex_home)
+                .stdin(Stdio::null())
+                .spawn()?,
+        ))
+    } else {
+        UnixStream::connect(&config.rpc_socket)
+            .context("Configured Codex control socket is unavailable")?;
+        None
+    };
+    let mut receiver = ChildGuard(
+        Command::new(binary)
+            .args(["-ip", "127.0.0.1", "-port", "9000", "-template", "-hooks"])
+            .arg(root.join("hooks.json.tmpl"))
+            .env("GITHUB_WEBHOOK_SECRET", secret)
+            .env("CODEX_WAKE_EXECUTABLE", env::current_exe()?)
+            .env("CODEX_WAKE_DB", &config.db)
+            .env("CODEX_WAKE_CODEX", &config.codex)
+            .env("CODEX_WAKE_DEFER", "1")
+            .spawn()?,
+    );
+    let config = config.clone();
+    thread::spawn(move || {
+        loop {
+            let result = (|| -> Result<()> {
+                let mut db = crate::bridge::connect(&config.db)?;
+                crate::subscriptions::initialize(&db)?;
+                crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::rules::initialize(&db)?;
+                crate::rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("codex-wake dispatch error: {error}");
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+    loop {
+        if let Some(controller) = &mut controller
+            && let Some(status) = controller.0.try_wait()?
+        {
+            bail!("Codex controller exited with {status}");
+        }
+        if let Some(status) = receiver.0.try_wait()? {
+            bail!("Webhook receiver exited with {status}");
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+pub fn remove_service(config: &Config) -> Result<()> {
+    let _guard = lock(config)?;
+    let contents = fs::read_to_string(&config.unit)?;
+    ensure!(
+        contents.starts_with(MARKER) && contents == unit(config)?,
+        "Refusing to remove a service not owned by this configuration"
+    );
+    systemctl(&["disable", "--now", UNIT])?;
+    fs::remove_file(&config.unit)?;
+    systemctl(&["daemon-reload"])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn socket_cleanup_preserves_active_and_unrelated_paths() {
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("controller.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(remove_stale_socket(&socket).is_err());
+        assert!(socket.exists());
+        drop(listener);
+        remove_stale_socket(&socket).unwrap();
+        assert!(!socket.exists());
+        fs::write(&socket, "unrelated").unwrap();
+        assert!(remove_stale_socket(&socket).is_err());
+        assert_eq!(fs::read_to_string(&socket).unwrap(), "unrelated");
+    }
+    #[test]
+    fn persistent_private_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("config/webhook.secret");
+        let secret = load_secret(&file).unwrap();
+        assert_eq!(secret.len(), 64);
+        assert_eq!(load_secret(&file).unwrap(), secret);
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_secret(&file).is_err());
+    }
+    #[test]
+    fn empty_and_symlink_secret_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("secret");
+        atomic_write(&file, b"", 0o600).unwrap();
+        assert!(load_secret(&file).is_err());
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(load_secret(&link).is_err());
+    }
+    #[test]
+    fn unit_values_are_quoted_without_line_injection() {
+        assert!(quote("/tmp/path\nExecStart=evil").is_err());
+        assert_eq!(
+            quote("/tmp/path with % and \"").unwrap(),
+            "\"/tmp/path with %% and \\\"\""
+        );
+    }
+}

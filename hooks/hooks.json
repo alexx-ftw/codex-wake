@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run-mcp.sh\" hook", "timeout": 150}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run-mcp.sh\" hook", "timeout": 150}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run-mcp.sh\" hook", "timeout": 150}]}]
+  }
+}

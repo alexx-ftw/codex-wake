@@ -1,0 +1,48 @@
+name: Tests
+run-name: "codex-wake ${{ inputs.probe || github.sha }}"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      probe:
+        description: Identifier for an explicitly requested webhook smoke test
+        required: false
+        default: manual
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Registration window for manual webhook probes
+        if: github.event_name == 'workflow_dispatch'
+        run: sleep 20
+      - name: Obtain verified receiver for HTTP tests
+        run: |
+          mkdir -p .tools
+          curl --fail --location --max-time 60 --silent --show-error \
+            --output .tools/webhook.tar.gz \
+            https://github.com/adnanh/webhook/releases/download/2.8.3/webhook-linux-amd64.tar.gz
+          printf '%s  %s\n' \
+            3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b \
+            .tools/webhook.tar.gz | sha256sum --check
+          tar -xzf .tools/webhook.tar.gz -C .tools webhook-linux-amd64/webhook
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Format and lint
+        run: |
+          cargo +stable fmt --check
+          cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Unit and real HTTP tests with fake Codex
+        env:
+          CODEX_WAKE_WEBHOOK: ${{ github.workspace }}/.tools/webhook-linux-amd64/webhook
+        run: |
+          cargo +stable test --locked --bin codex-wake
+          cargo +stable test --locked --test http -- --include-ignored

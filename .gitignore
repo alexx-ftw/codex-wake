@@ -1,0 +1,7 @@
+.env
+*.sqlite3
+*.sqlite3-*
+.tools/
+.test-results/
+/CHAT.md
+/target/
