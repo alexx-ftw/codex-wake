@@ -323,6 +323,21 @@ pub fn report(path: &Path, days: u32) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_lock_timeout_has_a_specific_private_classification() {
+        let dir = private_tempdir();
+        let path = dir.path().join("telemetry.sqlite3");
+        initialize(&path).unwrap();
+        let lock = lock_database(&path).unwrap();
+        let error = lock_database(&path).unwrap_err();
+        assert_eq!(
+            crate::observability::error_class(&error.context("record event")),
+            "telemetry_writer_lock_timeout"
+        );
+        drop(lock);
+        assert!(lock_database(&path).is_ok());
+    }
     use std::{os::unix::fs::PermissionsExt, sync::Arc, thread};
 
     fn event<'a>(trace: &'a str, outcome: &'a str, subject: Option<&'a str>) -> Event<'a> {

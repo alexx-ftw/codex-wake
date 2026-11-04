@@ -1,5 +1,16 @@
 # Validation
 
+## Telemetry contention diagnosis, 2026-11-04
+
+Eight isolated CLI processes retained all terminal error records without contention.
+Holding a SQLite reader or the cross-process writer lock for 600 ms reproduced
+missing intermediate telemetry at the existing 250 ms wait limit; all eight final
+records remained in this experiment. This does not promise lossless logging.
+A real held-lock regression failed with generic `timeout` before the diagnostic
+change and passes with `telemetry_writer_lock_timeout`, including an outer anyhow
+context. Separate assertions preserve `database_busy` for SQLite and `timeout`
+for I/O. No lock duration, delivery behavior or telemetry schema changed.
+
 ## Real MCP actions, 2026-11-04
 
 A dedicated real Codex chat verified the preset-delivery busy path: dispatch while

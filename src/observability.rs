@@ -209,6 +209,12 @@ impl Span {
 }
 
 pub fn error_class(error: &anyhow::Error) -> &'static str {
+    if error
+        .chain()
+        .any(|cause| cause.to_string() == "Telemetry writer lock timed out")
+    {
+        return "telemetry_writer_lock_timeout";
+    }
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
         return match error.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "timeout",
@@ -471,6 +477,11 @@ mod tests {
             error_class(&std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
             "timeout"
         );
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some(secret.to_owned()),
+        );
+        assert_eq!(error_class(&busy.into()), "database_busy");
     }
     #[test]
     fn parses_only_bounded_http_metadata_and_go_duration() {
