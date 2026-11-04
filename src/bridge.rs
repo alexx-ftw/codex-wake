@@ -3,11 +3,12 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
+    env,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::Path,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -536,6 +537,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
 enum Delivery {
     Accepted,
     ActiveWriter,
+    AcceptedWithWarning(&'static str),
     Failed,
     TimedOut,
 }
@@ -570,6 +572,7 @@ pub fn send_mode(
             "queued".into(),
             Some("resume_owned_by_active_writer".into()),
         ),
+        Delivery::AcceptedWithWarning(reason) => ("queued".into(), Some(reason.into())),
         Delivery::Failed => (
             "needs_attention".into(),
             Some("cli_warning_or_nonzero_exit".into()),
@@ -595,12 +598,22 @@ fn invoke_codex(
     timeout: Duration,
     resume: bool,
 ) -> Result<Delivery> {
+    let started = Instant::now();
     let mut stdout = private_tempfile()?;
     let mut stderr = private_tempfile()?;
     let mut command = Command::new(codex);
     command.args(["queue", "--thread", thread, "--message", message]);
     if resume {
         command.arg("--resume");
+    }
+    if let Some(socket) = crate::goals::rpc_socket(
+        env::var_os("CODEX_WAKE_RPC_SOCKET"),
+        env::var_os("XDG_STATE_HOME"),
+        env::var_os("HOME"),
+    ) {
+        command
+            .arg("--remote")
+            .arg(format!("unix://{}", Path::new(&socket).display()));
     }
     let mut child = command
         .stdout(Stdio::from(stdout.reopen()?))
@@ -621,6 +634,18 @@ fn invoke_codex(
         }
     };
 
+    let exit_reason = status
+        .code()
+        .map(|code| format!("exit_code_{code}"))
+        .unwrap_or_else(|| "exit_signal".into());
+    crate::observability::emit(
+        "delivery.cli_exit",
+        if status.success() { "ok" } else { "error" },
+        &exit_reason,
+        Some(thread),
+        started.elapsed(),
+        1,
+    );
     let stdout_bytes = read_limited(stdout.as_file_mut(), CODEX_OUTPUT_LIMIT)?;
     let stderr_bytes = read_limited(stderr.as_file_mut(), CODEX_OUTPUT_LIMIT)?;
     if status.success() && stderr_bytes.iter().all(u8::is_ascii_whitespace) {
@@ -628,6 +653,25 @@ fn invoke_codex(
     }
     if status.success() && queued_with_active_writer(&stdout_bytes, &stderr_bytes, thread) {
         return Ok(Delivery::ActiveWriter);
+    }
+    if status.success() && queued_acknowledged(&stdout_bytes, thread) {
+        let warning = format!(
+            "Warning: message was queued, but could not resume thread {thread}: start a local daemon or specify a server with --remote"
+        );
+        let reason = if String::from_utf8_lossy(&stderr_bytes).trim() == warning {
+            "resume_daemon_unavailable"
+        } else {
+            "cli_warning_after_queue_ack"
+        };
+        crate::observability::emit(
+            "delivery.cli_ack",
+            "queued",
+            reason,
+            Some(thread),
+            started.elapsed(),
+            1,
+        );
+        return Ok(Delivery::AcceptedWithWarning(reason));
     }
     Ok(Delivery::Failed)
 }
@@ -655,18 +699,22 @@ fn read_limited(file: &mut File, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn queued_with_active_writer(stdout: &[u8], stderr: &[u8], thread: &str) -> bool {
+fn queued_acknowledged(stdout: &[u8], thread: &str) -> bool {
     let message_id = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}";
     let ack = Regex::new(&format!(
         r"\AQueued message {message_id} for thread {thread}\.\z"
     ))
     .expect("constant acknowledgement pattern");
     let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    ack.is_match(&stdout)
+}
+
+fn queued_with_active_writer(stdout: &[u8], stderr: &[u8], thread: &str) -> bool {
     let warning = format!(
         "Warning: message was queued, but could not resume thread {thread}: \
          thread/resume failed: thread {thread} already has an active writer (code -32600)"
     );
-    ack.is_match(&stdout) && String::from_utf8_lossy(stderr).trim() == warning
+    queued_acknowledged(stdout, thread) && String::from_utf8_lossy(stderr).trim() == warning
 }
 
 /// Return all registrations in update order as a JSON array.
@@ -1126,6 +1174,49 @@ mod tests {
             .query_row("SELECT reason FROM waits", [], |row| row.get(0))
             .unwrap();
         assert_eq!(reason, "timeout_delivery_unknown");
+    }
+
+    #[test]
+    fn acknowledged_queue_with_other_resume_warning_is_not_a_failed_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let ack =
+            format!("Queued message 22222222-2222-4222-8222-222222222222 for thread {THREAD}.");
+        let warning = format!(
+            "Warning: message was queued, but could not resume thread {THREAD}: start a local daemon or specify a server with --remote"
+        );
+        for (stdout, stderr, code, expected) in [
+            (
+                ack.as_str(),
+                warning.as_str(),
+                0,
+                ("queued", "resume_daemon_unavailable"),
+            ),
+            (
+                ack.as_str(),
+                "other diagnostic",
+                0,
+                ("queued", "cli_warning_after_queue_ack"),
+            ),
+            (
+                ack.as_str(),
+                warning.as_str(),
+                1,
+                ("needs_attention", "cli_warning_or_nonzero_exit"),
+            ),
+            (
+                "Queued message for a different thread.",
+                warning.as_str(),
+                0,
+                ("needs_attention", "cli_warning_or_nonzero_exit"),
+            ),
+        ] {
+            let codex = fake_codex(
+                dir.path(),
+                &format!("printf '%s\\n' '{stdout}'\nprintf '%s\\n' '{stderr}' >&2\nexit {code}"),
+            );
+            let result = send_mode(&codex, Duration::from_secs(2), THREAD, "test", true).unwrap();
+            assert_eq!(result, (expected.0.into(), Some(expected.1.into())));
+        }
     }
 
     #[test]

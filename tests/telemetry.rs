@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     os::unix::fs::PermissionsExt,
+    os::unix::net::UnixListener,
     path::Path,
     process::{Command, Stdio},
 };
@@ -13,9 +14,11 @@ fn invoke(root: &Path, args: &[&str], input: Option<&str>) -> std::process::Outp
         .env("HOME", root)
         .env("CODEX_HOME", root.join("codex-home"))
         .env("XDG_STATE_HOME", root)
+        .env_remove("CODEX_WAKE_RPC_SOCKET")
         .env_remove("CODEX_WAKE_DB")
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
+        .env_remove("CODEX_WAKE_RPC_SOCKET")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -32,6 +35,17 @@ fn invoke(root: &Path, args: &[&str], input: Option<&str>) -> std::process::Outp
         drop(child.stdin.take());
     }
     child.wait_with_output().unwrap()
+}
+
+fn invoke_with_codex(
+    root: &Path,
+    codex: &Path,
+    args: &[&str],
+    input: Option<&str>,
+) -> std::process::Output {
+    let mut arguments = vec!["--codex", codex.to_str().unwrap()];
+    arguments.extend_from_slice(args);
+    invoke(root, &arguments, input)
 }
 
 #[test]
@@ -163,4 +177,127 @@ fn concurrent_cli_processes_keep_all_operation_results() {
         .map(|g| g["calls"].as_i64().unwrap())
         .sum();
     assert_eq!(errors, 8);
+}
+
+#[test]
+fn existing_app_server_socket_routes_queue_and_telemetry_stays_private() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let state = root.path().join("codex-wake");
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = state.join("app-server.sock");
+    let _server = UnixListener::bind(&socket).unwrap();
+    let repo = "owner/SECRET_MESSAGE_SENTINEL";
+    let run = "91827364";
+    let attempt = "2";
+    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let thread = "11111111-1111-4111-8111-111111111111";
+    let codex = root.path().join("fake-codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/fake-codex-argv\"\nprintf '%s\\n' 'Queued message 22222222-2222-4222-8222-222222222222 for thread {thread}.'\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let registered = invoke_with_codex(
+        root.path(),
+        &codex,
+        &[
+            "register",
+            "--repo",
+            repo,
+            "--run",
+            run,
+            "--attempt",
+            attempt,
+            "--thread",
+            thread,
+            "--sha",
+            sha,
+        ],
+        None,
+    );
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+
+    let payload = json!({
+        "action":"completed",
+        "repository":{"full_name":repo},
+        "workflow_run":{
+            "id":run.parse::<i64>().unwrap(),
+            "run_attempt":attempt.parse::<i64>().unwrap(),
+            "head_sha":sha,
+            "status":"completed",
+            "conclusion":"success",
+            "private_payload":"SECRET_PAYLOAD_SENTINEL"
+        }
+    });
+    let handled = invoke_with_codex(root.path(), &codex, &["handle"], Some(&payload.to_string()));
+    assert!(
+        handled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handled.stderr)
+    );
+    assert!(handled.stderr.is_empty());
+    let argv = fs::read_to_string(root.path().join("fake-codex-argv")).unwrap();
+    assert_eq!(argv.lines().next(), Some("queue"), "{argv}");
+    assert!(argv.lines().any(|arg| arg == "--resume"), "{argv}");
+    assert!(argv.lines().any(|arg| arg == "--remote"), "{argv}");
+    assert!(
+        argv.lines()
+            .any(|arg| arg == format!("unix://{}", socket.display())),
+        "{argv}"
+    );
+
+    let status = invoke_with_codex(root.path(), &codex, &["status"], None);
+    assert!(status.status.success());
+    let waits: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(waits[0]["state"], "queued");
+    assert_eq!(waits[0]["reason"], Value::Null);
+
+    let diagnostics = invoke(root.path(), &["diagnostics", "--days", "42"], None);
+    assert!(
+        diagnostics.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diagnostics.stderr)
+    );
+    let report: Value = serde_json::from_slice(&diagnostics.stdout).unwrap();
+    let groups = report["daily_groups"].as_array().unwrap();
+    assert!(groups.iter().any(|event| {
+        event["operation"] == "delivery.cli_exit"
+            && event["outcome"] == "ok"
+            && event["reason"] == "exit_code_0"
+    }));
+    assert!(
+        groups
+            .iter()
+            .any(|event| { event["operation"] == "dispatch.wait" && event["outcome"] == "queued" })
+    );
+
+    let telemetry = fs::read(root.path().join("codex-wake/telemetry.sqlite3")).unwrap();
+    for secret in [
+        repo,
+        "SECRET_MESSAGE_SENTINEL",
+        "SECRET_PAYLOAD_SENTINEL",
+        thread,
+        "Queued message 22222222-2222-4222-8222-222222222222",
+    ] {
+        assert!(!String::from_utf8_lossy(&telemetry).contains(secret));
+        assert!(!String::from_utf8_lossy(&diagnostics.stdout).contains(secret));
+    }
+    assert_eq!(
+        fs::metadata(root.path().join("codex-wake/telemetry.sqlite3"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }

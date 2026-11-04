@@ -244,7 +244,9 @@ No `additionalContext`, stop decision or forced continuation is emitted.
 Hooks are supported by manually installed desktop plugins; this package isn't
 currently eligible for the public directory while it bundles them. The resume
 transport targets Codex chats through the installed `codex queue --resume` CLI;
-it doesn't implement a ChatGPT chat-resume transport.
+when Wake's Unix controller is configured or present, `--remote` selects that
+same controller instead of requiring another local daemon.
+It doesn't implement a ChatGPT chat-resume transport.
 
 ## CLI and state
 
@@ -267,7 +269,9 @@ The database is `$XDG_STATE_HOME/codex-wake/state.sqlite3` (default
 `$XDG_DATA_HOME/codex-wake/runtime`. Secrets and database files are private.
 
 States are `waiting`, `ready`, `sending`, `queued` and `needs_attention`.
-`queued` means CLI acceptance, not proof that a chat resumed. A crash, timeout
+`queued` means CLI acceptance, not proof that a chat resumed. Exit zero plus an
+exact queue acknowledgement remains `queued` even if resuming emits a warning;
+`resume_daemon_unavailable` identifies a missing local daemon. A crash, timeout
 or uncertain warning is never blindly retried. Inspect the target chat before
 resolving ambiguous records. Exactly-once delivery across SQLite and the Codex
 CLI cannot be guaranteed without an idempotent acknowledgement protocol.

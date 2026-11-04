@@ -105,7 +105,7 @@ pub(crate) fn socket_rpc(
     result
 }
 
-fn rpc_socket(
+pub(crate) fn rpc_socket(
     explicit: Option<std::ffi::OsString>,
     state_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,

@@ -2,6 +2,21 @@
 
 ## Real MCP actions, 2026-11-04
 
+An enqueue previously reported needs_attention despite the exact original input
+being consumed and acknowledged in the destination chat. Its historical CLI
+output was not retained, so the precise original warning is unproven. A separate
+real-Codex fixture reproduced the false classification with exit zero, an exact
+queue acknowledgement and the warning that --resume had no local daemon. The
+candidate now reports queued/resume_daemon_unavailable and the fixture's agent
+produced its expected final reply. The original message was never replayed.
+The CLI was also tested with --remote pointing to the existing Wake Unix
+controller: exit zero, exact acknowledgement and no stderr. Default CLI delivery
+now uses that existing controller when available instead of requiring a separate
+local daemon; absence of a controller retains the legacy CLI behavior.
+Regression cases retain needs_attention for nonzero exit or a mismatched
+acknowledgement. New exit-code and warning-class telemetry excludes raw input,
+payloads and stderr, with a subprocess privacy regression.
+
 A post-restart audit also found two SessionStart failures while a newer binary
 was being prepared in the shared Cargo target before its source alias was
 installed. An isolated reproduction with two copies of the same package showed
