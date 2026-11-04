@@ -10,6 +10,16 @@ Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
   They cover authentication, duplicate delivery, deferred PR-comment rules and artifact events.
 - Real lifecycle test: passed. Concurrent MCP processes used one enabled user
   service; closing all test clients preserved its PID.
+- Administrative lifecycle qualification: passed against the real installation.
+  Persistently disabling the plugin and then uninstalling it preserved the
+  receiver PID and signed HTTP health. Uninstall removed the plugin cache.
+  Explicit `remove-service` removed the unit, stopped the receiver and its
+  supervised processes, and closed TCP port 9000. Database rows and webhook
+  secret were unchanged throughout; SQLite integrity remained `ok`.
+  `ensure` recreated the enabled service and ready native controller.
+  Reinstalling the plugin and starting its installed launcher reused that new
+  service without another restart. Final state: plugin installed/enabled,
+  receiver active, persisted data retained. No model turns were started.
 - Opt-in native qualification: passed. A signed loopback PR-comment event
   created a projectless chat and one requested model turn. The assistant returned
   the exact expected reply; persisted settings were `gpt-6.1-sol` / `low`.
