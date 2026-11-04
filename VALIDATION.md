@@ -1,5 +1,19 @@
 # Validation
 
+## Durable recovery after prolonged telemetry contention, 2026-11-04
+
+With SQLite reader and writer locks held for seven seconds, eight real CLI
+producers exited before release and left all 16 start/terminal events durably
+pending in each case. Another process recovered them with their original UUID,
+timestamp, PID, version and fields; repeated recovery did not duplicate events or
+daily counters. A permanent CLI regression also holds the lock until the producer
+has exited. These use isolated state and do not invoke live chat hooks.
+Regressions cover an interrupted commit/unlink cycle after aged-detail pruning,
+same-millisecond span ordering, 128+1 recovery batches, malformed timestamps,
+incomplete files, symlinks, permissions and capacity. Files are fsynced before
+acknowledgement; directory removals are synced before forgetting replay receipts.
+No existing source subscription or queued input is replayed by telemetry recovery.
+
 ## Reduced transient telemetry loss, 2026-11-04
 
 The writer-lock and SQLite write wait limits are now one second. A regression

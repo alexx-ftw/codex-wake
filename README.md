@@ -314,14 +314,22 @@ directory 0700) and removed with the plugin's state on uninstall. Telemetry
 failures emit a fixed diagnostic to stderr and do not stop event processing.
 `telemetry_writer_lock_timeout` identifies an exhausted one-second cross-process
 writer-lock wait; SQLite busy/locked errors remain `database_busy`, and other
-I/O timeouts remain `timeout`. These warnings imply missing telemetry detail.
+I/O timeouts remain `timeout`. A failed database attempt caused by contention is
+saved as a private `telemetry-pending-UUID.json` file, including its original time,
+process/build identity and correlation. The next successful telemetry write drains
+up to 128 pending records; receiver heartbeats keep recovery progressing when no
+other work arrives. Transactional receipts prevent duplicate aggregates if a
+process exits after committing a replay but before removing its pending file.
+Diagnostics show pending count, accounted bytes and oldest observation time.
+Pending storage has a separate 64 MiB cap (each file accounts for at least 4 KiB);
+individual records are capped at 64 KiB. Uninstall removes this plugin-owned state.
 Writers also allow SQLite up to one second to clear transient contention; read-only
 reports retain their 250 ms limit. Contended writes can delay telemetry callers,
-but logging still gives up after these bounded waits rather than blocking forever.
+and records are deferred to disk when these database waits expire.
 Child output is drained independently through a bounded nonblocking queue;
 overflow is counted when the writer catches up. Repeated storage warnings are
-rate-limited. If storage stays unavailable or a process is killed, some records
-can be missing; a stale heartbeat and incomplete spans are diagnostic signals,
+rate-limited. Full or unavailable storage and termination before a record is durably
+saved can still leave missing detail; a stale heartbeat and incomplete spans are diagnostic signals,
 not proof that the underlying work failed.
 
 `ok` means that operation succeeded. `queued` means queue/turn-start acceptance,

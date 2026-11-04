@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::Write,
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixListener,
     path::Path,
@@ -177,6 +178,91 @@ fn concurrent_cli_processes_keep_all_operation_results() {
         .map(|g| g["calls"].as_i64().unwrap())
         .sum();
     assert_eq!(errors, 8);
+}
+
+#[test]
+fn exited_cli_producers_are_recovered_once_after_long_contention() {
+    for reader in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("codex-wake");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !invoke(root.path(), &["hook"], Some("{INVALID_JSON"))
+                .status
+                .success()
+        );
+        let path = state.join("telemetry.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let writer = fs::File::open(&path).unwrap();
+        if reader {
+            db.execute_batch("BEGIN").unwrap();
+            let _: i64 = db
+                .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+        } else {
+            assert_eq!(unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_EX) }, 0);
+        }
+        let output = invoke(root.path(), &["hook"], Some("{INVALID_JSON"));
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("telemetry_write_failed"));
+        let pending: Vec<_> = fs::read_dir(&state)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name()?.to_str()?;
+                (name.starts_with("telemetry-pending-") && name.ends_with(".json")).then_some(path)
+            })
+            .collect();
+        assert_eq!(
+            pending.len(),
+            2,
+            "Exited producer must preserve start and terminal events"
+        );
+        let saved: Vec<Value> = pending
+            .iter()
+            .map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap())
+            .collect();
+        if reader {
+            db.execute_batch("COMMIT").unwrap();
+        } else {
+            assert_eq!(unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
+        assert!(
+            !invoke(root.path(), &["hook"], Some("{INVALID_JSON"))
+                .status
+                .success()
+        );
+        for (file, event) in pending.iter().zip(&saved) {
+            assert!(!file.exists());
+            let (at, pid, version): (i64, u32, String) = db
+                .query_row(
+                    "SELECT at_ms,pid,version FROM events WHERE id=?1",
+                    [event["id"].as_str().unwrap()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(at, event["at_ms"].as_i64().unwrap());
+            assert_eq!(u64::from(pid), event["pid"].as_u64().unwrap());
+            assert_eq!(version, event["version"].as_str().unwrap());
+        }
+        assert!(
+            !invoke(root.path(), &["hook"], Some("{INVALID_JSON"))
+                .status
+                .success()
+        );
+        let events: i64 = db
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        let calls: i64 = db
+            .query_row("SELECT sum(calls) FROM rollups", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 8);
+        assert_eq!(
+            calls, events,
+            "Replayed events must not increment rollups twice"
+        );
+    }
 }
 
 #[test]
