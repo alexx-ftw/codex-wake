@@ -16,6 +16,7 @@ const DETAIL_DAYS: i64 = 42;
 const ROLLUP_DAYS: i64 = 90;
 const MAX_ROWS: i64 = 100_000;
 const MAX_PAGE_COUNT: i64 = 16_384; // 64 MiB at SQLite's 4 KiB page size.
+const WRITE_WAIT: Duration = Duration::from_secs(1);
 static BUILD_VERSION: OnceLock<String> = OnceLock::new();
 static WRITER: Mutex<()> = Mutex::new(());
 
@@ -99,7 +100,7 @@ fn open_write(path: &Path) -> Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     check_file(path)?;
-    db.busy_timeout(Duration::from_millis(250))?;
+    db.busy_timeout(WRITE_WAIT)?;
     Ok(db)
 }
 
@@ -109,7 +110,7 @@ fn lock_database(path: &Path) -> Result<fs::File> {
         .write(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    let deadline = Instant::now() + Duration::from_millis(250);
+    let deadline = Instant::now() + WRITE_WAIT;
     loop {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(lock);
@@ -357,6 +358,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         dir
+    }
+
+    #[test]
+    fn transient_reader_and_writer_contention_keep_the_event() {
+        for reader in [false, true] {
+            let dir = private_tempdir();
+            let path = dir.path().join("telemetry.sqlite3");
+            initialize(&path).unwrap();
+            let blocked_path = path.clone();
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let holder = thread::spawn(move || {
+                if reader {
+                    let db = Connection::open(&blocked_path).unwrap();
+                    db.execute_batch("BEGIN").unwrap();
+                    let _: i64 = db
+                        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+                        .unwrap();
+                    ready.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(400));
+                    db.execute_batch("COMMIT").unwrap();
+                } else {
+                    let _lock = lock_database(&blocked_path).unwrap();
+                    ready.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(400));
+                }
+            });
+            waiting.recv().unwrap();
+            let result = record(&path, &event("transient-lock", "ok", None));
+            holder.join().unwrap();
+            result.unwrap();
+            let db = Connection::open(&path).unwrap();
+            let count: i64 = db
+                .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
     }
 
     #[test]

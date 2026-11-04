@@ -1,5 +1,16 @@
 # Validation
 
+## Reduced transient telemetry loss, 2026-11-04
+
+The writer-lock and SQLite write wait limits are now one second. A regression
+holds each kind of lock for 400 ms: it failed at the previous 250 ms deadline and
+now retains the event. The existing held-lock test still checks eventual timeout
+classification and reacquisition; SQLite read-only reports keep their old limit.
+With eight real CLI processes and a 600 ms reader or writer hold, all eight start
+and all eight terminal events were retained, with zero telemetry-write warnings.
+The largest observed CLI duration was 655 ms in that run. Longer contention can
+still lose detail, and writer waits can add latency; no durable spool was added.
+
 ## Telemetry contention diagnosis, 2026-11-04
 
 Eight isolated CLI processes retained all terminal error records without contention.
@@ -9,7 +20,8 @@ records remained in this experiment. This does not promise lossless logging.
 A real held-lock regression failed with generic `timeout` before the diagnostic
 change and passes with `telemetry_writer_lock_timeout`, including an outer anyhow
 context. Separate assertions preserve `database_busy` for SQLite and `timeout`
-for I/O. No lock duration, delivery behavior or telemetry schema changed.
+for I/O. That diagnostic-only change did not alter lock durations, delivery
+behavior or the telemetry schema.
 
 ## Real MCP actions, 2026-11-04
 

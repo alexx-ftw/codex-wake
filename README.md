@@ -312,9 +312,12 @@ first; daily aggregates retain 90 days. Pruned detail is counted explicitly.
 SQLite is limited to 64 MiB and reuses freed pages. Files are private (0600,
 directory 0700) and removed with the plugin's state on uninstall. Telemetry
 failures emit a fixed diagnostic to stderr and do not stop event processing.
-`telemetry_writer_lock_timeout` identifies an exhausted 250 ms cross-process
+`telemetry_writer_lock_timeout` identifies an exhausted one-second cross-process
 writer-lock wait; SQLite busy/locked errors remain `database_busy`, and other
 I/O timeouts remain `timeout`. These warnings imply missing telemetry detail.
+Writers also allow SQLite up to one second to clear transient contention; read-only
+reports retain their 250 ms limit. Contended writes can delay telemetry callers,
+but logging still gives up after these bounded waits rather than blocking forever.
 Child output is drained independently through a bounded nonblocking queue;
 overflow is counted when the writer catches up. Repeated storage warnings are
 rate-limited. If storage stays unavailable or a process is killed, some records
