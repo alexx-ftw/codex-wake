@@ -1,5 +1,41 @@
 # Validation
 
+## Background source polling, 2026-11-04
+
+The source revision adds deterministic polling in the existing user service:
+GitHub Actions attempts, PR state/head/base, reviews, deployment statuses, refs,
+PR-comment rules, explicit file/HTTP/flock/systemd probes, and native Codex turn
+metadata. No model is started to perform these observations. Public ingress is
+optional and disabled by default; existing explicit producers remain supported.
+
+The locked suite passed 146 unit tests and the normal integration suites
+(eight hooks/launcher, one native matcher self-check, one background service,
+one packaging and five telemetry tests). Clippy passed with warnings denied.
+Focused regressions cover failed-page cursor preservation, cached pagination
+with HTTP 304, global rate limits longer than the ordinary backoff, historical
+review exclusion, pending-to-submitted reviews, PR head/base changes, PR identity
+before comment routing, newly edited comments and exact native source identities.
+Native observations complete only their own registration, preserving independent
+baselines across namespaces. Same-second GitHub timestamp ties are included;
+this deliberately permits a first-read event from just before registration
+within that second rather than permanently dropping a later event.
+
+The background service test uses an actual service process, private SQLite state,
+a local WebSocket controller fixture and a fake queue executable. Publishing a
+file leads to one queue acknowledgement, with HTTP ingress disabled and no model
+turn. This proves observation-to-queue behavior, not native model execution.
+
+An explicit read-only GitHub test selected a real completed run from this
+repository. Only its registered attempt and SHA became ready; a different SHA
+and nonexistent attempt stayed waiting. Two existing signed HTTP integration
+tests also passed against the verified receiver binary. These checks did not
+change the host's existing subscriptions or start a GitHub workflow.
+
+The previously qualified clean-VM install, lifecycle and native model tests below
+predate this polling implementation and were not rerun for it. Polling cannot
+recover intermediate changes no longer exposed by a source, and native turn
+completion does not establish that the overall task has finished.
+
 ## Linux alpha packaging and clean VM qualification, 2026-11-04
 
 Rust 1.98.0 built the locked Linux x86_64 musl binary. The pinned toolchain

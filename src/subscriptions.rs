@@ -566,6 +566,48 @@ pub fn publish_with_source(
     ready(db, kind, repo, &resource, event, outcome, source)
 }
 
+/// Complete only the registration whose observation was verified.
+pub fn publish_observation(
+    db: &Connection,
+    id: &str,
+    outcome: &str,
+    source: &Value,
+) -> Result<usize> {
+    let registration: Option<(String, String)> = db
+        .query_row(
+            "SELECT kind,event FROM subscriptions WHERE id=?1 AND state='waiting'",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, event)) = registration else {
+        return Ok(0);
+    };
+    ensure!(
+        custom_outcome(&kind, &event, outcome),
+        "Unsupported event or outcome"
+    );
+    let source_json = serde_json::to_string(source)?;
+    ensure!(
+        source_json.len() <= MAX_PAYLOAD_BYTES,
+        "Payload exceeds 1 MiB"
+    );
+    let changed=db.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL,source_json=CASE WHEN message_template IS NOT NULL THEN ?2 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='waiting'",params![outcome,source_json,id])?;
+    crate::observability::emit(
+        "event.accept",
+        if changed > 0 {
+            "matched"
+        } else {
+            "no_new_match"
+        },
+        "",
+        Some(id),
+        Duration::ZERO,
+        changed as u64,
+    );
+    Ok(changed)
+}
+
 /// List subscription metadata without storing or returning untrusted event payloads.
 pub fn status(db: &Connection) -> Result<Value> {
     initialize(db)?;

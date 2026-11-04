@@ -3,7 +3,10 @@ mod execution;
 mod goals;
 mod host_cleanup;
 mod manager;
+mod native_poll;
 mod observability;
+mod observers;
+mod polling;
 mod probe;
 mod rules;
 mod subscriptions;
@@ -64,6 +67,8 @@ struct SubscriptionInput {
     /// Optional input: {{source.path}}, {{event.resource}}, {{target.thread}}.
     message_template: Option<String>,
     execution: Option<execution::ExecutionOptions>,
+    /// Optional deterministic file, health endpoint, lock or systemd-job observation.
+    observation: Option<observers::Observation>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -178,6 +183,9 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     let db = bridge::connect(&config.db)?;
     subscriptions::initialize(&db)?;
     rules::initialize(&db)?;
+    polling::initialize(&db)?;
+    observers::initialize(&db)?;
+    native_poll::initialize(&db)?;
     Ok(db)
 }
 
@@ -439,7 +447,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Subscribe a thread to one source/resource/event; other subscriptions stay independent. get_status lists supported events. Lifecycle signals require trusted hooks.",
+        description = "Subscribe to one source/resource/event. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. Other outcomes need a producer.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -449,6 +457,9 @@ impl WakeTools {
     fn subscribe(&self, Parameters(input): Parameters<SubscriptionInput>) -> CallToolResult {
         tool_result((|| {
             let db = database(&self.config)?;
+            if let Some(observation) = &input.observation {
+                observers::validate(&input.kind, &input.event, observation)?;
+            }
             let id = subscriptions::subscribe_with_delivery(
                 &db,
                 &input.kind,
@@ -461,6 +472,12 @@ impl WakeTools {
                     execution: input.execution.as_ref(),
                 },
             )?;
+            if let Some(observation) = &input.observation {
+                observers::attach(&db, &id, observation)?;
+            }
+            if matches!(input.kind.as_str(), "thread" | "subagent") {
+                native_poll::arm(&db, &id, &self.config.codex)?;
+            }
             let rows = subscriptions::status(&db)?;
             let record = rows
                 .as_array()
@@ -542,7 +559,7 @@ impl WakeTools {
         tool_result((|| {
             let db = database(&self.config)?;
             Ok(
-                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
+                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
             )
         })())
     }
@@ -699,7 +716,7 @@ async fn main() -> Result<()> {
     }
     anyhow::ensure!(
         !args.is_empty(),
-        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|register|subscribe|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
+        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|poll|register|subscribe|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
     );
     let command = args.remove(0);
     // Cleanup must never recreate state after removing the plugin.
@@ -711,6 +728,7 @@ async fn main() -> Result<()> {
         "ensure" => "cli.ensure",
         "record-funnel" => "cli.record_funnel",
         "receiver" => "cli.receiver",
+        "poll" => "cli.poll",
         "register" => "cli.register",
         "subscribe" => "cli.subscribe",
         "publish" => "cli.publish",
@@ -788,6 +806,14 @@ async fn run_command(
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             manager::run_receiver(&config)?;
         }
+        "poll" => {
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            let db = database(&config)?;
+            println!(
+                "{}",
+                json!({"github":polling::tick(&db,&config.gh)?,"observers":observers::tick(&db,&config.codex)?,"native":native_poll::tick(&db,&config.codex)?})
+            );
+        }
         "remove-service" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             manager::remove_service(&config)?;
@@ -826,6 +852,12 @@ async fn run_command(
             let thread = required(&mut args, "--thread")?;
             let message_template = option(&mut args, "--message-template")?;
             let execution = cli_execution(&mut args)?;
+            let observation = option(&mut args, "--observe")?
+                .map(|raw| serde_json::from_str::<observers::Observation>(&raw))
+                .transpose()?;
+            if let Some(observation) = &observation {
+                observers::validate(&kind, &event, observation)?;
+            }
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             let id = subscriptions::subscribe_with_delivery(
                 &database(&config)?,
@@ -839,6 +871,12 @@ async fn run_command(
                     execution: execution.as_ref(),
                 },
             )?;
+            if let Some(observation) = &observation {
+                observers::attach(&database(&config)?, &id, observation)?;
+            }
+            if matches!(kind.as_str(), "thread" | "subagent") {
+                native_poll::arm(&database(&config)?, &id, &config.codex)?;
+            }
             println!("{}", json!({"subscription_id":id}));
         }
         "publish" => {

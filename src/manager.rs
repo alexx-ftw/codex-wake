@@ -91,6 +91,10 @@ fn current_funnel_server(status: &Value) -> Result<String> {
 }
 
 pub fn record_funnel(config: &Config) -> Result<Value> {
+    ensure!(
+        config.webhooks_enabled,
+        "Enable optional webhooks before adopting a Funnel route"
+    );
     require_installed(config)?;
     let _guard = lock(config)?;
     require_installed(config)?;
@@ -185,6 +189,9 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("observability.rs").as_slice(),
         include_bytes!("telemetry.rs").as_slice(),
+        include_bytes!("polling.rs").as_slice(),
+        include_bytes!("observers.rs").as_slice(),
+        include_bytes!("native_poll.rs").as_slice(),
         include_bytes!("../Cargo.lock").as_slice(),
         HOOKS.as_bytes(),
     ] {
@@ -222,6 +229,8 @@ pub struct Config {
     pub unit: PathBuf,
     pub db: PathBuf,
     pub codex: PathBuf,
+    pub gh: PathBuf,
+    pub webhooks_enabled: bool,
     pub codex_home: PathBuf,
     pub rpc_socket: PathBuf,
     pub cache: PathBuf,
@@ -264,6 +273,19 @@ impl Config {
             .map(PathBuf::from)
             .or_else(|| saved.as_ref()?.get("codex")?.as_str().map(PathBuf::from))
             .unwrap_or_else(|| find_program("codex").unwrap_or_else(|_| PathBuf::from("codex")));
+        let gh = env::var_os("CODEX_WAKE_GH")
+            .map(PathBuf::from)
+            .or_else(|| saved.as_ref()?.get("gh")?.as_str().map(PathBuf::from))
+            .unwrap_or_else(|| find_program("gh").unwrap_or_else(|_| PathBuf::from("gh")));
+        let webhooks_enabled = match env::var("CODEX_WAKE_ENABLE_WEBHOOKS").ok().as_deref() {
+            Some("1" | "true") => true,
+            Some("0" | "false") => false,
+            Some(_) => bail!("CODEX_WAKE_ENABLE_WEBHOOKS must be 0 or 1"),
+            None => saved
+                .as_ref()
+                .and_then(|value| value["webhooks_enabled"].as_bool())
+                .unwrap_or(false),
+        };
         let base = env::var_os("CODEX_WAKE_PLUGIN_BASE")
             .map(PathBuf::from)
             .or_else(|| {
@@ -289,6 +311,8 @@ impl Config {
             unit: config_home.join("systemd/user").join(UNIT),
             db,
             codex,
+            gh,
+            webhooks_enabled,
             codex_home,
             rpc_socket,
             cache,
@@ -429,6 +453,7 @@ fn unit(config: &Config) -> Result<String> {
         .replace('%', "%%");
     let db = quote(&format!("CODEX_WAKE_DB={}", config.db.display()))?;
     let codex = quote(&format!("CODEX_WAKE_CODEX={}", config.codex.display()))?;
+    let gh = quote(&format!("CODEX_WAKE_GH={}", config.gh.display()))?;
     let cfg_home = config.config.parent().context("Missing config parent")?;
     let cfg_home = quote(&format!("XDG_CONFIG_HOME={}", cfg_home.display()))?;
     let mut extra = [
@@ -463,6 +488,10 @@ fn unit(config: &Config) -> Result<String> {
             quote(&format!("CODEX_WAKE_PLUGIN_BASE={}", base.display()))?
         ));
     }
+    extra.push_str(&format!(
+        "Environment={gh}\nEnvironment=CODEX_WAKE_ENABLE_WEBHOOKS={}\n",
+        u8::from(config.webhooks_enabled)
+    ));
     Ok(format!(
         "{MARKER}[Unit]\nDescription=Codex Wake shared webhook receiver\nAfter=network.target\n\n[Service]\nType=simple\nWorkingDirectory={runtime}\nExecStart=:{exe} receiver\nEnvironment={db}\nEnvironment={codex}\nEnvironment={cfg_home}\n{extra}Restart=on-failure\nRestartSec=5\nUMask=0077\nNoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n"
     ))
@@ -553,6 +582,14 @@ fn healthy(config: &Config) -> Result<()> {
         fs::read_link(format!("/proc/{pid}/exe"))? == config.runtime.join("codex-wake"),
         "Service executable differs from the managed receiver"
     );
+    if !config.webhooks_enabled {
+        let reply = crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}))?;
+        ensure!(
+            reply["data"].is_array(),
+            "Invalid controller readiness response"
+        );
+        return Ok(());
+    }
     let body = b"{\"action\":\"started\"}";
     let secret = load_secret(&config.config.join("webhook.secret"))?;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
@@ -609,13 +646,15 @@ pub fn status(config: &Config) -> Result<Value> {
             fs::read_to_string(config.runtime.join("hooks.json.tmpl"))? == HOOKS,
             "Receiver hook configuration differs"
         );
-        ensure!(
-            format!(
-                "{:x}",
-                Sha256::digest(fs::read(config.runtime.join("webhook"))?)
-            ) == WEBHOOK_SHA,
-            "Receiver binary checksum mismatch"
-        );
+        if config.webhooks_enabled {
+            ensure!(
+                format!(
+                    "{:x}",
+                    Sha256::digest(fs::read(config.runtime.join("webhook"))?)
+                ) == WEBHOOK_SHA,
+                "Receiver binary checksum mismatch"
+            );
+        }
         healthy(config)
     })();
     let controller = (|| -> Result<()> {
@@ -631,7 +670,8 @@ pub fn status(config: &Config) -> Result<Value> {
     Ok(
         json!({"service":fields, "local_ready":health.is_ok(), "health_error":health.err().map(|e|e.to_string()),
         "controller_ready":controller.is_ok(),"controller_error":controller.err().map(|e|e.to_string()),
-        "ingress":ingress,"public_ingress_verified":false,"lifecycle":"shared persistent user service; closing MCP does not stop it"}),
+        "github_transport":"polling","webhooks_enabled":config.webhooks_enabled,
+        "ingress_required":false,"ingress":ingress,"public_ingress_verified":false,"lifecycle":"shared persistent user service; closing MCP does not stop it"}),
     )
 }
 
@@ -694,8 +734,10 @@ pub fn ensure_receiver(config: &Config) -> Result<Value> {
             0o600,
         )?;
     }
-    obtain_webhook(&config.runtime)?;
-    load_secret(&config.config.join("webhook.secret"))?;
+    if config.webhooks_enabled {
+        obtain_webhook(&config.runtime)?;
+        load_secret(&config.config.join("webhook.secret"))?;
+    }
     fs::create_dir_all(config.unit.parent().context("Missing unit directory")?)?;
     if existing_unit.is_empty() {
         atomic_write(&config.unit, expected_unit.as_bytes(), 0o600)?;
@@ -760,7 +802,6 @@ pub fn run_receiver(config: &Config) -> Result<()> {
         .parent()
         .context("Executable has no directory")?
         .to_path_buf();
-    let secret = load_secret(&config.config.join("webhook.secret"))?;
     let binary = env::var_os("CODEX_WAKE_WEBHOOK")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("webhook"));
@@ -782,27 +823,34 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             .context("Configured Codex control socket is unavailable")?;
         None
     };
-    let mut receiver = ChildGuard(
-        Command::new(binary)
-            .args([
-                "-verbose",
-                "-ip",
-                "127.0.0.1",
-                "-port",
-                "9000",
-                "-template",
-                "-hooks",
-            ])
-            .arg(root.join("hooks.json.tmpl"))
-            .env("GITHUB_WEBHOOK_SECRET", secret)
-            .env("CODEX_WAKE_EXECUTABLE", env::current_exe()?)
-            .env("CODEX_WAKE_DB", &config.db)
-            .env("CODEX_WAKE_CODEX", &config.codex)
-            .env("CODEX_WAKE_DEFER", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+    let mut receiver = if config.webhooks_enabled {
+        Some(ChildGuard(
+            Command::new(binary)
+                .args([
+                    "-verbose",
+                    "-ip",
+                    "127.0.0.1",
+                    "-port",
+                    "9000",
+                    "-template",
+                    "-hooks",
+                ])
+                .arg(root.join("hooks.json.tmpl"))
+                .env(
+                    "GITHUB_WEBHOOK_SECRET",
+                    load_secret(&config.config.join("webhook.secret"))?,
+                )
+                .env("CODEX_WAKE_EXECUTABLE", env::current_exe()?)
+                .env("CODEX_WAKE_DB", &config.db)
+                .env("CODEX_WAKE_CODEX", &config.codex)
+                .env("CODEX_WAKE_DEFER", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ))
+    } else {
+        None
+    };
     if let Some(child) = &mut controller {
         if let Some(pipe) = child.0.stdout.take() {
             crate::observability::capture(pipe, "controller");
@@ -811,13 +859,53 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             crate::observability::capture(pipe, "controller");
         }
     }
-    if let Some(pipe) = receiver.0.stdout.take() {
+    if let Some(child) = &mut receiver
+        && let Some(pipe) = child.0.stdout.take()
+    {
         crate::observability::capture(pipe, "webhook");
     }
-    if let Some(pipe) = receiver.0.stderr.take() {
+    if let Some(child) = &mut receiver
+        && let Some(pipe) = child.0.stderr.take()
+    {
         crate::observability::capture(pipe, "webhook");
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
+    // Observation must keep running while accepted deliveries wait on a busy Codex thread.
+    for source in ["github", "external", "native"] {
+        let poll_config = config.clone();
+        thread::spawn(move || {
+            loop {
+                let result = (|| -> Result<()> {
+                    let db = crate::bridge::connect(&poll_config.db)?;
+                    crate::subscriptions::initialize(&db)?;
+                    crate::rules::initialize(&db)?;
+                    match source {
+                        "github" => {
+                            crate::polling::tick(&db, &poll_config.gh)?;
+                        }
+                        "external" => {
+                            crate::observers::tick(&db, &poll_config.codex)?;
+                        }
+                        _ => {
+                            crate::native_poll::tick(&db, &poll_config.codex)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    crate::observability::emit(
+                        "poll.cycle",
+                        "error",
+                        crate::observability::error_class(&error),
+                        Some(source),
+                        Duration::ZERO,
+                        1,
+                    );
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
     let config = config.clone();
     thread::spawn(move || {
         let mut heartbeat = Instant::now() - Duration::from_secs(60);
@@ -885,7 +973,9 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             );
             bail!("Codex controller exited with {status}");
         }
-        if let Some(status) = receiver.0.try_wait()? {
+        if let Some(receiver) = &mut receiver
+            && let Some(status) = receiver.0.try_wait()?
+        {
             crate::observability::emit(
                 "webhook.exit",
                 "error",
@@ -1012,7 +1102,7 @@ fn install_cleanup(config: &Config) -> Result<()> {
     }
     atomic_write(
         &config.state.join("installation.json"),
-        serde_json::to_vec(&json!({"plugin_base":base,"codex":config.codex}))?.as_slice(),
+        serde_json::to_vec(&json!({"plugin_base":base,"codex":config.codex,"gh":config.gh,"webhooks_enabled":config.webhooks_enabled}))?.as_slice(),
         0o600,
     )?;
     if changed {
@@ -1475,17 +1565,17 @@ mod tests {
     fn installed_codex_survives_a_different_path() {
         const CHILD: &str = "CODEX_WAKE_CONFIG_TEST_CHILD";
         if env::var_os(CHILD).is_some() {
-            assert_eq!(
-                Config::from_env().unwrap().codex,
-                PathBuf::from("/installed/codex")
-            );
+            let config = Config::from_env().unwrap();
+            assert_eq!(config.codex, PathBuf::from("/installed/codex"));
+            assert_eq!(config.gh, PathBuf::from("/installed/gh"));
+            assert!(config.webhooks_enabled);
             return;
         }
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("codex-wake")).unwrap();
         fs::write(
             temp.path().join("codex-wake/installation.json"),
-            br#"{"codex":"/installed/codex"}"#,
+            br#"{"codex":"/installed/codex","gh":"/installed/gh","webhooks_enabled":true}"#,
         )
         .unwrap();
         let status = Command::new(env::current_exe().unwrap())
@@ -1496,12 +1586,30 @@ mod tests {
             .env(CHILD, "1")
             .env("XDG_STATE_HOME", temp.path())
             .env("PATH", "/nonexistent")
+            .env_remove("CODEX_WAKE_GH")
+            .env_remove("CODEX_WAKE_ENABLE_WEBHOOKS")
             .env_remove("CODEX_WAKE_CODEX")
             .env_remove("CODEX_WAKE_PLUGIN_ROOT")
             .env_remove("CODEX_WAKE_PLUGIN_BASE")
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn service_persists_explicit_transport_and_github_executable() {
+        let mut config = Config::from_env().unwrap();
+        config.gh = PathBuf::from("/tools with spaces/gh");
+        config.webhooks_enabled = false;
+        let disabled = unit(&config).unwrap();
+        assert!(disabled.contains("Environment=CODEX_WAKE_ENABLE_WEBHOOKS=0"));
+        assert!(disabled.contains("CODEX_WAKE_GH=/tools with spaces/gh"));
+        config.webhooks_enabled = true;
+        assert!(
+            unit(&config)
+                .unwrap()
+                .contains("Environment=CODEX_WAKE_ENABLE_WEBHOOKS=1")
+        );
     }
     #[test]
     fn unit_values_are_quoted_without_line_injection() {
