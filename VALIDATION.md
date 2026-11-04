@@ -2,6 +2,25 @@
 
 Local qualification on 2026-11-04 with the installed Codex Desktop runtime:
 
+- Real GitHub end-to-end qualification passed with
+  [Actions run 41854888860](https://github.com/alexx-ftw/codex-wake/actions/runs/41854888860)
+  at revision `466e046af53ece277a92d0bdf89190b2f8398476`.
+  GitHub sent the real `workflow_run/completed` payload through a temporary
+  HTTPS tunnel to the installed shared receiver. The exact delivery record in
+  GitHub confirmed HTTP 200 for that run. Its registered run/attempt/SHA started
+  a real Sol/low turn, which spawned and waited for a Luna/low subagent.
+  Four exact assistant replies were observed in completed native agent-message
+  events: the subagent, the GitHub recipient, the SubagentStop subscriber and
+  the Stop subscriber. SessionStart, Stop and SubagentStop ran automatically,
+  completed successfully and emitted supported warning entries without plugin
+  model-context entries. No hook command or synthetic webhook was invoked.
+  The temporary GitHub webhook and fixture subscriptions/wait were removed,
+  ephemeral fixture chats unloaded and the tunnel stopped after qualification.
+  An initial verification-driver failure was JavaScript rounding a GitHub
+  delivery ID beyond its safe integer range; preserving the exact integer
+  string corrected the driver before this successful run. Private transcripts,
+  webhook configuration and fixture chat/subscription IDs are excluded from the repository.
+
 - Operational telemetry qualification: 96 binary tests, 3 isolated telemetry CLI
   tests, 2 hook CLI tests and the native reply-matcher self-check passed; format
   and Clippy with warnings denied passed. Eight simultaneous CLI processes
@@ -93,8 +112,9 @@ from the portable root manifest, including its compatibility overlay. Using the
 Codex manifest alone made all three hooks discoverable; `hooks/list` confirms
 SessionStart, Stop and SubagentStop are enabled and `trusted` after host review.
 
-The shared receiver and its persistent native controller report ready. Public
-HTTPS ingress is not configured or qualified. Real GitHub-to-Desktop delivery
-and ChatGPT Desktop compatibility are not claimed. The GitHub repository was
+The shared receiver and its persistent native controller report ready. A
+temporary HTTPS ingress and real GitHub-to-native-Codex delivery are qualified
+above; permanent public ingress remains unconfigured. Pixel rendering of hook
+results and ChatGPT Desktop compatibility are not claimed. The GitHub repository was
 recreated with Rust-only history and published; the functional revision's
-[CI passed](https://github.com/alexx-ftw/codex-wake/actions/runs/41838531726).
+[CI passed](https://github.com/alexx-ftw/codex-wake/actions/runs/41852198562).
