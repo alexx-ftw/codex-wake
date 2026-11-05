@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -41,7 +41,13 @@ pub(crate) fn socket_rpc(
 
     fn timeouts(ws: &mut WebSocket<UnixStream>, deadline: Instant) -> Result<()> {
         let left = deadline.saturating_duration_since(Instant::now());
-        ensure!(!left.is_zero(), "Unix WebSocket RPC timed out");
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Unix WebSocket RPC timed out",
+            )
+            .into());
+        }
         ws.get_mut().set_read_timeout(Some(left))?;
         ws.get_mut().set_write_timeout(Some(left))?;
         Ok(())
@@ -62,7 +68,10 @@ pub(crate) fn socket_rpc(
                         return Ok(result);
                     }
                 }
-                Message::Close(_) => bail!("Unix WebSocket closed before matched response"),
+                Message::Close(_) => {
+                    return Err(anyhow::Error::new(tungstenite::Error::ConnectionClosed)
+                        .context("Unix WebSocket closed before matched response"));
+                }
                 Message::Binary(_) => bail!("Expected a Unix WebSocket text frame"),
                 _ => {}
             }
@@ -76,8 +85,15 @@ pub(crate) fn socket_rpc(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     // --listen unix:// uses HTTP Upgrade followed by WebSocket text frames.
-    let (mut ws, _) = tungstenite::client("ws://localhost/", stream)
-        .map_err(|_| anyhow!("App-server Unix WebSocket HTTP Upgrade failed"))?;
+    let (mut ws, _) = tungstenite::client("ws://localhost/", stream).map_err(|error| {
+        match error {
+            tungstenite::HandshakeError::Failure(error) => anyhow::Error::new(error),
+            tungstenite::HandshakeError::Interrupted(_) => {
+                anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+        .context("App-server Unix WebSocket HTTP Upgrade failed")
+    })?;
     let result = (|| {
         send(
             &mut ws,
@@ -148,11 +164,10 @@ fn rpc_inner(method: &str, params: Value) -> Result<Value> {
         std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
         std::env::var_os("XDG_STATE_HOME"),
         std::env::var_os("HOME"),
-    ).context("Codex Wake app-server socket missing: start the receiver service or set CODEX_WAKE_RPC_SOCKET to its Unix socket")?;
-    ensure!(
-        Path::new(&socket).exists(),
-        "Codex Wake app-server socket missing: start the receiver service or correct CODEX_WAKE_RPC_SOCKET"
-    );
+    ).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or set CODEX_WAKE_RPC_SOCKET to its Unix socket"))?;
+    if !Path::new(&socket).try_exists()? {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or correct CODEX_WAKE_RPC_SOCKET").into());
+    }
     #[cfg(unix)]
     {
         socket_rpc(Path::new(&socket), method, params, TIMEOUT)
@@ -327,6 +342,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_default_socket_is_typed_not_found() {
+        if std::env::var_os("WAKE_TEST_MISSING_DEFAULT_SOCKET").is_some() {
+            let error = rpc_inner("thread/read", json!({"threadId":THREAD})).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            return;
+        }
+        let fixture = SocketDir::new();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "goals::tests::missing_default_socket_is_typed_not_found",
+            ])
+            .env("WAKE_TEST_MISSING_DEFAULT_SOCKET", "1")
+            .env("HOME", &fixture.0)
+            .env("XDG_STATE_HOME", &fixture.0)
+            .env_remove("CODEX_WAKE_RPC_SOCKET")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[cfg(unix)]

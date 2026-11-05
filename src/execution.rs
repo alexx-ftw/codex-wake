@@ -20,6 +20,55 @@ pub(crate) fn is_target_busy(error: &anyhow::Error) -> bool {
     error.downcast_ref::<TargetBusyBeforeSend>().is_some()
 }
 
+#[derive(Debug)]
+struct TargetUnavailableBeforeSend;
+
+impl fmt::Display for TargetUnavailableBeforeSend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Target unavailable during preparation; input was not sent")
+    }
+}
+
+impl Error for TargetUnavailableBeforeSend {}
+
+fn preparation_transport_error(error: &anyhow::Error) -> bool {
+    let io = error.downcast_ref::<std::io::Error>().or_else(|| {
+        match error.downcast_ref::<tungstenite::Error>() {
+            Some(tungstenite::Error::Io(io)) => Some(io),
+            _ => None,
+        }
+    });
+    io.is_some_and(|io| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotFound
+        )
+    }) || matches!(
+        error.downcast_ref::<tungstenite::Error>(),
+        Some(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed)
+    )
+}
+
+pub(crate) fn before_send_retry_reason(error: &anyhow::Error) -> Option<&'static str> {
+    if is_target_busy(error) {
+        Some("target_busy_before_send")
+    } else if error
+        .downcast_ref::<TargetUnavailableBeforeSend>()
+        .is_some()
+    {
+        Some("target_unavailable_before_send")
+    } else {
+        None
+    }
+}
+
 fn is_active_writer_resume_error(error: &anyhow::Error, thread: &str) -> bool {
     let text = error.to_string();
     let Some(response) = text.strip_prefix("Codex app-server RPC failed: ") else {
@@ -116,10 +165,19 @@ fn prepare_with(
     persist: bool,
     call: &mut impl FnMut(&str, Value) -> Result<Value>,
 ) -> Result<String> {
+    let mut call = |method: &str, params: Value| {
+        call(method, params).map_err(|error| {
+            if preparation_transport_error(&error) {
+                error.context(TargetUnavailableBeforeSend)
+            } else {
+                error
+            }
+        })
+    };
     let thread = Uuid::parse_str(thread)
         .context("Invalid thread UUID")?
         .to_string();
-    let model = validate_with(options, call)?;
+    let model = validate_with(options, &mut call)?;
     let read = call(
         "thread/read",
         json!({"threadId":thread,"includeTurns":false}),
@@ -479,6 +537,114 @@ mod tests {
         })
         .unwrap();
         assert_eq!(starts, 1);
+        assert_eq!(
+            result,
+            ("needs_attention".into(), Some("execution_api_error".into()))
+        );
+    }
+
+    #[test]
+    fn preparation_transport_errors_are_retryable_without_sending_input() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NotFound,
+        ] {
+            for failed_call in 0..4 {
+                let mut calls = 0;
+                let error = deliver_with(
+                    THREAD,
+                    "run",
+                    &ExecutionOptions::default(),
+                    &mut |method, _| {
+                        let current = calls;
+                        calls += 1;
+                        if current == failed_call {
+                            return Err(std::io::Error::from(kind).into());
+                        }
+                        Ok(match method {
+                            "model/list" => catalog_page("gpt-6.1-sol", "sol", "low", None),
+                            "thread/read" if current == 1 => {
+                                json!({"thread":{"status":{"type":"notLoaded"}}})
+                            }
+                            "thread/resume" => json!({}),
+                            "thread/read" => {
+                                json!({"thread":{"model":"gpt-6.1-sol","reasoningEffort":"low"}})
+                            }
+                            _ => panic!("input must not be sent during preparation"),
+                        })
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    before_send_retry_reason(&error),
+                    Some("target_unavailable_before_send")
+                );
+                assert_eq!(calls, failed_call + 1);
+            }
+        }
+        let error = deliver_with(THREAD, "run", &ExecutionOptions::default(), &mut |_, _| {
+            Err(
+                anyhow::Error::new(tungstenite::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::WouldBlock,
+                )))
+                .context("Read Unix WebSocket RPC"),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(
+            before_send_retry_reason(&error),
+            Some("target_unavailable_before_send")
+        );
+    }
+
+    #[test]
+    fn retry_classification_excludes_rpc_rejections_validation_and_sent_input() {
+        let busy: anyhow::Error = TargetBusyBeforeSend.into();
+        assert_eq!(
+            before_send_retry_reason(&busy),
+            Some("target_busy_before_send")
+        );
+        for message in [
+            "Codex app-server RPC failed: {\"message\":\"timeout\"}",
+            "Invalid model catalog",
+            "Expected a Unix WebSocket text frame",
+            "App-server Unix WebSocket HTTP Upgrade failed",
+        ] {
+            let error = deliver_with(THREAD, "run", &ExecutionOptions::default(), &mut |_, _| {
+                Err(anyhow::anyhow!("{message}"))
+            })
+            .unwrap_err();
+            assert_eq!(before_send_retry_reason(&error), None);
+        }
+        let error = deliver_with(THREAD, "run", &ExecutionOptions::default(), &mut |_, _| {
+            Err(anyhow::Error::new(tungstenite::Error::Http(Box::new(
+                tungstenite::http::Response::builder()
+                    .status(401)
+                    .body(None)
+                    .unwrap(),
+            )))
+            .context("App-server Unix WebSocket HTTP Upgrade failed"))
+        })
+        .unwrap_err();
+        assert_eq!(before_send_retry_reason(&error), None);
+        let error = deliver_with(THREAD, "run", &ExecutionOptions::default(), &mut |_, _| {
+            Ok(json!({"data":[]}))
+        })
+        .unwrap_err();
+        assert_eq!(before_send_retry_reason(&error), None);
+        let result = deliver_with(
+            THREAD,
+            "run",
+            &ExecutionOptions::default(),
+            &mut |method, _| match method {
+                "model/list" => Ok(catalog_page("gpt-6.1-sol", "sol", "low", None)),
+                "thread/read" => Ok(json!({"thread":{"status":{"type":"idle"}}})),
+                "turn/start" => Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into()),
+                _ => panic!("unexpected RPC"),
+            },
+        )
+        .unwrap();
         assert_eq!(
             result,
             ("needs_attention".into(), Some("execution_api_error".into()))

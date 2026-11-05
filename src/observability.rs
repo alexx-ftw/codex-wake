@@ -296,6 +296,7 @@ pub fn reason(value: Option<&str>) -> &'static str {
         "resume_daemon_unavailable" => "resume_daemon_unavailable",
         "cli_warning_after_queue_ack" => "cli_warning_after_queue_ack",
         "target_busy_before_send" => "target_busy_before_send",
+        "target_unavailable_before_send" => "target_unavailable_before_send",
         "cli_warning_or_nonzero_exit" => "cli_warning_or_nonzero_exit",
         "timeout_delivery_unknown" => "timeout_delivery_unknown",
         "send_failed_delivery_unknown" => "send_failed_delivery_unknown",

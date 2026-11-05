@@ -692,7 +692,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
         let row = transaction
             .query_row(
                 "SELECT id,kind,repo,resource,event,thread,outcome,message_template,source_json,execution_json FROM subscriptions \
-             WHERE state='ready' AND (reason IS NULL OR reason!='target_busy_before_send' OR updated<=datetime('now','-15 seconds')) ORDER BY updated,id LIMIT 1",
+             WHERE state='ready' AND (reason IS NULL OR reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR updated<=datetime('now','-15 seconds')) ORDER BY updated,id LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -779,14 +779,13 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                 "needs_attention".to_owned(),
                 Some("invalid_send_classification".to_owned()),
             ),
-            Err(error) if crate::execution::is_target_busy(&error) => (
-                "ready".to_owned(),
-                Some("target_busy_before_send".to_owned()),
-            ),
-            Err(error) => (
-                "needs_attention".to_owned(),
-                Some(bounded_reason("send_outcome_unknown", &error.to_string())),
-            ),
+            Err(error) => match crate::execution::before_send_retry_reason(&error) {
+                Some(reason) => ("ready".to_owned(), Some(reason.to_owned())),
+                None => (
+                    "needs_attention".to_owned(),
+                    Some(bounded_reason("send_outcome_unknown", &error.to_string())),
+                ),
+            },
         };
         db.execute(
             "UPDATE subscriptions SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='sending'",
@@ -833,38 +832,37 @@ mod tests {
 
     #[test]
     fn busy_target_backoff_defers_only_recent_definitive_rejections() {
-        let mut db = db();
-        subscribe(&db, "job", "ci", "busy", "failure", THREAD).unwrap();
-        publish_with_source(&db, "job", "ci", "busy", "failure", &json!({})).unwrap();
-        db.execute(
-            "UPDATE subscriptions SET reason='target_busy_before_send'",
-            [],
-        )
-        .unwrap();
-        let missing = Path::new("/bin/false");
-        assert_eq!(
-            dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
-            0
-        );
-        subscribe(&db, "job", "ci", "other", "failure", THREAD).unwrap();
-        publish_with_source(&db, "job", "ci", "other", "failure", &json!({})).unwrap();
-        assert_eq!(
-            dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
-            1
-        );
-        db.execute(
+        for reason in ["target_busy_before_send", "target_unavailable_before_send"] {
+            let mut db = db();
+            subscribe(&db, "job", "ci", "busy", "failure", THREAD).unwrap();
+            publish_with_source(&db, "job", "ci", "busy", "failure", &json!({})).unwrap();
+            db.execute("UPDATE subscriptions SET reason=?1", [reason])
+                .unwrap();
+            let missing = Path::new("/bin/false");
+            assert_eq!(
+                dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
+                0
+            );
+            subscribe(&db, "job", "ci", "other", "failure", THREAD).unwrap();
+            publish_with_source(&db, "job", "ci", "other", "failure", &json!({})).unwrap();
+            assert_eq!(
+                dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
+                1
+            );
+            db.execute(
             "UPDATE subscriptions SET updated=datetime('now','-16 seconds') WHERE resource='busy'",
             [],
         )
         .unwrap();
-        assert_eq!(
-            dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
-            1
-        );
-        assert_eq!(
-            dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
-            0
-        );
+            assert_eq!(
+                dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
+                1
+            );
+            assert_eq!(
+                dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

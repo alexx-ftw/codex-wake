@@ -393,7 +393,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
             let row = db
                 .query_row(
                     "SELECT repo,run_id,attempt,thread,sha,conclusion,message_template,source_json,execution_json FROM waits \
-             WHERE state='ready' AND (reason IS NULL OR reason!='target_busy_before_send' OR updated<=datetime('now','-15 seconds')) ORDER BY updated LIMIT 1",
+             WHERE state='ready' AND (reason IS NULL OR reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR updated<=datetime('now','-15 seconds')) ORDER BY updated LIMIT 1",
                     [],
                     |row| {
                         Ok((
@@ -507,14 +507,13 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                     "needs_attention".to_owned(),
                     Some("invalid_send_classification".to_owned()),
                 ),
-                Err(error) if crate::execution::is_target_busy(&error) => (
-                    "ready".to_owned(),
-                    Some("target_busy_before_send".to_owned()),
-                ),
-                Err(error) => (
-                    "needs_attention".to_owned(),
-                    Some(bounded_reason("send_outcome_unknown", &error.to_string())),
-                ),
+                Err(error) => match crate::execution::before_send_retry_reason(&error) {
+                    Some(reason) => ("ready".to_owned(), Some(reason.to_owned())),
+                    None => (
+                        "needs_attention".to_owned(),
+                        Some(bounded_reason("send_outcome_unknown", &error.to_string())),
+                    ),
+                },
             },
         };
         db.execute(
@@ -950,28 +949,29 @@ mod tests {
 
     #[test]
     fn busy_wait_backoff_defers_then_dispatches_once() {
-        let (dir, mut db) = setup();
-        accept(&db, &payload()).unwrap();
-        db.execute("UPDATE waits SET reason='target_busy_before_send'", [])
-            .unwrap();
-        let capture = dir.path().join("calls");
-        let codex = fake_codex(dir.path(), &format!("echo call >> '{}'", capture.display()));
-        assert_eq!(
-            dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
-            0
-        );
-        assert!(!capture.exists());
-        db.execute("UPDATE waits SET updated=datetime('now','-16 seconds')", [])
-            .unwrap();
-        assert_eq!(
-            dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
-            1
-        );
-        assert_eq!(
-            dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
-            0
-        );
-        assert_eq!(fs::read_to_string(capture).unwrap().lines().count(), 1);
+        for reason in ["target_busy_before_send", "target_unavailable_before_send"] {
+            let (dir, mut db) = setup();
+            accept(&db, &payload()).unwrap();
+            db.execute("UPDATE waits SET reason=?1", [reason]).unwrap();
+            let capture = dir.path().join("calls");
+            let codex = fake_codex(dir.path(), &format!("echo call >> '{}'", capture.display()));
+            assert_eq!(
+                dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+                0
+            );
+            assert!(!capture.exists());
+            db.execute("UPDATE waits SET updated=datetime('now','-16 seconds')", [])
+                .unwrap();
+            assert_eq!(
+                dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+                1
+            );
+            assert_eq!(
+                dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+                0
+            );
+            assert_eq!(fs::read_to_string(capture).unwrap().lines().count(), 1);
+        }
     }
 
     #[test]

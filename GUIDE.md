@@ -157,7 +157,8 @@ for the dated external delivery evidence in `VALIDATION.md`.
 
 Stored subscriptions and CI waits with a model preset remain ready when the target
 is active or `thread/resume` definitively rejects its active writer before input
-submission. They retry after 15 seconds, preserving the preset. An uncertain
+submission, or when transport fails during preparation before any input-bearing
+RPC. They retry after 15 seconds, preserving the preset. An uncertain
 `turn/start` result still requires inspection and is never automatically replayed.
 
 Every subscription is independent and one-shot. Completing one doesn't cancel
