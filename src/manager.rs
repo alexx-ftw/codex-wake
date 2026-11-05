@@ -202,21 +202,25 @@ pub(crate) fn source_digest() -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn source_matches(stamp: &Value) -> bool {
+    let source = source_digest();
+    stamp["source"] == source
+        || stamp["compatible_sources"]
+            .as_array()
+            .is_some_and(|sources| sources.contains(&json!(source)))
+}
+
+fn binary_matches_stamp(config: &Config, stamp: &Value) -> bool {
+    fs::read(config.runtime.join("codex-wake"))
+        .is_ok_and(|binary| stamp["binary"] == format!("{:x}", Sha256::digest(binary)))
+}
+
 fn runtime_matches(config: &Config) -> bool {
     (|| -> Result<bool> {
         let stamp: Value = serde_json::from_slice(&fs::read(config.runtime.join("runtime.json"))?)?;
-        let source = source_digest();
         // Explicit aliases allow reviewed MCP-only updates without replacing a live receiver.
-        let compatible = stamp["source"] == source
-            || stamp["compatible_sources"]
-                .as_array()
-                .is_some_and(|sources| sources.contains(&json!(source)));
-        Ok(compatible
-            && stamp["binary"]
-                == format!(
-                    "{:x}",
-                    Sha256::digest(fs::read(config.runtime.join("codex-wake"))?)
-                )
+        Ok(source_matches(&stamp)
+            && binary_matches_stamp(config, &stamp)
             && fs::read_to_string(config.runtime.join("hooks.json.tmpl"))? == HOOKS)
     })()
     .unwrap_or(false)
@@ -626,6 +630,12 @@ pub fn status(config: &Config) -> Result<Value> {
         .filter_map(|line| line.split_once('='))
         .map(|(key, value)| (key.to_owned(), json!(value)))
         .collect();
+    let stamp = fs::read(config.runtime.join("runtime.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let source_compatible = source_matches(&stamp);
+    let binary_verified = binary_matches_stamp(config, &stamp);
     let health = (|| {
         ensure!(
             fs::read_to_string(&config.unit)? == unit(config)?,
@@ -640,8 +650,12 @@ pub fn status(config: &Config) -> Result<Value> {
             "Service has overrides"
         );
         ensure!(
-            runtime_matches(config),
-            "Receiver runtime differs from MCP source or its binary was altered"
+            binary_verified,
+            "Receiver binary does not match its recorded checksum"
+        );
+        ensure!(
+            source_compatible,
+            "MCP build differs from receiver source; reconnect MCP before treating this compatibility failure as receiver downtime"
         );
         ensure!(
             fs::read_to_string(config.runtime.join("hooks.json.tmpl"))? == HOOKS,
@@ -671,6 +685,7 @@ pub fn status(config: &Config) -> Result<Value> {
     Ok(
         json!({"service":fields, "local_ready":health.is_ok(), "health_error":health.err().map(|e|e.to_string()),
         "controller_ready":controller.is_ok(),"controller_error":controller.err().map(|e|e.to_string()),
+        "runtime":{"client_source":source_digest(),"receiver_source":stamp["source"],"client_source_compatible":source_compatible,"stored_binary_matches_stamp":binary_verified},
         "github_transport":"polling","webhooks_enabled":config.webhooks_enabled,
         "ingress_required":false,"ingress":ingress,"public_ingress_verified":false,"lifecycle":"shared persistent user service; closing MCP does not stop it"}),
     )
@@ -1498,6 +1513,8 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         assert!(remove_stale_socket(&socket).is_err());
         assert!(socket.exists());
+        // Drain the successful probe so no pending connection retains the listener.
+        drop(listener.accept().unwrap());
         drop(listener);
         remove_stale_socket(&socket).unwrap();
         assert!(!socket.exists());
@@ -1543,6 +1560,8 @@ mod tests {
             fs::write(config.runtime.join("runtime.json"), stamp.to_string()).unwrap();
         };
         save(&stamp);
+        assert!(binary_matches_stamp(&config, &stamp));
+        assert!(!source_matches(&stamp));
         assert!(!runtime_matches(&config));
         stamp["compatible_sources"] = json!(["different-source"]);
         save(&stamp);
@@ -1552,6 +1571,7 @@ mod tests {
         assert!(runtime_matches(&config));
         assert_eq!(stamp["source"], "previous-source");
         fs::write(config.runtime.join("codex-wake"), b"altered receiver").unwrap();
+        assert!(!binary_matches_stamp(&config, &stamp));
         assert!(!runtime_matches(&config));
         fs::write(config.runtime.join("codex-wake"), binary).unwrap();
         fs::write(config.runtime.join("hooks.json.tmpl"), "altered hooks").unwrap();
