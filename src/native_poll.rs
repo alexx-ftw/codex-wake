@@ -332,8 +332,9 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
         let mut event_turn = None;
         for turn in chronological {
             let same = previous_id.as_deref() == Some(turn.id.as_str());
+            // Another controller can reconstruct an unloaded live turn as interrupted.
             if turn.status == "completed"
-                && ((same && previous_status.as_deref() == Some("inProgress")) || !same)
+                && (!same || previous_status.as_deref() != Some("completed"))
             {
                 event_turn = Some(turn.clone());
                 break;
@@ -376,7 +377,13 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
                 1,
             );
         }
-        let last_status = latest.as_ref().map(|t| t.status.as_str());
+        let last_status = if latest.as_ref().map(|t| t.id.as_str()) == base_id.as_deref()
+            && base_status.as_deref() == Some("completed")
+        {
+            Some("completed")
+        } else {
+            latest.as_ref().map(|t| t.status.as_str())
+        };
         db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='observed',reason=NULL,updated_ms=?3 WHERE subscription_id=?4",params![latest.as_ref().map(|t|t.id.as_str()),last_status,stamp+INTERVAL_MS,id])?;
     }
     Ok(report)
@@ -617,6 +624,26 @@ mod tests {
     }
 
     #[test]
+    fn completed_baseline_does_not_replay_after_reconstructed_interruption() {
+        let db = db();
+        let id = sub(&db);
+        arm_with(&db, &id, &mut page(SOURCE, vec![turn("old", "completed")])).unwrap();
+        for observed in ["interrupted", "completed"] {
+            db.execute("UPDATE native_observers SET next_poll_ms=0", [])
+                .unwrap();
+            assert_eq!(
+                tick_with(&db, &mut page(SOURCE, vec![turn("old", observed)])).unwrap()["published"],
+                0
+            );
+            assert_eq!(
+                crate::subscriptions::status(&db).unwrap()[0]["state"],
+                "waiting"
+            );
+            assert_eq!(status(&db).unwrap()[0]["baseline_status"], "completed");
+        }
+    }
+
+    #[test]
     fn unarmed_first_poll_baselines_historical_completion() {
         let db = db();
         sub(&db);
@@ -672,6 +699,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(status(&db).unwrap()[0]["baseline_turn_id"], "active");
+    }
+
+    #[test]
+    fn unloaded_interrupted_baseline_can_later_complete() {
+        let db = db();
+        let id = sub(&db);
+        arm_with(&db, &id, &mut page(SOURCE, vec![turn("t1", "interrupted")])).unwrap();
+        db.execute("UPDATE native_observers SET next_poll_ms=0", [])
+            .unwrap();
+        assert_eq!(
+            tick_with(&db, &mut page(SOURCE, vec![turn("t1", "interrupted")])).unwrap()["published"],
+            0
+        );
+        assert_eq!(
+            crate::subscriptions::status(&db).unwrap()[0]["state"],
+            "waiting"
+        );
+        db.execute("UPDATE native_observers SET next_poll_ms=0", [])
+            .unwrap();
+        assert_eq!(
+            tick_with(&db, &mut page(SOURCE, vec![turn("t1", "completed")])).unwrap()["published"],
+            1
+        );
+        assert_eq!(
+            crate::subscriptions::status(&db).unwrap()[0]["state"],
+            "ready"
+        );
     }
 
     #[test]

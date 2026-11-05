@@ -18,7 +18,7 @@ PR-comment rules, explicit file/HTTP/flock/systemd probes, and native Codex turn
 metadata. No model is started to perform these observations. Public ingress is
 optional and disabled by default; existing explicit producers remain supported.
 
-Rust 1.98.0 passed the locked suite of 146 unit tests and the normal integrations
+Rust 1.98.0 passed the locked suite of 148 unit tests and the normal integrations
 (eight hooks/launcher, one native matcher self-check, one background service,
 one packaging and five telemetry tests). Pinned Clippy passed with warnings denied.
 The Linux x86_64 musl release binary built successfully and was packaged locally.
@@ -46,6 +46,12 @@ The static candidate also armed a private subscription through the actual native
 controller's metadata API. It persisted the correct source UUID and in-progress
 baseline, remained waiting and published nothing on an immediate poll. No model
 was started and the host business database was not used by that fixture.
+
+A live cross-controller comparison found the same Desktop-active turn reported
+as `interrupted` by the private metadata reader. Polling now accepts a later
+explicit `completed` observation for that same ID. Once an ID has been observed
+completed, its baseline remains completed through reconstructed interruptions;
+regressions cover both recovery and prevention of historical replay.
 
 The previously qualified clean-VM install, lifecycle and native model tests below
 predate this polling implementation and were not rerun for it. Polling cannot
