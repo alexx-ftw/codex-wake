@@ -13,17 +13,21 @@ fn executable(path: &std::path::Path, body: &str) {
 
 fn invoke(payload: Value) -> std::process::Output {
     let temp = tempfile::tempdir().unwrap();
+    invoke_at(payload, temp.path())
+}
+
+fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_codex-wake"))
         .args([
             "--db",
-            temp.path().join("state.sqlite3").to_str().unwrap(),
+            temp.join("state.sqlite3").to_str().unwrap(),
             "--codex",
             "/nonexistent/codex-wake-test-codex",
             "hook",
         ])
-        .env("XDG_STATE_HOME", temp.path())
+        .env("XDG_STATE_HOME", temp)
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .stdin(Stdio::piped())
@@ -38,6 +42,64 @@ fn invoke(payload: Value) -> std::process::Output {
         .write_all(payload.to_string().as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn concurrent_hook_processes_emit_one_context_and_never_replay_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = json!({"hook_event_name":"PostToolUse","session_id":"11111111-1111-4111-8111-111111111111","turn_id":"turn1","tool_use_id":"tool1"});
+    assert!(invoke_at(payload.clone(), temp.path()).status.success());
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute(
+        "INSERT INTO steers(id,thread,message) VALUES('one',?1,'Process the authorized result')",
+        [payload["session_id"].as_str().unwrap()],
+    )
+    .unwrap();
+    let workers = (0..2)
+        .map(|_| {
+            let path = temp.path().to_path_buf();
+            let payload = payload.clone();
+            std::thread::spawn(move || {
+                let output = invoke_at(payload, &path);
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    let contexts = outputs
+        .iter()
+        .filter(|output| output.get("hookSpecificOutput").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(contexts.len(), 1);
+    assert!(
+        contexts[0]["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("Process the authorized result")
+    );
+    assert!(
+        outputs
+            .iter()
+            .all(|output| output.get("decision").is_none())
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM steers WHERE id='one'", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "claimed"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invoke_at(payload, temp.path()).stdout).unwrap(),
+        json!({})
+    );
 }
 
 #[test]
