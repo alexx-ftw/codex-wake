@@ -287,6 +287,18 @@ thread. Goal actions first persist and read back the preset, then mutate the goa
 A busy thread or unavailable API produces an error rather than silently
 discarding the preset. A queue-only input cannot carry a per-turn override.
 
+For an explicitly requested deferred handoff, `queue_thread` accepts
+`steer: true` (default `false`). It is incompatible with `resume: true` and
+`execution`; normal queue and resume behavior is unchanged. Wake renders the
+template first and limits the JSON-encoded rendered string to 2048 UTF-8 bytes,
+including JSON quotes and escapes. It remains
+`pending` until the destination's own `PostToolUse` or `Stop` hook claims it;
+this does not wake an idle chat. Claiming is atomic and single-use. `claimed`
+means hook output was prepared, not that Codex accepted it or the model consumed
+it. If the process crashes or Codex rejects the output after the claim, Wake
+does not replay it automatically. Inspect status and decide whether to submit a
+new input. A child hook cannot consume input for its parent thread.
+
 [examples/pr-bot-review.json](examples/pr-bot-review.json) demonstrates a bot/phrase
 rule. Configure only rules and objectives actually authorized by the user:
 
@@ -323,7 +335,18 @@ newly matched subscriptions and current delivery states for that source; no new
 matches produce `{}`. Accepted queue input is explicitly distinguished from
 verified execution. Hook failures retain a failing exit code and diagnostics.
 These messages surface in the UI/event stream, not as model instructions.
-No `additionalContext`, stop decision or forced continuation is emitted.
+No `additionalContext`, stop decision or forced continuation is emitted for
+lifecycle notifications.
+
+When a deferred steer is claimed, `PostToolUse` returns its input as
+`hookSpecificOutput.additionalContext`; `Stop` uses the documented continuation
+output. When `stop_hook_active: true`, only the steer claim/continuation is
+skipped; the `Stop` lifecycle signal is still published. Subagent hooks carry
+the parent `session_id`, so they must not consume the parent's queued steer;
+only a hook belonging to the destination thread may claim it. A claim records
+that output was prepared, not delivered to or consumed by the model. Neither
+hook output nor a successful claim grants approval for tools or expands the
+task's authorization.
 
 Hooks are supported by manually installed desktop plugins; this package isn't
 currently eligible for the public directory while it bundles them. The resume

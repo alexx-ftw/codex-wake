@@ -992,10 +992,12 @@ pub fn run_receiver(config: &Config) -> Result<()> {
 
 fn observe_queues(config: &Config) -> Result<()> {
     let db = crate::bridge::connect(&config.db)?;
+    crate::steer::initialize(&db)?;
     for (table, operation) in [
         ("waits", "queue.waits"),
         ("subscriptions", "queue.subscriptions"),
         ("rule_deliveries", "queue.rules"),
+        ("steers", "queue.steers"),
     ] {
         let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table} GROUP BY state"))?;
         let rows = statement.query_map([], |r| {
@@ -1014,6 +1016,8 @@ fn observe_queues(config: &Config) -> Result<()> {
                 "creating" => "creating",
                 "queued" => "queued",
                 "needs_attention" => "needs_attention",
+                "pending" => "pending",
+                "claimed" => "claimed",
                 _ => "unknown_state",
             };
             crate::observability::emit(

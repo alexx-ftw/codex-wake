@@ -9,6 +9,7 @@ mod observers;
 mod polling;
 mod probe;
 mod rules;
+mod steer;
 mod subscriptions;
 mod telemetry;
 mod templates;
@@ -141,6 +142,9 @@ struct QueueInput {
     /// False queues only; true also resumes execution.
     #[serde(default)]
     resume: bool,
+    /// Deliver through the destination's next PostToolUse or Stop hook; does not wake an idle chat.
+    #[serde(default)]
+    steer: bool,
     execution: Option<execution::ExecutionOptions>,
 }
 
@@ -186,6 +190,7 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     polling::initialize(&db)?;
     observers::initialize(&db)?;
     native_poll::initialize(&db)?;
+    steer::initialize(&db)?;
     Ok(db)
 }
 
@@ -219,6 +224,7 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
         Some("SessionStart") => "hook.session_start",
         Some("Stop") => "hook.stop",
         Some("SubagentStop") => "hook.subagent_stop",
+        Some("PostToolUse") => "hook.post_tool_use",
         _ => "hook.unsupported",
     };
     let span = observability::Span::new(
@@ -233,6 +239,9 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
 }
 
 fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
+    if payload["hook_event_name"] == "PostToolUse" {
+        return steer::take(&mut database(config)?, payload);
+    }
     if payload["hook_event_name"] == "SessionStart" {
         let status = manager::ensure_receiver(config)?;
         return Ok(
@@ -272,11 +281,19 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
             row.get::<_, String>(0)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(lifecycle_output(
+    let mut output = lifecycle_output(
         payload["hook_event_name"].as_str().unwrap_or_default(),
         matched,
         &states,
-    ))
+    );
+    if payload["hook_event_name"] == "Stop" {
+        let steer = steer::take(&mut database(config)?, payload)?;
+        output
+            .as_object_mut()
+            .unwrap()
+            .extend(steer.as_object().unwrap().clone());
+    }
+    Ok(output)
 }
 
 fn tool_result(result: Result<Value>) -> CallToolResult {
@@ -337,7 +354,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Render and queue input for a thread. resume also wakes it; execution presets require an idle resumable thread.",
+        description = "Render and queue input for a thread. resume wakes it. steer delivers via its next tool/stop hook without waking or changing its model; incompatible with resume/execution.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn queue_thread(&self, Parameters(input): Parameters<QueueInput>) -> CallToolResult {
@@ -347,6 +364,13 @@ impl WakeTools {
                 &input.message_template,
                 &json!({"source":input.source.unwrap_or(Value::Null),"target":{"thread":thread}}),
             )?;
+            if input.steer {
+                anyhow::ensure!(
+                    !input.resume && input.execution.is_none(),
+                    "Steer cannot resume or change execution presets"
+                );
+                return steer::enqueue(&database(&self.config)?, &thread, &message);
+            }
             let (state, reason) = execution::deliver(
                 &self.config.codex,
                 Duration::from_secs(120),
@@ -559,7 +583,7 @@ impl WakeTools {
         tool_result((|| {
             let db = database(&self.config)?;
             Ok(
-                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
+                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"steers":steer::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
             )
         })())
     }
@@ -671,7 +695,7 @@ fn diagnostics(config: &manager::Config, days: u32) -> Result<Value> {
         )?;
         db.busy_timeout(Duration::from_millis(250))?;
         let mut queues = serde_json::Map::new();
-        for table in ["waits", "subscriptions", "rule_deliveries"] {
+        for table in ["waits", "subscriptions", "rule_deliveries", "steers"] {
             let exists: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
                 [table],
@@ -1014,6 +1038,49 @@ mod hook_output_tests {
     }
 
     #[test]
+    fn queue_steer_renders_input_without_resuming_or_changing_presets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let tools = WakeTools { config };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let input = |extra: Value| {
+            let mut input = json!({"thread":thread,"message_template":"Read {{source.path}}","source":{"path":"α.txt"},"steer":true});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<QueueInput>(input).unwrap()
+        };
+        let result = tools.queue_thread(Parameters(input(json!({}))));
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.unwrap()["state"], "pending");
+        for extra in [
+            json!({"resume":true}),
+            json!({"execution":{"model":"gpt-6.1-sol","reasoning_effort":"low"}}),
+        ] {
+            assert_eq!(
+                tools.queue_thread(Parameters(input(extra))).is_error,
+                Some(true)
+            );
+        }
+        let db = database(&tools.config).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM steers", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT message FROM steers", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "Read α.txt"
+        );
+    }
+
+    #[test]
     fn hook_reports_real_delivery_states_and_duplicate_is_quiet() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = manager::Config::from_env().unwrap();
@@ -1037,7 +1104,15 @@ mod hook_output_tests {
         )
         .unwrap();
         let payload = json!({"hook_event_name":"Stop","session_id":source,"last_assistant_message":"PRIVATE_TEXT_NOT_FOR_HOOK_OUTPUT"});
+        steer::enqueue(&db, source, "Continue the existing task").unwrap();
         let output = run_hook(&config, &payload).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert!(
+            output["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Continue the existing task")
+        );
         let text = output["systemMessage"].as_str().unwrap();
         assert!(text.contains("1 newly matched"));
         assert!(text.contains("0 queue acceptance(s), 1 pending"));
