@@ -1545,6 +1545,43 @@ mod hook_output_tests {
     }
 
     #[test]
+    fn publication_tool_warns_about_conflicting_exact_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let tools = WakeTools { config };
+        let publish = |outcome: &str, attempt: u64, agent: &str| {
+            let input = serde_json::from_value::<PublicationInput>(json!({
+                "kind":"job", "repo":"ci", "resource":"build", "outcome":outcome,
+                "execution_id":"run", "attempt":attempt, "source":{"agent":agent}
+            }))
+            .unwrap();
+            let response = tools.publish_result(Parameters(input));
+            assert_ne!(response.is_error, Some(true));
+            response.structured_content.unwrap()
+        };
+        assert_eq!(publish("success", 1, "a")["conflict"], false);
+        assert_eq!(publish("failure", 2, "b")["conflict"], false);
+        let result = publish("failure", 1, "b");
+        assert_eq!(result["conflict"], true);
+        assert_eq!(result["prior_delivery_possible"], true);
+        assert_eq!(result["conflicts"][0]["evidence"]["agent"], "a");
+        assert_eq!(result["conflicts"][1]["evidence"]["agent"], "b");
+
+        let partial = serde_json::from_value::<PublicationInput>(json!({
+            "kind":"job", "repo":"ci", "resource":"build", "outcome":"failure", "execution_id":"run"
+        }))
+        .unwrap();
+        assert_eq!(
+            tools.publish_result(Parameters(partial)).is_error,
+            Some(true)
+        );
+    }
+
+    #[test]
     fn queue_steer_renders_input_without_resuming_or_changing_presets() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = manager::Config::from_env().unwrap();
