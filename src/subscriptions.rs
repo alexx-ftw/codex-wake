@@ -808,13 +808,13 @@ pub fn publish_observation(
 }
 
 /// List subscription metadata without storing or returning untrusted event payloads.
-pub fn status(db: &Connection) -> Result<Value> {
+fn status_rows(db: &Connection, id: Option<&str>) -> Result<Vec<Value>> {
     initialize(db)?;
     let mut statement = db.prepare(
         "SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,required_source,source_json,dependency_timeout_secs,dependency_progress_at_ms,dependency_deadline_ms,dependency_notice_state,dependency_notice_reason,dependency_notice_started_at_ms \
-         FROM subscriptions ORDER BY updated,id",
+         FROM subscriptions WHERE (?1 IS NULL OR id=?1) ORDER BY updated,id",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([id], |row| {
         let required: Option<String> = row.get(10)?;
         let source: Option<String> = row.get(11)?;
         let missing = if source.is_some() { Some(missing_source(required.as_deref(), source.as_deref()).map_err(|error| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error)))?) } else { None };
@@ -834,7 +834,18 @@ pub fn status(db: &Connection) -> Result<Value> {
             "inactivity_notice_started_at_ms":row.get::<_,Option<i64>>(17)?,
         }))
     })?;
-    Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn status(db: &Connection) -> Result<Value> {
+    Ok(Value::Array(status_rows(db, None)?))
+}
+
+pub fn status_for_id(db: &Connection, id: &str) -> Result<Value> {
+    status_rows(db, Some(id))?
+        .into_iter()
+        .next()
+        .context("Registered subscription missing")
 }
 
 /// Report durable delivery evidence for one exact event without exposing its payload.

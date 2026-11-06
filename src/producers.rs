@@ -16,6 +16,12 @@ pub fn subscriptions_status(db: &Connection) -> Result<Value> {
     Ok(subscriptions)
 }
 
+pub fn subscription_status(db: &Connection, id: &str) -> Result<Value> {
+    let mut subscription = crate::subscriptions::status_for_id(db, id)?;
+    subscription["producer"] = status(db, id)?;
+    Ok(subscription)
+}
+
 pub fn status(db: &Connection, id: &str) -> Result<Value> {
     let (kind, repo, resource, event, state): (String, String, String, String, String) = db
         .query_row(

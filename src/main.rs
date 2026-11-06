@@ -923,7 +923,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Subscribe to one source/resource/event. Dependency/recovered subscriptions send one investigation request after progress_timeout_secs (default 3600) without an explicit progress signal. The deadline does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs.",
+        description = "Subscribe to one source/resource/event. Dependency/recovered subscriptions send one investigation request after progress_timeout_secs (default 3600) without an explicit progress signal. The deadline does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. After registration, registration_error reports an observer setup failure and subscription_error reports a status lookup failure; subscription_id remains valid.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -950,18 +950,26 @@ impl WakeTools {
                     progress_timeout_secs: input.progress_timeout_secs,
                 },
             )?;
-            if let Some(observation) = &input.observation {
-                observers::attach(&db, &id, observation)?;
+            let mut result = json!({"subscription_id":id});
+            if let Some(observation) = &input.observation
+                && let Err(error) = observers::attach(&db, &id, observation)
+            {
+                result["registration_error"] =
+                    json!({"stage":"observation", "category":observability::error_class(&error)});
             }
-            if matches!(input.kind.as_str(), "thread" | "subagent") {
-                native_poll::arm(&db, &id, &self.config.codex)?;
+            if matches!(input.kind.as_str(), "thread" | "subagent")
+                && let Err(error) = native_poll::arm(&db, &id, &self.config.codex)
+            {
+                result["registration_error"] =
+                    json!({"stage":"native_poll", "category":observability::error_class(&error)});
             }
-            let rows = producers::subscriptions_status(&db)?;
-            let record = rows
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["id"] == id))
-                .context("Registered subscription missing")?;
-            Ok(json!({"subscription_id":id,"subscription":record}))
+            match producers::subscription_status(&db, &id) {
+                Ok(record) => result["subscription"] = record,
+                Err(error) => {
+                    result["subscription_error"] = json!(observability::error_class(&error))
+                }
+            }
+            Ok(result)
         })())
     }
 
@@ -1743,6 +1751,62 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn subscription_reports_failures_after_registration_without_losing_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        db.execute_batch("CREATE TRIGGER bad_status AFTER INSERT ON subscriptions WHEN NEW.resource='bad-status' BEGIN UPDATE subscriptions SET required_source='invalid' WHERE id=NEW.id; END;
+            CREATE TRIGGER bad_observer BEFORE INSERT ON observers BEGIN SELECT RAISE(FAIL,'injected'); END;
+            CREATE TRIGGER bad_native BEFORE INSERT ON native_observers BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+        drop(db);
+        let call = |value: Value| {
+            let response = tools.subscribe(Parameters(serde_json::from_value(value).unwrap()));
+            assert_ne!(response.is_error, Some(true));
+            let value = response.structured_content.unwrap();
+            let id = value["subscription_id"].as_str().unwrap();
+            let db = database(&tools.config).unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM subscriptions WHERE id=?1",
+                    [id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            value
+        };
+        let dest = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let base = |resource: &str| json!({"kind":"artifact","repo":"ci","resource":resource,"event":"available","thread":dest});
+        let bad_status = call(base("bad-status"));
+        assert!(bad_status["subscription_error"].is_string());
+        let good = call(base("good"));
+        assert_eq!(good["subscription"]["producer"]["type"], "unknown");
+        assert!(good.get("subscription_error").is_none());
+        let dependency = call(
+            json!({"kind":"dependency","repo":"ci","resource":"db","event":"recovered","thread":dest,"progress_timeout_secs":45,"required_source":["artifact.name"]}),
+        );
+        assert_eq!(dependency["subscription"]["progress_timeout_secs"], 45);
+        assert_eq!(
+            dependency["subscription"]["required_source"],
+            json!(["artifact.name"])
+        );
+        assert!(dependency["subscription"]["progress_deadline_ms"].is_number());
+        let mut observer = base("observed");
+        observer["observation"] = json!({"type":"file","path":"/tmp/wake-test-artifact"});
+        assert_eq!(call(observer)["registration_error"]["stage"], "observation");
+        let native = call(
+            json!({"kind":"thread","resource":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","event":"turn_completed","thread":dest}),
+        );
+        assert_eq!(native["registration_error"]["stage"], "native_poll");
+    }
 
     #[test]
     fn publication_warns_when_only_an_earlier_subscription_exists() {

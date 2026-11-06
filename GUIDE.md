@@ -216,6 +216,9 @@ GitHub polling capability, matching pending publication obligations, or no
 recorded publisher. An unknown publisher is a warning, not a registration error.
 Automatic-source health is unverified: capability and configuration do not prove
 that credentials, polling or delivery work, nor that an event will arrive.
+After MCP registration, `registration_error` identifies a failed observer setup
+and `subscription_error` identifies a failed status lookup; `subscription_id`
+still identifies the saved subscription.
 
 ## GitHub and external events
 
