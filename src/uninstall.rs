@@ -211,7 +211,11 @@ mod tests {
             )
             .unwrap();
         assert!(transfer_table);
-        for table in ["coordinators", "coordinator_alerts", "dependency_notice_uncertainties"] {
+        for table in [
+            "coordinators",
+            "coordinator_alerts",
+            "dependency_notice_uncertainties",
+        ] {
             let exists: bool = db
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -343,7 +347,11 @@ mod tests {
 
     #[test]
     fn wake_metadata_tables_are_allowed_for_uninstall_only_when_database_is_identified() {
-        for table in ["coordinators", "coordinator_alerts", "dependency_notice_uncertainties"] {
+        for table in [
+            "coordinators",
+            "coordinator_alerts",
+            "dependency_notice_uncertainties",
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("state.sqlite3");
             let db = rusqlite::Connection::open(&path).unwrap();

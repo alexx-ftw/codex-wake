@@ -962,7 +962,9 @@ mod tests {
         drop(db);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let db = connect(&path).unwrap();
-        let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0)).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
         assert_eq!(id, 0);
         let preserved: (String, i64, String, i64) = db.query_row("SELECT subscription_id,generation,reason,recorded_at_ms FROM dependency_notice_uncertainties", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(preserved, ("foreign".into(), 7, "keep".into(), 42));

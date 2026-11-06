@@ -1213,7 +1213,9 @@ fn dependency_tick_with(
             // known-unsent old-period attempt must not consume that new period.
             db.execute("UPDATE subscriptions SET dependency_notice_state=CASE WHEN dependency_period_generation=?1 THEN ?2 ELSE NULL END,dependency_notice_reason=CASE WHEN dependency_period_generation=?1 THEN ?3 ELSE NULL END,dependency_notice_after_ms=CASE WHEN dependency_period_generation=?1 AND ?2='pending' THEN ?4 ELSE NULL END,dependency_notice_generation=CASE WHEN dependency_period_generation=?1 THEN dependency_notice_generation ELSE NULL END WHERE id=?5 AND dependency_notice_state='sending' AND dependency_notice_generation=?1", params![generation, state, reason, retry_after, id])?;
         } else if state == "needs_attention"
-            && reason.as_deref().is_some_and(|reason| reason.starts_with("send_outcome_unknown:"))
+            && reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("send_outcome_unknown:"))
         {
             // Keep the uncertain outcome tied to its claimed generation. If
             // progress advanced during delivery, leave the new period eligible.
@@ -1286,9 +1288,30 @@ mod tests {
         assert_eq!(notice_state, None);
         assert_eq!(generation, 1);
         let mut sends = 0;
-        assert_eq!(dependency_tick_with(&db, 10_999, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
-        assert_eq!(dependency_tick_with(&db, 11_000, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 1);
-        assert_eq!(dependency_tick_with(&db, 11_001, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        assert_eq!(
+            dependency_tick_with(&db, 10_999, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            dependency_tick_with(&db, 11_000, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            dependency_tick_with(&db, 11_001, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
         assert_eq!(sends, 1);
         let preserved: (i64, String) = db.query_row("SELECT generation,reason FROM dependency_notice_uncertainties WHERE subscription_id='old-uncertain'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(preserved, (1, "send_outcome_unknown: prior attempt".into()));
@@ -1304,21 +1327,57 @@ mod tests {
             "history",
             "recovered",
             THREAD,
-            DeliveryConfig { progress_timeout_secs: Some(1), ..DeliveryConfig::default() },
-        ).unwrap();
-        let first_deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
-        dependency_tick_with(&db, first_deadline, |_, _, _| anyhow::bail!("uncertain outcome generation one")).unwrap();
+            DeliveryConfig {
+                progress_timeout_secs: Some(1),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let first_deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        dependency_tick_with(&db, first_deadline, |_, _, _| {
+            anyhow::bail!("uncertain outcome generation one")
+        })
+        .unwrap();
         record_dependency_progress(&db, "provider", "history", first_deadline).unwrap();
-        let second_deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
-        dependency_tick_with(&db, second_deadline, |_, _, _| anyhow::bail!("uncertain outcome generation two")).unwrap();
-        assert_eq!(dependency_tick_with(&db, second_deadline + 1, |_, _, _| panic!("uncertain generation must not be replayed")).unwrap(), 0);
+        let second_deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        dependency_tick_with(&db, second_deadline, |_, _, _| {
+            anyhow::bail!("uncertain outcome generation two")
+        })
+        .unwrap();
+        assert_eq!(
+            dependency_tick_with(&db, second_deadline + 1, |_, _, _| panic!(
+                "uncertain generation must not be replayed"
+            ))
+            .unwrap(),
+            0
+        );
         let status = status_for_id(&db, &id).unwrap();
-        let history = status["inactivity_notice_uncertainties"].as_array().unwrap();
+        let history = status["inactivity_notice_uncertainties"]
+            .as_array()
+            .unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0]["generation"], 1);
-        assert_eq!(history[0]["reason"], "send_outcome_unknown: uncertain outcome generation one");
+        assert_eq!(
+            history[0]["reason"],
+            "send_outcome_unknown: uncertain outcome generation one"
+        );
         assert_eq!(history[1]["generation"], 2);
-        assert_eq!(history[1]["reason"], "send_outcome_unknown: uncertain outcome generation two");
+        assert_eq!(
+            history[1]["reason"],
+            "send_outcome_unknown: uncertain outcome generation two"
+        );
     }
 
     #[test]
@@ -1535,9 +1594,19 @@ mod tests {
             "paused",
             "recovered",
             THREAD,
-            DeliveryConfig { progress_timeout_secs: Some(10), ..DeliveryConfig::default() },
-        ).unwrap();
-        let deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+            DeliveryConfig {
+                progress_timeout_secs: Some(10),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
         let worker_path = file.path().to_owned();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -1547,21 +1616,42 @@ mod tests {
                 claimed_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
                 Ok(("queued".into(), None))
-            }).unwrap()
+            })
+            .unwrap()
         });
         claimed_rx.recv().unwrap();
         let progress_db = Connection::open(file.path()).unwrap();
         record_dependency_progress(&progress_db, "provider", "paused", deadline).unwrap();
         resume_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), 1);
-        let next_deadline: i64 = progress_db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        let next_deadline: i64 = progress_db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
         let (state, generation, claimed_generation): (Option<String>, i64, Option<i64>) = progress_db.query_row("SELECT dependency_notice_state,dependency_period_generation,dependency_notice_generation FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!(state, None);
         assert_eq!(generation, 2);
         assert_eq!(claimed_generation, None);
         let mut sends = 0;
-        assert_eq!(dependency_tick_with(&progress_db, next_deadline - 1, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
-        assert_eq!(dependency_tick_with(&progress_db, next_deadline, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 1);
+        assert_eq!(
+            dependency_tick_with(&progress_db, next_deadline - 1, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            dependency_tick_with(&progress_db, next_deadline, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
         assert_eq!(sends, 1);
     }
 
@@ -1577,9 +1667,19 @@ mod tests {
             "uncertain-progress",
             "recovered",
             THREAD,
-            DeliveryConfig { progress_timeout_secs: Some(1), ..DeliveryConfig::default() },
-        ).unwrap();
-        let deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+            DeliveryConfig {
+                progress_timeout_secs: Some(1),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
         let worker_path = file.path().to_owned();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -1589,22 +1689,51 @@ mod tests {
                 claimed_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
                 anyhow::bail!("connection lost after send")
-            }).unwrap()
+            })
+            .unwrap()
         });
         claimed_rx.recv().unwrap();
         let progress_db = Connection::open(file.path()).unwrap();
-        record_dependency_progress(&progress_db, "provider", "uncertain-progress", deadline).unwrap();
+        record_dependency_progress(&progress_db, "provider", "uncertain-progress", deadline)
+            .unwrap();
         resume_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), 1);
-        let next_deadline: i64 = progress_db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        let next_deadline: i64 = progress_db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
         let (state, uncertain_generation, uncertain_reason): (Option<String>, i64, String) = progress_db.query_row("SELECT dependency_notice_state,dependency_notice_uncertain_generation,dependency_notice_uncertain_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
         assert_eq!(state, None);
         assert_eq!(uncertain_generation, 1);
         assert!(uncertain_reason.starts_with("send_outcome_unknown:"));
         let mut new_period_sends = 0;
-        assert_eq!(dependency_tick_with(&progress_db, next_deadline - 1, |_, _, _| { new_period_sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
-        assert_eq!(dependency_tick_with(&progress_db, next_deadline, |_, _, _| { new_period_sends += 1; Ok(("queued".into(), None)) }).unwrap(), 1);
-        assert_eq!(dependency_tick_with(&progress_db, next_deadline + 1, |_, _, _| { new_period_sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        assert_eq!(
+            dependency_tick_with(&progress_db, next_deadline - 1, |_, _, _| {
+                new_period_sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            dependency_tick_with(&progress_db, next_deadline, |_, _, _| {
+                new_period_sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            dependency_tick_with(&progress_db, next_deadline + 1, |_, _, _| {
+                new_period_sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
         assert_eq!(new_period_sends, 1);
         let (uncertain_generation, uncertain_reason): (i64, String) = progress_db.query_row("SELECT dependency_notice_uncertain_generation,dependency_notice_uncertain_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(uncertain_generation, 1);
@@ -1623,9 +1752,19 @@ mod tests {
             "crash-after-claim",
             "recovered",
             THREAD,
-            DeliveryConfig { progress_timeout_secs: Some(1), ..DeliveryConfig::default() },
-        ).unwrap();
-        let deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+            DeliveryConfig {
+                progress_timeout_secs: Some(1),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
         drop(db);
         let worker_path = file.path().to_owned();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
@@ -1636,18 +1775,27 @@ mod tests {
                 claimed_tx.send(()).unwrap();
                 crash_rx.recv().unwrap();
                 panic!("simulated service crash after durable claim")
-            }).unwrap()
+            })
+            .unwrap()
         });
         claimed_rx.recv().unwrap();
         let progress_db = Connection::open(file.path()).unwrap();
-        record_dependency_progress(&progress_db, "provider", "crash-after-claim", deadline + 1).unwrap();
+        record_dependency_progress(&progress_db, "provider", "crash-after-claim", deadline + 1)
+            .unwrap();
         crash_tx.send(()).unwrap();
         assert!(worker.join().is_err());
         drop(progress_db);
         let db = Connection::open(file.path()).unwrap();
         initialize(&db).unwrap();
         let mut sends = 0;
-        assert_eq!(dependency_tick_with(&db, deadline + 120_001, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        assert_eq!(
+            dependency_tick_with(&db, deadline + 120_001, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
         let (state, reason): (String, String) = db.query_row("SELECT dependency_notice_state,dependency_notice_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(state, "needs_attention");
         assert!(reason.starts_with("send_outcome_unknown:"));
