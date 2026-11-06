@@ -689,6 +689,34 @@ pub fn status(db: &Connection) -> Result<Value> {
     Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
 }
 
+/// Report durable delivery evidence for one exact event without exposing its payload.
+pub fn delivery_warnings(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+) -> Result<Value> {
+    let resource = if matches!(kind, "chat" | "thread" | "subagent") {
+        uuid(resource)?
+    } else {
+        resource.to_owned()
+    };
+    let mut statement = db.prepare("SELECT id,thread,state,reason,updated FROM subscriptions WHERE kind=?1 AND repo=?2 AND resource=?3 AND event=?4 AND state!='waiting' ORDER BY id")?;
+    let rows = statement.query_map(params![kind, repo, resource, outcome], |row| {
+        let state: String = row.get(2)?;
+        let reason: Option<String> = row.get(3)?;
+        let warning = match state.as_str() {
+            "queued" => "Queue or turn accepted; receipt and execution are not confirmed.",
+            "ready" => "Event accepted; delivery is pending.",
+            "sending" => "Delivery started; its outcome is unknown.",
+            _ => "Delivery requires attention; receipt is not confirmed.",
+        };
+        Ok(json!({"subscription_id":row.get::<_,String>(0)?,"thread":row.get::<_,String>(1)?,"state":state,"reason":reason,"updated":row.get::<_,String>(4)?,"warning":warning}))
+    })?;
+    Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+}
+
 struct DeliveryEvent<'a> {
     kind: &'a str,
     repo: &'a str,
@@ -880,6 +908,40 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         initialize(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn delivery_warnings_report_only_the_exact_accepted_event() {
+        let db = db();
+        let id = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        subscribe(&db, "artifact", "ci", "other", "available", CHAT).unwrap();
+        publish(&db, "artifact", "ci", "pkg", "available").unwrap();
+        db.execute("UPDATE subscriptions SET state='needs_attention',reason='send_outcome_unknown: timeout' WHERE id=?1", [&id]).unwrap();
+        let warnings = delivery_warnings(&db, "artifact", "ci", "pkg", "available").unwrap();
+        assert_eq!(warnings.as_array().unwrap().len(), 1);
+        assert_eq!(warnings[0]["subscription_id"], id);
+        assert_eq!(warnings[0]["thread"], THREAD);
+        assert_eq!(warnings[0]["reason"], "send_outcome_unknown: timeout");
+        assert!(warnings[0]["updated"].is_string());
+        db.execute(
+            "UPDATE subscriptions SET state='queued',reason='native_queue_accepted' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        let queued = delivery_warnings(&db, "artifact", "ci", "pkg", "available").unwrap();
+        assert!(
+            queued[0]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("not confirmed")
+        );
+        assert!(
+            delivery_warnings(&db, "artifact", "ci", "other", "available")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1360,6 +1422,18 @@ mod tests {
                 .starts_with("template_error:")
         );
         assert!(rows[0]["reason"].as_str().unwrap().len() <= 180);
+        let warnings = delivery_warnings(&db, "job", "ci", "build-2", "failure").unwrap();
+        assert_eq!(warnings[0]["thread"], THREAD);
+        assert_eq!(warnings[0]["reason"], rows[0]["reason"]);
+        assert_eq!(
+            dispatch(
+                &mut db,
+                Path::new("/no/such/codex-executable"),
+                Duration::from_secs(1)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
