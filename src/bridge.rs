@@ -909,6 +909,35 @@ mod tests {
     }
 
     #[test]
+    fn connect_does_not_adopt_unmarked_circular_tables() {
+        for table in ["circular_waits", "circular_notices"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.sqlite3");
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE {table} (unrelated TEXT); INSERT INTO {table} VALUES ('keep');"
+            ))
+            .unwrap();
+            drop(db);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let db = connect(&path).unwrap();
+            let id: i32 = db
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .unwrap();
+            assert_eq!(id, 0, "unmarked database with {table} was adopted");
+            let value: String = db
+                .query_row(&format!("SELECT unrelated FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(value, "keep");
+            drop(db);
+            assert!(crate::uninstall::remove_external_database(&path).is_err());
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
     fn connect_creates_private_directory_and_database() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("private/state.sqlite3");

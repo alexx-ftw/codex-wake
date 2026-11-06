@@ -338,6 +338,23 @@ before that input is queued, so it can be consumed by a subsequent turn.
 
 ## Thread and subagent signals
 
+`register_circular_wait` records an explicit wait from `thread` to `waits_for`,
+with evidence supplied by the caller. Ordinary subscriptions do not create waits.
+When both directions are active, Wake records a notice for each chat containing
+both wait IDs and their evidence. A mutual registration is a possible circular
+dependency, not proof of deadlock. `continuation` is the caller's declaration:
+`none`, `registered`, or `unknown` (the default); `registered` requires
+`continuation_ref` identifying the declared subscription, event, or other
+mechanism. Wake does not verify that it works. An eligible Stop continues the
+agent once when a wait is declared `none`; this does not prove that no mechanism
+exists outside Wake. The reentrant Stop does not continue again for that warning.
+Use `resolve_circular_wait` when a wait ends; ready notices for that cycle are
+cancelled, but a notice already being sent cannot be recalled. Re-registering a
+resolved wait creates a new episode. `get_status.circular_waits` exposes waits
+and notice states. The receiver and `recover_ready` dispatch notices; a stopped
+receiver leaves them ready. Queued means accepted, not read or executed. Sending
+and uncertain notices are never retried automatically; inspect status first.
+
 For an expected result, `register_obligation` records the responsible chat and
 the exact publication kind, namespace, resource and outcome. At an eligible
 `Stop`, Wake reminds that chat of pending obligations; it does not infer that

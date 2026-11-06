@@ -1,4 +1,5 @@
 mod bridge;
+mod circular_waits;
 mod execution;
 mod goals;
 mod host_cleanup;
@@ -128,6 +129,27 @@ struct ObligationInput {
 #[serde(deny_unknown_fields)]
 struct ObligationIdInput {
     obligation_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CircularWaitInput {
+    /// Chat explicitly waiting for another chat.
+    thread: String,
+    /// Chat whose result is being awaited.
+    waits_for: String,
+    /// Explicit evidence describing the registered wait.
+    evidence: String,
+    /// Declared continuation: none, registered, or unknown (default). Not a health check.
+    continuation: Option<String>,
+    /// Identifier of the declared subscription, event, or other continuation; required for registered.
+    continuation_ref: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CircularWaitId {
+    wait_id: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -262,6 +284,7 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     steer::initialize(&db)?;
     obligations::initialize(&db)?;
     validation_obligations::initialize(&db)?;
+    circular_waits::initialize(&db)?;
     Ok(db)
 }
 
@@ -270,6 +293,7 @@ fn recover(config: &manager::Config) -> Result<usize> {
     Ok(
         bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+            + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
     )
 }
@@ -394,6 +418,14 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         Ok(0)
     };
     let reminder_error = reminder.is_err();
+    let missing_continuation = if payload["hook_event_name"] == "Stop"
+        && payload["stop_hook_active"] != true
+        && payload["agent_id"].as_str().is_none_or(|id| id == resource)
+    {
+        circular_waits::without_continuation(&db, &resource)
+    } else {
+        Ok(0)
+    };
     if let Err(error) = &reminder {
         observability::emit(
             "obligation.reminder",
@@ -406,7 +438,9 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
     }
     let reminder_count = reminder.unwrap_or(0);
     // The receiver already dispatches ready records; don't delay a reminder on unrelated deliveries.
-    let recovery_error = if reminder_count > 0 {
+    let defer_recovery =
+        reminder_count > 0 || matches!(&missing_continuation, Ok(count) if *count > 0);
+    let recovery_error = if defer_recovery {
         None
     } else {
         recover(config).err()
@@ -459,7 +493,23 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
             "{previous} Wake could not check obligations; inspect status."
         ));
     }
-    if reminder_count > 0 {
+    let missing_count = missing_continuation.as_ref().copied().unwrap_or(0);
+    match missing_continuation {
+        Ok(count) if count > 0 => {
+            let previous = output["systemMessage"].as_str().unwrap_or_default();
+            output["systemMessage"] = json!(format!(
+                "{previous} Wake: {count} explicitly registered wait(s) declare no continuation mechanism; inspect circular_waits in get_status."
+            ));
+        }
+        Err(_) => {
+            let previous = output["systemMessage"].as_str().unwrap_or_default();
+            output["systemMessage"] = json!(format!(
+                "{previous} Wake could not check registered wait continuations; inspect status."
+            ));
+        }
+        _ => {}
+    }
+    if defer_recovery {
         let previous = output["systemMessage"].as_str().unwrap_or_default();
         output["systemMessage"] = json!(format!(
             "{previous} Delivery recovery is deferred to the receiver; inspect status if it is unavailable."
@@ -495,6 +545,19 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
             output["decision"] = json!("block");
             output["reason"] = json!(reason);
         }
+        if missing_count > 0 {
+            let reminder = format!(
+                "Wake: {missing_count} active wait(s) for chat {resource} were explicitly declared without an identified continuation mechanism. Inspect circular_waits in get_status and establish or report the appropriate continuation within existing authorization. This declaration does not establish that no mechanism exists outside Wake."
+            );
+            let previous = output["reason"].as_str().unwrap_or_default();
+            let reason = if previous.is_empty() {
+                reminder
+            } else {
+                format!("{previous}\n\n{reminder}")
+            };
+            output["decision"] = json!("block");
+            output["reason"] = json!(reason);
+        }
     }
     Ok(output)
 }
@@ -518,6 +581,50 @@ fn tool_result(result: Result<Value>) -> CallToolResult {
 
 #[tool_router]
 impl WakeTools {
+    #[tool(
+        description = "Register an explicit chat-to-chat wait with evidence; mutual waits create durable notices for both chats.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    fn register_circular_wait(
+        &self,
+        Parameters(input): Parameters<CircularWaitInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let mut db = database(&self.config)?;
+            let id = circular_waits::register(
+                &mut db,
+                &input.thread,
+                &input.waits_for,
+                &input.evidence,
+                input.continuation.as_deref().unwrap_or("unknown"),
+                input.continuation_ref.as_deref(),
+            )?;
+            Ok(json!({"wait_id":id}))
+        })())
+    }
+
+    #[tool(
+        description = "Mark an explicitly registered chat-to-chat wait as no longer active.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    fn resolve_circular_wait(
+        &self,
+        Parameters(input): Parameters<CircularWaitId>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            Ok(
+                json!({"resolved":circular_waits::resolve(&mut database(&self.config)?, &input.wait_id)?}),
+            )
+        })())
+    }
     #[tool(
         description = "List available models and supported reasoning efforts.",
         annotations(read_only_hint = true)
@@ -922,7 +1029,7 @@ impl WakeTools {
             let rules = rules::status(&db)?;
             let actionable = status_view::actionable(&waits, &subscriptions, &rules);
             Ok(
-                json!({"actionable":actionable,"receiver": manager::status(&self.config)?, "waits": waits, "subscriptions":subscriptions,"rules":rules,"steers":steer::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
+                json!({"actionable":actionable,"receiver": manager::status(&self.config)?, "waits": waits, "subscriptions":subscriptions,"rules":rules,"steers":steer::status(&db)?,"circular_waits":circular_waits::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
             )
         })())
     }
@@ -958,6 +1065,8 @@ impl rmcp::ServerHandler for WakeTools {
             "subscribe" => "mcp.subscribe",
             "publish_result" => "mcp.publish_result",
             "register_obligation" => "mcp.register_obligation",
+            "register_circular_wait" => "mcp.register_circular_wait",
+            "resolve_circular_wait" => "mcp.resolve_circular_wait",
             "list_obligations" => "mcp.list_obligations",
             "resolve_obligation" => "mcp.resolve_obligation",
             "register_validation" => "mcp.register_validation",
@@ -1397,6 +1506,111 @@ mod hook_output_tests {
         add_delivery_evidence(&mut result, &db, "artifact", "ci", "pkg", "available");
         assert!(result["no_waiting_subscriber"].is_string());
         assert_eq!(result["delivery_warnings"][0]["state"], "ready");
+    }
+
+    #[test]
+    fn stop_reports_only_explicit_waits_with_no_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let mut db = database(&config).unwrap();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        subscriptions::subscribe(&db, "artifact", "ci", "pkg", "available", a).unwrap();
+        let payload = json!({"hook_event_name":"Stop","session_id":a});
+        assert!(
+            run_hook(&config, &payload)
+                .unwrap()
+                .get("systemMessage")
+                .is_none()
+        );
+        let unknown = circular_waits::register(&mut db, a, b, "Waiting", "unknown", None).unwrap();
+        assert!(
+            run_hook(&config, &payload)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        circular_waits::resolve(&mut db, &unknown).unwrap();
+        let registered = circular_waits::register(
+            &mut db,
+            a,
+            b,
+            "Waiting",
+            "registered",
+            Some("subscription:123"),
+        )
+        .unwrap();
+        assert!(
+            run_hook(&config, &payload)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        circular_waits::resolve(&mut db, &registered).unwrap();
+        let id =
+            circular_waits::register(&mut db, a, b, "Waiting for report", "none", None).unwrap();
+        let result = run_hook(&config, &payload).unwrap();
+        assert!(
+            result["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("1 explicitly registered wait")
+        );
+        assert_eq!(result["decision"], "block");
+        assert!(
+            result["reason"]
+                .as_str()
+                .unwrap()
+                .contains("does not establish that no mechanism exists outside Wake")
+        );
+        let continued = json!({"hook_event_name":"Stop","session_id":a,"stop_hook_active":true});
+        assert!(
+            run_hook(&config, &continued)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        circular_waits::resolve(&mut db, &id).unwrap();
+        assert!(
+            run_hook(&config, &payload)
+                .unwrap()
+                .get("systemMessage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stop_combines_wait_warning_with_obligation_and_steer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let mut db = database(&config).unwrap();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        circular_waits::register(&mut db, a, b, "Waiting for report", "none", None).unwrap();
+        obligations::register(&db, a, "artifact", "ci", "report", "available", "Publish").unwrap();
+        steer::enqueue(&db, a, "Review the input").unwrap();
+        let output = run_hook(&config, &json!({"hook_event_name":"Stop", "session_id":a})).unwrap();
+        let reason = output["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("Review the input")
+                && reason.contains("publication or validation obligation")
+                && reason.contains("without an identified continuation")
+        );
+        assert_eq!(output["decision"], "block");
+        let again = run_hook(
+            &config,
+            &json!({"hook_event_name":"Stop", "session_id":a, "stop_hook_active":true}),
+        )
+        .unwrap();
+        assert!(again.get("decision").is_none());
     }
 
     #[test]

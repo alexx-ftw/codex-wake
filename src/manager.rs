@@ -179,6 +179,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("main.rs").as_slice(),
         include_bytes!("manager.rs").as_slice(),
         include_bytes!("bridge.rs").as_slice(),
+        include_bytes!("circular_waits.rs").as_slice(),
         include_bytes!("subscriptions.rs").as_slice(),
         include_bytes!("producers.rs").as_slice(),
         include_bytes!("result_conflicts.rs").as_slice(),
@@ -936,6 +937,8 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 crate::subscriptions::initialize(&db)?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::circular_waits::initialize(&db)?;
+                crate::circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::rules::initialize(&db)?;
                 crate::rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?;
                 Ok(())
@@ -1014,11 +1017,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
 fn observe_queues(config: &Config) -> Result<()> {
     let db = crate::bridge::connect(&config.db)?;
     crate::steer::initialize(&db)?;
+    crate::circular_waits::initialize(&db)?;
     for (table, operation) in [
         ("waits", "queue.waits"),
         ("subscriptions", "queue.subscriptions"),
         ("rule_deliveries", "queue.rules"),
         ("steers", "queue.steers"),
+        ("circular_notices", "queue.circular_notices"),
     ] {
         let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table} GROUP BY state"))?;
         let rows = statement.query_map([], |r| {

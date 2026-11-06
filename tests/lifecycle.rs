@@ -57,6 +57,8 @@ fn concurrent_mcp_sessions_share_receiver_and_closing_them_preserves_it() {
         assert!(tools.len() >= 16);
         assert!(tools.iter().any(|t| t["name"] == "register_wait"));
         for name in [
+            "register_circular_wait",
+            "resolve_circular_wait",
             "register_obligation",
             "list_obligations",
             "resolve_obligation",
