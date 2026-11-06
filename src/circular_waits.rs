@@ -113,7 +113,7 @@ pub fn status(db: &Connection) -> Result<Value> {
     let notices = stmt.query_map([], |r| {
         let state: String = r.get(4)?;
         let age: Option<i64> = r.get(8)?;
-        let uncertain = state == "sending" && age.is_none_or(|seconds| seconds < 0 || seconds >= SENDING_DIAGNOSTIC_SECONDS);
+        let uncertain = state == "sending" && age.is_none_or(|seconds| !(0..SENDING_DIAGNOSTIC_SECONDS).contains(&seconds));
         Ok(json!({"id":r.get::<_,String>(0)?,"first_wait":r.get::<_,String>(1)?,"second_wait":r.get::<_,String>(2)?,"thread":r.get::<_,String>(3)?,"state":state,"reason":r.get::<_,Option<String>>(5)?,"updated":r.get::<_,String>(6)?,"message":r.get::<_,String>(7)?,"sending_age_seconds":if state == "sending" { age } else { None },"diagnostic":if uncertain { Some("sending_outcome_unknown") } else { None },"execution_verified":false}))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!({"waits":waits,"notices":notices}))

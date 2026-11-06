@@ -557,6 +557,7 @@ pub fn validate_publication_identity(kind: &str, repo: &str, resource: &str) -> 
 }
 
 /// Create a durable proposal while leaving the obligation owned by its source chat.
+#[allow(clippy::too_many_arguments)]
 pub fn propose_transfer(
     db: &mut Connection,
     obligation_id: &str,

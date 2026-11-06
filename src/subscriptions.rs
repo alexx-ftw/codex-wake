@@ -393,6 +393,7 @@ fn ready(
     Ok(changed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ready_update(
     db: &Connection,
     kind: &str,
