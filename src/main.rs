@@ -73,6 +73,8 @@ struct SubscriptionInput {
     /// Optional input: {{source.path}}, {{event.resource}}, {{target.thread}}.
     message_template: Option<String>,
     execution: Option<execution::ExecutionOptions>,
+    /// Optional dotted paths relative to source; missing or null values are reported.
+    required_source: Option<Vec<String>>,
     /// Optional deterministic file, health endpoint, lock or systemd-job observation.
     observation: Option<observers::Observation>,
 }
@@ -695,6 +697,7 @@ impl WakeTools {
                 subscriptions::DeliveryConfig {
                     message_template: input.message_template.as_deref(),
                     execution: input.execution.as_ref(),
+                    required_source: input.required_source.as_deref(),
                 },
             )?;
             if let Some(observation) = &input.observation {
@@ -1221,6 +1224,9 @@ async fn run_command(
             let observation = option(&mut args, "--observe")?
                 .map(|raw| serde_json::from_str::<observers::Observation>(&raw))
                 .transpose()?;
+            let required_source = option(&mut args, "--required-source")?
+                .map(|raw| serde_json::from_str::<Vec<String>>(&raw))
+                .transpose()?;
             if let Some(observation) = &observation {
                 observers::validate(&kind, &event, observation)?;
             }
@@ -1235,6 +1241,7 @@ async fn run_command(
                 subscriptions::DeliveryConfig {
                     message_template: message_template.as_deref(),
                     execution: execution.as_ref(),
+                    required_source: required_source.as_deref(),
                 },
             )?;
             if let Some(observation) = &observation {
@@ -1675,6 +1682,7 @@ mod hook_output_tests {
             subscriptions::DeliveryConfig {
                 message_template: None,
                 execution: None,
+                required_source: None,
             },
         )
         .unwrap();

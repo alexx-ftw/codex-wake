@@ -986,7 +986,7 @@ fn scoped_subscription_accept(
     let candidate = Connection::open_in_memory().map_err(|_| Failure::new("database"))?;
     crate::subscriptions::initialize(&candidate).map_err(|_| Failure::new("database"))?;
     // GitHub dates have second precision; include ties rather than permanently dropping them.
-    let mut s=db.prepare("SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json FROM subscriptions WHERE state='waiting' AND kind=?1 AND repo=?2 AND resource=?3 AND (?4 IS NULL OR datetime(updated)<=datetime(?4))").map_err(|_|Failure::new("database"))?;
+    let mut s=db.prepare("SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json,required_source FROM subscriptions WHERE state='waiting' AND kind=?1 AND repo=?2 AND resource=?3 AND (?4 IS NULL OR datetime(updated)<=datetime(?4))").map_err(|_|Failure::new("database"))?;
     let rows = s
         .query_map(params![kind, repo, resource, event_time], |r| {
             Ok((
@@ -1003,13 +1003,14 @@ fn scoped_subscription_accept(
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, Option<String>>(11)?,
                 r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
             ))
         })
         .map_err(|_| Failure::new("database"))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| Failure::new("database"))?;
     for row in rows {
-        candidate.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![row.0,row.1,row.2,row.3,row.4,row.5,row.6,row.7,row.8,row.9,row.10,row.11,row.12]).map_err(|_|Failure::new("database"))?;
+        candidate.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json,required_source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![row.0,row.1,row.2,row.3,row.4,row.5,row.6,row.7,row.8,row.9,row.10,row.11,row.12,row.13]).map_err(|_|Failure::new("database"))?;
     }
     crate::subscriptions::accept(&candidate, header, payload)
         .map_err(|_| Failure::new("accept"))?;
@@ -1034,7 +1035,7 @@ fn scoped_subscription_accept(
         .map_err(|_| Failure::new("database"))?;
     let mut count = 0;
     for (id, outcome, reason, source) in ready {
-        count+=tx.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=?2,source_json=CASE WHEN message_template IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,reason,source,id]).map_err(|_|Failure::new("database"))?;
+        count+=tx.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=?2,source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,reason,source,id]).map_err(|_|Failure::new("database"))?;
     }
     tx.commit().map_err(|_| Failure::new("database"))?;
     Ok(count)
@@ -1280,6 +1281,47 @@ mod tests {
     fn no_listeners_make_no_network_requests() {
         let report = tick_with(&db(), 1, |_, _| panic!("unexpected request")).unwrap();
         assert_eq!(report["calls"], 0);
+    }
+
+    #[test]
+    fn github_scoped_accept_preserves_source_and_required_fields() {
+        let db = db();
+        let paths = vec!["pull_request.html_url".to_string()];
+        let id = crate::subscriptions::subscribe_with_delivery(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "merged",
+            "11111111-1111-4111-8111-111111111111",
+            crate::subscriptions::DeliveryConfig {
+                required_source: Some(&paths),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payload = json!({"action":"closed","number":7,"pull_request":{"merged":true},"repository":{"full_name":"owner/repo"}});
+        assert_eq!(
+            scoped_subscription_accept(&db, "pull_request", &payload, "owner/repo", "7", None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            scoped_subscription_accept(&db, "pull_request", &payload, "owner/repo", "7", None)
+                .unwrap(),
+            0
+        );
+        let row = crate::subscriptions::status(&db).unwrap();
+        assert_eq!(row[0]["id"], id);
+        assert_eq!(row[0]["missing_source"], json!(["pull_request.html_url"]));
+        let source: String = db
+            .query_row(
+                "SELECT source_json FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&source).unwrap(), payload);
     }
 
     #[test]

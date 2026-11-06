@@ -978,6 +978,10 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         subscriptions::initialize(&db).unwrap();
         initialize(&db).unwrap();
+        let required = vec![
+            "evidence.http_status".to_string(),
+            "evidence.missing".to_string(),
+        ];
         let id = subscriptions::subscribe_with_delivery(
             &db,
             "dependency",
@@ -988,6 +992,7 @@ mod tests {
             DeliveryConfig {
                 message_template: Some("{{source.url}}"),
                 execution: None,
+                required_source: Some(&required),
             },
         )
         .unwrap();
@@ -1049,6 +1054,7 @@ mod tests {
         let row = subscriptions::status(&db).unwrap();
         assert_eq!(row[0]["state"], "ready");
         assert_eq!(row[0]["outcome"], "recovered");
+        assert_eq!(row[0]["missing_source"], json!(["evidence.missing"]));
         let source: Value = db
             .query_row(
                 "SELECT source_json FROM subscriptions WHERE id=?1",
