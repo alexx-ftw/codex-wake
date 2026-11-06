@@ -931,6 +931,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     let config = config.clone();
     thread::spawn(move || {
         let mut heartbeat = Instant::now() - Duration::from_secs(60);
+        let mut obligations_initialized = false;
         loop {
             let result = (|| -> Result<()> {
                 let mut db = crate::bridge::connect(&config.db)?;
@@ -940,8 +941,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                     &config.codex,
                     Duration::from_secs(120),
                 )?;
+                if !obligations_initialized {
+                    crate::obligations::initialize(&db)?;
+                    obligations_initialized = true;
+                }
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::circular_waits::initialize(&db)?;
                 crate::circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::rules::initialize(&db)?;

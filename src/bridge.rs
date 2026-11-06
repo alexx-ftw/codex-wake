@@ -1398,6 +1398,28 @@ mod tests {
     }
 
     #[test]
+    fn resume_mode_passes_resume_flag_to_wake_idle_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("argv");
+        let codex = fake_codex(
+            dir.path(),
+            &format!("printf '%s\\n' \"$*\" > '{}'", capture.display()),
+        );
+        let result = send_mode(
+            &codex,
+            Duration::from_secs(2),
+            THREAD,
+            "transfer notice",
+            true,
+        )
+        .unwrap();
+        assert_eq!(result, ("queued".to_owned(), None));
+        let args = fs::read_to_string(capture).unwrap();
+        assert!(args.contains("queue --thread "));
+        assert!(args.contains("--resume"));
+    }
+
+    #[test]
     fn status_returns_wait_rows_as_json() {
         let (_dir, db) = setup();
         let value = status(&db).unwrap();

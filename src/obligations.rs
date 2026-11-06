@@ -2,6 +2,8 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
 const MAX_DESCRIPTION_BYTES: usize = 2048;
@@ -28,6 +30,16 @@ pub struct Transfer {
     pub tests: String,
     pub next_step: String,
     pub state: String,
+    pub notification_state: String,
+    pub notification_reason: Option<String>,
+    #[serde(skip)]
+    pub confirmation_code: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct NotificationStatus {
+    pub state: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +53,7 @@ pub struct CoordinatorAlert {
 }
 
 pub fn initialize(db: &Connection) -> Result<()> {
+    crate::steer::initialize(db)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS obligations (
             id TEXT PRIMARY KEY,
@@ -82,6 +95,12 @@ pub fn initialize(db: &Connection) -> Result<()> {
             tests TEXT NOT NULL,
             next_step TEXT NOT NULL,
             state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'accepted')),
+            confirmation_code_hash TEXT,
+            notification_message TEXT,
+            notification_state TEXT NOT NULL DEFAULT 'ready'
+                CHECK(notification_state IN ('ready', 'sending', 'queued', 'needs_attention')),
+            notification_reason TEXT,
+            notification_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             accepted_at TEXT
         );
@@ -102,6 +121,149 @@ pub fn initialize(db: &Connection) -> Result<()> {
     if !columns.iter().any(|column| column == "sender_start") {
         db.execute_batch("ALTER TABLE coordinator_alerts ADD COLUMN sender_start INTEGER")?;
     }
+
+    let has_code_hash = {
+        let mut statement = db.prepare("PRAGMA table_info(obligation_transfers)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "confirmation_code_hash")
+    };
+    if !has_code_hash {
+        db.execute(
+            "ALTER TABLE obligation_transfers ADD COLUMN confirmation_code_hash TEXT",
+            [],
+        )?;
+    }
+    let columns = {
+        let mut statement = db.prepare("PRAGMA table_info(obligation_transfers)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !columns
+        .iter()
+        .any(|column| column == "notification_message")
+    {
+        db.execute(
+            "ALTER TABLE obligation_transfers ADD COLUMN notification_message TEXT",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "notification_state") {
+        db.execute(
+            "ALTER TABLE obligation_transfers ADD COLUMN notification_state TEXT NOT NULL DEFAULT 'ready'",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "notification_reason") {
+        db.execute(
+            "ALTER TABLE obligation_transfers ADD COLUMN notification_reason TEXT",
+            [],
+        )?;
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "notification_updated_at")
+    {
+        db.execute(
+            "ALTER TABLE obligation_transfers ADD COLUMN notification_updated_at TEXT",
+            [],
+        )?;
+        db.execute(
+            "UPDATE obligation_transfers SET notification_updated_at=CURRENT_TIMESTAMP
+             WHERE notification_updated_at IS NULL",
+            [],
+        )?;
+    }
+    db.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS obligation_transfers_confirmation_code
+            ON obligation_transfers(confirmation_code_hash)
+            WHERE confirmation_code_hash IS NOT NULL;",
+    )?;
+
+    // Backfill durable notices for pending proposals created before code confirmation existed.
+    let tx = db.unchecked_transaction()?;
+    let old_pending = {
+        let mut statement = tx.prepare(
+            "SELECT id, target_thread, confirmation_code_hash FROM obligation_transfers
+             WHERE state='pending' AND notification_state='ready'
+               AND notification_message IS NULL ORDER BY rowid",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if old_pending.is_empty() {
+        tx.rollback()?;
+        return Ok(());
+    }
+    for (transfer_id, target_thread, code_hash) in old_pending {
+        if code_hash.is_some() {
+            let old_notice = tx
+                .query_row(
+                    "SELECT id, message, state FROM steers
+                     WHERE thread=?1 AND message LIKE ?2 ORDER BY rowid DESC LIMIT 1",
+                    params![
+                        target_thread,
+                        format!("Wake: nueva propuesta de traspaso {transfer_id}. Código de confirmación: %")
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let (message, reason, pending_notice_id) = match old_notice {
+                Some((notice_id, message, state)) if state == "pending" => {
+                    (Some(message), None, Some(notice_id))
+                }
+                Some((_, message, _)) => (
+                    Some(message),
+                    Some("prior_hook_notice_claimed_outcome_unknown"),
+                    None,
+                ),
+                None => (None, Some("prior_notice_missing_outcome_unknown"), None),
+            };
+            if let Some(notice_id) = pending_notice_id {
+                tx.execute(
+                    "UPDATE obligation_transfers SET notification_message=?1
+                     WHERE id=?2 AND state='pending' AND notification_message IS NULL",
+                    params![message, transfer_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM steers WHERE id=?1 AND state='pending'",
+                    [notice_id],
+                )?;
+                continue;
+            }
+            tx.execute(
+                "UPDATE obligation_transfers SET notification_message=?1,
+                    notification_state='needs_attention', notification_reason=?2
+                 WHERE id=?3 AND state='pending' AND notification_message IS NULL",
+                params![message, reason, transfer_id],
+            )?;
+            continue;
+        }
+        let code = new_confirmation_code();
+        let notice = transfer_notice(&transfer_id, &code);
+        tx.execute(
+            "UPDATE obligation_transfers SET confirmation_code_hash=?1, notification_message=?2
+             WHERE id=?3 AND state='pending' AND notification_message IS NULL",
+            params![confirmation_code_hash(&code), notice, transfer_id],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -227,6 +389,145 @@ pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+fn new_confirmation_code() -> String {
+    Uuid::new_v4().simple().to_string()[..16].to_ascii_uppercase()
+}
+
+fn confirmation_code_hash(code: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hash = String::with_capacity(64);
+    for byte in Sha256::digest(code.as_bytes()) {
+        hash.push(HEX[(byte >> 4) as usize] as char);
+        hash.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hash
+}
+
+fn transfer_notice(transfer_id: &str, code: &str) -> String {
+    format!(
+        "Wake: nueva propuesta de traspaso {transfer_id}. Código de confirmación: {code}. Consulta list_obligation_transfers(target_thread) para ver objetivo, estado, pruebas y siguiente paso. Acepta con accept_obligation_transfer(transfer_id, recipient_thread, confirmation_code)."
+    )
+}
+
+pub fn notification_status(db: &Connection, transfer_id: &str) -> Result<NotificationStatus> {
+    let transfer_id = Uuid::parse_str(transfer_id)?.to_string();
+    let (state, reason) = db.query_row(
+        "SELECT notification_state, notification_reason FROM obligation_transfers WHERE id=?1",
+        [transfer_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    Ok(NotificationStatus { state, reason })
+}
+
+fn dispatch_with(
+    db: &mut Connection,
+    transfer_id: Option<&str>,
+    send: &mut impl FnMut(&str, &str, bool) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
+    let mut attempted = 0;
+    loop {
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT id, target_thread, notification_message FROM obligation_transfers
+                 WHERE (?1 IS NULL OR id=?1) AND state='pending' AND notification_state='ready'
+                   AND (notification_reason IS NULL OR notification_reason NOT IN
+                       ('executable_not_found', 'target_busy_before_send', 'target_unavailable_before_send')
+                       OR notification_updated_at<=datetime('now','-15 seconds'))
+                 ORDER BY rowid LIMIT 1",
+                [transfer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, _, _)) = &row {
+            ensure!(
+                transaction.execute(
+                    "UPDATE obligation_transfers SET notification_state='sending',
+                        notification_reason=NULL, notification_updated_at=CURRENT_TIMESTAMP
+                     WHERE id=?1 AND state='pending' AND notification_state='ready'",
+                    [id],
+                )? == 1,
+                "Transfer notification was claimed concurrently"
+            );
+        }
+        transaction.commit()?;
+        let Some((id, thread, message)) = row else {
+            return Ok(attempted);
+        };
+
+        let (state, reason) = match send(&thread, &message, true) {
+            Ok((state, Some(reason)))
+                if state == "queued" && reason == "resume_daemon_unavailable" =>
+            {
+                (
+                    "needs_attention".to_owned(),
+                    Some("queued_but_recipient_not_resumed".to_owned()),
+                )
+            }
+            Ok((state, reason))
+                if matches!(state.as_str(), "queued" | "ready" | "needs_attention") =>
+            {
+                (state, reason)
+            }
+            Ok(_) => (
+                "needs_attention".to_owned(),
+                Some("invalid_send_classification".to_owned()),
+            ),
+            Err(error) => match crate::execution::before_send_retry_reason(&error) {
+                Some(reason) => ("ready".to_owned(), Some(reason.to_owned())),
+                None => (
+                    "needs_attention".to_owned(),
+                    Some("send_outcome_unknown".to_owned()),
+                ),
+            },
+        };
+        db.execute(
+            "UPDATE obligation_transfers SET notification_state=?1, notification_reason=?2,
+                notification_updated_at=CURRENT_TIMESTAMP,
+                notification_message=CASE WHEN ?1='queued' THEN NULL ELSE notification_message END
+             WHERE id=?3 AND notification_state='sending'",
+            params![state, reason, id],
+        )?;
+        crate::observability::emit(
+            "obligation_transfer.notify",
+            &state,
+            reason.as_deref().unwrap_or(""),
+            Some(&id),
+            Duration::ZERO,
+            1,
+        );
+        attempted += 1;
+        if state == "ready" {
+            return Ok(attempted);
+        }
+    }
+}
+
+/// Claim each durable notice once and resume the recipient; ambiguous sends are never replayed.
+pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<usize> {
+    dispatch_with(db, None, &mut |thread, message, resume| {
+        crate::bridge::send_mode(codex, timeout, thread, message, resume)
+    })
+}
+
+pub fn dispatch_transfer(
+    db: &mut Connection,
+    transfer_id: &str,
+    codex: &Path,
+    timeout: Duration,
+) -> Result<usize> {
+    let transfer_id = Uuid::parse_str(transfer_id)?.to_string();
+    dispatch_with(db, Some(&transfer_id), &mut |thread, message, resume| {
+        crate::bridge::send_mode(codex, timeout, thread, message, resume)
+    })
+}
+
 pub fn validate_publication_identity(kind: &str, repo: &str, resource: &str) -> Result<()> {
     ensure!(
         ["job", "chat", "dependency", "resource", "artifact"].contains(&kind),
@@ -310,10 +611,13 @@ pub fn propose_transfer(
         "Target already owns this obligation"
     );
     let id = Uuid::new_v4().to_string();
+    let confirmation_code = new_confirmation_code();
+    let notification_message = transfer_notice(&id, &confirmation_code);
     tx.execute(
         "INSERT INTO obligation_transfers
-            (id, obligation_id, source_thread, target_thread, goal, status, tests, next_step)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (id, obligation_id, source_thread, target_thread, goal, status, tests, next_step,
+             confirmation_code_hash, notification_message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             id,
             obligation.id,
@@ -322,7 +626,9 @@ pub fn propose_transfer(
             goal,
             status,
             tests,
-            next_step
+            next_step,
+            confirmation_code_hash(&confirmation_code),
+            notification_message
         ],
     )?;
     tx.commit()?;
@@ -335,6 +641,9 @@ pub fn propose_transfer(
         tests: tests.to_owned(),
         next_step: next_step.to_owned(),
         state: "pending".into(),
+        notification_state: "ready".into(),
+        notification_reason: None,
+        confirmation_code,
         obligation,
     })
 }
@@ -346,7 +655,8 @@ pub fn pending_transfers(db: &Connection, target_thread: &str) -> Result<Vec<Tra
         .to_string();
     let mut statement = db.prepare(
         "SELECT t.id, t.source_thread, t.target_thread, t.goal, t.status, t.tests,
-                t.next_step, t.state, o.id, o.thread, o.kind, o.repo, o.resource,
+                t.next_step, t.state, t.notification_state, t.notification_reason,
+                o.id, o.thread, o.kind, o.repo, o.resource,
                 o.outcome, o.description
          FROM obligation_transfers t JOIN obligations o ON o.id=t.obligation_id
          WHERE t.target_thread=?1 AND t.state='pending' AND o.resolved=0 ORDER BY t.rowid",
@@ -361,14 +671,17 @@ pub fn pending_transfers(db: &Connection, target_thread: &str) -> Result<Vec<Tra
             tests: row.get(5)?,
             next_step: row.get(6)?,
             state: row.get(7)?,
+            notification_state: row.get(8)?,
+            notification_reason: row.get(9)?,
+            confirmation_code: String::new(),
             obligation: Obligation {
-                id: row.get(8)?,
-                thread: row.get(9)?,
-                kind: row.get(10)?,
-                repo: row.get(11)?,
-                resource: row.get(12)?,
-                outcome: row.get(13)?,
-                description: row.get(14)?,
+                id: row.get(10)?,
+                thread: row.get(11)?,
+                kind: row.get(12)?,
+                repo: row.get(13)?,
+                resource: row.get(14)?,
+                outcome: row.get(15)?,
+                description: row.get(16)?,
             },
         })
     })?;
@@ -380,6 +693,7 @@ pub fn accept_transfer(
     db: &mut Connection,
     transfer_id: &str,
     recipient_thread: &str,
+    confirmation_code: &str,
 ) -> Result<Transfer> {
     let transfer_id = Uuid::parse_str(transfer_id)
         .context("Invalid transfer UUID")?
@@ -388,26 +702,52 @@ pub fn accept_transfer(
         .context("Invalid recipient thread UUID")?
         .to_string();
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (obligation_id, source_thread, target_thread, goal, status, tests, next_step) = tx
-        .query_row(
-            "SELECT obligation_id, source_thread, target_thread, goal, status, tests, next_step
+    ensure!(
+        confirmation_code.len() == 16
+            && confirmation_code
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid confirmation code"
+    );
+    let (
+        obligation_id,
+        source_thread,
+        target_thread,
+        goal,
+        status,
+        tests,
+        next_step,
+        notification_state,
+        notification_reason,
+        code_hash,
+    ) = tx.query_row(
+        "SELECT obligation_id, source_thread, target_thread, goal, status, tests, next_step,
+                    notification_state, notification_reason, confirmation_code_hash
          FROM obligation_transfers WHERE id=?1 AND state='pending'",
-            [&transfer_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            },
-        )?;
+        [&transfer_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        },
+    )?;
     ensure!(
         target_thread == recipient_thread,
         "Only the proposed recipient can accept"
+    );
+    let supplied_code_hash = confirmation_code_hash(confirmation_code);
+    ensure!(
+        code_hash.as_deref() == Some(supplied_code_hash.as_str()),
+        "Invalid confirmation code"
     );
     ensure!(
         tx.execute(
@@ -417,7 +757,8 @@ pub fn accept_transfer(
         "Obligation is no longer pending with its original owner"
     );
     tx.execute(
-        "UPDATE obligation_transfers SET state='accepted', accepted_at=CURRENT_TIMESTAMP
+        "UPDATE obligation_transfers SET state='accepted', accepted_at=CURRENT_TIMESTAMP,
+             notification_message=NULL
          WHERE id=?1 AND state='pending'",
         [&transfer_id],
     )?;
@@ -440,6 +781,9 @@ pub fn accept_transfer(
         tests,
         next_step,
         state: "accepted".into(),
+        notification_state,
+        notification_reason,
+        confirmation_code: String::new(),
     })
 }
 
@@ -603,7 +947,7 @@ mod tests {
     const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const OTHER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-    fn transfer_input(db: &mut Connection) -> (String, String) {
+    fn transfer_input(db: &mut Connection) -> (String, String, String) {
         let obligation = register(
             db,
             THREAD,
@@ -625,7 +969,82 @@ mod tests {
             "Run the focused checks",
         )
         .unwrap();
-        (obligation, transfer.id)
+        assert!(
+            !serde_json::to_string(&transfer)
+                .unwrap()
+                .contains(&transfer.confirmation_code)
+        );
+        let stored_code_hash: String = db
+            .query_row(
+                "SELECT confirmation_code_hash FROM obligation_transfers WHERE id=?1",
+                [&transfer.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_code_hash,
+            confirmation_code_hash(&transfer.confirmation_code)
+        );
+        (obligation, transfer.id, transfer.confirmation_code)
+    }
+
+    fn notice_code(db: &Connection, thread: &str) -> String {
+        let message: String = db
+            .query_row(
+                "SELECT notification_message FROM obligation_transfers
+                 WHERE target_thread=?1 AND state='pending' ORDER BY rowid DESC LIMIT 1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        message
+            .split_once("Código de confirmación: ")
+            .unwrap()
+            .1
+            .split('.')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn insert_intermediate_transfer(db: &Connection, steer_state: &str) -> (String, String) {
+        let obligation_id = register(
+            db,
+            THREAD,
+            "artifact",
+            "ci",
+            "legacy-result",
+            "available",
+            "Publish the report",
+        )
+        .unwrap();
+        let transfer_id = Uuid::new_v4().to_string();
+        let code = new_confirmation_code();
+        db.execute(
+            "INSERT INTO obligation_transfers
+                (id, obligation_id, source_thread, target_thread, goal, status, tests,
+                 next_step, confirmation_code_hash)
+             VALUES (?1, ?2, ?3, ?4, 'Finish report', 'In progress', 'Checks pending',
+                     'Run focused checks', ?5)",
+            params![
+                transfer_id,
+                obligation_id,
+                THREAD,
+                OTHER,
+                confirmation_code_hash(&code)
+            ],
+        )
+        .unwrap();
+        let notice = transfer_notice(&transfer_id, &code);
+        let queued = crate::steer::enqueue(db, OTHER, &notice).unwrap();
+        if steer_state != "pending" {
+            db.execute(
+                "UPDATE steers SET state=?1 WHERE id=?2",
+                params![steer_state, queued["steer_id"].as_str().unwrap()],
+            )
+            .unwrap();
+        }
+        (transfer_id, code)
     }
 
     #[test]
@@ -807,10 +1226,13 @@ mod tests {
         let path = dir.path().join("state.sqlite3");
         let mut db = Connection::open(&path).unwrap();
         initialize(&db).unwrap();
-        let (obligation_id, transfer_id) = transfer_input(&mut db);
+        let (obligation_id, transfer_id, confirmation_code) = transfer_input(&mut db);
         assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
         assert!(pending(&db, OTHER).unwrap().is_empty());
         assert_eq!(pending_transfers(&db, OTHER).unwrap()[0].id, transfer_id);
+        assert_eq!(notice_code(&db, OTHER), confirmation_code);
+        assert!(accept_transfer(&mut db, &transfer_id, OTHER, "BADBADBADBADBADB").is_err());
+        assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
         assert!(
             propose_transfer(
                 &mut db,
@@ -824,12 +1246,13 @@ mod tests {
             )
             .is_err()
         );
-        assert!(accept_transfer(&mut db, &transfer_id, THREAD).is_err());
+        assert!(accept_transfer(&mut db, &transfer_id, THREAD, &confirmation_code).is_err());
         drop(db);
 
         let mut db = Connection::open(path).unwrap();
         initialize(&db).unwrap();
-        let accepted = accept_transfer(&mut db, &transfer_id, OTHER).unwrap();
+        assert_eq!(notice_code(&db, OTHER), confirmation_code);
+        let accepted = accept_transfer(&mut db, &transfer_id, OTHER, &confirmation_code).unwrap();
         assert_eq!(accepted.state, "accepted");
         assert_eq!(accepted.goal, "Finish report");
         assert_eq!(accepted.status, "In progress");
@@ -838,7 +1261,272 @@ mod tests {
         assert!(pending(&db, THREAD).unwrap().is_empty());
         assert_eq!(pending(&db, OTHER).unwrap()[0].id, obligation_id);
         assert!(pending_transfers(&db, OTHER).unwrap().is_empty());
-        assert!(accept_transfer(&mut db, &transfer_id, OTHER).is_err());
+        assert!(accept_transfer(&mut db, &transfer_id, OTHER, &confirmation_code).is_err());
+    }
+
+    #[test]
+    fn upgrading_legacy_pending_transfer_adds_code_notice_without_changing_owner() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE obligations (
+                id TEXT PRIMARY KEY, thread TEXT NOT NULL, kind TEXT NOT NULL,
+                repo TEXT NOT NULL, resource TEXT NOT NULL, outcome TEXT NOT NULL,
+                description TEXT NOT NULL, resolved INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO obligations VALUES
+                ('cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'artifact', 'ci', 'result',
+                 'available', 'Publish the report', 0);
+            CREATE TABLE obligation_transfers (
+                id TEXT PRIMARY KEY, obligation_id TEXT NOT NULL,
+                source_thread TEXT NOT NULL, target_thread TEXT NOT NULL,
+                goal TEXT NOT NULL, status TEXT NOT NULL, tests TEXT NOT NULL,
+                next_step TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, accepted_at TEXT
+            );
+            INSERT INTO obligation_transfers
+                (id, obligation_id, source_thread, target_thread, goal, status, tests, next_step)
+            VALUES
+                ('dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+                 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+                 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+                 'Finish report', 'In progress', 'Checks pending', 'Run focused checks');",
+        )
+        .unwrap();
+
+        initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let code = notice_code(&db, OTHER);
+        let notice_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM obligation_transfers
+                 WHERE target_thread=?1 AND state='pending' AND notification_message IS NOT NULL",
+                [OTHER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notice_count, 1);
+        assert_eq!(
+            notification_status(&db, "dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+                .unwrap()
+                .state,
+            "ready"
+        );
+        assert_eq!(
+            pending(&db, THREAD).unwrap()[0].id,
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        );
+        assert_eq!(pending_transfers(&db, OTHER).unwrap().len(), 1);
+        let accepted = accept_transfer(
+            &mut db,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            OTHER,
+            &code,
+        )
+        .unwrap();
+        assert_eq!(accepted.state, "accepted");
+        assert_eq!(
+            pending(&db, OTHER).unwrap()[0].id,
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        );
+    }
+
+    #[test]
+    fn failed_transfer_insert_preserves_original_owner() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let obligation_id = register(
+            &db,
+            THREAD,
+            "artifact",
+            "ci",
+            "result",
+            "available",
+            "Publish the report",
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_transfer_insert BEFORE INSERT ON obligation_transfers
+             BEGIN SELECT RAISE(ABORT, 'transfer insert rejected'); END;",
+        )
+        .unwrap();
+        assert!(
+            propose_transfer(
+                &mut db,
+                &obligation_id,
+                THREAD,
+                OTHER,
+                "Finish report",
+                "In progress",
+                "Checks pending",
+                "Run focused checks",
+            )
+            .is_err()
+        );
+        assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
+        assert!(pending_transfers(&db, OTHER).unwrap().is_empty());
+    }
+
+    #[test]
+    fn durable_notification_resumes_idle_recipient_and_is_not_repeated_after_queue_ack() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (obligation_id, transfer_id, confirmation_code) = transfer_input(&mut db);
+        let mut calls = 0;
+        let attempted = dispatch_with(&mut db, None, &mut |thread, message, resume| {
+            calls += 1;
+            assert_eq!(thread, OTHER);
+            assert!(resume, "idle and notLoaded recipients must be resumed");
+            assert!(message.contains(&confirmation_code));
+            Ok(("queued".into(), Some("native_queue_accepted".into())))
+        })
+        .unwrap();
+        assert_eq!(attempted, 1);
+        assert_eq!(calls, 1);
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "queued"
+        );
+        let message: Option<String> = db
+            .query_row(
+                "SELECT notification_message FROM obligation_transfers WHERE id=?1",
+                [&transfer_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(message.is_none());
+        assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
+        initialize(&db).unwrap();
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn uncertain_notification_is_needs_attention_and_never_retried() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (obligation_id, transfer_id, _) = transfer_input(&mut db);
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| {
+                Ok((
+                    "needs_attention".into(),
+                    Some("timeout_delivery_unknown".into()),
+                ))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "needs_attention"
+        );
+        assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn accepted_queue_without_resume_is_visible_and_not_sent_again() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (obligation_id, transfer_id, _) = transfer_input(&mut db);
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, resume| {
+                assert!(resume);
+                Ok(("queued".into(), Some("resume_daemon_unavailable".into())))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap(),
+            NotificationStatus {
+                state: "needs_attention".into(),
+                reason: Some("queued_but_recipient_not_resumed".into()),
+            }
+        );
+        assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupted_sending_notice_is_not_retried() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (_, transfer_id, _) = transfer_input(&mut db);
+        db.execute(
+            "UPDATE obligation_transfers SET notification_state='sending'
+             WHERE id=?1",
+            [&transfer_id],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "sending"
+        );
+    }
+
+    #[test]
+    fn pending_hook_notice_migrates_to_resuming_delivery_without_duplicate() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (transfer_id, code) = insert_intermediate_transfer(&db, "pending");
+        initialize(&db).unwrap();
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "ready"
+        );
+        let old_pending: i64 = db
+            .query_row(
+                "SELECT count(*) FROM steers WHERE thread=?1 AND state='pending'",
+                [OTHER],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_pending, 0);
+        assert_eq!(notice_code(&db, OTHER), code);
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |thread, message, resume| {
+                assert_eq!(thread, OTHER);
+                assert!(resume);
+                assert!(message.contains(&code));
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn claimed_legacy_hook_notice_is_not_sent_again() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (transfer_id, _) = insert_intermediate_transfer(&db, "claimed");
+        initialize(&db).unwrap();
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "needs_attention"
+        );
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -853,7 +1541,7 @@ mod tests {
         let mut db = Connection::open(&path).unwrap();
         db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
         initialize(&db).unwrap();
-        let (obligation_id, transfer_id) = transfer_input(&mut db);
+        let (obligation_id, transfer_id, confirmation_code) = transfer_input(&mut db);
         drop(db);
 
         let barrier = Arc::new(Barrier::new(2));
@@ -861,12 +1549,13 @@ mod tests {
             .map(|_| {
                 let path = path.clone();
                 let transfer_id = transfer_id.clone();
+                let confirmation_code = confirmation_code.clone();
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     let mut db = Connection::open(path).unwrap();
                     db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
                     barrier.wait();
-                    accept_transfer(&mut db, &transfer_id, OTHER).is_ok()
+                    accept_transfer(&mut db, &transfer_id, OTHER, &confirmation_code).is_ok()
                 })
             })
             .collect();

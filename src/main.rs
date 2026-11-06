@@ -222,6 +222,8 @@ struct ObligationTransferListInput {
 struct AcceptObligationTransferInput {
     transfer_id: String,
     recipient_thread: String,
+    /// One-time code delivered to the recipient's durable chat notice.
+    confirmation_code: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -340,6 +342,7 @@ fn recover(config: &manager::Config) -> Result<usize> {
     Ok(
         bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+            + obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
     )
@@ -1131,7 +1134,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Propose transferring a pending obligation with its goal, current status, tests, and next step. The source chat remains responsible until the named recipient explicitly accepts.",
+        description = "Propose transferring a pending obligation with its goal, current status, tests, and next step. A one-time confirmation code is stored in a durable notice sent with resume to idle recipients. If queuing is uncertain or resume is unavailable, notification state is needs_attention and the notice is not resent automatically. The source chat remains responsible until the recipient accepts with that code.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn propose_obligation_transfer(
@@ -1140,7 +1143,7 @@ impl WakeTools {
     ) -> CallToolResult {
         tool_result((|| {
             let mut db = database(&self.config)?;
-            Ok(json!({"transfer":obligations::propose_transfer(
+            let transfer = obligations::propose_transfer(
                 &mut db,
                 &input.obligation_id,
                 &input.source_thread,
@@ -1149,12 +1152,22 @@ impl WakeTools {
                 &input.status,
                 &input.tests,
                 &input.next_step,
-            )?}))
+            )?;
+            obligations::dispatch_transfer(
+                &mut db,
+                &transfer.id,
+                &self.config.codex,
+                Duration::from_secs(120),
+            )?;
+            let notification = obligations::notification_status(&db, &transfer.id)?;
+            transfer.notification_state = notification.state.clone();
+            transfer.notification_reason = notification.reason.clone();
+            Ok(json!({"transfer":transfer,"notification":notification}))
         })())
     }
 
     #[tool(
-        description = "List pending obligation-transfer proposals addressed to a chat. The listed chat can explicitly accept a proposal.",
+        description = "List pending obligation-transfer proposals addressed to a chat, including goal, status, tests, next step, and notification state/reason. Accept with the confirmation code from the durable recipient notice.",
         annotations(read_only_hint = true)
     )]
     fn list_obligation_transfers(
@@ -1170,7 +1183,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Explicitly accept an obligation transfer addressed to this recipient chat. Acceptance atomically changes the responsible chat.",
+        description = "Accept a pending transfer using the one-time code in the recipient chat's Wake notice. The code confirms possession of that notice; it is not strong authentication against local processes with database access. Acceptance atomically changes the responsible chat.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn accept_obligation_transfer(
@@ -1183,6 +1196,7 @@ impl WakeTools {
                 &mut db,
                 &input.transfer_id,
                 &input.recipient_thread,
+                &input.confirmation_code,
             )?}))
         })())
     }
