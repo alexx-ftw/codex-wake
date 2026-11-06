@@ -9,6 +9,7 @@ mod observability;
 mod observers;
 mod polling;
 mod probe;
+mod producers;
 mod result_conflicts;
 mod rules;
 mod status_view;
@@ -695,7 +696,7 @@ impl WakeTools {
             if matches!(input.kind.as_str(), "thread" | "subagent") {
                 native_poll::arm(&db, &id, &self.config.codex)?;
             }
-            let rows = subscriptions::status(&db)?;
+            let rows = producers::subscriptions_status(&db)?;
             let record = rows
                 .as_array()
                 .and_then(|rows| rows.iter().find(|row| row["id"] == id))
@@ -907,7 +908,7 @@ impl WakeTools {
         tool_result((|| {
             let db = database(&self.config)?;
             let waits = bridge::status(&db)?;
-            let subscriptions = subscriptions::status(&db)?;
+            let subscriptions = producers::subscriptions_status(&db)?;
             let rules = rules::status(&db)?;
             let actionable = status_view::actionable(&waits, &subscriptions, &rules);
             Ok(
@@ -1337,7 +1338,7 @@ async fn run_command(
             let value = if command == "status" {
                 bridge::status(&db)?
             } else if command == "subscriptions" {
-                subscriptions::status(&db)?
+                producers::subscriptions_status(&db)?
             } else {
                 drop(db);
                 json!({"attempted":recover(&config)?})

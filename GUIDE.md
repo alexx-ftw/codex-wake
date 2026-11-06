@@ -198,6 +198,11 @@ Subscribe to `git_ref updated` for changes to a PR's base branch. A PR's
 Other provider results remain explicit unless the subscription specifies an
 observation below. The plugin does not infer backup health or task success from
 silence. A producer can still call `publish_result` for any supported custom source.
+Wake reports whether a waiting subscription has a configured automatic observer,
+GitHub polling capability, matching pending publication obligations, or no
+recorded publisher. An unknown publisher is a warning, not a registration error.
+Automatic-source health is unverified: capability and configuration do not prove
+that credentials, polling or delivery work, nor that an event will arrive.
 
 ## GitHub and external events
 
