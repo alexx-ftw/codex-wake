@@ -4,6 +4,7 @@ mod goals;
 mod host_cleanup;
 mod manager;
 mod native_poll;
+mod obligations;
 mod observability;
 mod observers;
 mod polling;
@@ -84,6 +85,35 @@ struct PublicationInput {
     outcome: String,
     /// Optional original values for matching subscribers' source.* placeholders.
     source: Option<Value>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ObligationInput {
+    /// Chat responsible for publishing the result.
+    thread: String,
+    /// Publication kind: job, chat, dependency, resource, or artifact.
+    kind: String,
+    #[serde(default)]
+    repo: String,
+    resource: String,
+    outcome: String,
+    /// What result the chat is expected to publish.
+    description: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ObligationIdInput {
+    obligation_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ObligationListInput {
+    thread: String,
+    /// Cursor from the previous page, if any.
+    after: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -191,6 +221,7 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     observers::initialize(&db)?;
     native_poll::initialize(&db)?;
     steer::initialize(&db)?;
+    obligations::initialize(&db)?;
     Ok(db)
 }
 
@@ -201,6 +232,25 @@ fn recover(config: &manager::Config) -> Result<usize> {
             + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
     )
+}
+
+fn publication_result(config: &manager::Config, matched: usize, resolved: usize) -> Value {
+    match recover(config) {
+        Ok(attempted) => {
+            json!({"matched":matched,"obligations_resolved":resolved,"attempted":attempted})
+        }
+        Err(error) => {
+            observability::emit(
+                "publication.recover",
+                "needs_attention",
+                observability::error_class(&error),
+                None,
+                Duration::ZERO,
+                1,
+            );
+            json!({"matched":matched,"obligations_resolved":resolved,"attempted":null,"delivery_error":"recovery_failed"})
+        }
+    }
 }
 
 fn lifecycle_output(event: &str, matched: usize, states: &[String]) -> Value {
@@ -272,7 +322,42 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         Duration::ZERO,
         matched as u64,
     );
-    recover(config)?;
+    let reminder = if payload["hook_event_name"] == "Stop"
+        && payload["stop_hook_active"] != true
+        && payload["agent_id"].as_str().is_none_or(|id| id == resource)
+    {
+        obligations::pending_count(&db, &resource)
+    } else {
+        Ok(0)
+    };
+    let reminder_error = reminder.is_err();
+    if let Err(error) = &reminder {
+        observability::emit(
+            "obligation.reminder",
+            "error",
+            observability::error_class(error),
+            Some(&resource),
+            Duration::ZERO,
+            1,
+        );
+    }
+    let reminder_count = reminder.unwrap_or(0);
+    // The receiver already dispatches ready records; don't delay a reminder on unrelated deliveries.
+    let recovery_error = if reminder_count > 0 {
+        None
+    } else {
+        recover(config).err()
+    };
+    if let Some(error) = &recovery_error {
+        observability::emit(
+            "hook.recover",
+            "needs_attention",
+            observability::error_class(error),
+            Some(&resource),
+            Duration::ZERO,
+            1,
+        );
+    }
     let mut statement = db.prepare(
         "SELECT state FROM subscriptions WHERE kind=?1 AND repo='' AND resource=?2 AND event=?3",
     )?;
@@ -286,12 +371,54 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         matched,
         &states,
     );
+    if recovery_error.is_some() {
+        let previous = output["systemMessage"].as_str().unwrap_or_default();
+        output["systemMessage"] = json!(format!(
+            "{previous} Wake could not recover deliveries; inspect status."
+        ));
+    }
+    if reminder_error {
+        let previous = output["systemMessage"].as_str().unwrap_or_default();
+        output["systemMessage"] = json!(format!(
+            "{previous} Wake could not check publication obligations; inspect status."
+        ));
+    }
+    if reminder_count > 0 {
+        let previous = output["systemMessage"].as_str().unwrap_or_default();
+        output["systemMessage"] = json!(format!(
+            "{previous} Delivery recovery is deferred to the receiver; inspect status if it is unavailable."
+        ));
+    }
     if payload["hook_event_name"] == "Stop" {
+        let count = reminder_count;
+        if count > 0 {
+            observability::emit(
+                "obligation.reminder",
+                "prepared",
+                "hook_output_unconfirmed",
+                Some(&resource),
+                Duration::ZERO,
+                count as u64,
+            );
+        }
         let steer = steer::take(&mut database(config)?, payload)?;
         output
             .as_object_mut()
             .unwrap()
             .extend(steer.as_object().unwrap().clone());
+        if count > 0 {
+            let reminder = format!(
+                "Wake: {count} publication obligation(s) remain pending for chat {resource}. Call list_obligations with this chat ID to review them. Publish only when the result is available; if work is ongoing or blocked, continue or report that status without inventing a result. Existing authorization only."
+            );
+            let previous = output["reason"].as_str().unwrap_or_default();
+            let reason = if previous.is_empty() {
+                reminder
+            } else {
+                format!("{previous}\n\n{reminder}")
+            };
+            output["decision"] = json!("block");
+            output["reason"] = json!(reason);
+        }
     }
     Ok(output)
 }
@@ -527,26 +654,78 @@ impl WakeTools {
                 "Unsupported publication kind"
             );
             let db = database(&self.config)?;
-            let matched = if let Some(source) = input.source {
-                subscriptions::publish_with_source(
-                    &db,
-                    &input.kind,
-                    &input.repo,
-                    &input.resource,
-                    &input.outcome,
-                    &source,
-                )?
+            let resource = if input.kind == "chat" {
+                uuid::Uuid::parse_str(&input.resource)?.to_string()
             } else {
-                subscriptions::publish(
-                    &db,
-                    &input.kind,
-                    &input.repo,
-                    &input.resource,
-                    &input.outcome,
-                )?
+                input.resource.clone()
             };
+            let source = input.source.unwrap_or_else(|| json!({"kind":input.kind,"repo":input.repo,"resource":resource,"event":input.outcome,"outcome":input.outcome}));
+            let (matched, resolved) = subscriptions::publish_agent(
+                &db,
+                &input.kind,
+                &input.repo,
+                &input.resource,
+                &input.outcome,
+                &source,
+            )?;
             drop(db);
-            Ok(json!({"matched":matched,"attempted":recover(&self.config)?}))
+            Ok(publication_result(&self.config, matched, resolved))
+        })())
+    }
+
+    #[tool(
+        description = "Register a chat's pending publication; an exact publish_result resolves it.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn register_obligation(
+        &self,
+        Parameters(input): Parameters<ObligationInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let db = database(&self.config)?;
+            let id = obligations::register(
+                &db,
+                &input.thread,
+                &input.kind,
+                &input.repo,
+                &input.resource,
+                &input.outcome,
+                &input.description,
+            )?;
+            Ok(json!({"obligation_id":id}))
+        })())
+    }
+
+    #[tool(
+        description = "List a chat's pending publication obligations; pass next_cursor as after for the next page.",
+        annotations(read_only_hint = true)
+    )]
+    fn list_obligations(
+        &self,
+        Parameters(input): Parameters<ObligationListInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let (items, next) = obligations::pending_page(
+                &database(&self.config)?,
+                &input.thread,
+                input.after.as_deref(),
+            )?;
+            Ok(json!({"obligations":items,"next_cursor":next}))
+        })())
+    }
+
+    #[tool(
+        description = "Resolve an obligation explicitly when publication is no longer needed.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn resolve_obligation(
+        &self,
+        Parameters(input): Parameters<ObligationIdInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            Ok(
+                json!({"resolved":obligations::resolve(&database(&self.config)?, &input.obligation_id)?}),
+            )
         })())
     }
 
@@ -618,6 +797,9 @@ impl rmcp::ServerHandler for WakeTools {
             "resume_goal" => "mcp.resume_goal",
             "subscribe" => "mcp.subscribe",
             "publish_result" => "mcp.publish_result",
+            "register_obligation" => "mcp.register_obligation",
+            "list_obligations" => "mcp.list_obligations",
+            "resolve_obligation" => "mcp.resolve_obligation",
             "register_wait" => "mcp.register_wait",
             "get_status" => "mcp.get_status",
             "recover_ready" => "mcp.recover_ready",
@@ -913,12 +1095,21 @@ async fn run_command(
                 ["job", "chat", "dependency", "resource", "artifact"].contains(&kind.as_str()),
                 "Unsupported publication kind"
             );
-            let matched =
-                subscriptions::publish(&database(&config)?, &kind, &repo, &resource, &outcome)?;
-            println!(
-                "{}",
-                json!({"matched":matched,"attempted":recover(&config)?})
-            );
+            let canonical = if kind == "chat" {
+                uuid::Uuid::parse_str(&resource)?.to_string()
+            } else {
+                resource.clone()
+            };
+            let source = json!({"kind":kind,"repo":repo,"resource":canonical,"event":outcome,"outcome":outcome});
+            let (matched, resolved) = subscriptions::publish_agent(
+                &database(&config)?,
+                &kind,
+                &repo,
+                &resource,
+                &outcome,
+                &source,
+            )?;
+            println!("{}", publication_result(&config, matched, resolved));
         }
         "hook" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
@@ -1012,6 +1203,42 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn committed_publication_is_reported_when_recovery_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        obligations::register(
+            &db,
+            thread,
+            "artifact",
+            "ci",
+            "package",
+            "available",
+            "package ready",
+        )
+        .unwrap();
+        let (matched, resolved) =
+            subscriptions::publish_agent(&db, "artifact", "ci", "package", "available", &json!({}))
+                .unwrap();
+        drop(db);
+        let saved_db = config.db.clone();
+        config.db = temp.path().to_path_buf();
+        let result = publication_result(&config, matched, resolved);
+        assert_eq!(result["obligations_resolved"], 1);
+        assert_eq!(result["delivery_error"], "recovery_failed");
+        config.db = saved_db;
+        assert!(
+            obligations::pending(&database(&config).unwrap(), thread)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn no_new_subscription_is_quiet() {

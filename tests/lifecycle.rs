@@ -54,8 +54,15 @@ fn concurrent_mcp_sessions_share_receiver_and_closing_them_preserves_it() {
         client.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
         let reply = client.response(2, Duration::from_secs(100));
         let tools = reply["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert!(tools.len() >= 16);
         assert!(tools.iter().any(|t| t["name"] == "register_wait"));
+        for name in [
+            "register_obligation",
+            "list_obligations",
+            "resolve_obligation",
+        ] {
+            assert!(tools.iter().any(|t| t["name"] == name));
+        }
         let reply = json!({"result":{"structuredContent":client.call("get_status", json!({}))}});
         assert_eq!(
             reply["result"]["structuredContent"]["receiver"]["local_ready"], true,

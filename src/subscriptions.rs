@@ -304,6 +304,20 @@ fn ready(
     outcome: &str,
     source: &Value,
 ) -> Result<usize> {
+    let changed = ready_update(db, kind, repo, resource, event, outcome, source)?;
+    log_accept(kind, repo, resource, event, changed);
+    Ok(changed)
+}
+
+fn ready_update(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    event: &str,
+    outcome: &str,
+    source: &Value,
+) -> Result<usize> {
     ensure!(valid_kind_event(kind, event), "Unsupported event");
     let source_json = serde_json::to_string(source)?;
     let changed = db.execute(
@@ -313,6 +327,10 @@ fn ready(
          WHERE kind=?3 AND repo=?4 AND resource=?5 AND event=?6 AND state='waiting'",
         params![outcome, source_json, kind, repo, resource, event],
     )?;
+    Ok(changed)
+}
+
+fn log_accept(kind: &str, repo: &str, resource: &str, event: &str, changed: usize) {
     let subject = format!("{kind}/{repo}/{resource}/{event}");
     crate::observability::emit(
         "event.accept",
@@ -326,7 +344,6 @@ fn ready(
         Duration::ZERO,
         changed as u64,
     );
-    Ok(changed)
 }
 
 fn custom_outcome(kind: &str, event: &str, outcome: &str) -> bool {
@@ -411,7 +428,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
                 _ => return Ok(0),
             };
             let transaction = db.unchecked_transaction()?;
-            let mut count = ready(
+            let submitted = ready_update(
                 &transaction,
                 "review",
                 repo,
@@ -420,8 +437,8 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
                 event,
                 payload,
             )?;
-            if event != "submitted" {
-                count += ready(
+            let specific = if event != "submitted" {
+                ready_update(
                     &transaction,
                     "review",
                     repo,
@@ -429,10 +446,16 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
                     event,
                     event,
                     payload,
-                )?;
-            }
+                )?
+            } else {
+                0
+            };
             transaction.commit()?;
-            Ok(count)
+            log_accept("review", repo, &resource, "submitted", submitted);
+            if event != "submitted" {
+                log_accept("review", repo, &resource, event, specific);
+            }
+            Ok(submitted + specific)
         }
         "deployment_status" => {
             let status = field(
@@ -511,6 +534,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
 }
 
 /// Publish an explicit custom-source outcome without accepting free-form message text.
+#[cfg(test)]
 pub fn publish(
     db: &Connection,
     kind: &str,
@@ -543,6 +567,18 @@ pub fn publish_with_source(
     outcome: &str,
     source: &Value,
 ) -> Result<usize> {
+    let resource = validate_publication(kind, repo, resource, outcome, source)?;
+    initialize(db)?;
+    ready(db, kind, repo, &resource, outcome, outcome, source)
+}
+
+fn validate_publication(
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+) -> Result<String> {
     let event = outcome;
     ensure!(
         custom_outcome(kind, event, outcome),
@@ -562,8 +598,34 @@ pub fn publish_with_source(
         serde_json::to_vec(source)?.len() <= MAX_PAYLOAD_BYTES,
         "Payload exceeds 1 MiB"
     );
+    Ok(resource)
+}
+
+/// Commit an agent publication and its exact matching obligations together.
+pub fn publish_agent(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+) -> Result<(usize, usize)> {
+    let resource = validate_publication(kind, repo, resource, outcome, source)?;
     initialize(db)?;
-    ready(db, kind, repo, &resource, event, outcome, source)
+    let tx = db.unchecked_transaction()?;
+    let matched = ready_update(&tx, kind, repo, &resource, outcome, outcome, source)?;
+    let resolved = crate::obligations::resolve_publication(&tx, kind, repo, &resource, outcome)?;
+    tx.commit()?;
+    log_accept(kind, repo, &resource, outcome, matched);
+    crate::observability::emit(
+        "obligation.resolve",
+        "resolved",
+        "publication",
+        None,
+        Duration::ZERO,
+        resolved as u64,
+    );
+    Ok((matched, resolved))
 }
 
 /// Complete only the registration whose observation was verified.
@@ -818,6 +880,38 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         initialize(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn agent_publication_atomically_resolves_only_matching_obligations() {
+        let db = db();
+        crate::obligations::initialize(&db).unwrap();
+        subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        crate::obligations::register(&db, THREAD, "artifact", "ci", "pkg", "available", "release")
+            .unwrap();
+        crate::obligations::register(&db, THREAD, "artifact", "ci", "other", "available", "other")
+            .unwrap();
+        db.execute_batch("CREATE TRIGGER fail_obligation BEFORE UPDATE ON obligations BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(publish_agent(&db, "artifact", "ci", "pkg", "available", &json!({})).is_err());
+        assert_eq!(
+            db.query_row("SELECT state FROM subscriptions", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "waiting"
+        );
+        assert_eq!(crate::obligations::pending(&db, THREAD).unwrap().len(), 2);
+        db.execute_batch("DROP TRIGGER fail_obligation;").unwrap();
+        assert_eq!(
+            publish_agent(&db, "artifact", "ci", "pkg", "available", &json!({})).unwrap(),
+            (1, 1)
+        );
+        let pending = crate::obligations::pending(&db, THREAD).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].resource, "other");
+        assert_eq!(
+            publish_agent(&db, "artifact", "ci", "pkg", "available", &json!({})).unwrap(),
+            (0, 0)
+        );
     }
 
     fn delivery_config<'a>(

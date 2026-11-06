@@ -144,6 +144,9 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `register_wait` | Register exact CI repo/run/attempt/SHA and destination chat |
 | `subscribe` | Register another exact source/resource/event and destination |
 | `publish_result` | Publish a verified provider result and dispatch matching waits |
+| `register_obligation` | Record a chat's pending result publication |
+| `list_obligations` | List a chat's pending publications |
+| `resolve_obligation` | Resolve a pending obligation explicitly |
 | `get_status` | Inspect local receiver health, CI waits and subscriptions |
 | `recover_ready` | Dispatch stored ready events; never retry ambiguous deliveries |
 | `configure_rule` | Match a PR comment and create or message a thread |
@@ -317,6 +320,25 @@ API has no atomic goal-plus-input operation: an automatic continuation may start
 before that input is queued, so it can be consumed by a subsequent turn.
 
 ## Thread and subagent signals
+
+For an expected result, `register_obligation` records the responsible chat and
+the exact publication kind, namespace, resource and outcome. At an eligible
+`Stop`, Wake reminds that chat of pending obligations; it does not infer that
+work has finished or that a result is successful. A matching explicit
+`publish_result` (or `publish` CLI invocation) resolves those obligations in
+the same transaction that accepts the publication. Delivery to subscribers is
+separate and can still require attention. `list_obligations` shows pending
+records in pages of eight (`next_cursor` is supplied as `after`);
+`resolve_obligation` permits an agent to resolve one explicitly. Local MCP or
+CLI callers can register and publish obligations; Wake does not authenticate
+their agent identity. An emitted hook response is not proof that Codex consumed
+it, and the loop guard permits a pending obligation to survive the current turn.
+The hook checks a database snapshot: an obligation registered after that check
+is eligible for a later stop. Delivery recovery failures are reported
+separately from a publication already committed.
+When a reminder is due, the hook leaves lifecycle deliveries ready for the
+receiver's background dispatcher instead of waiting for unrelated sends. If the
+receiver is unavailable, they remain ready until it restarts or recovery runs.
 
 Bundled `SessionStart` checks the shared receiver. `Stop` and `SubagentStop` command hooks publish local lifecycle signals
 without asking a model to interpret instructions. Codex requires users to review

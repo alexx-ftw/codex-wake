@@ -103,6 +103,67 @@ fn concurrent_hook_processes_emit_one_context_and_never_replay_it() {
 }
 
 #[test]
+fn stop_combines_steer_and_pending_publication_without_resolving_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let thread = "11111111-1111-4111-8111-111111111111";
+    let payload = json!({"hook_event_name":"Stop","session_id":thread,"turn_id":"turn1"});
+    assert!(invoke_at(payload.clone(), temp.path()).status.success());
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','artifact1','available','report ready')", [thread]).unwrap();
+    db.execute(
+        "INSERT INTO steers(id,thread,message) VALUES('steer1',?1,'review input')",
+        [thread],
+    )
+    .unwrap();
+    db.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state) VALUES('sub','thread','',?1,'turn_completed','22222222-2222-4222-8222-222222222222','waiting')", [thread]).unwrap();
+    let result = invoke_at(payload.clone(), temp.path());
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(output["decision"], "block");
+    let reason = output["reason"].as_str().unwrap();
+    assert!(reason.contains("review input") && reason.contains("list_obligations"));
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("deferred to the receiver")
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM subscriptions WHERE id='sub'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "ready"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT resolved FROM obligations WHERE id='one'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute("DELETE FROM subscriptions WHERE id='sub'", [])
+        .unwrap();
+    let again = invoke_at(
+        json!({"hook_event_name":"Stop","session_id":thread,"turn_id":"turn1","stop_hook_active":true}),
+        temp.path(),
+    );
+    assert!(again.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&again.stdout).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
 fn lifecycle_cli_emits_one_json_object_without_plain_text_or_control_fields() {
     for event in ["Stop", "SubagentStop"] {
         let output = invoke(
