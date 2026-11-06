@@ -300,7 +300,14 @@ fn add_delivery_evidence(
     event: &str,
 ) {
     match subscriptions::delivery_warnings(db, kind, repo, resource, event) {
-        Ok(warnings) => result["delivery_warnings"] = warnings,
+        Ok(warnings) => {
+            if result["matched"] == 0 && warnings.as_array().is_some_and(|rows| !rows.is_empty()) {
+                result["no_waiting_subscriber"] = json!(
+                    "An earlier subscription matches this result, but none is waiting for this publication. Inspect the delivery evidence before deciding how to notify the destination."
+                );
+            }
+            result["delivery_warnings"] = warnings;
+        }
         Err(error) => {
             result["delivery_warnings_error"] = json!({"reason":observability::error_class(&error),"message":"Event accepted, but delivery evidence could not be read; inspect status before taking action."})
         }
@@ -1353,6 +1360,30 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn publication_warns_when_only_an_earlier_subscription_exists() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        subscriptions::initialize(&db).unwrap();
+        obligations::initialize(&db).unwrap();
+        let mut result = json!({"matched":0});
+        add_delivery_evidence(&mut result, &db, "artifact", "ci", "pkg", "available");
+        assert!(result.get("no_waiting_subscriber").is_none());
+        subscriptions::subscribe(
+            &db,
+            "artifact",
+            "ci",
+            "pkg",
+            "available",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        subscriptions::publish_agent(&db, "artifact", "ci", "pkg", "available", &json!({}))
+            .unwrap();
+        add_delivery_evidence(&mut result, &db, "artifact", "ci", "pkg", "available");
+        assert!(result["no_waiting_subscriber"].is_string());
+        assert_eq!(result["delivery_warnings"][0]["state"], "ready");
+    }
 
     #[test]
     fn validation_tools_and_stop_require_evidence() {

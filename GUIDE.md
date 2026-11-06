@@ -167,6 +167,8 @@ cancellation disagree; use `get_result_conflicts` with the same identity and its
 `next` cursor for all pages. It does not determine which is correct or undo any
 earlier delivery.
 Publications without an execution identity remain supported and are not compared.
+If no subscription is waiting but an earlier one matches, the publisher receives
+`no_waiting_subscriber` and the available delivery evidence for inspection.
 
 Stored subscriptions and CI waits with a model preset remain ready when the target
 is active or `thread/resume` definitively rejects its active writer before input
