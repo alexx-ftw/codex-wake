@@ -189,6 +189,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("observability.rs").as_slice(),
         include_bytes!("obligations.rs").as_slice(),
+        include_bytes!("validation_obligations.rs").as_slice(),
         include_bytes!("telemetry.rs").as_slice(),
         include_bytes!("polling.rs").as_slice(),
         include_bytes!("observers.rs").as_slice(),

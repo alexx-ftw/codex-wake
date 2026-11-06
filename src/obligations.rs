@@ -187,7 +187,7 @@ pub fn resolve(db: &Connection, id: &str) -> Result<bool> {
         .context("Invalid obligation UUID")?
         .to_string();
     let changed = db.execute(
-        "UPDATE obligations SET resolved=1 WHERE id=?1 AND resolved=0",
+        "UPDATE obligations SET resolved=1 WHERE id=?1 AND kind!='validation' AND resolved=0",
         [&id],
     )? == 1;
     crate::observability::emit(

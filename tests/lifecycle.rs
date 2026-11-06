@@ -60,6 +60,8 @@ fn concurrent_mcp_sessions_share_receiver_and_closing_them_preserves_it() {
             "register_obligation",
             "list_obligations",
             "resolve_obligation",
+            "register_validation",
+            "resolve_validation",
         ] {
             assert!(tools.iter().any(|t| t["name"] == name));
         }

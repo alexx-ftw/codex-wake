@@ -336,6 +336,14 @@ it, and the loop guard permits a pending obligation to survive the current turn.
 The hook checks a database snapshot: an obligation registered after that check
 is eligible for a later stop. Delivery recovery failures are reported
 separately from a publication already committed.
+
+An agent can explicitly register a committed, pending check with
+`register_validation`. Wake does not infer checks from conversation. The same
+eligible `Stop` reminds the responsible chat; `list_obligations` includes these
+checks. After performing a check, `resolve_validation` requires nonempty
+evidence of what was checked and observed, and stores it atomically with the
+resolution. A publication or `resolve_obligation` does not resolve a validation.
+Wake stores the agent's evidence; it does not independently verify the claim.
 When a reminder is due, the hook leaves lifecycle deliveries ready for the
 receiver's background dispatcher instead of waiting for unrelated sends. If the
 receiver is unavailable, they remain ready until it restarts or recovery runs.

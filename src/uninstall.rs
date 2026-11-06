@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','validation_evidence')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -166,6 +166,22 @@ mod tests {
     }
 
     #[test]
+    fn evidence_named_foreign_table_does_not_acquire_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE validation_evidence(value TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(crate::bridge::connect(&path).unwrap());
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
     fn polling_schema_cleanup_removes_only_plugin_state() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -179,6 +195,7 @@ mod tests {
         crate::native_poll::initialize(&db).unwrap();
         crate::observers::initialize(&db).unwrap();
         crate::obligations::initialize(&db).unwrap();
+        crate::validation_obligations::initialize(&db).unwrap();
         let id = crate::subscriptions::subscribe(
             &db,
             "artifact",

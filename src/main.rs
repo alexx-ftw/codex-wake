@@ -16,6 +16,7 @@ mod subscriptions;
 mod telemetry;
 mod templates;
 mod uninstall;
+mod validation_obligations;
 
 use anyhow::{Context, Result, bail};
 use rmcp::{
@@ -107,6 +108,23 @@ struct ObligationInput {
 #[serde(deny_unknown_fields)]
 struct ObligationIdInput {
     obligation_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ValidationInput {
+    /// Chat responsible for the committed validation.
+    thread: String,
+    /// Specific validation the agent committed to perform.
+    description: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ValidationResolutionInput {
+    obligation_id: String,
+    /// Evidence of the validation actually performed and observed.
+    evidence: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -223,6 +241,7 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     native_poll::initialize(&db)?;
     steer::initialize(&db)?;
     obligations::initialize(&db)?;
+    validation_obligations::initialize(&db)?;
     Ok(db)
 }
 
@@ -410,7 +429,7 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
     if reminder_error {
         let previous = output["systemMessage"].as_str().unwrap_or_default();
         output["systemMessage"] = json!(format!(
-            "{previous} Wake could not check publication obligations; inspect status."
+            "{previous} Wake could not check obligations; inspect status."
         ));
     }
     if reminder_count > 0 {
@@ -438,7 +457,7 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
             .extend(steer.as_object().unwrap().clone());
         if count > 0 {
             let reminder = format!(
-                "Wake: {count} publication obligation(s) remain pending for chat {resource}. Call list_obligations with this chat ID to review them. Publish only when the result is available; if work is ongoing or blocked, continue or report that status without inventing a result. Existing authorization only."
+                "Wake: {count} publication or validation obligation(s) remain pending for chat {resource}. Call list_obligations with this chat ID to review them. Publish only when a result is available; resolve a validation only with evidence of the check performed. If work is ongoing or blocked, continue or report that status without inventing a result. Existing authorization only."
             );
             let previous = output["reason"].as_str().unwrap_or_default();
             let reason = if previous.is_empty() {
@@ -735,7 +754,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "List a chat's pending publication obligations; pass next_cursor as after for the next page.",
+        description = "List a chat's pending publication and validation obligations; pass next_cursor as after for the next page.",
         annotations(read_only_hint = true)
     )]
     fn list_obligations(
@@ -763,6 +782,40 @@ impl WakeTools {
         tool_result((|| {
             Ok(
                 json!({"resolved":obligations::resolve(&database(&self.config)?, &input.obligation_id)?}),
+            )
+        })())
+    }
+
+    #[tool(
+        description = "Register a specific pending validation committed to by an agent. Wake does not infer commitments from prose.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn register_validation(
+        &self,
+        Parameters(input): Parameters<ValidationInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let id = validation_obligations::register(
+                &database(&self.config)?,
+                &input.thread,
+                &input.description,
+            )?;
+            Ok(json!({"obligation_id":id}))
+        })())
+    }
+
+    #[tool(
+        description = "Resolve a validation explicitly and store evidence of the check performed.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn resolve_validation(
+        &self,
+        Parameters(input): Parameters<ValidationResolutionInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let mut db = database(&self.config)?;
+            Ok(
+                json!({"resolved":validation_obligations::resolve(&mut db, &input.obligation_id, &input.evidence)?}),
             )
         })())
     }
@@ -842,6 +895,8 @@ impl rmcp::ServerHandler for WakeTools {
             "register_obligation" => "mcp.register_obligation",
             "list_obligations" => "mcp.list_obligations",
             "resolve_obligation" => "mcp.resolve_obligation",
+            "register_validation" => "mcp.register_validation",
+            "resolve_validation" => "mcp.resolve_validation",
             "register_wait" => "mcp.register_wait",
             "get_status" => "mcp.get_status",
             "recover_ready" => "mcp.recover_ready",
@@ -1242,6 +1297,56 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn validation_tools_and_stop_require_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let tools = WakeTools { config };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let registered = tools.register_validation(Parameters(ValidationInput {
+            thread: thread.into(),
+            description: "Check migration".into(),
+        }));
+        assert_ne!(registered.is_error, Some(true));
+        let id = registered.structured_content.unwrap()["obligation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let stop = json!({"hook_event_name":"Stop", "session_id":thread, "turn_id":"turn1"});
+        let output = run_hook_inner(&tools.config, &stop).unwrap();
+        assert_eq!(output["decision"], "block");
+        assert!(output["reason"].as_str().unwrap().contains("validation"));
+        let missing = tools.resolve_validation(Parameters(ValidationResolutionInput {
+            obligation_id: id.clone(),
+            evidence: " ".into(),
+        }));
+        assert_eq!(missing.is_error, Some(true));
+        let resolved = tools.resolve_validation(Parameters(ValidationResolutionInput {
+            obligation_id: id.clone(),
+            evidence: "migration test passed".into(),
+        }));
+        assert_eq!(resolved.structured_content.unwrap()["resolved"], true);
+        assert!(
+            run_hook_inner(&tools.config, &stop)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        let db = database(&tools.config).unwrap();
+        let evidence: String = db
+            .query_row(
+                "SELECT evidence FROM validation_evidence WHERE obligation_id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence, "migration test passed");
+    }
 
     #[test]
     fn committed_publication_is_reported_when_recovery_fails() {
