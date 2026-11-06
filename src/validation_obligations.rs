@@ -1,6 +1,6 @@
 //! Explicit validation commitments, using Wake's existing obligation queue.
 use anyhow::{Context, Result, ensure};
-use rmcp::schemars::JsonSchema;
+use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
