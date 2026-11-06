@@ -313,6 +313,7 @@ pub fn status(db: &Connection) -> Result<Value> {
     Ok(json!({"rules":rules,"deliveries":deliveries}))
 }
 
+#[cfg(test)]
 fn dispatch_with(
     db: &mut Connection,
     workspace_base: &Path,

@@ -1569,7 +1569,11 @@ mod tests {
         let uid = fs::metadata("/proc/self").unwrap().uid();
         let target = env::temp_dir()
             .join(format!("codex-daemon-{uid}"))
-            .join(format!("{:0>64}", uuid::Uuid::new_v4().simple()));
+            .join(format!(
+                "{}{}",
+                "0".repeat(32),
+                uuid::Uuid::new_v4().simple()
+            ));
         assert!(!target.exists());
         symlink(&target, &socket).unwrap();
         remove_stale_socket(&socket).unwrap();
