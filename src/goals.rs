@@ -77,7 +77,7 @@ pub(crate) fn socket_rpc_with_notifications(
             timeouts(ws, deadline)?;
             match ws.read().context("Read Unix WebSocket RPC")? {
                 Message::Text(text) => {
-                    let message =
+                    let message: Value =
                         serde_json::from_str(&text).context("Invalid Unix WebSocket RPC JSON")?;
                     if message.get("method").and_then(Value::as_str).is_some() {
                         notifications.push(message.clone());

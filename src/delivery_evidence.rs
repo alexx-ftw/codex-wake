@@ -310,7 +310,7 @@ pub fn begin(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationResult {
-    pub distinct_receipts: u64,
+    pub distinct_receipts: i64,
     pub duplicate_confirmed: bool,
     /// True exactly once, when this call atomically claims the warning attempt.
     pub should_warn: bool,
@@ -354,7 +354,7 @@ pub fn observe_user_message(
          VALUES(?1,?2,?3,?4,?5,?6)",
         params![event_key, thread, client_id, item_id, turn_id, now_ms()],
     )?;
-    let distinct_receipts: u64 = tx.query_row(
+    let distinct_receipts: i64 = tx.query_row(
         "SELECT count(*) FROM user_message_observations WHERE event_key=?1 AND target_thread=?2 AND client_user_message_id=?3",
         params![event_key, thread, client_id],
         |row| row.get(0),
@@ -497,7 +497,7 @@ pub fn status(db: &Connection) -> Result<Value> {
                 "coverage": row.get::<_, String>(3)?,
                 "event_identity_verified": row.get::<_, bool>(4)?,
                 "warning": row.get::<_, String>(5)?,
-                "distinct_user_message_items": row.get::<_, u64>(6)?,
+                "distinct_user_message_items": row.get::<_, i64>(6)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

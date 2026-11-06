@@ -804,8 +804,24 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    let uid = fs::metadata("/proc/self")?.uid();
+    if meta.file_type().is_symlink() && meta.uid() == uid {
+        let target = fs::read_link(path)?;
+        let daemon_dir = env::temp_dir().join(format!("codex-daemon-{uid}"));
+        let is_daemon_target = target.parent() == Some(daemon_dir.as_path())
+            && target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+        if is_daemon_target && !target.try_exists()? {
+            fs::remove_file(path)?;
+            return Ok(());
+        }
+    }
     ensure!(
-        meta.file_type().is_socket() && meta.uid() == fs::metadata("/proc/self")?.uid(),
+        meta.file_type().is_socket() && meta.uid() == uid,
         "Controller path is not an owned socket"
     );
     match UnixStream::connect(path) {
@@ -1544,6 +1560,28 @@ mod tests {
         fs::write(&socket, "unrelated").unwrap();
         assert!(remove_stale_socket(&socket).is_err());
         assert_eq!(fs::read_to_string(&socket).unwrap(), "unrelated");
+    }
+    #[test]
+    fn socket_cleanup_removes_only_dangling_codex_daemon_links() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("controller.sock");
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        let target = env::temp_dir()
+            .join(format!("codex-daemon-{uid}"))
+            .join(format!("{:0>64}", uuid::Uuid::new_v4().simple()));
+        assert!(!target.exists());
+        symlink(&target, &socket).unwrap();
+        remove_stale_socket(&socket).unwrap();
+        assert!(fs::symlink_metadata(&socket).is_err());
+        symlink(temp.path().join("unrelated"), &socket).unwrap();
+        assert!(remove_stale_socket(&socket).is_err());
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
     #[test]
     fn persistent_private_secret() {
