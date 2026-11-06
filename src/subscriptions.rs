@@ -2975,8 +2975,12 @@ mod tests {
                     resource TEXT NOT NULL, event TEXT NOT NULL, thread TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'waiting', outcome TEXT, reason TEXT,
                     updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    message_template TEXT, source_json TEXT, execution_json TEXT,
                     UNIQUE(kind,repo,resource,event,thread)
-                );",
+                );
+                INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome)
+                VALUES('legacy-ready','job','','job-1','success',
+                       '11111111-1111-4111-8111-111111111111','ready','success');",
             )
             .unwrap();
         drop(legacy);
@@ -3008,9 +3012,19 @@ mod tests {
             "source_json",
             "execution_json",
             "required_source",
+            "source_event_key",
         ] {
             assert!(columns.iter().any(|existing| existing == column));
         }
+        let (state, identity): (String, Option<String>) = db
+            .query_row(
+                "SELECT state,source_event_key FROM subscriptions WHERE id='legacy-ready'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(identity, None);
     }
 
     #[test]

@@ -590,6 +590,42 @@ mod tests {
         json!({"action":"created","repository":{"full_name":"owner/repo"},"issue":{"number":42,"pull_request":{}},"comment":{"id":7,"user":{"login":"alice","type":"User"},"body":"ship it untrusted body"}})
     }
     #[test]
+    fn legacy_ready_deliveries_remain_without_verified_event_identity() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE rules (
+                id TEXT PRIMARY KEY, input TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE rule_deliveries (
+                rule_id TEXT NOT NULL, event_header TEXT NOT NULL,
+                comment_id TEXT NOT NULL, source TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'ready', thread_id TEXT,
+                reason TEXT, updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(rule_id,event_header,comment_id)
+            );
+            INSERT INTO rule_deliveries(rule_id,event_header,comment_id,source,state)
+            VALUES('legacy-rule','issue_comment','77','{}','ready');",
+        )
+        .unwrap();
+
+        initialize(&db).unwrap();
+
+        let (state, key, verified): (String, Option<String>, bool) = db
+            .query_row(
+                "SELECT state,source_event_key,event_identity_verified
+                 FROM rule_deliveries WHERE rule_id='legacy-rule'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(key, None);
+        assert!(!verified);
+    }
+
+    #[test]
     fn matching_all_any_bot_and_non_pr() {
         let mut i = input();
         assert!(matches(&i, "alice", "User", "ship it"));
