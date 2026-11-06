@@ -180,6 +180,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("manager.rs").as_slice(),
         include_bytes!("bridge.rs").as_slice(),
         include_bytes!("circular_waits.rs").as_slice(),
+        include_bytes!("delivery_evidence.rs").as_slice(),
         include_bytes!("subscriptions.rs").as_slice(),
         include_bytes!("producers.rs").as_slice(),
         include_bytes!("result_conflicts.rs").as_slice(),

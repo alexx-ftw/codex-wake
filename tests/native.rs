@@ -568,7 +568,7 @@ fn native_rule_turn_and_goal_metadata_qualification() {
         "author":"codex-wake-fixture[bot]", "author_type":"Bot",
         "contains":"native-test",
         "prompt":"Reply exactly CODEX_WAKE_NATIVE_OK. Do not call tools.",
-        "model":"gpt-6.1-sol", "reasoning_effort":"low"
+        "model":"gpt-6.1-terra", "reasoning_effort":"medium"
     });
     let configured = mcp.call("configure_rule", input);
     let rule_id = configured["rule_id"]
@@ -707,13 +707,13 @@ fn native_rule_turn_and_goal_metadata_qualification() {
     );
     assert_eq!(
         thread_read.pointer("/thread/model").and_then(Value::as_str),
-        Some("gpt-6.1-sol")
+        Some("gpt-6.1-terra")
     );
     assert_eq!(
         thread_read
             .pointer("/thread/reasoningEffort")
             .and_then(Value::as_str),
-        Some("low")
+        Some("medium")
     );
     let first_turn_evidence = json!({
         "assistant_final_text":final_text,
@@ -738,7 +738,7 @@ fn native_rule_turn_and_goal_metadata_qualification() {
 
     let create_goal_args = json!({"thread":thread_id,
         "objective":"Verify goal create/edit/read metadata for this qualification thread",
-        "execution":{"model":"gpt-6.1-sol","reasoning_effort":"low"}});
+        "execution":{"model":"gpt-6.1-terra","reasoning_effort":"medium"}});
     assert!(create_goal_args.get("message_template").is_none());
     let created = mcp.call("create_goal", create_goal_args);
     assert_eq!(
@@ -826,7 +826,7 @@ fn native_rule_turn_and_goal_metadata_qualification() {
         "native_continuation_count":turns.len().saturating_sub(1),
         "explicit_message_template_supplied":false,
         "queue_thread_calls":0,
-        "create_goal_execution":{"model":"gpt-6.1-sol","reasoning_effort":"low",
+        "create_goal_execution":{"model":"gpt-6.1-terra","reasoning_effort":"medium",
             "prepare_and_readback_succeeded":true},
         "goal":"complete"
     });
