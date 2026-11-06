@@ -1250,8 +1250,14 @@ async fn run_command(
             if matches!(kind.as_str(), "thread" | "subagent") {
                 native_poll::arm(&database(&config)?, &id, &config.codex)?;
             }
-            let producer = producers::status(&database(&config)?, &id)?;
-            println!("{}", json!({"subscription_id":id,"producer":producer}));
+            let producer = database(&config).and_then(|db| producers::status(&db, &id));
+            let result = match producer {
+                Ok(producer) => json!({"subscription_id":id,"producer":producer}),
+                Err(error) => {
+                    json!({"subscription_id":id,"producer_error":observability::error_class(&error)})
+                }
+            };
+            println!("{result}");
         }
         "publish" => {
             let kind = required(&mut args, "--kind")?;

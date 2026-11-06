@@ -892,7 +892,10 @@ mod tests {
     #[test]
     fn connect_does_not_adopt_unmarked_obligations_database() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite3");
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
         let db = Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE obligations (unrelated TEXT)")
             .unwrap();
