@@ -36,6 +36,16 @@ pub(crate) fn socket_rpc(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
+    socket_rpc_with_notifications(socket, method, params, timeout).map(|(result, _)| result)
+}
+
+#[cfg(unix)]
+pub(crate) fn socket_rpc_with_notifications(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<(Value, Vec<Value>)> {
     use std::os::unix::net::UnixStream;
     use tungstenite::{Message, WebSocket};
 
@@ -57,13 +67,21 @@ pub(crate) fn socket_rpc(
         ws.send(Message::Text(message.to_string().into()))
             .context("Send Unix WebSocket RPC")
     }
-    fn receive(ws: &mut WebSocket<UnixStream>, deadline: Instant, id: &str) -> Result<Value> {
+    fn receive(
+        ws: &mut WebSocket<UnixStream>,
+        deadline: Instant,
+        id: &str,
+        notifications: &mut Vec<Value>,
+    ) -> Result<Value> {
         loop {
             timeouts(ws, deadline)?;
             match ws.read().context("Read Unix WebSocket RPC")? {
                 Message::Text(text) => {
                     let message =
                         serde_json::from_str(&text).context("Invalid Unix WebSocket RPC JSON")?;
+                    if message.get("method").and_then(Value::as_str).is_some() {
+                        notifications.push(message.clone());
+                    }
                     if let Some(result) = matched_response(message, id)? {
                         return Ok(result);
                     }
@@ -94,6 +112,7 @@ pub(crate) fn socket_rpc(
         }
         .context("App-server Unix WebSocket HTTP Upgrade failed")
     })?;
+    let mut notifications = Vec::new();
     let result = (|| {
         send(
             &mut ws,
@@ -101,7 +120,13 @@ pub(crate) fn socket_rpc(
             json!({"id":"codex-wake-initialize","method":"initialize",
             "params":{"clientInfo":{"name":"codex-wake","title":"Codex Wake","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}}),
         )?;
-        receive(&mut ws, deadline, "codex-wake-initialize")?;
+        receive(
+            &mut ws,
+            deadline,
+            "codex-wake-initialize",
+            &mut notifications,
+        )?;
+        notifications.clear();
         send(
             &mut ws,
             deadline,
@@ -112,7 +137,8 @@ pub(crate) fn socket_rpc(
             deadline,
             json!({"id":"codex-wake-request","method":method,"params":params}),
         )?;
-        receive(&mut ws, deadline, "codex-wake-request")
+        let result = receive(&mut ws, deadline, "codex-wake-request", &mut notifications)?;
+        Ok((result, std::mem::take(&mut notifications)))
     })();
     // Close only this client connection; the receiver owns the persistent server.
     if Instant::now() < deadline {
@@ -171,6 +197,29 @@ fn rpc_inner(method: &str, params: Value) -> Result<Value> {
     #[cfg(unix)]
     {
         socket_rpc(Path::new(&socket), method, params, TIMEOUT)
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("Codex Wake app-server requires Unix sockets")
+    }
+}
+
+pub fn rpc_with_notifications(
+    _codex: &Path,
+    method: &str,
+    params: Value,
+) -> Result<(Value, Vec<Value>)> {
+    let socket = rpc_socket(
+        std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    ).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or set CODEX_WAKE_RPC_SOCKET to its Unix socket"))?;
+    if !Path::new(&socket).try_exists()? {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or correct CODEX_WAKE_RPC_SOCKET").into());
+    }
+    #[cfg(unix)]
+    {
+        socket_rpc_with_notifications(Path::new(&socket), method, params, TIMEOUT)
     }
     #[cfg(not(unix))]
     {

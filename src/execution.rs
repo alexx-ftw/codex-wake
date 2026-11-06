@@ -270,10 +270,11 @@ pub fn queue_prepared(
     })
 }
 
-fn deliver_with(
+fn deliver_with_id(
     thread: &str,
     message: &str,
     options: &ExecutionOptions,
+    client_user_message_id: &str,
     call: &mut impl FnMut(&str, Value) -> Result<Value>,
 ) -> Result<(String, Option<String>)> {
     let thread = prepare_with(thread, options, false, call)?;
@@ -284,13 +285,22 @@ fn deliver_with(
             "model":options.model,
             "effort":options.reasoning_effort,
             "input":[{"type":"text","text":message,"text_elements":[]}],
-            "clientUserMessageId":Uuid::new_v4().to_string()
+            "clientUserMessageId":client_user_message_id
         }),
     );
     match result {
         Ok(_) => Ok(("queued".into(), Some("turn_start_accepted".into()))),
         Err(_) => Ok(("needs_attention".into(), Some("execution_api_error".into()))),
     }
+}
+
+fn deliver_with(
+    thread: &str,
+    message: &str,
+    options: &ExecutionOptions,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<(String, Option<String>)> {
+    deliver_with_id(thread, message, options, &Uuid::new_v4().to_string(), call)
 }
 
 /// Deliver a message, applying explicit execution options to the resumed thread and turn.
@@ -313,6 +323,42 @@ pub fn deliver(
     deliver_with(thread, message, options, &mut |method, params| {
         crate::goals::rpc(codex, method, params)
     })
+}
+
+/// Native delivery variant that retains notifications observed before the
+/// matching turn/start response. It does not infer missing notifications.
+pub fn deliver_with_identity_observed(
+    codex: &Path,
+    thread: &str,
+    message: &str,
+    options: &ExecutionOptions,
+    client_user_message_id: &str,
+) -> Result<(String, Option<String>, Vec<Value>)> {
+    let thread = prepare_with(thread, options, false, &mut |method, params| {
+        crate::goals::rpc(codex, method, params)
+    })?;
+    match crate::goals::rpc_with_notifications(
+        codex,
+        "turn/start",
+        json!({
+            "threadId":thread,
+            "model":options.model,
+            "effort":options.reasoning_effort,
+            "input":[{"type":"text","text":message,"text_elements":[]}],
+            "clientUserMessageId":client_user_message_id
+        }),
+    ) {
+        Ok((_, notifications)) => Ok((
+            "queued".into(),
+            Some("turn_start_accepted".into()),
+            notifications,
+        )),
+        Err(_) => Ok((
+            "needs_attention".into(),
+            Some("execution_api_error".into()),
+            Vec::new(),
+        )),
+    }
 }
 
 #[cfg(test)]

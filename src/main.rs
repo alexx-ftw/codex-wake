@@ -1,5 +1,6 @@
 mod bridge;
 mod circular_waits;
+mod delivery_evidence;
 mod execution;
 mod goals;
 mod host_cleanup;
@@ -325,6 +326,7 @@ fn goal_input_result(
 fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     manager::require_installed(config)?;
     let db = bridge::connect(&config.db)?;
+    delivery_evidence::initialize(&db)?;
     subscriptions::initialize(&db)?;
     rules::initialize(&db)?;
     polling::initialize(&db)?;
@@ -1315,6 +1317,7 @@ impl WakeTools {
             let waits = bridge::status(&db)?;
             let subscriptions = producers::subscriptions_status(&db)?;
             let rules = rules::status(&db)?;
+            let delivery_evidence = delivery_evidence::status(&db)?;
             let mut actionable = status_view::actionable(&waits, &subscriptions, &rules);
             let circular = circular_waits::status(&db)?;
             actionable
@@ -1327,6 +1330,7 @@ impl WakeTools {
                 "waits":waits,
                 "subscriptions":subscriptions,
                 "rules":rules,
+                "delivery_evidence":delivery_evidence,
                 "steers":steer::status(&db)?,
                 "circular_waits":circular,
                 "coordinator_alerts":obligations::coordinator_alerts_status(&db)?,
@@ -1776,7 +1780,7 @@ async fn run_command(
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             let db = database(&config)?;
             let value = if command == "status" {
-                bridge::status(&db)?
+                json!({"waits":bridge::status(&db)?,"delivery_evidence":delivery_evidence::status(&db)?})
             } else if command == "subscriptions" {
                 producers::subscriptions_status(&db)?
             } else {

@@ -321,6 +321,21 @@ thread. Goal actions first persist and read back the preset, then mutate the goa
 A busy thread or unavailable API produces an error rather than silently
 discarding the preset. A queue-only input cannot carry a per-turn override.
 
+## Duplicate recipient-delivery evidence
+
+Wake only labels a delivery duplicated after observing two distinct native
+`userMessage` item IDs with the same stable source event, destination chat, and
+`clientId`. The `item/started` and `item/completed` notifications for one item
+ID count once. An incoming webhook repeated by itself is not delivery evidence.
+
+Correlation uses live notifications received on the same native `turn/start`
+request socket. Rules, waits, and subscription dispatch can be observed when
+their source has a stable event ID. Polling can supply source event IDs to those
+dispatch paths; a poll result alone is not recipient evidence. Sources without
+a stable event ID, CLI sends, and `queue/add` remain `unknown`; the
+`clientUserMessageId`-to-`clientId` mapping for `queue/add` is unqualified.
+Queue acceptance is not confirmation that a warning was delivered.
+
 For an explicitly requested deferred handoff, `queue_thread` accepts
 `steer: true` (default `false`). It is incompatible with `resume: true` and
 `execution`; normal queue and resume behavior is unchanged. Wake renders the

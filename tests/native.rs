@@ -3,11 +3,12 @@ mod support;
 
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     env, fs,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     thread,
     time::{Duration, Instant},
@@ -212,6 +213,306 @@ fn completed_text(page: &Value) -> bool {
     let turn = page["data"].as_array().and_then(|turns| turns.first());
     let Some(turn) = turn else { return false };
     turn["status"] == "completed" && assistant_final_text(turn) == Some(TURN_MARKER)
+}
+
+fn stable_qualification_message_id(event_id: &str, thread_id: &str) -> String {
+    let identity = format!("codex-wake-qualification-v1:{event_id}:{thread_id}");
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn qualification_user_message(page: &Value, turn_id: &str, event_marker: &str) -> Option<Value> {
+    let turn = page["data"]
+        .as_array()?
+        .iter()
+        .find(|turn| turn["id"] == turn_id)?;
+    turn["items"].as_array()?.iter().find_map(|item| {
+        if item["type"] != "userMessage" {
+            return None;
+        }
+        let contains_event = item["content"].as_array().is_some_and(|content| {
+            content.iter().any(|entry| {
+                entry["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(event_marker))
+            })
+        });
+        contains_event.then(|| item.clone())
+    })
+}
+
+struct EphemeralThread {
+    rpc: NativeRpc,
+    id: Option<String>,
+}
+
+impl EphemeralThread {
+    fn cleanup(&mut self) -> &'static str {
+        let Some(id) = self.id.as_deref() else {
+            return "not_created";
+        };
+        if catch_unwind(AssertUnwindSafe(|| {
+            self.rpc.call("thread/delete", json!({"threadId":id}))
+        }))
+        .is_ok()
+        {
+            self.id = None;
+            return "deleted";
+        }
+        if catch_unwind(AssertUnwindSafe(|| {
+            self.rpc.call("thread/archive", json!({"threadId":id}))
+        }))
+        .is_ok()
+        {
+            self.id = None;
+            return "archived";
+        }
+        "cleanup_failed"
+    }
+}
+
+impl Drop for EphemeralThread {
+    fn drop(&mut self) {
+        if self.id.is_some() {
+            let outcome = self.cleanup();
+            if outcome == "cleanup_failed" {
+                eprintln!("could not delete or archive ephemeral qualification thread");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "creates one ephemeral thread and sends one qualification input; run only on a ready Codex host"]
+fn native_client_user_message_id_is_persisted_in_ephemeral_thread() {
+    let rpc = NativeRpc::connect();
+    let mut fixture = EphemeralThread { rpc, id: None };
+    let cwd = tempfile::tempdir().expect("create isolated ephemeral thread cwd");
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let event_marker = format!("codex-wake-qualification-event:{event_id}");
+    let report_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-results/native-client-id");
+    fs::create_dir_all(&report_dir).expect("create qualification report directory");
+    let report_path = report_dir.join(format!("{event_id}.json"));
+    let pending_path = report_dir.join("pending.json");
+    let mut pending = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)
+        .expect("an earlier qualification is unresolved; inspect its report before another send");
+    pending
+        .write_all(
+            json!({"state":"preparing","event_id":event_id})
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("persist one-shot qualification guard");
+    pending
+        .sync_all()
+        .expect("sync one-shot qualification guard");
+    drop(pending);
+    fs::write(
+        &report_path,
+        json!({"outcome":"prepared","event_id":event_id,"turn_start_calls":0}).to_string(),
+    )
+    .expect("persist qualification intent before creating the chat");
+    let started = fixture.rpc.call(
+        "thread/start",
+        json!({
+            "model":"gpt-6.1-terra",
+            "config":{"model_reasoning_effort":"medium"},
+            "cwd":cwd.path(),
+            "ephemeral":true,
+            "allowProviderModelFallback":false
+        }),
+    );
+    let thread_id = started
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .expect("thread/start returned a destination thread ID")
+        .to_owned();
+    uuid::Uuid::parse_str(&thread_id).expect("destination is a UUID");
+    fixture.id = Some(thread_id.clone());
+    fs::write(
+        &report_path,
+        json!({"outcome":"ephemeral_chat_created","event_id":event_id,
+            "destination_thread_id":thread_id,"turn_start_calls":0})
+        .to_string(),
+    )
+    .expect("persist exact destination identity");
+
+    let destination = fixture.rpc.call(
+        "thread/read",
+        json!({"threadId":thread_id,"includeTurns":false}),
+    );
+    let readback_thread_id = destination.pointer("/thread/id").and_then(Value::as_str);
+    if readback_thread_id != Some(thread_id.as_str()) {
+        fs::write(
+            &report_path,
+            json!({"outcome":"destination_readback_mismatch_no_input_sent","event_id":event_id,
+                "destination_thread_id":thread_id,"readback_thread_id":readback_thread_id,
+                "turn_start_calls":0})
+            .to_string(),
+        )
+        .expect("persist destination mismatch evidence");
+        let cleanup = fixture.cleanup();
+        assert_ne!(
+            cleanup, "cleanup_failed",
+            "mismatched ephemeral fixture could not be cleaned"
+        );
+        fs::remove_file(&pending_path).expect("clear guard after no-send cleanup");
+        panic!("thread/read did not confirm the exact ephemeral destination; no input was sent");
+    }
+    let baseline = fixture.rpc.turns(&thread_id);
+    let baseline_turn_count = baseline["data"].as_array().map_or(0, Vec::len);
+    if baseline_turn_count != 0 {
+        fs::write(
+            &report_path,
+            json!({"outcome":"fixture_not_empty_no_input_sent","event_id":event_id,
+                "destination_thread_id":thread_id,"baseline_turn_count":baseline_turn_count,
+                "turn_start_calls":0})
+            .to_string(),
+        )
+        .expect("persist contaminated fixture evidence");
+        let cleanup = fixture.cleanup();
+        assert_ne!(
+            cleanup, "cleanup_failed",
+            "contaminated ephemeral fixture could not be cleaned"
+        );
+        fs::remove_file(&pending_path).expect("clear guard after no-send cleanup");
+        panic!("ephemeral fixture chat was not empty; no input was sent");
+    }
+
+    let client_message_id = stable_qualification_message_id(&event_id, &thread_id);
+    let input = format!("{event_marker}\nReply exactly CODEX_WAKE_CLIENT_ID_OK.");
+    fs::write(
+        &report_path,
+        json!({"outcome":"turn_start_in_flight","event_id":event_id,
+            "destination_thread_id":thread_id,"client_user_message_id":client_message_id,
+            "event_marker":event_marker,"turn_start_calls":1})
+        .to_string(),
+    )
+    .expect("persist single-send intent before turn/start");
+    let mut pending = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&pending_path)
+        .expect("reopen one-shot qualification guard");
+    pending
+        .write_all(
+            json!({"state":"turn_start_in_flight","event_id":event_id,
+                "destination_thread_id":thread_id,"client_user_message_id":client_message_id,
+                "turn_start_calls":1})
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("record single-send intent");
+    pending
+        .sync_all()
+        .expect("sync single-send intent before turn/start");
+    drop(pending);
+    let accepted = fixture.rpc.call(
+        "turn/start",
+        json!({
+            "threadId":thread_id,
+            "model":"gpt-6.1-terra",
+            "effort":"medium",
+            "input":[{"type":"text","text":input,"text_elements":[]}],
+            "clientUserMessageId":client_message_id
+        }),
+    );
+    let accepted_turn_id = accepted
+        .pointer("/turn/id")
+        .and_then(Value::as_str)
+        .expect("turn/start returned a turn ID")
+        .to_owned();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut page = fixture.rpc.turns(&thread_id);
+    let mut user_message = qualification_user_message(&page, &accepted_turn_id, &event_marker);
+    while user_message.is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(1));
+        page = fixture.rpc.turns(&thread_id);
+        user_message = qualification_user_message(&page, &accepted_turn_id, &event_marker);
+    }
+    let observed_message_id = user_message
+        .as_ref()
+        .and_then(|message| message["id"].as_str());
+    let observed_client_id = user_message
+        .as_ref()
+        .and_then(|message| message["clientId"].as_str());
+    let observed_turn_count = page["data"].as_array().map_or(0, Vec::len);
+    let matching_count = page["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+        .filter(|item| item["type"] == "userMessage" && item["clientId"] == client_message_id)
+        .count();
+    let event_message_count = page["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|turn| turn["items"].as_array().into_iter().flatten())
+        .filter(|item| {
+            item["type"] == "userMessage"
+                && item["content"].as_array().is_some_and(|content| {
+                    content.iter().any(|entry| {
+                        entry["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(&event_marker))
+                    })
+                })
+        })
+        .count();
+
+    let cleanup = fixture.cleanup();
+    fs::write(
+        &report_path,
+        json!({
+            "outcome":if observed_client_id == Some(client_message_id.as_str()) && matching_count == 1 && event_message_count == 1 { "client_id_matched_persisted_user_message" } else { "client_id_mapping_not_confirmed" },
+            "event_id":event_id,
+            "destination_thread_id":thread_id,
+            "accepted_turn_id":accepted_turn_id,
+            "observed_turn_count":observed_turn_count,
+            "user_message_id":observed_message_id,
+            "persisted_user_message_content":user_message.as_ref().map(|message| &message["content"]),
+            "client_user_message_id":client_message_id,
+            "persisted_user_message_client_id":observed_client_id,
+            "matching_message_count":matching_count,
+            "event_marker_message_count":event_message_count,
+            "event_marker":event_marker,
+            "cleanup":cleanup
+        })
+        .to_string(),
+    )
+    .expect("persist event-chat-message evidence");
+    assert_ne!(
+        cleanup, "cleanup_failed",
+        "ephemeral fixture could not be deleted or archived"
+    );
+    fs::remove_file(&pending_path).expect("clear completed one-shot qualification guard");
+    assert_eq!(
+        observed_client_id,
+        Some(client_message_id.as_str()),
+        "protocol did not persist the submitted client ID on the matching user message"
+    );
+    assert_eq!(
+        observed_turn_count, 1,
+        "fresh ephemeral chat must contain exactly the qualification turn"
+    );
+    assert_eq!(
+        matching_count, 1,
+        "the exact event-destination ID must identify one persisted user message"
+    );
+    assert_eq!(
+        event_message_count, 1,
+        "the event marker must identify exactly one persisted user message"
+    );
 }
 
 #[cfg(test)]

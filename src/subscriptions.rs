@@ -124,6 +124,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
             source_json TEXT,
             execution_json TEXT,
             required_source TEXT,
+            source_event_key TEXT,
             UNIQUE(kind,repo,resource,event,thread)
         );
         CREATE INDEX IF NOT EXISTS subscriptions_ready ON subscriptions(state,updated);",
@@ -140,6 +141,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
             "source_json",
             "execution_json",
             "required_source",
+            "source_event_key",
         ] {
             if !columns.iter().any(|existing| existing == column) {
                 db.execute_batch(&format!(
@@ -386,7 +388,7 @@ fn ready(
     outcome: &str,
     source: &Value,
 ) -> Result<usize> {
-    let changed = ready_update(db, kind, repo, resource, event, outcome, source)?;
+    let changed = ready_update(db, kind, repo, resource, event, outcome, source, None)?;
     log_accept(kind, repo, resource, event, changed);
     Ok(changed)
 }
@@ -399,17 +401,32 @@ fn ready_update(
     event: &str,
     outcome: &str,
     source: &Value,
+    source_event_key: Option<&str>,
 ) -> Result<usize> {
     ensure!(valid_kind_event(kind, event), "Unsupported event");
+    let source_event_key = match source_event_key {
+        Some(key) => Some(key.to_owned()),
+        None => crate::delivery_evidence::subscription_event_identity(
+            kind, repo, resource, event, outcome, source,
+        )?,
+    };
     let source_json = serde_json::to_string(source)?;
     let changed = db.execute(
-        "UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL, \
-         source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?2 ELSE source_json END, \
+        "UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL,source_event_key=?2, \
+         source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?3 ELSE source_json END, \
          dependency_notice_state=CASE WHEN kind='dependency' AND event='recovered' AND dependency_notice_state='pending' THEN NULL ELSE dependency_notice_state END, \
          dependency_notice_after_ms=CASE WHEN kind='dependency' AND event='recovered' AND dependency_notice_state='pending' THEN NULL ELSE dependency_notice_after_ms END, \
          updated=CURRENT_TIMESTAMP \
-         WHERE kind=?3 AND repo=?4 AND resource=?5 AND event=?6 AND state='waiting'",
-        params![outcome, source_json, kind, repo, resource, event],
+         WHERE kind=?4 AND repo=?5 AND resource=?6 AND event=?7 AND state='waiting'",
+        params![
+            outcome,
+            source_event_key,
+            source_json,
+            kind,
+            repo,
+            resource,
+            event
+        ],
     )?;
     Ok(changed)
 }
@@ -520,6 +537,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
                 "submitted",
                 event,
                 payload,
+                None,
             )?;
             let specific = if event != "submitted" {
                 ready_update(
@@ -530,6 +548,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
                     event,
                     event,
                     payload,
+                    None,
                 )?
             } else {
                 0
@@ -739,6 +758,17 @@ pub fn publish_report(
     if let Some((execution, attempt)) = identity {
         crate::result_conflicts::validate_identity(execution, attempt)?;
     }
+    let source_event_key = if let Some((execution, attempt)) = identity {
+        let attempt = attempt.to_string();
+        let repo = format!("repo:{repo}");
+        let resource = format!("resource:{resource}");
+        Some(crate::delivery_evidence::source_fields_identity(
+            "codex-wake/subscription/job/job-execution/v1",
+            &[&repo, &resource, execution, &attempt, outcome],
+        )?)
+    } else {
+        None
+    };
     initialize(db)?;
     if kind == "dependency" && outcome == "progress" {
         return Ok((
@@ -759,7 +789,16 @@ pub fn publish_report(
     } else {
         Vec::new()
     };
-    let matched = ready_update(&tx, kind, repo, &resource, outcome, outcome, source)?;
+    let matched = ready_update(
+        &tx,
+        kind,
+        repo,
+        &resource,
+        outcome,
+        outcome,
+        source,
+        source_event_key.as_deref(),
+    )?;
     let resolved = crate::obligations::resolve_publication(&tx, kind, repo, &resource, outcome)?;
     tx.commit()?;
     log_accept(kind, repo, &resource, outcome, matched);
@@ -781,14 +820,14 @@ pub fn publish_observation(
     outcome: &str,
     source: &Value,
 ) -> Result<usize> {
-    let registration: Option<(String, String)> = db
+    let registration: Option<(String, String, String, String)> = db
         .query_row(
-            "SELECT kind,event FROM subscriptions WHERE id=?1 AND state='waiting'",
+            "SELECT kind,event,repo,resource FROM subscriptions WHERE id=?1 AND state='waiting'",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((kind, event)) = registration else {
+    let Some((kind, event, repo, resource)) = registration else {
         return Ok(0);
     };
     ensure!(
@@ -800,7 +839,10 @@ pub fn publish_observation(
         source_json.len() <= MAX_PAYLOAD_BYTES,
         "Payload exceeds 1 MiB"
     );
-    let changed=db.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL,source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?2 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='waiting'",params![outcome,source_json,id])?;
+    let source_event_key = crate::delivery_evidence::subscription_event_identity(
+        &kind, &repo, &resource, &event, outcome, source,
+    )?;
+    let changed=db.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL,source_event_key=?2,source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,source_event_key,source_json,id])?;
     crate::observability::emit(
         "event.accept",
         if changed > 0 {
@@ -1002,22 +1044,23 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
-                "SELECT id,kind,repo,resource,event,thread,outcome,message_template,source_json,execution_json,required_source FROM subscriptions \
+                "SELECT id,source_event_key,kind,repo,resource,event,thread,outcome,message_template,source_json,execution_json,required_source FROM subscriptions \
              WHERE state='ready' AND (reason IS NULL OR reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR updated<=datetime('now','-15 seconds')) ORDER BY updated,id LIMIT 1",
                 [],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
                         row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
                     ))
                 },
             )
@@ -1028,6 +1071,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
         transaction.commit()?;
         let Some((
             id,
+            source_event_key,
             kind,
             repo,
             resource,
@@ -1067,6 +1111,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
             .as_deref()
             .map(serde_json::from_str::<crate::execution::ExecutionOptions>)
             .transpose();
+        let mut native_observation = None;
         let result = match (message, options) {
             (Err(error), _) => Ok((
                 "needs_attention".to_owned(),
@@ -1079,6 +1124,31 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                     &error.to_string(),
                 )),
             )),
+            (Ok(message), Ok(Some(options))) => {
+                if let Some(event_key) = source_event_key.as_deref() {
+                    let (client_id, _) =
+                        crate::delivery_evidence::begin(db, event_key, &thread, true)?;
+                    match crate::execution::deliver_with_identity_observed(
+                        codex, &thread, &message, &options, &client_id,
+                    ) {
+                        Ok((state, reason, notifications)) => {
+                            native_observation =
+                                Some((event_key.to_owned(), client_id, notifications));
+                            Ok((state, reason))
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    crate::execution::deliver(
+                        codex,
+                        timeout,
+                        &thread,
+                        &message,
+                        true,
+                        Some(&options),
+                    )
+                }
+            }
             (Ok(message), Ok(options)) => {
                 crate::execution::deliver(codex, timeout, &thread, &message, true, options.as_ref())
             }
@@ -1101,6 +1171,18 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                 ),
             },
         };
+        if let Some((event_key, client_id, notifications)) = native_observation {
+            let (_, should_warn) = crate::delivery_evidence::record_notifications(
+                db,
+                &event_key,
+                &thread,
+                &client_id,
+                &notifications,
+            )?;
+            if should_warn {
+                crate::delivery_evidence::warn_once(db, codex, &event_key, &thread)?;
+            }
+        }
         db.execute(
             "UPDATE subscriptions SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='sending'",
             params![state, reason, id],
@@ -1840,6 +1922,76 @@ mod tests {
     }
 
     #[test]
+    fn review_event_identity_is_shared_and_payload_is_not_persisted_without_a_template() {
+        let db = db();
+        subscribe(&db, "review", "owner/repo", "7", "submitted", THREAD).unwrap();
+        subscribe(&db, "review", "owner/repo", "7", "approved", THREAD).unwrap();
+        let source = json!({
+            "action":"submitted",
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7},
+            "review":{"id":42,"state":"approved","body":"private review text"}
+        });
+        assert_eq!(accept(&db, "pull_request_review", &source).unwrap(), 2);
+        let expected = crate::delivery_evidence::subscription_event_identity(
+            "review",
+            "owner/repo",
+            "7",
+            "approved",
+            "approved",
+            &source,
+        )
+        .unwrap();
+        let rows = db
+            .prepare("SELECT source_event_key,source_json FROM subscriptions ORDER BY event")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, expected);
+        assert_eq!(rows[1].0, expected);
+        assert!(rows.iter().all(|(_, source)| source.is_none()));
+    }
+
+    #[test]
+    fn native_poll_publication_persists_its_turn_identity() {
+        let db = db();
+        let source_thread = "33333333-3333-4333-8333-333333333333";
+        let id = subscribe(&db, "thread", "", source_thread, "turn_completed", THREAD).unwrap();
+        let source = json!({"session_id":source_thread,"turnId":"turn-42","status":"completed"});
+        assert_eq!(
+            publish_observation(&db, &id, "turn_completed", &source).unwrap(),
+            1
+        );
+        let stored: String = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(stored),
+            crate::delivery_evidence::subscription_event_identity(
+                "thread",
+                "",
+                source_thread,
+                "turn_completed",
+                "turn_completed",
+                &source,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn agent_publication_atomically_resolves_only_matching_obligations() {
         let db = db();
         crate::obligations::initialize(&db).unwrap();
@@ -2102,6 +2254,21 @@ mod tests {
         .unwrap();
         assert_eq!(matched, 1);
         assert!(conflict.is_empty());
+        let event_key: String = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE resource='build'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            event_key,
+            crate::delivery_evidence::source_fields_identity(
+                "codex-wake/subscription/job/job-execution/v1",
+                &["repo:ci", "resource:build", "run-7", "1", "success"],
+            )
+            .unwrap()
+        );
         assert!(
             publish_report(
                 &db,

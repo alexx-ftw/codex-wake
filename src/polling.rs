@@ -1016,7 +1016,7 @@ fn scoped_subscription_accept(
         .map_err(|_| Failure::new("accept"))?;
     let ready = {
         let mut s = candidate
-            .prepare("SELECT id,outcome,reason,source_json FROM subscriptions WHERE state='ready'")
+            .prepare("SELECT id,outcome,reason,source_json,source_event_key FROM subscriptions WHERE state='ready'")
             .map_err(|_| Failure::new("database"))?;
         s.query_map([], |r| {
             Ok((
@@ -1024,6 +1024,7 @@ fn scoped_subscription_accept(
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(|_| Failure::new("database"))?
@@ -1034,8 +1035,8 @@ fn scoped_subscription_accept(
         .unchecked_transaction()
         .map_err(|_| Failure::new("database"))?;
     let mut count = 0;
-    for (id, outcome, reason, source) in ready {
-        count+=tx.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=?2,source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,reason,source,id]).map_err(|_|Failure::new("database"))?;
+    for (id, outcome, reason, source, source_event_key) in ready {
+        count+=tx.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=?2,source_event_key=?5,source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,reason,source,id,source_event_key]).map_err(|_|Failure::new("database"))?;
     }
     tx.commit().map_err(|_| Failure::new("database"))?;
     Ok(count)
@@ -1082,7 +1083,7 @@ fn rules_accept_scoped(
     crate::rules::accept(&candidate, header, payload).map_err(|_| Failure::new("accept"))?;
     let pending = {
         let mut s = candidate
-            .prepare("SELECT rule_id,event_header,comment_id,source FROM rule_deliveries")
+            .prepare("SELECT rule_id,event_header,comment_id,source,source_event_key,event_identity_verified FROM rule_deliveries")
             .map_err(|_| Failure::new("database"))?;
         s.query_map([], |r| {
             Ok((
@@ -1090,6 +1091,8 @@ fn rules_accept_scoped(
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })
         .map_err(|_| Failure::new("database"))?
@@ -1100,8 +1103,8 @@ fn rules_accept_scoped(
         .unchecked_transaction()
         .map_err(|_| Failure::new("database"))?;
     let mut count = 0;
-    for (id, event, comment, source) in pending {
-        count+=tx.execute("INSERT OR IGNORE INTO rule_deliveries(rule_id,event_header,comment_id,source) VALUES(?1,?2,?3,?4)",params![id,event,comment,source]).map_err(|_|Failure::new("database"))?;
+    for (id, event, comment, source, source_event_key, identity_verified) in pending {
+        count+=tx.execute("INSERT OR IGNORE INTO rule_deliveries(rule_id,event_header,comment_id,source,source_event_key,event_identity_verified) VALUES(?1,?2,?3,?4,?5,?6)",params![id,event,comment,source,source_event_key,identity_verified]).map_err(|_|Failure::new("database"))?;
     }
     tx.commit().map_err(|_| Failure::new("database"))?;
     Ok(count)
@@ -1275,6 +1278,102 @@ mod tests {
             r.get(0)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn scoped_polling_copies_the_stable_event_key_from_its_candidate_database() {
+        let db = db();
+        let id = subscribe(&db, "review", "42", "approved");
+        let source = json!({
+            "action":"submitted",
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":42},
+            "review":{"id":77,"state":"approved"}
+        });
+        assert_eq!(
+            scoped_subscription_accept(
+                &db,
+                "pull_request_review",
+                &source,
+                "owner/repo",
+                "42",
+                None,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(registration_state(&db, &id), "ready");
+        let stored: String = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(stored),
+            crate::delivery_evidence::subscription_event_identity(
+                "review",
+                "owner/repo",
+                "42",
+                "approved",
+                "approved",
+                &source,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_comment_polling_copies_event_identity_to_rule_delivery() {
+        let db = db();
+        let rule: crate::rules::RuleInput = serde_json::from_value(json!({
+            "repo":"owner/repo",
+            "pr":42,
+            "author":"alice",
+            "author_type":"User",
+            "contains":"ship it",
+            "prompt":"Review the existing task",
+            "target_thread":"11111111-1111-4111-8111-111111111111"
+        }))
+        .unwrap();
+        let rule_id = crate::rules::configure(&db, rule).unwrap();
+        db.execute(
+            "UPDATE rules SET updated='2025-01-01 00:00:00' WHERE id=?1",
+            [&rule_id],
+        )
+        .unwrap();
+        let source = json!({
+            "action":"created",
+            "repository":{"full_name":"owner/repo"},
+            "issue":{"number":42,"pull_request":{"url":"https://api.github.com/repos/owner/repo/pulls/42"}},
+            "comment":{"id":77,"user":{"login":"alice","type":"User"},"body":"please ship it"}
+        });
+        assert_eq!(
+            rules_accept_scoped(
+                &db,
+                "issue_comment",
+                &source,
+                "owner/repo",
+                42,
+                "2026-01-02T00:00:00Z",
+            )
+            .unwrap(),
+            1
+        );
+        let stored: (String, bool) = db
+            .query_row(
+                "SELECT source_event_key,event_identity_verified FROM rule_deliveries WHERE rule_id=?1",
+                [&rule_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(stored.0),
+            crate::delivery_evidence::github_comment_event_identity("issue_comment", &source)
+                .unwrap()
+        );
+        assert!(stored.1);
     }
 
     #[test]
