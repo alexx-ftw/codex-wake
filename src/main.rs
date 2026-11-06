@@ -10,6 +10,7 @@ mod observers;
 mod polling;
 mod probe;
 mod rules;
+mod status_view;
 mod steer;
 mod subscriptions;
 mod telemetry;
@@ -798,8 +799,12 @@ impl WakeTools {
     fn get_status(&self) -> CallToolResult {
         tool_result((|| {
             let db = database(&self.config)?;
+            let waits = bridge::status(&db)?;
+            let subscriptions = subscriptions::status(&db)?;
+            let rules = rules::status(&db)?;
+            let actionable = status_view::actionable(&waits, &subscriptions, &rules);
             Ok(
-                json!({"receiver": manager::status(&self.config)?, "waits": bridge::status(&db)?, "subscriptions":subscriptions::status(&db)?,"rules":rules::status(&db)?,"steers":steer::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
+                json!({"actionable":actionable,"receiver": manager::status(&self.config)?, "waits": waits, "subscriptions":subscriptions,"rules":rules,"steers":steer::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
             )
         })())
     }
@@ -1283,6 +1288,31 @@ mod hook_output_tests {
             obligations::pending(&database(&config).unwrap(), thread)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn actionable_uses_persisted_delivery_status_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = bridge::connect(&temp.path().join("wake.sqlite3")).unwrap();
+        subscriptions::initialize(&db).unwrap();
+        rules::initialize(&db).unwrap();
+        db.execute_batch("INSERT INTO waits(repo,run_id,attempt,thread,sha,state,reason) VALUES('owner/repo',42,2,'11111111-1111-4111-8111-111111111111','abc','needs_attention','timeout_delivery_unknown');
+            INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome) VALUES('dep','dependency','provider','db','recovered','11111111-1111-4111-8111-111111111111','queued','recovered');").unwrap();
+        let result = status_view::actionable(
+            &bridge::status(&db).unwrap(),
+            &subscriptions::status(&db).unwrap(),
+            &rules::status(&db).unwrap(),
+        );
+        assert_eq!(result.as_array().unwrap().len(), 2);
+        assert_eq!(result[0]["evidence"]["run_id"], 42);
+        assert_eq!(result[0]["evidence"]["reason"], "timeout_delivery_unknown");
+        assert_eq!(result[1]["evidence"]["resource"], "db");
+        assert!(
+            result[1]["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("execution is not verified")
         );
     }
 

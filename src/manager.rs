@@ -194,6 +194,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("observers.rs").as_slice(),
         include_bytes!("native_poll.rs").as_slice(),
         include_bytes!("steer.rs").as_slice(),
+        include_bytes!("status_view.rs").as_slice(),
         include_bytes!("../Cargo.lock").as_slice(),
         HOOKS.as_bytes(),
     ] {

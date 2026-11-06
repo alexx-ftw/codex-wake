@@ -405,6 +405,13 @@ or uncertain warning is never blindly retried. Inspect the target chat before
 resolving ambiguous records. Exactly-once delivery across SQLite and the Codex
 CLI cannot be guaranteed without an idempotent acknowledgement protocol.
 
+MCP `get_status` places deliveries needing attention and dependency recovery
+subscriptions in `actionable`. Each entry includes the original status evidence,
+an optional link to the destination chat, and a suggested next action. The
+underlying `waits`, `subscriptions` and `rules` inventories remain available.
+An event matching a recovery subscription does not by itself prove that the
+destination chat resumed or that its work completed.
+
 Every continuation contains fixed routing metadata rather than webhook message
 text. It grants no new authority. The receiving agent verifies the event at its
 source and continues only the existing authorized task.
