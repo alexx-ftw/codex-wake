@@ -68,7 +68,9 @@ pub fn initialize(db: &Connection) -> Result<()> {
             state TEXT NOT NULL CHECK(state IN ('sending','queued','ready','needs_attention')),
             reason TEXT,
             created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            sender_pid INTEGER,
+            sender_start INTEGER
         );
         CREATE TABLE IF NOT EXISTS obligation_transfers (
             id TEXT PRIMARY KEY,
@@ -88,7 +90,29 @@ pub fn initialize(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS obligation_transfers_target
             ON obligation_transfers(target_thread, state);",
     )?;
+    let columns = {
+        let mut statement = db.prepare("PRAGMA table_info(coordinator_alerts)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !columns.iter().any(|column| column == "sender_pid") {
+        db.execute_batch("ALTER TABLE coordinator_alerts ADD COLUMN sender_pid INTEGER")?;
+    }
+    if !columns.iter().any(|column| column == "sender_start") {
+        db.execute_batch("ALTER TABLE coordinator_alerts ADD COLUMN sender_start INTEGER")?;
+    }
     Ok(())
+}
+
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 pub fn register_coordinator(db: &Connection, responsible: &str, coordinator: &str) -> Result<()> {
@@ -128,10 +152,21 @@ pub fn claim_coordinator_alert(
         "{:x}",
         Sha256::digest(format!("{responsible}:{coordinator}:{fingerprint}").as_bytes())
     );
+    let sender_pid = i64::from(std::process::id());
+    let sender_start =
+        process_start_time(std::process::id()).and_then(|started| i64::try_from(started).ok());
     let inserted = db.execute(
-        "INSERT OR IGNORE INTO coordinator_alerts(id,responsible,coordinator,message,state)
-         VALUES (?1,?2,?3,?4,'sending')",
-        params![id, responsible, coordinator, message],
+        "INSERT OR IGNORE INTO coordinator_alerts
+            (id,responsible,coordinator,message,state,sender_pid,sender_start)
+         VALUES (?1,?2,?3,?4,'sending',?5,?6)",
+        params![
+            id,
+            responsible,
+            coordinator,
+            message,
+            sender_pid,
+            sender_start
+        ],
     )?;
     Ok((inserted == 1).then_some((id, coordinator)))
 }
@@ -147,7 +182,8 @@ pub fn finish_coordinator_alert(
         "Invalid coordinator alert state"
     );
     db.execute(
-        "UPDATE coordinator_alerts SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='sending'",
+        "UPDATE coordinator_alerts SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP,
+         sender_pid=NULL,sender_start=NULL WHERE id=?3 AND state='sending'",
         params![state, reason, id],
     )?;
     Ok(())
@@ -155,18 +191,38 @@ pub fn finish_coordinator_alert(
 
 pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert>> {
     let mut statement = db.prepare(
-        "SELECT id,responsible,coordinator,state,reason,created
+        "SELECT id,responsible,coordinator,state,reason,created,sender_pid,sender_start
          FROM coordinator_alerts ORDER BY rowid DESC LIMIT 25",
     )?;
     let rows = statement.query_map([], |row| {
-        Ok(CoordinatorAlert {
+        let mut alert = CoordinatorAlert {
             id: row.get(0)?,
             responsible: row.get(1)?,
             coordinator: row.get(2)?,
             state: row.get(3)?,
             reason: row.get(4)?,
             created: row.get(5)?,
-        })
+        };
+        if alert.state == "sending" {
+            let pid = row.get::<_, Option<i64>>(6)?;
+            let started = row.get::<_, Option<i64>>(7)?;
+            let sender_is_live = match (pid, started) {
+                (Some(pid), Some(started)) if u32::try_from(pid).is_ok() && started >= 0 => {
+                    process_start_time(pid as u32) == Some(started as u64)
+                }
+                _ => false,
+            };
+            if sender_is_live {
+                alert.reason.get_or_insert_with(|| {
+                    "A sender process is still alive; its delivery result is not recorded yet."
+                        .into()
+                });
+            } else {
+                alert.state = "uncertain".into();
+                alert.reason = Some("The sender process is not verifiably alive; delivery may have been abandoned. Receipt is unknown, and Wake will not resend it automatically.".into());
+            }
+        }
+        Ok(alert)
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -884,5 +940,90 @@ mod tests {
                 .1,
             OTHER
         );
+    }
+
+    #[test]
+    fn abandoned_sending_alert_is_reported_uncertain_without_mutation_or_replay() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, THREAD, OTHER).unwrap();
+        let (id, _) = claim_coordinator_alert(&db, THREAD, "turn-uncertain", "pending check")
+            .unwrap()
+            .unwrap();
+
+        let live = coordinator_alerts_status(&db).unwrap();
+        assert_eq!(live[0].state, "sending");
+
+        db.execute(
+            "UPDATE coordinator_alerts SET sender_pid=?1,sender_start=?2 WHERE id=?3",
+            params![i64::MAX, 0, id],
+        )
+        .unwrap();
+        let uncertain = coordinator_alerts_status(&db).unwrap();
+        assert_eq!(uncertain[0].state, "uncertain");
+        assert!(
+            uncertain[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("may have been abandoned")
+        );
+        assert!(
+            uncertain[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("will not resend")
+        );
+        assert!(
+            claim_coordinator_alert(&db, THREAD, "turn-uncertain", "pending check")
+                .unwrap()
+                .is_none()
+        );
+
+        let persisted: (String, Option<String>) = db
+            .query_row(
+                "SELECT state,reason FROM coordinator_alerts WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("sending".into(), None));
+    }
+
+    #[test]
+    fn pre_identity_sending_rows_migrate_to_read_only_uncertain_status() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE coordinator_alerts (
+                id TEXT PRIMARY KEY,responsible TEXT NOT NULL,coordinator TEXT NOT NULL,
+                message TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,
+                created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO coordinator_alerts(id,responsible,coordinator,message,state)
+            VALUES ('legacy','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                    'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','pending','sending');",
+        )
+        .unwrap();
+
+        initialize(&db).unwrap();
+        let alerts = coordinator_alerts_status(&db).unwrap();
+        assert_eq!(alerts[0].state, "uncertain");
+        assert!(
+            alerts[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("delivery may have been abandoned")
+        );
+        let persisted: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, "sending");
     }
 }

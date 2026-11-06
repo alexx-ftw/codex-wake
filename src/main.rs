@@ -416,11 +416,7 @@ fn notify_coordinator(
         .map(|message| message.chars().take(2048).collect::<String>())
         .filter(|message| !message.trim().is_empty())
         .unwrap_or_else(|| "Unavailable in the Stop hook payload.".into());
-    let fingerprint = serde_json::to_string(&json!({
-        "source":source,
-        "turn":payload["turn_id"].as_str().unwrap_or("no_turn_id"),
-        "pending_ids":obligations.iter().map(|obligation| &obligation.id).collect::<Vec<_>>()
-    }))?;
+    let fingerprint = coordinator_alert_fingerprint(source, payload, &obligations, &last)?;
     let descriptions = obligations
         .iter()
         .map(|obligation| {
@@ -481,6 +477,35 @@ fn notify_coordinator(
         1,
     );
     Ok(Some((coordinator, state)))
+}
+
+fn coordinator_alert_fingerprint(
+    source: &str,
+    payload: &Value,
+    pending: &[obligations::Obligation],
+    last_message: &str,
+) -> Result<String> {
+    let pending_ids = pending
+        .iter()
+        .map(|obligation| &obligation.id)
+        .collect::<Vec<_>>();
+    let turn_id = payload["turn_id"]
+        .as_str()
+        .filter(|turn_id| !turn_id.is_empty());
+    let event = match turn_id {
+        Some(turn_id) => json!({
+            "source": source,
+            "turn": turn_id,
+            "pending_ids": pending_ids,
+        }),
+        None => json!({
+            "source": source,
+            "turn": "no_turn_id",
+            "pending_ids": pending_ids,
+            "last_assistant_message": last_message,
+        }),
+    };
+    Ok(serde_json::to_string(&event)?)
 }
 
 fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
@@ -1267,7 +1292,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Read local receiver health, supported events and delivery states. queued means acceptance, not verified execution.",
+        description = "Read local receiver health, supported events and delivery states. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
         annotations(read_only_hint = true)
     )]
     fn get_status(&self) -> CallToolResult {
@@ -1754,6 +1779,77 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn no_turn_id_alert_fingerprint_distinguishes_messages_and_deduplicates_reentry() {
+        let source = "11111111-1111-4111-8111-111111111111";
+        let pending = vec![obligations::Obligation {
+            id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            thread: source.into(),
+            kind: "artifact".into(),
+            repo: "owner/repo".into(),
+            resource: "release-notes".into(),
+            outcome: "published".into(),
+            description: "Publish notes".into(),
+        }];
+        let payload = json!({"session_id":source});
+        let first = coordinator_alert_fingerprint(
+            source,
+            &payload,
+            &pending,
+            "Release notes still need signing.",
+        )
+        .unwrap();
+        let reentry = coordinator_alert_fingerprint(
+            source,
+            &payload,
+            &pending,
+            "Release notes still need signing.",
+        )
+        .unwrap();
+        let next_stop = coordinator_alert_fingerprint(
+            source,
+            &payload,
+            &pending,
+            "Signing is complete; upload remains.",
+        )
+        .unwrap();
+        assert_eq!(first, reentry);
+        assert_ne!(first, next_stop);
+
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        obligations::initialize(&db).unwrap();
+        obligations::register_coordinator(&db, source, "22222222-2222-4222-8222-222222222222")
+            .unwrap();
+        assert!(
+            obligations::claim_coordinator_alert(&db, source, &first, "first stop")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            obligations::claim_coordinator_alert(&db, source, &reentry, "reentry")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            obligations::claim_coordinator_alert(&db, source, &next_stop, "next stop")
+                .unwrap()
+                .is_some()
+        );
+
+        let payload_with_turn = json!({"session_id":source,"turn_id":"turn-7"});
+        assert_eq!(
+            coordinator_alert_fingerprint(source, &payload_with_turn, &pending, "first message")
+                .unwrap(),
+            coordinator_alert_fingerprint(
+                source,
+                &payload_with_turn,
+                &pending,
+                "reentrant payload update"
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn subscription_reports_failures_after_registration_without_losing_id() {

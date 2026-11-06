@@ -405,8 +405,17 @@ alert. Wake persists the alert before sending and never retries the same
 fingerprinted event automatically. An uncertain send remains recorded for
 inspection; queue acceptance still does not prove that the coordinator read it.
 If the hook has no turn ID, Wake sends at most one alert for the same pending
-obligation set; resolving or replacing an obligation allows a later alert.
+obligation set and last assistant message; a changed message can identify a
+later Stop, while an identical reentrant hook remains deduplicated. In `get_status`,
+a `sending` alert whose sender process is no longer verifiably alive appears as
+`uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
+not resend it. A live sender remains `sending`; this read-only diagnosis does
+not establish receipt or execution and does not alter the sending record.
 `get_status` includes the latest 25 persisted alerts and their send state.
+`uncertain` is a read-only interpretation of a persisted `sending` row whose
+recorded sender PID and process start time no longer match a live process; older
+rows without that identity are also uncertain. It does not prove whether the
+coordinator received or acted on the message.
 
 An agent can explicitly register a committed, pending check with
 `register_validation`. Wake does not infer checks from conversation. The same
