@@ -139,7 +139,8 @@ fn receiver_path() -> Option<PathBuf> {
     env::var_os("CODEX_WAKE_WEBHOOK")
         .map(PathBuf::from)
         .or_else(|| {
-            let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            let local = env::current_dir()
+                .ok()?
                 .join(".tools/webhook-linux-amd64/webhook");
             local.is_file().then_some(local)
         })
@@ -170,7 +171,6 @@ fn start_receiver(
             "-hooks",
             "hooks.json.tmpl",
         ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("CODEX_WAKE_EXECUTABLE", env!("CARGO_BIN_EXE_codex-wake"))
         .env("CODEX_WAKE_DB", db)
         .env("CODEX_WAKE_CODEX", codex)
