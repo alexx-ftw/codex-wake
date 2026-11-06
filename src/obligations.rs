@@ -1,6 +1,6 @@
 //! Persistent obligations, independent of notification delivery state.
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -30,6 +30,16 @@ pub struct Transfer {
     pub state: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CoordinatorAlert {
+    pub id: String,
+    pub responsible: String,
+    pub coordinator: String,
+    pub state: String,
+    pub reason: Option<String>,
+    pub created: String,
+}
+
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS obligations (
@@ -45,6 +55,21 @@ pub fn initialize(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS obligations_pending ON obligations(thread, resolved);
         CREATE INDEX IF NOT EXISTS obligations_publication
             ON obligations(kind, repo, resource, outcome, resolved);
+        CREATE TABLE IF NOT EXISTS coordinators (
+            responsible TEXT PRIMARY KEY,
+            coordinator TEXT NOT NULL,
+            CHECK(responsible != coordinator)
+        );
+        CREATE TABLE IF NOT EXISTS coordinator_alerts (
+            id TEXT PRIMARY KEY,
+            responsible TEXT NOT NULL,
+            coordinator TEXT NOT NULL,
+            message TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('sending','queued','ready','needs_attention')),
+            reason TEXT,
+            created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS obligation_transfers (
             id TEXT PRIMARY KEY,
             obligation_id TEXT NOT NULL,
@@ -64,6 +89,86 @@ pub fn initialize(db: &Connection) -> Result<()> {
             ON obligation_transfers(target_thread, state);",
     )?;
     Ok(())
+}
+
+pub fn register_coordinator(db: &Connection, responsible: &str, coordinator: &str) -> Result<()> {
+    let responsible = Uuid::parse_str(responsible)?.to_string();
+    let coordinator = Uuid::parse_str(coordinator)?.to_string();
+    ensure!(
+        responsible != coordinator,
+        "A chat cannot coordinate itself"
+    );
+    db.execute(
+        "INSERT INTO coordinators(responsible, coordinator) VALUES (?1, ?2)
+         ON CONFLICT(responsible) DO UPDATE SET coordinator=excluded.coordinator",
+        params![responsible, coordinator],
+    )?;
+    Ok(())
+}
+
+/// Persist before sending. Existing event IDs are never sent again, including after an uncertain result.
+pub fn claim_coordinator_alert(
+    db: &Connection,
+    responsible: &str,
+    fingerprint: &str,
+    message: &str,
+) -> Result<Option<(String, String)>> {
+    let responsible = Uuid::parse_str(responsible)?.to_string();
+    let Some(coordinator) = db
+        .query_row(
+            "SELECT coordinator FROM coordinators WHERE responsible=?1",
+            [&responsible],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let id = format!(
+        "{:x}",
+        Sha256::digest(format!("{responsible}:{coordinator}:{fingerprint}").as_bytes())
+    );
+    let inserted = db.execute(
+        "INSERT OR IGNORE INTO coordinator_alerts(id,responsible,coordinator,message,state)
+         VALUES (?1,?2,?3,?4,'sending')",
+        params![id, responsible, coordinator, message],
+    )?;
+    Ok((inserted == 1).then_some((id, coordinator)))
+}
+
+pub fn finish_coordinator_alert(
+    db: &Connection,
+    id: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        matches!(state, "queued" | "ready" | "needs_attention"),
+        "Invalid coordinator alert state"
+    );
+    db.execute(
+        "UPDATE coordinator_alerts SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='sending'",
+        params![state, reason, id],
+    )?;
+    Ok(())
+}
+
+pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert>> {
+    let mut statement = db.prepare(
+        "SELECT id,responsible,coordinator,state,reason,created
+         FROM coordinator_alerts ORDER BY rowid DESC LIMIT 25",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(CoordinatorAlert {
+            id: row.get(0)?,
+            responsible: row.get(1)?,
+            coordinator: row.get(2)?,
+            state: row.get(3)?,
+            reason: row.get(4)?,
+            created: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn validate_publication_identity(kind: &str, repo: &str, resource: &str) -> Result<()> {
@@ -720,5 +825,64 @@ mod tests {
         assert!(pending(&db, THREAD).unwrap().is_empty());
         assert_eq!(pending(&db, OTHER).unwrap()[0].id, obligation_id);
         assert_eq!(pending_transfers(&db, OTHER).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn coordinator_alert_is_persisted_and_never_reclaimed_after_uncertain_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, THREAD, OTHER).unwrap();
+        let claimed = claim_coordinator_alert(&db, THREAD, "turn-1", "pending check: smoke")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.1, OTHER);
+        finish_coordinator_alert(&db, &claimed.0, "needs_attention", Some("timeout")).unwrap();
+        drop(db);
+
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        assert!(
+            claim_coordinator_alert(&db, THREAD, "turn-1", "pending check: smoke")
+                .unwrap()
+                .is_none()
+        );
+        let saved: (String, String, String) = db
+            .query_row(
+                "SELECT message,state,reason FROM coordinator_alerts WHERE id=?1",
+                [&claimed.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            (
+                "pending check: smoke".into(),
+                "needs_attention".into(),
+                "timeout".into()
+            )
+        );
+    }
+
+    #[test]
+    fn coordinator_registration_is_explicit_idempotent_and_cannot_self_target() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        assert!(
+            claim_coordinator_alert(&db, THREAD, "turn-1", "alert")
+                .unwrap()
+                .is_none()
+        );
+        assert!(register_coordinator(&db, THREAD, THREAD).is_err());
+        register_coordinator(&db, THREAD, OTHER).unwrap();
+        register_coordinator(&db, &THREAD.to_uppercase(), &OTHER.to_uppercase()).unwrap();
+        assert_eq!(
+            claim_coordinator_alert(&db, THREAD, "turn-1", "alert")
+                .unwrap()
+                .unwrap()
+                .1,
+            OTHER
+        );
     }
 }

@@ -17,6 +17,10 @@ fn invoke(payload: Value) -> std::process::Output {
 }
 
 fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
+    invoke_with_codex(payload, temp, "/nonexistent/codex-wake-test-codex")
+}
+
+fn invoke_with_codex(payload: Value, temp: &std::path::Path, codex: &str) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_codex-wake"))
@@ -24,10 +28,11 @@ fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
             "--db",
             temp.join("state.sqlite3").to_str().unwrap(),
             "--codex",
-            "/nonexistent/codex-wake-test-codex",
+            codex,
             "hook",
         ])
         .env("XDG_STATE_HOME", temp)
+        .env("WAKE_TEST_CALLS", temp.join("codex-calls"))
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .stdin(Stdio::piped())
@@ -42,6 +47,89 @@ fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
         .write_all(payload.to_string().as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn stop_notifies_only_the_explicit_coordinator_once_with_obligation_and_last_info() {
+    let temp = tempfile::tempdir().unwrap();
+    let responsible = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$WAKE_TEST_CALLS\"\n",
+    );
+    let initial = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(initial.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Publish signed release notes')", [responsible]).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [responsible, coordinator],
+    )
+    .unwrap();
+
+    for ignored in [
+        json!({"hook_event_name":"SubagentStop","session_id":responsible,"agent_id":"33333333-3333-4333-8333-333333333333","turn_id":"turn-1"}),
+        json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1","stop_hook_active":true}),
+    ] {
+        let result = invoke_with_codex(ignored, temp.path(), codex.to_str().unwrap());
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!temp.path().join("codex-calls").exists());
+    }
+
+    let payload = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1","last_assistant_message":"Release notes are still waiting on signing."});
+    let first = invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap());
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let output: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains(coordinator)
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let again = invoke_with_codex(payload, temp.path(), codex.to_str().unwrap());
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    let (message, state): (String, String) = db
+        .query_row("SELECT message,state FROM coordinator_alerts", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert!(message.contains("Publish signed release notes"));
+    assert!(message.contains("Release notes are still waiting on signing."));
+    assert!(message.contains("not establish task completion or abandonment"));
+    assert_eq!(state, "queued");
 }
 
 #[test]

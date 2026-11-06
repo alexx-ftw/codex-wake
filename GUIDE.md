@@ -145,10 +145,14 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `subscribe` | Register another exact source/resource/event and destination |
 | `publish_result` | Publish a verified provider result and dispatch matching waits |
 | `register_obligation` | Record a chat's pending result publication |
+| `register_coordinator` | Explicitly set the coordinator for a responsible chat |
 | `list_obligations` | List a chat's pending publications |
 | `resolve_obligation` | Resolve a pending obligation explicitly |
+| `propose_obligation_transfer` | Propose transferring a pending obligation to another chat |
+| `list_obligation_transfers` | List transfer proposals addressed to a chat |
+| `accept_obligation_transfer` | Accept a proposal and become responsible |
 | `get_result_conflicts` | Read paginated evidence for an exact job execution and attempt |
-| `get_status` | Inspect local receiver health, CI waits and subscriptions |
+| `get_status` | Inspect local receiver health, CI waits, subscriptions and recent coordinator alert states |
 | `recover_ready` | Dispatch stored ready events; never retry ambiguous deliveries |
 | `configure_rule` | Match a PR comment and create or message a thread |
 | `queue_thread` | Render and queue an input, optionally resuming the thread |
@@ -382,6 +386,24 @@ it, and the loop guard permits a pending obligation to survive the current turn.
 The hook checks a database snapshot: an obligation registered after that check
 is eligible for a later stop. Delivery recovery failures are reported
 separately from a publication already committed.
+
+`propose_obligation_transfer` records a proposed recipient, goal, status, tests,
+and next step while leaving responsibility with the source chat. The recipient
+can inspect it with `list_obligation_transfers` and take ownership only by
+calling `accept_obligation_transfer` from that chat.
+
+`register_coordinator` explicitly associates a responsible chat with its
+coordinator. On a root `Stop` hook with pending obligations, Wake queues one
+alert to that coordinator with the pending descriptions and the hook's
+`last_assistant_message` when available. The alert says that a turn stopped;
+`Stop` does not establish completion or abandonment. `SubagentStop`, repeated
+Stop-loop hooks, and chats without an explicit coordinator do not trigger this
+alert. Wake persists the alert before sending and never retries the same
+fingerprinted event automatically. An uncertain send remains recorded for
+inspection; queue acceptance still does not prove that the coordinator read it.
+If the hook has no turn ID, Wake sends at most one alert for the same pending
+obligation set; resolving or replacing an obligation allows a later alert.
+`get_status` includes the latest 25 persisted alerts and their send state.
 
 An agent can explicitly register a committed, pending check with
 `register_validation`. Wake does not infer checks from conversation. The same

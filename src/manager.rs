@@ -1023,12 +1023,14 @@ fn observe_queues(config: &Config) -> Result<()> {
     let db = crate::bridge::connect(&config.db)?;
     crate::steer::initialize(&db)?;
     crate::circular_waits::initialize(&db)?;
+    crate::obligations::initialize(&db)?;
     for (table, operation) in [
         ("waits", "queue.waits"),
         ("subscriptions", "queue.subscriptions"),
         ("rule_deliveries", "queue.rules"),
         ("steers", "queue.steers"),
         ("circular_notices", "queue.circular_notices"),
+        ("coordinator_alerts", "queue.coordinator_alerts"),
     ] {
         let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table} GROUP BY state"))?;
         let rows = statement.query_map([], |r| {
