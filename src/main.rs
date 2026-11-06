@@ -1455,7 +1455,7 @@ mod hook_output_tests {
     #[test]
     fn actionable_uses_persisted_delivery_status_evidence() {
         let temp = tempfile::tempdir().unwrap();
-        let db = bridge::connect(&temp.path().join("wake.sqlite3")).unwrap();
+        let db = bridge::connect(&temp.path().join("state/wake.sqlite3")).unwrap();
         subscriptions::initialize(&db).unwrap();
         rules::initialize(&db).unwrap();
         db.execute_batch("INSERT INTO waits(repo,run_id,attempt,thread,sha,state,reason) VALUES('owner/repo',42,2,'11111111-1111-4111-8111-111111111111','abc','needs_attention','timeout_delivery_unknown');
