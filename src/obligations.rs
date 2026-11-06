@@ -1,6 +1,6 @@
 //! Persistent obligations, independent of notification delivery state.
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -17,6 +17,19 @@ pub struct Obligation {
     pub description: String,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Transfer {
+    pub id: String,
+    pub obligation: Obligation,
+    pub source_thread: String,
+    pub target_thread: String,
+    pub goal: String,
+    pub status: String,
+    pub tests: String,
+    pub next_step: String,
+    pub state: String,
+}
+
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS obligations (
@@ -31,7 +44,24 @@ pub fn initialize(db: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS obligations_pending ON obligations(thread, resolved);
         CREATE INDEX IF NOT EXISTS obligations_publication
-            ON obligations(kind, repo, resource, outcome, resolved);",
+            ON obligations(kind, repo, resource, outcome, resolved);
+        CREATE TABLE IF NOT EXISTS obligation_transfers (
+            id TEXT PRIMARY KEY,
+            obligation_id TEXT NOT NULL,
+            source_thread TEXT NOT NULL,
+            target_thread TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            status TEXT NOT NULL,
+            tests TEXT NOT NULL,
+            next_step TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'accepted')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            accepted_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS obligation_transfers_pending
+            ON obligation_transfers(obligation_id) WHERE state='pending';
+        CREATE INDEX IF NOT EXISTS obligation_transfers_target
+            ON obligation_transfers(target_thread, state);",
     )?;
     Ok(())
 }
@@ -58,6 +88,198 @@ pub fn validate_publication_identity(kind: &str, repo: &str, resource: &str) -> 
         Uuid::parse_str(resource).context("Invalid source UUID")?;
     }
     Ok(())
+}
+
+/// Create a durable proposal while leaving the obligation owned by its source chat.
+pub fn propose_transfer(
+    db: &mut Connection,
+    obligation_id: &str,
+    source_thread: &str,
+    target_thread: &str,
+    goal: &str,
+    status: &str,
+    tests: &str,
+    next_step: &str,
+) -> Result<Transfer> {
+    let obligation_id = Uuid::parse_str(obligation_id)
+        .context("Invalid obligation UUID")?
+        .to_string();
+    let target_thread = Uuid::parse_str(target_thread)
+        .context("Invalid target thread UUID")?
+        .to_string();
+    let source_thread = Uuid::parse_str(source_thread)
+        .context("Invalid source thread UUID")?
+        .to_string();
+    for (label, value) in [
+        ("Goal", goal),
+        ("Status", status),
+        ("Tests", tests),
+        ("Next step", next_step),
+    ] {
+        ensure!(!value.trim().is_empty(), "{label} is empty");
+        ensure!(
+            value.len() <= MAX_DESCRIPTION_BYTES,
+            "{label} exceeds 2048 bytes"
+        );
+    }
+
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let obligation = tx.query_row(
+        "SELECT id, thread, kind, repo, resource, outcome, description
+         FROM obligations WHERE id=?1 AND resolved=0",
+        [&obligation_id],
+        |row| {
+            Ok(Obligation {
+                id: row.get(0)?,
+                thread: row.get(1)?,
+                kind: row.get(2)?,
+                repo: row.get(3)?,
+                resource: row.get(4)?,
+                outcome: row.get(5)?,
+                description: row.get(6)?,
+            })
+        },
+    )?;
+    ensure!(
+        obligation.thread == source_thread,
+        "Only the current owner can propose a transfer"
+    );
+    ensure!(
+        obligation.thread != target_thread,
+        "Target already owns this obligation"
+    );
+    let id = Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO obligation_transfers
+            (id, obligation_id, source_thread, target_thread, goal, status, tests, next_step)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            id,
+            obligation.id,
+            obligation.thread,
+            target_thread,
+            goal,
+            status,
+            tests,
+            next_step
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Transfer {
+        id,
+        source_thread: obligation.thread.clone(),
+        target_thread,
+        goal: goal.to_owned(),
+        status: status.to_owned(),
+        tests: tests.to_owned(),
+        next_step: next_step.to_owned(),
+        state: "pending".into(),
+        obligation,
+    })
+}
+
+/// List proposals for the recipient; only that thread may accept them.
+pub fn pending_transfers(db: &Connection, target_thread: &str) -> Result<Vec<Transfer>> {
+    let target_thread = Uuid::parse_str(target_thread)
+        .context("Invalid target thread UUID")?
+        .to_string();
+    let mut statement = db.prepare(
+        "SELECT t.id, t.source_thread, t.target_thread, t.goal, t.status, t.tests,
+                t.next_step, t.state, o.id, o.thread, o.kind, o.repo, o.resource,
+                o.outcome, o.description
+         FROM obligation_transfers t JOIN obligations o ON o.id=t.obligation_id
+         WHERE t.target_thread=?1 AND t.state='pending' AND o.resolved=0 ORDER BY t.rowid",
+    )?;
+    let rows = statement.query_map([target_thread], |row| {
+        Ok(Transfer {
+            id: row.get(0)?,
+            source_thread: row.get(1)?,
+            target_thread: row.get(2)?,
+            goal: row.get(3)?,
+            status: row.get(4)?,
+            tests: row.get(5)?,
+            next_step: row.get(6)?,
+            state: row.get(7)?,
+            obligation: Obligation {
+                id: row.get(8)?,
+                thread: row.get(9)?,
+                kind: row.get(10)?,
+                repo: row.get(11)?,
+                resource: row.get(12)?,
+                outcome: row.get(13)?,
+                description: row.get(14)?,
+            },
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Atomically move responsibility after explicit acceptance by the proposed recipient.
+pub fn accept_transfer(
+    db: &mut Connection,
+    transfer_id: &str,
+    recipient_thread: &str,
+) -> Result<Transfer> {
+    let transfer_id = Uuid::parse_str(transfer_id)
+        .context("Invalid transfer UUID")?
+        .to_string();
+    let recipient_thread = Uuid::parse_str(recipient_thread)
+        .context("Invalid recipient thread UUID")?
+        .to_string();
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (obligation_id, source_thread, target_thread, goal, status, tests, next_step) = tx
+        .query_row(
+            "SELECT obligation_id, source_thread, target_thread, goal, status, tests, next_step
+         FROM obligation_transfers WHERE id=?1 AND state='pending'",
+            [&transfer_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+    ensure!(
+        target_thread == recipient_thread,
+        "Only the proposed recipient can accept"
+    );
+    ensure!(
+        tx.execute(
+            "UPDATE obligations SET thread=?1 WHERE id=?2 AND thread=?3 AND resolved=0",
+            params![target_thread, obligation_id, source_thread],
+        )? == 1,
+        "Obligation is no longer pending with its original owner"
+    );
+    tx.execute(
+        "UPDATE obligation_transfers SET state='accepted', accepted_at=CURRENT_TIMESTAMP
+         WHERE id=?1 AND state='pending'",
+        [&transfer_id],
+    )?;
+    let obligation = tx.query_row(
+        "SELECT id, thread, kind, repo, resource, outcome, description FROM obligations WHERE id=?1",
+        [&obligation_id],
+        |row| Ok(Obligation {
+            id: row.get(0)?, thread: row.get(1)?, kind: row.get(2)?, repo: row.get(3)?,
+            resource: row.get(4)?, outcome: row.get(5)?, description: row.get(6)?,
+        }),
+    )?;
+    tx.commit()?;
+    Ok(Transfer {
+        id: transfer_id,
+        obligation,
+        source_thread,
+        target_thread,
+        goal,
+        status,
+        tests,
+        next_step,
+        state: "accepted".into(),
+    })
 }
 
 fn publication_resource(kind: &str, repo: &str, resource: &str, outcome: &str) -> Result<String> {
@@ -219,6 +441,31 @@ mod tests {
 
     const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const OTHER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    fn transfer_input(db: &mut Connection) -> (String, String) {
+        let obligation = register(
+            db,
+            THREAD,
+            "artifact",
+            "ci",
+            "result",
+            "available",
+            "Publish the report",
+        )
+        .unwrap();
+        let transfer = propose_transfer(
+            db,
+            &obligation,
+            THREAD,
+            OTHER,
+            "Finish report",
+            "In progress",
+            "Unit checks pending",
+            "Run the focused checks",
+        )
+        .unwrap();
+        (obligation, transfer.id)
+    }
 
     #[test]
     fn pagination_reaches_every_pending_obligation() {
@@ -391,5 +638,87 @@ mod tests {
             .query_row("SELECT state FROM deliveries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(state, "needs_attention");
+    }
+
+    #[test]
+    fn proposal_keeps_original_owner_until_recipient_accepts_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        let (obligation_id, transfer_id) = transfer_input(&mut db);
+        assert_eq!(pending(&db, THREAD).unwrap()[0].id, obligation_id);
+        assert!(pending(&db, OTHER).unwrap().is_empty());
+        assert_eq!(pending_transfers(&db, OTHER).unwrap()[0].id, transfer_id);
+        assert!(
+            propose_transfer(
+                &mut db,
+                &obligation_id,
+                OTHER,
+                THREAD,
+                "Wrong owner",
+                "In progress",
+                "Not run",
+                "Continue",
+            )
+            .is_err()
+        );
+        assert!(accept_transfer(&mut db, &transfer_id, THREAD).is_err());
+        drop(db);
+
+        let mut db = Connection::open(path).unwrap();
+        initialize(&db).unwrap();
+        let accepted = accept_transfer(&mut db, &transfer_id, OTHER).unwrap();
+        assert_eq!(accepted.state, "accepted");
+        assert_eq!(accepted.goal, "Finish report");
+        assert_eq!(accepted.status, "In progress");
+        assert_eq!(accepted.tests, "Unit checks pending");
+        assert_eq!(accepted.next_step, "Run the focused checks");
+        assert!(pending(&db, THREAD).unwrap().is_empty());
+        assert_eq!(pending(&db, OTHER).unwrap()[0].id, obligation_id);
+        assert!(pending_transfers(&db, OTHER).unwrap().is_empty());
+        assert!(accept_transfer(&mut db, &transfer_id, OTHER).is_err());
+    }
+
+    #[test]
+    fn concurrent_acceptance_transfers_responsibility_once() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        initialize(&db).unwrap();
+        let (obligation_id, transfer_id) = transfer_input(&mut db);
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let transfer_id = transfer_id.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut db = Connection::open(path).unwrap();
+                    db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    accept_transfer(&mut db, &transfer_id, OTHER).is_ok()
+                })
+            })
+            .collect();
+        let accepted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count();
+        assert_eq!(accepted, 1);
+
+        let db = Connection::open(path).unwrap();
+        assert!(pending(&db, THREAD).unwrap().is_empty());
+        assert_eq!(pending(&db, OTHER).unwrap()[0].id, obligation_id);
+        assert_eq!(pending_transfers(&db, OTHER).unwrap().len(), 0);
     }
 }

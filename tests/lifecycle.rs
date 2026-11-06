@@ -62,6 +62,9 @@ fn concurrent_mcp_sessions_share_receiver_and_closing_them_preserves_it() {
             "register_obligation",
             "list_obligations",
             "resolve_obligation",
+            "propose_obligation_transfer",
+            "list_obligation_transfers",
+            "accept_obligation_transfer",
             "register_validation",
             "resolve_validation",
         ] {

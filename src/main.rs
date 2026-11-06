@@ -186,6 +186,35 @@ struct ObligationListInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ObligationTransferInput {
+    obligation_id: String,
+    source_thread: String,
+    target_thread: String,
+    /// Goal the recipient is being asked to pursue.
+    goal: String,
+    /// Current work status, including any blocker.
+    status: String,
+    /// Checks already run and their results, or checks still pending.
+    tests: String,
+    /// Concrete next action for the recipient.
+    next_step: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ObligationTransferListInput {
+    target_thread: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AcceptObligationTransferInput {
+    transfer_id: String,
+    recipient_thread: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ThreadInput {
     thread: String,
 }
@@ -938,6 +967,63 @@ impl WakeTools {
     }
 
     #[tool(
+        description = "Propose transferring a pending obligation with its goal, current status, tests, and next step. The source chat remains responsible until the named recipient explicitly accepts.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn propose_obligation_transfer(
+        &self,
+        Parameters(input): Parameters<ObligationTransferInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let mut db = database(&self.config)?;
+            Ok(json!({"transfer":obligations::propose_transfer(
+                &mut db,
+                &input.obligation_id,
+                &input.source_thread,
+                &input.target_thread,
+                &input.goal,
+                &input.status,
+                &input.tests,
+                &input.next_step,
+            )?}))
+        })())
+    }
+
+    #[tool(
+        description = "List pending obligation-transfer proposals addressed to a chat. The listed chat can explicitly accept a proposal.",
+        annotations(read_only_hint = true)
+    )]
+    fn list_obligation_transfers(
+        &self,
+        Parameters(input): Parameters<ObligationTransferListInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            Ok(json!({"transfers":obligations::pending_transfers(
+                &database(&self.config)?,
+                &input.target_thread,
+            )?}))
+        })())
+    }
+
+    #[tool(
+        description = "Explicitly accept an obligation transfer addressed to this recipient chat. Acceptance atomically changes the responsible chat.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn accept_obligation_transfer(
+        &self,
+        Parameters(input): Parameters<AcceptObligationTransferInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let mut db = database(&self.config)?;
+            Ok(json!({"transfer":obligations::accept_transfer(
+                &mut db,
+                &input.transfer_id,
+                &input.recipient_thread,
+            )?}))
+        })())
+    }
+
+    #[tool(
         description = "Resolve an obligation explicitly when publication is no longer needed.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -1093,6 +1179,9 @@ impl rmcp::ServerHandler for WakeTools {
             "resolve_circular_wait" => "mcp.resolve_circular_wait",
             "list_obligations" => "mcp.list_obligations",
             "resolve_obligation" => "mcp.resolve_obligation",
+            "propose_obligation_transfer" => "mcp.propose_obligation_transfer",
+            "list_obligation_transfers" => "mcp.list_obligation_transfers",
+            "accept_obligation_transfer" => "mcp.accept_obligation_transfer",
             "register_validation" => "mcp.register_validation",
             "resolve_validation" => "mcp.resolve_validation",
             "get_result_conflicts" => "mcp.get_result_conflicts",

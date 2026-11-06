@@ -938,6 +938,22 @@ mod tests {
     }
 
     #[test]
+    fn connect_does_not_adopt_unmarked_obligation_transfers_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE obligation_transfers (id TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+    }
+
+    #[test]
     fn connect_creates_private_directory_and_database() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("private/state.sqlite3");

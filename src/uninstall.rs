@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -197,6 +197,18 @@ mod tests {
         crate::obligations::initialize(&db).unwrap();
         crate::validation_obligations::initialize(&db).unwrap();
         crate::circular_waits::initialize(&db).unwrap();
+        let application_id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, DATABASE_ID);
+        let transfer_table: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='obligation_transfers')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(transfer_table);
         crate::result_conflicts::record(
             &db,
             "ci",
@@ -294,6 +306,27 @@ mod tests {
         assert!(has_scope_links);
         drop(db);
         validate_external_database(&path).unwrap();
+    }
+
+    #[test]
+    fn transfer_table_does_not_bypass_application_id_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE obligation_transfers(id TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let application_id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, 0);
     }
 
     #[test]
