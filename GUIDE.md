@@ -334,6 +334,9 @@ their source has a stable event ID. Polling can supply source event IDs to those
 dispatch paths; a poll result alone is not recipient evidence. Sources without
 a stable event ID, CLI sends, and `queue/add` remain `unknown`; the
 `clientUserMessageId`-to-`clientId` mapping for `queue/add` is unqualified.
+Subscription identity includes its exact event and outcome. Base/ref transitions
+and pull request synchronization remain unknown when only old/new refs or commit
+SHAs are available, since those values can recur.
 Queue acceptance is not confirmation that a warning was delivered.
 
 For an explicitly requested deferred handoff, `queue_thread` accepts

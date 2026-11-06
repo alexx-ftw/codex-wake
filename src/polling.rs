@@ -1603,6 +1603,14 @@ mod tests {
             .unwrap();
             assert_eq!(registration_state(&db, &id), expected);
         }
+        let event_key: Option<String> = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_key, None);
     }
 
     #[test]
@@ -1623,6 +1631,16 @@ mod tests {
             assert_eq!(calls, 1);
             assert_eq!(registration_state(&db, &head), expected);
             assert_eq!(registration_state(&db, &base), expected);
+        }
+        for id in [&head, &base] {
+            let event_key: Option<String> = db
+                .query_row(
+                    "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(event_key, None);
         }
     }
 

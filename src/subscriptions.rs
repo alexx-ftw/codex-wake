@@ -759,13 +759,13 @@ pub fn publish_report(
         crate::result_conflicts::validate_identity(execution, attempt)?;
     }
     let source_event_key = if let Some((execution, attempt)) = identity {
-        let attempt = attempt.to_string();
-        let repo = format!("repo:{repo}");
-        let resource = format!("resource:{resource}");
-        Some(crate::delivery_evidence::source_fields_identity(
-            "codex-wake/subscription/job/job-execution/v1",
-            &[&repo, &resource, execution, &attempt, outcome],
-        )?)
+        let source = json!({"workflow_run":{"id":execution,"run_attempt":attempt}});
+        Some(
+            crate::delivery_evidence::subscription_event_identity(
+                kind, repo, &resource, outcome, outcome, &source,
+            )?
+            .context("Missing stable execution event identity")?,
+        )
     } else {
         None
     };
@@ -1922,7 +1922,8 @@ mod tests {
     }
 
     #[test]
-    fn review_event_identity_is_shared_and_payload_is_not_persisted_without_a_template() {
+    fn review_routes_have_distinct_event_identity_and_payload_is_not_persisted_without_a_template()
+    {
         let db = db();
         subscribe(&db, "review", "owner/repo", "7", "submitted", THREAD).unwrap();
         subscribe(&db, "review", "owner/repo", "7", "approved", THREAD).unwrap();
@@ -1933,7 +1934,7 @@ mod tests {
             "review":{"id":42,"state":"approved","body":"private review text"}
         });
         assert_eq!(accept(&db, "pull_request_review", &source).unwrap(), 2);
-        let expected = crate::delivery_evidence::subscription_event_identity(
+        let approved = crate::delivery_evidence::subscription_event_identity(
             "review",
             "owner/repo",
             "7",
@@ -1942,6 +1943,28 @@ mod tests {
             &source,
         )
         .unwrap();
+        let submitted = crate::delivery_evidence::subscription_event_identity(
+            "review",
+            "owner/repo",
+            "7",
+            "submitted",
+            "approved",
+            &source,
+        )
+        .unwrap();
+        assert_ne!(approved, submitted);
+        assert_ne!(
+            crate::delivery_evidence::client_user_message_id(
+                approved.as_deref().unwrap(),
+                THREAD,
+            )
+            .unwrap(),
+            crate::delivery_evidence::client_user_message_id(
+                submitted.as_deref().unwrap(),
+                THREAD,
+            )
+            .unwrap()
+        );
         let rows = db
             .prepare("SELECT source_event_key,source_json FROM subscriptions ORDER BY event")
             .unwrap()
@@ -1955,8 +1978,8 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, expected);
-        assert_eq!(rows[1].0, expected);
+        assert_eq!(rows[0].0, approved);
+        assert_eq!(rows[1].0, submitted);
         assert!(rows.iter().all(|(_, source)| source.is_none()));
     }
 
@@ -2262,10 +2285,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            event_key,
-            crate::delivery_evidence::source_fields_identity(
-                "codex-wake/subscription/job/job-execution/v1",
-                &["repo:ci", "resource:build", "run-7", "1", "success"],
+            Some(event_key),
+            crate::delivery_evidence::subscription_event_identity(
+                "job",
+                "ci",
+                "build",
+                "success",
+                "success",
+                &json!({"workflow_run":{"id":"run-7","run_attempt":1}}),
             )
             .unwrap()
         );
@@ -2502,6 +2529,14 @@ mod tests {
             ).unwrap(),
             1
         );
+        let base_change_identity: Option<String> = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE event='base_changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(base_change_identity, None);
 
         let review_payload = |state: &str| json!({"action":"submitted","pull_request":{"number":42},"review":{"state":state},"repository":{"full_name":"owner/repo"}});
         for (state, event) in [

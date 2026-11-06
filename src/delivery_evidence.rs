@@ -121,6 +121,8 @@ fn subscription_identity(
     kind: &str,
     repo: &str,
     resource: &str,
+    event: &str,
+    outcome: &str,
     identity_kind: &str,
     components: Vec<Option<String>>,
 ) -> Result<Option<String>> {
@@ -128,7 +130,12 @@ fn subscription_identity(
         return Ok(None);
     };
     let scope = format!("codex-wake/subscription/{kind}/{identity_kind}/v1");
-    let mut fields = vec![format!("repo:{repo}"), format!("resource:{resource}")];
+    let mut fields = vec![
+        format!("repo:{repo}"),
+        format!("resource:{resource}"),
+        format!("event:{event}"),
+        format!("outcome:{outcome}"),
+    ];
     fields.extend(components);
     let fields = fields.iter().map(String::as_str).collect::<Vec<_>>();
     Ok(Some(source_fields_identity(&scope, &fields)?))
@@ -146,17 +153,6 @@ pub fn subscription_event_identity(
 ) -> Result<Option<String>> {
     let explicit_id = identity_component(source.get("event_id").or_else(|| source.get("eventId")));
     let (identity_kind, components) = match (kind, event) {
-        ("pull_request", "synchronize") => (
-            "pull-request-head",
-            vec![identity_component(source.pointer("/pull_request/head/sha"))],
-        ),
-        ("pull_request", "base_changed") => (
-            "pull-request-base-change",
-            vec![
-                identity_component(source.pointer("/changes/base/ref")),
-                identity_component(source.pointer("/pull_request/base/ref")),
-            ],
-        ),
         ("pull_request", "merged") => (
             "pull-request-merged",
             vec![identity_component(
@@ -178,13 +174,6 @@ pub fn subscription_event_identity(
         ("deployment", _) => (
             "deployment-status",
             vec![identity_component(source.pointer("/deployment_status/id"))],
-        ),
-        ("git_ref", "updated") => (
-            "git-ref-update",
-            vec![
-                identity_component(source.get("ref")),
-                identity_component(source.get("after")),
-            ],
         ),
         ("job", _) => {
             let run_id = identity_component(source.pointer("/workflow_run/id"))
@@ -215,13 +204,27 @@ pub fn subscription_event_identity(
         _ if explicit_id.is_some() => ("explicit-event", vec![explicit_id.clone()]),
         _ => return Ok(None),
     };
-    if let Some(key) = subscription_identity(kind, repo, resource, identity_kind, components)? {
+    if let Some(key) = subscription_identity(
+        kind,
+        repo,
+        resource,
+        event,
+        outcome,
+        identity_kind,
+        components,
+    )? {
         return Ok(Some(key));
     }
     match explicit_id {
-        Some(id) if identity_kind != "explicit-event" => {
-            subscription_identity(kind, repo, resource, "explicit-event", vec![Some(id)])
-        }
+        Some(id) if identity_kind != "explicit-event" => subscription_identity(
+            kind,
+            repo,
+            resource,
+            event,
+            outcome,
+            "explicit-event",
+            vec![Some(id)],
+        ),
         _ => Ok(None),
     }
 }
@@ -579,7 +582,7 @@ mod tests {
         let first = serde_json::json!({"review":{"id":42,"body":"first"}});
         let changed = serde_json::json!({"review":{"id":42,"body":"changed"}});
         let other = serde_json::json!({"review":{"id":43,"body":"first"}});
-        let first = subscription_event_identity(
+        let submitted = subscription_event_identity(
             "review",
             "owner/repo",
             "7",
@@ -589,21 +592,38 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let submitted_retry = subscription_event_identity(
+            "review",
+            "owner/repo",
+            "7",
+            "submitted",
+            "approved",
+            &changed,
+        )
+        .unwrap()
+        .unwrap();
+        let approved = subscription_event_identity(
+            "review",
+            "owner/repo",
+            "7",
+            "approved",
+            "approved",
+            &changed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(submitted, submitted_retry);
         assert_eq!(
-            Some(first.as_str()),
-            subscription_event_identity(
-                "review",
-                "owner/repo",
-                "7",
-                "approved",
-                "approved",
-                &changed,
-            )
-            .unwrap()
-            .as_deref()
+            client_user_message_id(&submitted, THREAD).unwrap(),
+            client_user_message_id(&submitted_retry, THREAD).unwrap()
+        );
+        assert_ne!(submitted, approved);
+        assert_ne!(
+            client_user_message_id(&submitted, THREAD).unwrap(),
+            client_user_message_id(&approved, THREAD).unwrap()
         );
         assert_ne!(
-            Some(first.as_str()),
+            Some(submitted.as_str()),
             subscription_event_identity(
                 "review",
                 "owner/repo",
@@ -626,6 +646,134 @@ mod tests {
                 &serde_json::json!({"delivery_id":"retry-1","message":"same content is not an event ID"}),
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn reusable_refs_and_commit_shas_do_not_verify_event_identity() {
+        let base_change = serde_json::json!({
+            "changes":{"base":{"from":"A","to":"B"}},
+            "pull_request":{"base":{}}
+        });
+        assert_eq!(
+            None,
+            subscription_event_identity(
+                "pull_request",
+                "owner/repo",
+                "7",
+                "base_changed",
+                "base_changed",
+                &base_change,
+            )
+            .unwrap()
+        );
+        for (old, new) in [("A", "B"), ("B", "A"), ("A", "B"), ("B", "A")] {
+            let base_change = serde_json::json!({
+                "changes":{"base":{"ref":old}},
+                "pull_request":{"base":{"ref":new}}
+            });
+            assert_eq!(
+                None,
+                subscription_event_identity(
+                    "pull_request",
+                    "owner/repo",
+                    "7",
+                    "base_changed",
+                    "base_changed",
+                    &base_change,
+                )
+                .unwrap()
+            );
+        }
+        let identified_base_change = serde_json::json!({
+            "event_id":"base-change-event-1",
+            "changes":{"base":{"from":"A","to":"B"}},
+            "pull_request":{"base":{}}
+        });
+        let identified = subscription_event_identity(
+            "pull_request",
+            "owner/repo",
+            "7",
+            "base_changed",
+            "base_changed",
+            &identified_base_change,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            Some(identified.as_str()),
+            subscription_event_identity(
+                "pull_request",
+                "owner/repo",
+                "7",
+                "base_changed",
+                "base_changed",
+                &identified_base_change,
+            )
+            .unwrap()
+            .as_deref()
+        );
+        assert_eq!(
+            None,
+            subscription_event_identity(
+                "pull_request",
+                "owner/repo",
+                "7",
+                "synchronize",
+                "synchronize",
+                &serde_json::json!({"pull_request":{"head":{"sha":"reused-sha"}}}),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            None,
+            subscription_event_identity(
+                "git_ref",
+                "owner/repo",
+                "main",
+                "updated",
+                "updated",
+                &serde_json::json!({"ref":"refs/heads/main","after":"reused-sha"}),
+            )
+            .unwrap()
+        );
+
+        let retry = serde_json::json!({"event_id":"push-event-1","after":"reused-sha"});
+        let first = subscription_event_identity(
+            "git_ref",
+            "owner/repo",
+            "main",
+            "updated",
+            "updated",
+            &retry,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            Some(first.as_str()),
+            subscription_event_identity(
+                "git_ref",
+                "owner/repo",
+                "main",
+                "updated",
+                "updated",
+                &retry,
+            )
+            .unwrap()
+            .as_deref()
+        );
+        assert_ne!(
+            Some(first.as_str()),
+            subscription_event_identity(
+                "git_ref",
+                "owner/repo",
+                "main",
+                "updated",
+                "updated",
+                &serde_json::json!({"event_id":"push-event-2","after":"reused-sha"}),
+            )
+            .unwrap()
+            .as_deref()
         );
     }
 
