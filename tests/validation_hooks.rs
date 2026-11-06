@@ -38,7 +38,9 @@ fn hook(dir: &std::path::Path, payload: Value) -> Value {
 
 #[test]
 fn stop_reminds_only_the_owner_and_does_not_resolve_validation() {
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let owner = "11111111-1111-4111-8111-111111111111";
     let other = "22222222-2222-4222-8222-222222222222";
     let stop = |thread| json!({"hook_event_name":"Stop", "session_id":thread, "turn_id":"turn1"});
