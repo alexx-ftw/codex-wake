@@ -1795,12 +1795,14 @@ mod tests {
                 Ok(("queued".into(), None))
             })
             .unwrap(),
-            0
+            1
         );
-        let (state, reason): (String, String) = db.query_row("SELECT dependency_notice_state,dependency_notice_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!(state, "needs_attention");
+        let (generation, reason): (i64, String) = db.query_row("SELECT generation,reason FROM dependency_notice_uncertainties WHERE subscription_id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(generation, 1);
         assert!(reason.starts_with("send_outcome_unknown:"));
-        assert_eq!(sends, 0);
+        let current: (i64, String) = db.query_row("SELECT dependency_notice_generation,dependency_notice_state FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(current, (2, "queued".to_owned()));
+        assert_eq!(sends, 1);
     }
 
     #[test]

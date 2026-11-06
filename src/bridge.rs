@@ -912,7 +912,10 @@ mod tests {
     fn connect_does_not_adopt_unmarked_circular_tables() {
         for table in ["circular_waits", "circular_notices"] {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("state.sqlite3");
+            let parent = dir.path().join("state");
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = parent.join("state.sqlite3");
             let db = Connection::open(&path).unwrap();
             db.execute_batch(&format!(
                 "CREATE TABLE {table} (unrelated TEXT); INSERT INTO {table} VALUES ('keep');"
@@ -940,7 +943,10 @@ mod tests {
     #[test]
     fn connect_does_not_adopt_unmarked_obligation_transfers_database() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite3");
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
         let db = Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE obligation_transfers (id TEXT)")
             .unwrap();
@@ -956,7 +962,10 @@ mod tests {
     #[test]
     fn connect_does_not_adopt_unmarked_dependency_uncertainties_table() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.sqlite3");
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
         let db = Connection::open(&path).unwrap();
         db.execute_batch("CREATE TABLE dependency_notice_uncertainties (subscription_id TEXT,generation INTEGER,reason TEXT,recorded_at_ms INTEGER); INSERT INTO dependency_notice_uncertainties VALUES ('foreign',7,'keep',42);").unwrap();
         drop(db);

@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn wake_validation_scope_links_table_is_accepted_for_uninstall() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state.sqlite3");
+        let path = temp.path().join("state").join("state.sqlite3");
         let db = crate::bridge::connect(&path).unwrap();
         crate::obligations::initialize(&db).unwrap();
         crate::validation_obligations::initialize(&db).unwrap();
