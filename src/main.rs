@@ -1780,7 +1780,7 @@ async fn run_command(
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             let db = database(&config)?;
             let value = if command == "status" {
-                json!({"waits":bridge::status(&db)?,"delivery_evidence":delivery_evidence::status(&db)?})
+                bridge::status(&db)?
             } else if command == "subscriptions" {
                 producers::subscriptions_status(&db)?
             } else {
