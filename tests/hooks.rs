@@ -57,7 +57,7 @@ fn stop_notifies_only_the_explicit_coordinator_once_with_obligation_and_last_inf
     let codex = temp.path().join("codex");
     executable(
         &codex,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$WAKE_TEST_CALLS\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$WAKE_TEST_CALLS\"\n",
     );
     let initial = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1"});
     assert!(
@@ -101,11 +101,8 @@ fn stop_notifies_only_the_explicit_coordinator_once_with_obligation_and_last_inf
             .contains(coordinator)
     );
     assert_eq!(
-        std::fs::read_to_string(temp.path().join("codex-calls"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "queue\n"
     );
 
     let again = invoke_with_codex(payload, temp.path(), codex.to_str().unwrap());
@@ -115,11 +112,8 @@ fn stop_notifies_only_the_explicit_coordinator_once_with_obligation_and_last_inf
         String::from_utf8_lossy(&again.stderr)
     );
     assert_eq!(
-        std::fs::read_to_string(temp.path().join("codex-calls"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "queue\n"
     );
     let (message, state): (String, String) = db
         .query_row("SELECT message,state FROM coordinator_alerts", [], |row| {
