@@ -935,6 +935,11 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             let result = (|| -> Result<()> {
                 let mut db = crate::bridge::connect(&config.db)?;
                 crate::subscriptions::initialize(&db)?;
+                crate::subscriptions::dependency_tick(
+                    &db,
+                    &config.codex,
+                    Duration::from_secs(120),
+                )?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::circular_waits::initialize(&db)?;

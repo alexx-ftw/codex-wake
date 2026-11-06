@@ -191,9 +191,16 @@ a consumed subscription. Source events received before registration aren't repla
 | `chat` | Source chat UUID | `completed`, `blocked`, `failed` reported by its owner |
 | `thread` | Source chat UUID | `turn_completed` from the `Stop` lifecycle signal |
 | `subagent` | Source agent UUID | `completed` from `SubagentStop` |
-| `dependency` | Namespace and dependency ID | `recovered` after provider health verification |
+| `dependency` | Namespace and dependency ID | `progress` resets the inactivity deadline; `recovered` after provider health verification |
 | `resource` | Namespace and resource ID | `released` by its owner |
 | `artifact` | Namespace and exact artifact ID | `available` |
+
+Dependency subscriptions use `progress_timeout_secs` (default 3600) and persist
+the last explicit progress signal and its deadline. When it expires, Wake sends
+one request to investigate for that inactivity period; silence is not treated as failure. Publish
+`dependency/progress` only when progress is observed and `dependency/recovered`
+after recovery is verified. An ambiguous notice delivery is retained as
+`needs_attention` and is never replayed automatically.
 
 Subscribe to `git_ref updated` for changes to a PR's base branch. A PR's
 `base_changed` reports its base selection changing, a distinct event.
@@ -440,6 +447,11 @@ cargo run --locked -- register --repo owner/repo --run 123 --attempt 1 \
 cargo run --locked -- subscribe --kind artifact --repo release-pipeline \
   --resource package-1.2.3 --event available \
   --thread 11111111-1111-4111-8111-111111111111
+cargo run --locked -- subscribe --kind dependency --repo payments \
+  --resource database --event recovered --progress-timeout-seconds 1800 \
+  --thread 11111111-1111-4111-8111-111111111111
+cargo run --locked -- publish --kind dependency --repo payments \
+  --resource database --outcome progress
 cargo run --locked -- status
 cargo run --locked -- subscriptions
 cargo run --locked -- recover

@@ -77,6 +77,8 @@ struct SubscriptionInput {
     execution: Option<execution::ExecutionOptions>,
     /// Optional dotted paths relative to source; missing or null values are reported.
     required_source: Option<Vec<String>>,
+    /// Dependency inactivity timeout in seconds; defaults to 3600 for dependency/recovered.
+    progress_timeout_secs: Option<u64>,
     /// Optional deterministic file, health endpoint, lock or systemd-job observation.
     observation: Option<observers::Observation>,
 }
@@ -89,7 +91,7 @@ struct PublicationInput {
     #[serde(default)]
     repo: String,
     resource: String,
-    /// Verified outcome: success/failure/cancelled/completed for job; completed/blocked/failed for chat; recovered, released, or available for the respective other kinds.
+    /// Verified outcome: progress/recovered for dependency; otherwise the documented completion outcome.
     outcome: String,
     /// Optional original values for matching subscribers' source.* placeholders.
     source: Option<Value>,
@@ -817,7 +819,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Subscribe to one source/resource/event. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. Other outcomes need a producer.",
+        description = "Subscribe to one source/resource/event. Dependency/recovered subscriptions send one investigation request after progress_timeout_secs (default 3600) without an explicit progress signal. The deadline does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -841,6 +843,7 @@ impl WakeTools {
                     message_template: input.message_template.as_deref(),
                     execution: input.execution.as_ref(),
                     required_source: input.required_source.as_deref(),
+                    progress_timeout_secs: input.progress_timeout_secs,
                 },
             )?;
             if let Some(observation) = &input.observation {
@@ -859,7 +862,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Publish a job/chat result, dependency recovery, resource release or artifact availability to matching subscriptions. When comparing an explicitly linked validation commitment, supply its structured scope; Wake warns on mismatch but does not verify the result or resolve the validation.",
+        description = "Publish verified job/chat results, dependency progress or recovery, resource release, or artifact availability. For dependencies, progress resets the inactivity deadline. When comparing an explicitly linked validation commitment, provide its structured scope; Wake warns on mismatch but does not verify results or resolve validation.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1407,7 +1410,7 @@ async fn run_command(
             let db = database(&config)?;
             println!(
                 "{}",
-                json!({"github":polling::tick(&db,&config.gh)?,"observers":observers::tick(&db,&config.codex)?,"native":native_poll::tick(&db,&config.codex)?})
+                json!({"github":polling::tick(&db,&config.gh)?,"observers":observers::tick(&db,&config.codex)?,"native":native_poll::tick(&db,&config.codex)?,"dependency_notices":subscriptions::dependency_tick(&db,&config.codex,Duration::from_secs(120))?})
             );
         }
         "remove-service" => {
@@ -1447,6 +1450,9 @@ async fn run_command(
             let event = required(&mut args, "--event")?;
             let thread = required(&mut args, "--thread")?;
             let message_template = option(&mut args, "--message-template")?;
+            let progress_timeout_secs = option(&mut args, "--progress-timeout-seconds")?
+                .map(|value| value.parse::<u64>())
+                .transpose()?;
             let execution = cli_execution(&mut args)?;
             let observation = option(&mut args, "--observe")?
                 .map(|raw| serde_json::from_str::<observers::Observation>(&raw))
@@ -1469,6 +1475,7 @@ async fn run_command(
                     message_template: message_template.as_deref(),
                     execution: execution.as_ref(),
                     required_source: required_source.as_deref(),
+                    progress_timeout_secs,
                 },
             )?;
             if let Some(observation) = &observation {
@@ -2090,6 +2097,7 @@ mod hook_output_tests {
                 message_template: None,
                 execution: None,
                 required_source: None,
+                progress_timeout_secs: None,
             },
         )
         .unwrap();

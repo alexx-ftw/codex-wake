@@ -1,16 +1,21 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_DEPENDENCY_PROGRESS_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Clone, Copy, Default)]
 pub struct DeliveryConfig<'a> {
     pub message_template: Option<&'a str>,
     pub execution: Option<&'a crate::execution::ExecutionOptions>,
     pub required_source: Option<&'a [String]>,
+    pub progress_timeout_secs: Option<u64>,
 }
 
 pub const ALLOWED_EVENTS: &[(&str, &[&str])] = &[
@@ -140,6 +145,27 @@ pub fn initialize(db: &Connection) -> Result<()> {
                 ))?;
             }
         }
+        for (column, kind) in [
+            ("dependency_timeout_secs", "INTEGER"),
+            ("dependency_progress_at_ms", "INTEGER"),
+            ("dependency_deadline_ms", "INTEGER"),
+            ("dependency_notice_state", "TEXT"),
+            ("dependency_notice_started_at_ms", "INTEGER"),
+            ("dependency_notice_after_ms", "INTEGER"),
+            ("dependency_notice_reason", "TEXT"),
+        ] {
+            if !columns.iter().any(|existing| existing == column) {
+                db.execute_batch(&format!(
+                    "ALTER TABLE subscriptions ADD COLUMN {column} {kind}"
+                ))?;
+            }
+        }
+        let now = epoch_ms()?;
+        db.execute(
+            "UPDATE subscriptions SET dependency_timeout_secs=?1,dependency_progress_at_ms=?2,dependency_deadline_ms=?3 \
+             WHERE kind='dependency' AND event='recovered' AND state='waiting' AND dependency_timeout_secs IS NULL",
+            params![DEFAULT_DEPENDENCY_PROGRESS_TIMEOUT_SECS as i64, now, now + (DEFAULT_DEPENDENCY_PROGRESS_TIMEOUT_SECS * 1000) as i64],
+        )?;
         Ok(())
     })();
     finish_transaction(db, migration)
@@ -156,6 +182,12 @@ fn finish_transaction<T>(db: &Connection, result: Result<T>) -> Result<T> {
             Err(error)
         }
     }
+}
+
+fn epoch_ms() -> Result<i64> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
 }
 
 fn immediate<T>(db: &Connection, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -246,11 +278,31 @@ pub fn subscribe_with_delivery(
     } else {
         Some(serde_json::to_string(required)?)
     };
+    let progress_timeout_secs = if kind == "dependency" && event == "recovered" {
+        let seconds = delivery
+            .progress_timeout_secs
+            .unwrap_or(DEFAULT_DEPENDENCY_PROGRESS_TIMEOUT_SECS);
+        ensure!(seconds > 0, "Invalid progress timeout");
+        let milliseconds = seconds
+            .checked_mul(1000)
+            .context("Progress timeout overflow")?;
+        Some((i64::try_from(seconds)?, i64::try_from(milliseconds)?))
+    } else {
+        ensure!(
+            delivery.progress_timeout_secs.is_none(),
+            "Progress timeout applies only to dependency/recovered subscriptions"
+        );
+        None
+    };
+    let now = epoch_ms()?;
+    let deadline = progress_timeout_secs
+        .map(|(_, ms)| now.checked_add(ms).context("Progress deadline overflow"))
+        .transpose()?;
 
     let (id, created) = immediate(db, || {
         let existing = {
             let mut statement = db.prepare(
-                "SELECT id,thread,message_template,execution_json,required_source FROM subscriptions \
+                "SELECT id,thread,message_template,execution_json,required_source,dependency_timeout_secs FROM subscriptions \
 				 WHERE kind=?1 AND repo=?2 AND resource=?3 AND event=?4",
             )?;
             statement
@@ -261,20 +313,20 @@ pub fn subscribe_with_delivery(
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        if let Some((id, ..)) =
-            existing
-                .iter()
-                .find(|(_, existing_thread, template, options, required)| {
-                    existing_thread == &thread
-                        && template.as_deref() == message_template.as_deref()
-                        && options == &execution_json
-                        && required == &required_json
-                })
-        {
+        if let Some((id, ..)) = existing.iter().find(
+            |(_, existing_thread, template, options, required, timeout)| {
+                existing_thread == &thread
+                    && template.as_deref() == message_template.as_deref()
+                    && options == &execution_json
+                    && required == &required_json
+                    && *timeout == progress_timeout_secs.map(|(seconds, _)| seconds)
+            },
+        ) {
             return Ok((id.clone(), false));
         }
         ensure!(
@@ -283,9 +335,9 @@ pub fn subscribe_with_delivery(
         );
         let id = Uuid::new_v4().to_string();
         db.execute(
-			"INSERT INTO subscriptions(id,kind,repo,resource,event,thread,message_template,execution_json,required_source) \
-			 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-			params![id, kind, repo, resource, event, thread, message_template, execution_json, required_json],
+			"INSERT INTO subscriptions(id,kind,repo,resource,event,thread,message_template,execution_json,required_source,dependency_timeout_secs,dependency_progress_at_ms,dependency_deadline_ms) \
+			 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+			params![id, kind, repo, resource, event, thread, message_template, execution_json, required_json, progress_timeout_secs.map(|(seconds, _)| seconds), progress_timeout_secs.map(|_| now), deadline],
 		)?;
         Ok((id, true))
     })?;
@@ -344,6 +396,8 @@ fn ready_update(
     let changed = db.execute(
         "UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL, \
          source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?2 ELSE source_json END, \
+         dependency_notice_state=CASE WHEN kind='dependency' AND event='recovered' AND dependency_notice_state='pending' THEN NULL ELSE dependency_notice_state END, \
+         dependency_notice_after_ms=CASE WHEN kind='dependency' AND event='recovered' AND dependency_notice_state='pending' THEN NULL ELSE dependency_notice_after_ms END, \
          updated=CURRENT_TIMESTAMP \
          WHERE kind=?3 AND repo=?4 AND resource=?5 AND event=?6 AND state='waiting'",
         params![outcome, source_json, kind, repo, resource, event],
@@ -368,7 +422,7 @@ fn log_accept(kind: &str, repo: &str, resource: &str, event: &str, changed: usiz
 }
 
 fn custom_outcome(kind: &str, event: &str, outcome: &str) -> bool {
-    if !valid_kind_event(kind, event) {
+    if !valid_kind_event(kind, event) && !(kind == "dependency" && event == "progress") {
         return false;
     }
     match kind {
@@ -377,7 +431,7 @@ fn custom_outcome(kind: &str, event: &str, outcome: &str) -> bool {
                 && (event == outcome || event == "completed")
         }
         "chat" => event == outcome,
-        "dependency" => event == outcome && outcome == "recovered",
+        "dependency" => event == outcome && matches!(outcome, "progress" | "recovered"),
         "resource" => event == outcome && outcome == "released",
         "artifact" => event == outcome && outcome == "available",
         "thread" => event == outcome && outcome == "turn_completed",
@@ -548,6 +602,9 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
             if matches!(custom_kind, "chat" | "thread" | "subagent") {
                 resource = uuid(&resource)?;
             }
+            if custom_kind == "dependency" && outcome == "progress" {
+                return record_dependency_progress(db, repo, &resource, epoch_ms()?);
+            }
             ready(db, custom_kind, repo, &resource, event, outcome, payload)
         }
         _ => anyhow::bail!("Unsupported event header"),
@@ -590,7 +647,28 @@ pub fn publish_with_source(
 ) -> Result<usize> {
     let resource = validate_publication(kind, repo, resource, outcome, source)?;
     initialize(db)?;
+    if kind == "dependency" && outcome == "progress" {
+        return record_dependency_progress(db, repo, &resource, epoch_ms()?);
+    }
     ready(db, kind, repo, &resource, outcome, outcome, source)
+}
+
+fn record_dependency_progress(
+    db: &Connection,
+    repo: &str,
+    resource: &str,
+    now: i64,
+) -> Result<usize> {
+    let changed = db.execute(
+        "UPDATE subscriptions SET dependency_progress_at_ms=?1,dependency_deadline_ms=?1+dependency_timeout_secs*1000, \
+         dependency_notice_state=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_state END, \
+         dependency_notice_after_ms=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_after_ms END, \
+         dependency_notice_reason=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_reason END,updated=CURRENT_TIMESTAMP \
+         WHERE kind='dependency' AND repo=?2 AND resource=?3 AND event='recovered' AND state='waiting' AND dependency_timeout_secs IS NOT NULL",
+        params![now, repo, resource],
+    )?;
+    log_accept("dependency", repo, resource, "progress", changed);
+    Ok(changed)
 }
 
 pub(crate) fn validate_publication(
@@ -653,6 +731,13 @@ pub fn publish_report(
         crate::result_conflicts::validate_identity(execution, attempt)?;
     }
     initialize(db)?;
+    if kind == "dependency" && outcome == "progress" {
+        return Ok((
+            record_dependency_progress(db, repo, &resource, epoch_ms()?)?,
+            0,
+            Vec::new(),
+        ));
+    }
     let tx = db.unchecked_transaction()?;
     let conflicts = if let Some((execution, attempt)) = identity {
         if matches!(outcome, "success" | "failure" | "cancelled") {
@@ -726,7 +811,7 @@ pub fn publish_observation(
 pub fn status(db: &Connection) -> Result<Value> {
     initialize(db)?;
     let mut statement = db.prepare(
-        "SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,required_source,source_json \
+        "SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,required_source,source_json,dependency_timeout_secs,dependency_progress_at_ms,dependency_deadline_ms,dependency_notice_state,dependency_notice_reason,dependency_notice_started_at_ms \
          FROM subscriptions ORDER BY updated,id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -741,6 +826,12 @@ pub fn status(db: &Connection) -> Result<Value> {
             "reason":row.get::<_,Option<String>>(8)?, "updated":row.get::<_,String>(9)?,
             "required_source": required.as_deref().map(serde_json::from_str::<Value>).transpose().map_err(|error| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error)))?,
             "missing_source":missing,
+            "progress_timeout_secs":row.get::<_,Option<i64>>(12)?,
+            "last_progress_at_ms":row.get::<_,Option<i64>>(13)?,
+            "progress_deadline_ms":row.get::<_,Option<i64>>(14)?,
+            "inactivity_notice_state":row.get::<_,Option<String>>(15)?,
+            "inactivity_notice_reason":row.get::<_,Option<String>>(16)?,
+            "inactivity_notice_started_at_ms":row.get::<_,Option<i64>>(17)?,
         }))
     })?;
     Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
@@ -999,6 +1090,101 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
     }
 }
 
+/// Check dependency progress deadlines and attempt each due investigation notice once.
+pub fn dependency_tick(db: &Connection, codex: &Path, timeout: Duration) -> Result<usize> {
+    dependency_tick_with(db, epoch_ms()?, |thread, message, options| {
+        crate::execution::deliver(codex, timeout, thread, message, true, options)
+    })
+}
+
+fn dependency_tick_with(
+    db: &Connection,
+    now: i64,
+    mut deliver: impl FnMut(
+        &str,
+        &str,
+        Option<&crate::execution::ExecutionOptions>,
+    ) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
+    initialize(db)?;
+    // A sender left in this state across a service restart has an unknown delivery outcome.
+    db.execute("UPDATE subscriptions SET dependency_notice_state='needs_attention',dependency_notice_reason='send_outcome_unknown: sender stopped while delivery was in progress' WHERE dependency_notice_state='sending' AND dependency_notice_started_at_ms<=?1", [now.saturating_sub(120_000)])?;
+    let mut attempted = 0;
+    loop {
+        let row = immediate(db, || {
+            let row = db.query_row(
+                "SELECT id,repo,resource,thread,dependency_timeout_secs,execution_json FROM subscriptions \
+                 WHERE kind='dependency' AND event='recovered' AND state='waiting' AND dependency_deadline_ms<=?1 \
+                 AND (dependency_notice_state IS NULL OR (dependency_notice_state='pending' AND COALESCE(dependency_notice_after_ms,0)<=?1)) ORDER BY dependency_deadline_ms,id LIMIT 1",
+                [now],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,Option<String>>(5)?)),
+            ).optional()?;
+            if let Some((id, ..)) = &row {
+                db.execute("UPDATE subscriptions SET dependency_notice_state='sending',dependency_notice_reason=NULL,dependency_notice_after_ms=NULL,dependency_notice_started_at_ms=?2 WHERE id=?1 AND (dependency_notice_state IS NULL OR dependency_notice_state='pending')", params![id, now])?;
+            }
+            Ok(row)
+        })?;
+        let Some((id, repo, resource, thread, seconds, execution_json)) = row else {
+            break;
+        };
+        let message = format!(
+            "The registered dependency {repo}/{resource} has produced no explicit progress signal for {seconds} seconds. The deadline indicates missing progress information only; it does not mean the dependency failed. Investigate its current state. Publish dependency/progress when progress is verified, or dependency/recovered when recovery is verified."
+        );
+        let options = execution_json
+            .as_deref()
+            .map(serde_json::from_str::<crate::execution::ExecutionOptions>);
+        let result = match options {
+            Err(error) => Ok((
+                "needs_attention".to_owned(),
+                Some(bounded_reason(
+                    "execution_options_error",
+                    &error.to_string(),
+                )),
+            )),
+            Ok(options) => deliver(&thread, &message, options.as_ref()),
+        };
+        let (state, reason, retry_after) = match result {
+            Ok((state, reason)) if state == "queued" => ("queued", reason, None),
+            Ok((state, reason))
+                if state == "ready"
+                    && matches!(
+                        reason.as_deref(),
+                        Some("target_busy_before_send" | "target_unavailable_before_send")
+                    ) =>
+            {
+                ("pending", reason, Some(now.saturating_add(15_000)))
+            }
+            Ok((state, reason)) if state == "needs_attention" => ("needs_attention", reason, None),
+            Ok((state, reason)) => (
+                "needs_attention",
+                Some(bounded_reason(
+                    "invalid_send_classification",
+                    &format!("{state}: {}", reason.as_deref().unwrap_or("no reason")),
+                )),
+                None,
+            ),
+            Err(error) => match crate::execution::before_send_retry_reason(&error) {
+                Some(reason) => (
+                    "pending",
+                    Some(reason.to_owned()),
+                    Some(now.saturating_add(15_000)),
+                ),
+                None => (
+                    "needs_attention",
+                    Some(bounded_reason("send_outcome_unknown", &error.to_string())),
+                    None,
+                ),
+            },
+        };
+        db.execute("UPDATE subscriptions SET dependency_notice_state=?1,dependency_notice_reason=?2,dependency_notice_after_ms=?3 WHERE id=?4 AND dependency_notice_state='sending'", params![state, reason, retry_after, id])?;
+        attempted += 1;
+        if retry_after.is_some() {
+            break;
+        }
+    }
+    Ok(attempted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,6 +1196,239 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         initialize(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn legacy_dependency_deadlines_start_at_migration_without_touching_deliveries() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE subscriptions (id TEXT PRIMARY KEY,kind TEXT NOT NULL,repo TEXT NOT NULL,resource TEXT NOT NULL,event TEXT NOT NULL,thread TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT,reason TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,message_template TEXT,source_json TEXT,execution_json TEXT,required_source TEXT); INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state) VALUES ('waiting','dependency','provider','cache','recovered','11111111-1111-4111-8111-111111111111','waiting'); INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome,reason) VALUES ('ready','dependency','provider','replica','recovered','11111111-1111-4111-8111-111111111111','ready','recovered',NULL),('uncertain','dependency','provider','queue','recovered','11111111-1111-4111-8111-111111111111','needs_attention',NULL,'send_outcome_unknown: prior delivery');").unwrap();
+        let started = epoch_ms().unwrap();
+        initialize(&db).unwrap();
+        let (progress, deadline, state): (i64, i64, String) = db.query_row("SELECT dependency_progress_at_ms,dependency_deadline_ms,state FROM subscriptions WHERE id='waiting'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert!(progress >= started);
+        assert_eq!(
+            deadline,
+            progress + (DEFAULT_DEPENDENCY_PROGRESS_TIMEOUT_SECS as i64 * 1000)
+        );
+        assert_eq!(state, "waiting");
+        assert_eq!(
+            dependency_tick_with(&db, progress, |_, _, _| {
+                panic!("migration must not send an immediate notice")
+            })
+            .unwrap(),
+            0
+        );
+        let (ready, ready_outcome, uncertain, reason): (String, String, String, String) = db.query_row("SELECT (SELECT state FROM subscriptions WHERE id='ready'),(SELECT outcome FROM subscriptions WHERE id='ready'),(SELECT state FROM subscriptions WHERE id='uncertain'),(SELECT reason FROM subscriptions WHERE id='uncertain')", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(
+            (ready.as_str(), ready_outcome.as_str()),
+            ("ready", "recovered")
+        );
+        assert_eq!(
+            (uncertain.as_str(), reason.as_str()),
+            ("needs_attention", "send_outcome_unknown: prior delivery")
+        );
+    }
+
+    #[test]
+    fn dependency_deadline_resets_on_explicit_progress_and_alerts_once() {
+        let db = db();
+        let id = subscribe_with_delivery(
+            &db,
+            "dependency",
+            "provider",
+            "cache",
+            "recovered",
+            THREAD,
+            DeliveryConfig {
+                progress_timeout_secs: Some(10),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut sends = 0;
+        assert_eq!(
+            dependency_tick_with(&db, deadline - 1, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            record_dependency_progress(&db, "provider", "cache", deadline - 1_000).unwrap(),
+            1
+        );
+        let reset: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset, deadline + 9_000);
+        assert_eq!(
+            dependency_tick_with(&db, deadline, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        let mut notice = String::new();
+        assert_eq!(
+            dependency_tick_with(&db, reset, |thread, message, _| {
+                assert_eq!(thread, THREAD);
+                notice = message.to_owned();
+                sends += 1;
+                Ok(("queued".into(), Some("accepted".into())))
+            })
+            .unwrap(),
+            1
+        );
+        assert!(notice.contains("does not mean the dependency failed"));
+        assert_eq!(
+            dependency_tick_with(&db, reset + 1, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(sends, 1);
+        let state: String = db
+            .query_row(
+                "SELECT dependency_notice_state FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "queued");
+        record_dependency_progress(&db, "provider", "cache", reset + 1).unwrap();
+        assert_eq!(
+            dependency_tick_with(&db, reset + 10_000, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            dependency_tick_with(&db, reset + 10_001, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(sends, 2);
+        assert_eq!(
+            publish_with_source(
+                &db,
+                "dependency",
+                "provider",
+                "cache",
+                "recovered",
+                &json!({"healthy":true})
+            )
+            .unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row("SELECT state FROM subscriptions WHERE id=?1", [&id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "ready");
+    }
+
+    #[test]
+    fn dependency_progress_timestamp_and_deadline_survive_reopen() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe_with_delivery(
+            &db,
+            "dependency",
+            "provider",
+            "store",
+            "recovered",
+            THREAD,
+            DeliveryConfig {
+                progress_timeout_secs: Some(60),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let signal_at = deadline - 5_000;
+        record_dependency_progress(&db, "provider", "store", signal_at).unwrap();
+        drop(db);
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let (progress, persisted_deadline): (i64, i64) = db.query_row("SELECT dependency_progress_at_ms,dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(progress, signal_at);
+        assert_eq!(persisted_deadline, signal_at + 60_000);
+    }
+
+    #[test]
+    fn dependency_notice_delivery_uncertainty_is_persisted_without_replay() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe_with_delivery(
+            &db,
+            "dependency",
+            "provider",
+            "queue",
+            "recovered",
+            THREAD,
+            DeliveryConfig {
+                progress_timeout_secs: Some(1),
+                ..DeliveryConfig::default()
+            },
+        )
+        .unwrap();
+        let deadline: i64 = db
+            .query_row(
+                "SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut sends = 0;
+        dependency_tick_with(&db, deadline, |_, _, _| {
+            sends += 1;
+            anyhow::bail!("connection lost after send")
+        })
+        .unwrap();
+        drop(db);
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        assert_eq!(
+            dependency_tick_with(&db, deadline + 1, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            0
+        );
+        let (state, reason): (String, String) = db.query_row("SELECT dependency_notice_state,dependency_notice_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(state, "needs_attention");
+        assert!(reason.starts_with("send_outcome_unknown:"));
+        assert_eq!(sends, 1);
     }
 
     #[test]
@@ -1086,6 +1505,7 @@ mod tests {
             message_template,
             execution,
             required_source: None,
+            progress_timeout_secs: None,
         }
     }
 
@@ -1098,6 +1518,7 @@ mod tests {
             message_template: Some("Open {{source.details.url}}"),
             execution: None,
             required_source: Some(&paths),
+            progress_timeout_secs: None,
         };
         let id = subscribe_with_delivery(&db, "artifact", "ci", "pkg", "available", THREAD, config)
             .unwrap();

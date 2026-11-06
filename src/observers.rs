@@ -993,6 +993,7 @@ mod tests {
                 message_template: Some("{{source.url}}"),
                 execution: None,
                 required_source: Some(&required),
+                progress_timeout_secs: None,
             },
         )
         .unwrap();
