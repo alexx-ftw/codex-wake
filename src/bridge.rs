@@ -954,6 +954,21 @@ mod tests {
     }
 
     #[test]
+    fn connect_does_not_adopt_unmarked_dependency_uncertainties_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE dependency_notice_uncertainties (subscription_id TEXT,generation INTEGER,reason TEXT,recorded_at_ms INTEGER); INSERT INTO dependency_notice_uncertainties VALUES ('foreign',7,'keep',42);").unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = connect(&path).unwrap();
+        let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0)).unwrap();
+        assert_eq!(id, 0);
+        let preserved: (String, i64, String, i64) = db.query_row("SELECT subscription_id,generation,reason,recorded_at_ms FROM dependency_notice_uncertainties", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(preserved, ("foreign".into(), 7, "keep".into(), 42));
+    }
+
+    #[test]
     fn connect_does_not_adopt_either_unmarked_coordinator_table() {
         for table in ["coordinators", "coordinator_alerts"] {
             let dir = tempfile::tempdir().unwrap();

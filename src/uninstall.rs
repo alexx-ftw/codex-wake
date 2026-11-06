@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','dependency_notice_uncertainties')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -211,7 +211,7 @@ mod tests {
             )
             .unwrap();
         assert!(transfer_table);
-        for table in ["coordinators", "coordinator_alerts"] {
+        for table in ["coordinators", "coordinator_alerts", "dependency_notice_uncertainties"] {
             let exists: bool = db
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -342,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_tables_are_allowed_for_uninstall_only_when_database_is_identified() {
-        for table in ["coordinators", "coordinator_alerts"] {
+    fn wake_metadata_tables_are_allowed_for_uninstall_only_when_database_is_identified() {
+        for table in ["coordinators", "coordinator_alerts", "dependency_notice_uncertainties"] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("state.sqlite3");
             let db = rusqlite::Connection::open(&path).unwrap();
