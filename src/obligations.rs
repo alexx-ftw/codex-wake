@@ -36,16 +36,11 @@ pub fn initialize(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn publication_resource(kind: &str, repo: &str, resource: &str, outcome: &str) -> Result<String> {
-    let valid_outcome = match kind {
-        "job" => matches!(outcome, "success" | "failure" | "cancelled" | "completed"),
-        "chat" => matches!(outcome, "completed" | "blocked" | "failed"),
-        "dependency" => outcome == "recovered",
-        "resource" => outcome == "released",
-        "artifact" => outcome == "available",
-        _ => false,
-    };
-    ensure!(valid_outcome, "Unsupported publication kind or outcome");
+pub fn validate_publication_identity(kind: &str, repo: &str, resource: &str) -> Result<()> {
+    ensure!(
+        ["job", "chat", "dependency", "resource", "artifact"].contains(&kind),
+        "Unsupported publication kind"
+    );
     ensure!(
         repo.len() <= 255
             && repo
@@ -59,6 +54,23 @@ fn publication_resource(kind: &str, repo: &str, resource: &str, outcome: &str) -
             && resource.bytes().all(|b| b.is_ascii_graphic()),
         "Invalid resource identifier"
     );
+    if kind == "chat" {
+        Uuid::parse_str(resource).context("Invalid source UUID")?;
+    }
+    Ok(())
+}
+
+fn publication_resource(kind: &str, repo: &str, resource: &str, outcome: &str) -> Result<String> {
+    let valid_outcome = match kind {
+        "job" => matches!(outcome, "success" | "failure" | "cancelled" | "completed"),
+        "chat" => matches!(outcome, "completed" | "blocked" | "failed"),
+        "dependency" => outcome == "recovered",
+        "resource" => outcome == "released",
+        "artifact" => outcome == "available",
+        _ => false,
+    };
+    ensure!(valid_outcome, "Unsupported publication kind or outcome");
+    validate_publication_identity(kind, repo, resource)?;
     if kind == "chat" {
         Ok(Uuid::parse_str(resource)
             .context("Invalid source UUID")?

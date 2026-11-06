@@ -378,6 +378,13 @@ checks. After performing a check, `resolve_validation` requires nonempty
 evidence of what was checked and observed, and stores it atomically with the
 resolution. A publication or `resolve_obligation` does not resolve a validation.
 Wake stores the agent's evidence; it does not independently verify the claim.
+For an explicit scope comparison at publication time, register the validation
+with both a structured `link` (`kind`, `repo`, `resource`) and `scope` object,
+then include the corresponding `scope` in `publish_result`. Wake warns when the
+declared scope differs for that exact linked publication and leaves the
+validation pending. It compares declarations only; it does not verify the
+published result or either scope. Legacy registrations and publications without
+these fields remain supported and are not compared.
 When a reminder is due, the hook leaves lifecycle deliveries ready for the
 receiver's background dispatcher instead of waiting for unrelated sends. If the
 receiver is unavailable, they remain ready until it restarts or recovery runs.

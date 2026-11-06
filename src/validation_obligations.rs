@@ -1,31 +1,136 @@
 //! Explicit validation commitments, using Wake's existing obligation queue.
 use anyhow::{Context, Result, ensure};
+use rmcp::schemars::JsonSchema;
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
+
+const MAX_SCOPE_BYTES: usize = 2048;
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationLink {
+    /// Exact publish_result kind.
+    pub kind: String,
+    /// Exact publication namespace.
+    #[serde(default)]
+    pub repo: String,
+    /// Exact publication resource.
+    pub resource: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScopeMismatch {
+    pub obligation_id: String,
+    pub thread: String,
+    pub expected_scope: BTreeMap<String, String>,
+    pub published_scope: BTreeMap<String, String>,
+}
 
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS validation_evidence (
             obligation_id TEXT PRIMARY KEY REFERENCES obligations(id),
             evidence TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS validation_scope_links (
+            obligation_id TEXT PRIMARY KEY REFERENCES obligations(id),
+            kind TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            scope TEXT NOT NULL
         );",
     )?;
     Ok(())
 }
 
-pub fn register(db: &Connection, thread: &str, description: &str) -> Result<String> {
+pub fn register(
+    db: &Connection,
+    thread: &str,
+    description: &str,
+    link: Option<&PublicationLink>,
+    scope: Option<&BTreeMap<String, String>>,
+) -> Result<String> {
     let thread = Uuid::parse_str(thread)
         .context("Invalid thread UUID")?
         .to_string();
     ensure!(!description.trim().is_empty(), "Description is empty");
     ensure!(description.len() <= 2048, "Description exceeds 2048 bytes");
+    ensure!(
+        link.is_some() == scope.is_some(),
+        "link and scope must be supplied together"
+    );
+    if let Some(link) = link {
+        crate::obligations::validate_publication_identity(&link.kind, &link.repo, &link.resource)?;
+        validate_scope(scope.unwrap())?;
+    }
     let id = Uuid::new_v4().to_string();
-    db.execute(
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO obligations(id, thread, kind, repo, resource, outcome, description)
          VALUES (?1, ?2, 'validation', '', ?1, '', ?3)",
         params![id, thread, description],
     )?;
+    if let (Some(link), Some(scope)) = (link, scope) {
+        tx.execute(
+            "INSERT INTO validation_scope_links(obligation_id, kind, repo, resource, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                link.kind,
+                link.repo,
+                link.resource,
+                serde_json::to_string(scope)?
+            ],
+        )?;
+    }
+    tx.commit()?;
     Ok(id)
+}
+
+pub fn validate_scope(scope: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(!scope.is_empty(), "scope must contain at least one field");
+    ensure!(
+        scope
+            .iter()
+            .all(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty()),
+        "scope keys and values must not be empty"
+    );
+    ensure!(
+        serde_json::to_vec(scope)?.len() <= MAX_SCOPE_BYTES,
+        "scope exceeds 2048 bytes"
+    );
+    Ok(())
+}
+
+pub fn scope_mismatches(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    published_scope: &BTreeMap<String, String>,
+) -> Result<Vec<ScopeMismatch>> {
+    validate_scope(published_scope)?;
+    let mut statement = db.prepare(
+        "SELECT o.id, o.thread, s.scope
+         FROM obligations o JOIN validation_scope_links s ON s.obligation_id=o.id
+         WHERE o.kind='validation' AND o.resolved=0 AND s.kind=?1 AND s.repo=?2 AND s.resource=?3",
+    )?;
+    let mut rows = statement.query(params![kind, repo, resource])?;
+    let mut mismatches = Vec::new();
+    while let Some(row) = rows.next()? {
+        let expected: BTreeMap<String, String> = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        if &expected != published_scope {
+            mismatches.push(ScopeMismatch {
+                obligation_id: row.get(0)?,
+                thread: row.get(1)?,
+                expected_scope: expected,
+                published_scope: published_scope.clone(),
+            });
+        }
+    }
+    Ok(mismatches)
 }
 
 pub fn resolve(db: &mut Connection, id: &str, evidence: &str) -> Result<bool> {
@@ -62,7 +167,7 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         crate::obligations::initialize(&db).unwrap();
         initialize(&db).unwrap();
-        let id = register(&db, owner, "Check the migration").unwrap();
+        let id = register(&db, owner, "Check the migration", None, None).unwrap();
         drop(db);
         let mut db = Connection::open(&path).unwrap();
         assert_eq!(crate::obligations::pending(&db, owner).unwrap().len(), 1);
@@ -87,9 +192,9 @@ mod tests {
         crate::obligations::initialize(&db).unwrap();
         initialize(&db).unwrap();
         let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        assert!(register(&db, thread, " ").is_err());
-        assert!(register(&db, "invalid", "Check the migration").is_err());
-        let id = register(&db, thread, "Check the migration").unwrap();
+        assert!(register(&db, thread, " ", None, None).is_err());
+        assert!(register(&db, "invalid", "Check the migration", None, None).is_err());
+        let id = register(&db, thread, "Check the migration", None, None).unwrap();
         let publication = crate::obligations::register(
             &db,
             thread,

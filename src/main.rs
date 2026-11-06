@@ -29,6 +29,7 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     env,
     io::{self, Read},
     path::PathBuf,
@@ -96,6 +97,8 @@ struct PublicationInput {
     execution_id: Option<String>,
     /// Exact positive attempt number within that execution.
     attempt: Option<u64>,
+    /// Explicit structured scope, compared only with validations linked to this exact kind/namespace/resource.
+    scope: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -159,6 +162,10 @@ struct ValidationInput {
     thread: String,
     /// Specific validation the agent committed to perform.
     description: String,
+    /// Exact publication identity this validation covers; supply together with scope.
+    link: Option<validation_obligations::PublicationLink>,
+    /// Structured committed scope, for example {"environment":"production"}.
+    scope: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -823,7 +830,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Publish a verified job/chat result, dependency recovery, resource release or artifact availability to matching subscriptions.",
+        description = "Publish a job/chat result, dependency recovery, resource release or artifact availability to matching subscriptions. When comparing an explicitly linked validation commitment, supply its structured scope; Wake warns on mismatch but does not verify the result or resolve the validation.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -849,6 +856,17 @@ impl WakeTools {
                 _ => anyhow::bail!("execution_id and attempt must be supplied together"),
             };
             let source = input.source.unwrap_or_else(|| json!({"kind":input.kind,"repo":input.repo,"resource":resource,"event":input.outcome,"outcome":input.outcome}));
+            let scope_mismatches = if let Some(scope) = input.scope.as_ref() {
+                validation_obligations::scope_mismatches(
+                    &db,
+                    &input.kind,
+                    &input.repo,
+                    &input.resource,
+                    scope,
+                )?
+            } else {
+                Vec::new()
+            };
             let (matched, resolved, conflicts) = subscriptions::publish_report(
                 &db,
                 &input.kind,
@@ -870,6 +888,10 @@ impl WakeTools {
             result["conflict"] = json!(!conflicts.is_empty());
             result["prior_delivery_possible"] = json!(!conflicts.is_empty());
             result["conflicts"] = json!(conflicts);
+            if input.scope.is_some() {
+                result["validation_scope_mismatch"] = json!(!scope_mismatches.is_empty());
+                result["validation_scope_warnings"] = json!(scope_mismatches);
+            }
             Ok(result)
         })())
     }
@@ -931,7 +953,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Register a specific pending validation committed to by an agent. Wake does not infer commitments from prose.",
+        description = "Register a specific pending validation commitment. Optionally link it to an exact publication kind/namespace/resource and a structured scope, supplied together; Wake does not infer commitments from prose.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn register_validation(
@@ -943,6 +965,8 @@ impl WakeTools {
                 &database(&self.config)?,
                 &input.thread,
                 &input.description,
+                input.link.as_ref(),
+                input.scope.as_ref(),
             )?;
             Ok(json!({"obligation_id":id}))
         })())
@@ -1626,6 +1650,8 @@ mod hook_output_tests {
         let registered = tools.register_validation(Parameters(ValidationInput {
             thread: thread.into(),
             description: "Check migration".into(),
+            link: None,
+            scope: None,
         }));
         assert_ne!(registered.is_error, Some(true));
         let id = registered.structured_content.unwrap()["obligation_id"]
@@ -1837,6 +1863,72 @@ mod hook_output_tests {
         assert_eq!(
             tools.publish_result(Parameters(partial)).is_error,
             Some(true)
+        );
+    }
+
+    #[test]
+    fn publication_warns_on_explicit_validation_scope_mismatch_without_resolving_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let tools = WakeTools { config };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let validation: ValidationInput = serde_json::from_value(json!({
+            "thread":thread,
+            "description":"Run the production validation",
+            "link":{"kind":"job","repo":"ci","resource":"deploy"},
+            "scope":{"environment":"production"}
+        }))
+        .unwrap();
+        let registered = tools.register_validation(Parameters(validation));
+        assert_ne!(registered.is_error, Some(true));
+        let id = registered.structured_content.unwrap()["obligation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let publish = |resource: &str, scope: Option<Value>| {
+            let mut input = json!({
+                "kind":"job", "repo":"ci", "resource":resource, "outcome":"success"
+            });
+            if let Some(scope) = scope {
+                input["scope"] = scope;
+            }
+            let response = tools.publish_result(Parameters(
+                serde_json::from_value::<PublicationInput>(input).unwrap(),
+            ));
+            assert_ne!(response.is_error, Some(true));
+            response.structured_content.unwrap()
+        };
+
+        let local = publish("deploy", Some(json!({"environment":"local"})));
+        assert_eq!(local["validation_scope_mismatch"], true);
+        assert_eq!(local["validation_scope_warnings"][0]["obligation_id"], id);
+        assert_eq!(
+            local["validation_scope_warnings"][0]["expected_scope"]["environment"],
+            "production"
+        );
+        assert_eq!(
+            local["validation_scope_warnings"][0]["published_scope"]["environment"],
+            "local"
+        );
+        assert_eq!(
+            publish("other-deploy", Some(json!({"environment":"local"})))["validation_scope_mismatch"],
+            false
+        );
+        assert_eq!(
+            publish("deploy", Some(json!({"environment":"production"})))["validation_scope_mismatch"],
+            false
+        );
+        let legacy = publish("deploy", None);
+        assert!(legacy.get("validation_scope_mismatch").is_none());
+        assert!(
+            obligations::pending(&database(&tools.config).unwrap(), thread)
+                .unwrap()
+                .iter()
+                .any(|item| item.id == id)
         );
     }
 
