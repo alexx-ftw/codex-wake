@@ -1278,7 +1278,10 @@ impl WakeTools {
             let rules = rules::status(&db)?;
             let mut actionable = status_view::actionable(&waits, &subscriptions, &rules);
             let circular = circular_waits::status(&db)?;
-            actionable.as_array_mut().unwrap().extend(status_view::circular_notices(&circular));
+            actionable
+                .as_array_mut()
+                .unwrap()
+                .extend(status_view::circular_notices(&circular));
             Ok(json!({
                 "actionable":actionable,
                 "receiver":manager::status(&self.config)?,
