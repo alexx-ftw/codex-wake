@@ -572,7 +572,7 @@ pub fn publish_with_source(
     ready(db, kind, repo, &resource, outcome, outcome, source)
 }
 
-fn validate_publication(
+pub(crate) fn validate_publication(
     kind: &str,
     repo: &str,
     resource: &str,
@@ -610,9 +610,40 @@ pub fn publish_agent(
     outcome: &str,
     source: &Value,
 ) -> Result<(usize, usize)> {
+    let (matched, resolved, _) = publish_report(db, kind, repo, resource, outcome, source, None)?;
+    Ok((matched, resolved))
+}
+
+pub fn publish_report(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+    identity: Option<(&str, u64)>,
+) -> Result<(usize, usize, Vec<Value>)> {
     let resource = validate_publication(kind, repo, resource, outcome, source)?;
+    ensure!(
+        identity.is_none() || kind == "job",
+        "Execution identity requires a job"
+    );
+    if let Some((execution, attempt)) = identity {
+        crate::result_conflicts::validate_identity(execution, attempt)?;
+    }
     initialize(db)?;
     let tx = db.unchecked_transaction()?;
+    let conflicts = if let Some((execution, attempt)) = identity {
+        if matches!(outcome, "success" | "failure" | "cancelled") {
+            crate::result_conflicts::record(
+                &tx, repo, &resource, execution, attempt, outcome, source,
+            )?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let matched = ready_update(&tx, kind, repo, &resource, outcome, outcome, source)?;
     let resolved = crate::obligations::resolve_publication(&tx, kind, repo, &resource, outcome)?;
     tx.commit()?;
@@ -625,7 +656,7 @@ pub fn publish_agent(
         Duration::ZERO,
         resolved as u64,
     );
-    Ok((matched, resolved))
+    Ok((matched, resolved, conflicts))
 }
 
 /// Complete only the registration whose observation was verified.
@@ -984,6 +1015,114 @@ mod tests {
             message_template,
             execution,
         }
+    }
+
+    #[test]
+    fn publication_reports_conflict_without_changing_prior_subscription() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        crate::obligations::initialize(&db).unwrap();
+        subscribe(&db, "job", "ci", "build", "success", THREAD).unwrap();
+        let success = json!({"agent":"a", "proof":"log-a"});
+        let failure = json!({"agent":"b", "proof":"log-b"});
+        let (matched, _, conflict) = publish_report(
+            &db,
+            "job",
+            "ci",
+            "build",
+            "success",
+            &success,
+            Some(("run-7", 1)),
+        )
+        .unwrap();
+        assert_eq!(matched, 1);
+        assert!(conflict.is_empty());
+        assert!(
+            publish_report(
+                &db,
+                "job",
+                "ci",
+                "build",
+                "failure",
+                &failure,
+                Some(("run-7", 2))
+            )
+            .unwrap()
+            .2
+            .is_empty()
+        );
+        drop(db);
+        let db = Connection::open(file.path()).unwrap();
+        let conflict = publish_report(
+            &db,
+            "job",
+            "ci",
+            "build",
+            "failure",
+            &failure,
+            Some(("run-7", 1)),
+        )
+        .unwrap()
+        .2;
+        assert_eq!(conflict.len(), 2);
+        assert_eq!(conflict[0]["evidence"], success);
+        assert_eq!(conflict[1]["evidence"], failure);
+        assert_eq!(status(&db).unwrap()[0]["outcome"], "success");
+        assert!(
+            publish_report(&db, "job", "ci", "build", "failure", &failure, None)
+                .unwrap()
+                .2
+                .is_empty()
+        );
+        assert!(
+            publish_report(
+                &db,
+                "job",
+                "ci",
+                "build",
+                "completed",
+                &failure,
+                Some(("", 0))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_obligation_update_rolls_back_result_evidence() {
+        let db = db();
+        crate::obligations::initialize(&db).unwrap();
+        crate::obligations::register(&db, THREAD, "job", "ci", "build", "success", "report")
+            .unwrap();
+        db.execute_batch("CREATE TRIGGER fail_obligation BEFORE UPDATE ON obligations BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(
+            publish_report(
+                &db,
+                "job",
+                "ci",
+                "build",
+                "success",
+                &json!({"agent":"a"}),
+                Some(("run", 1))
+            )
+            .is_err()
+        );
+        db.execute_batch("DROP TRIGGER fail_obligation").unwrap();
+        assert!(
+            publish_report(
+                &db,
+                "job",
+                "ci",
+                "build",
+                "failure",
+                &json!({"agent":"b"}),
+                Some(("run", 1))
+            )
+            .unwrap()
+            .2
+            .is_empty()
+        );
     }
 
     #[test]

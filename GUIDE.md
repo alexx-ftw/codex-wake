@@ -147,6 +147,7 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `register_obligation` | Record a chat's pending result publication |
 | `list_obligations` | List a chat's pending publications |
 | `resolve_obligation` | Resolve a pending obligation explicitly |
+| `get_result_conflicts` | Read paginated evidence for an exact job execution and attempt |
 | `get_status` | Inspect local receiver health, CI waits and subscriptions |
 | `recover_ready` | Dispatch stored ready events; never retry ambiguous deliveries |
 | `configure_rule` | Match a PR comment and create or message a thread |
@@ -157,6 +158,15 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `create_goal` | Create an explicitly requested goal without overwriting one |
 | `edit_goal` | Edit an existing objective or explicitly requested budget |
 | `resume_goal` | Resume an authorized existing goal and separately report queue acceptance |
+
+For conflicting job reports, provide both `execution_id` and the positive `attempt`
+to `publish_result`, together with the publisher and supporting evidence in
+`source`. Wake compares only reports for the same namespace, resource, execution
+and attempt. The response lists up to ten reports when success, failure or
+cancellation disagree; use `get_result_conflicts` with the same identity and its
+`next` cursor for all pages. It does not determine which is correct or undo any
+earlier delivery.
+Publications without an execution identity remain supported and are not compared.
 
 Stored subscriptions and CI waits with a model preset remain ready when the target
 is active or `thread/resume` definitively rejects its active writer before input

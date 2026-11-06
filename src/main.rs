@@ -9,6 +9,7 @@ mod observability;
 mod observers;
 mod polling;
 mod probe;
+mod result_conflicts;
 mod rules;
 mod status_view;
 mod steer;
@@ -87,6 +88,22 @@ struct PublicationInput {
     outcome: String,
     /// Optional original values for matching subscribers' source.* placeholders.
     source: Option<Value>,
+    /// Exact execution ID, supplied together with attempt to detect conflicting job reports.
+    execution_id: Option<String>,
+    /// Exact positive attempt number within that execution.
+    attempt: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConflictQuery {
+    #[serde(default)]
+    repo: String,
+    resource: String,
+    execution_id: String,
+    attempt: u64,
+    /// Cursor returned by a previous page; omit for the first page.
+    after: Option<i64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -708,14 +725,20 @@ impl WakeTools {
             } else {
                 input.resource.clone()
             };
+            let identity = match (input.execution_id.as_deref(), input.attempt) {
+                (None, None) => None,
+                (Some(execution), Some(attempt)) => Some((execution, attempt)),
+                _ => anyhow::bail!("execution_id and attempt must be supplied together"),
+            };
             let source = input.source.unwrap_or_else(|| json!({"kind":input.kind,"repo":input.repo,"resource":resource,"event":input.outcome,"outcome":input.outcome}));
-            let (matched, resolved) = subscriptions::publish_agent(
+            let (matched, resolved, conflicts) = subscriptions::publish_report(
                 &db,
                 &input.kind,
                 &input.repo,
                 &input.resource,
                 &input.outcome,
                 &source,
+                identity,
             )?;
             let mut result = publication_result(&self.config, matched, resolved);
             add_delivery_evidence(
@@ -726,6 +749,9 @@ impl WakeTools {
                 &input.resource,
                 &input.outcome,
             );
+            result["conflict"] = json!(!conflicts.is_empty());
+            result["prior_delivery_possible"] = json!(!conflicts.is_empty());
+            result["conflicts"] = json!(conflicts);
             Ok(result)
         })())
     }
@@ -821,6 +847,34 @@ impl WakeTools {
     }
 
     #[tool(
+        description = "Read a page of persisted contradictory job reports for an exact execution and attempt. Earlier deliveries may already have occurred.",
+        annotations(read_only_hint = true)
+    )]
+    fn get_result_conflicts(&self, Parameters(input): Parameters<ConflictQuery>) -> CallToolResult {
+        tool_result((|| {
+            let resource = subscriptions::validate_publication(
+                "job",
+                &input.repo,
+                &input.resource,
+                "success",
+                &json!({}),
+            )?;
+            let db = database(&self.config)?;
+            let (conflict, reports, next) = result_conflicts::lookup_page(
+                &db,
+                &input.repo,
+                &resource,
+                &input.execution_id,
+                input.attempt,
+                input.after.unwrap_or(0),
+            )?;
+            Ok(
+                json!({"conflict":conflict,"reports":reports,"next":next,"prior_delivery_possible":conflict}),
+            )
+        })())
+    }
+
+    #[tool(
         description = "Subscribe a thread to completion of an exact GitHub Actions repo/run/attempt/SHA.",
         annotations(
             read_only_hint = false,
@@ -897,6 +951,7 @@ impl rmcp::ServerHandler for WakeTools {
             "resolve_obligation" => "mcp.resolve_obligation",
             "register_validation" => "mcp.register_validation",
             "resolve_validation" => "mcp.resolve_validation",
+            "get_result_conflicts" => "mcp.get_result_conflicts",
             "register_wait" => "mcp.register_wait",
             "get_status" => "mcp.get_status",
             "recover_ready" => "mcp.recover_ready",
@@ -1443,6 +1498,49 @@ mod hook_output_tests {
         assert!(text.contains("1 queue acceptance(s), 2 pending, 1 requiring attention"));
         assert!(text.contains("does not verify execution"));
         assert_eq!(output.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn conflict_query_returns_persisted_reports_with_delivery_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        subscriptions::publish_report(
+            &db,
+            "job",
+            "ci",
+            "build",
+            "success",
+            &json!({"agent":"a"}),
+            Some(("run", 1)),
+        )
+        .unwrap();
+        subscriptions::publish_report(
+            &db,
+            "job",
+            "ci",
+            "build",
+            "failure",
+            &json!({"agent":"b"}),
+            Some(("run", 1)),
+        )
+        .unwrap();
+        drop(db);
+        let tools = WakeTools { config };
+        let query = serde_json::from_value::<ConflictQuery>(
+            json!({"repo":"ci","resource":"build","execution_id":"run","attempt":1}),
+        )
+        .unwrap();
+        let response = tools.get_result_conflicts(Parameters(query));
+        assert_ne!(response.is_error, Some(true));
+        let data = response.structured_content.unwrap();
+        assert_eq!(data["conflict"], true);
+        assert_eq!(data["prior_delivery_possible"], true);
+        assert_eq!(data["reports"][0]["evidence"]["agent"], "a");
+        assert_eq!(data["reports"][1]["evidence"]["agent"], "b");
     }
 
     #[test]
