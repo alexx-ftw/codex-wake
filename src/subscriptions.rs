@@ -151,6 +151,8 @@ pub fn initialize(db: &Connection) -> Result<()> {
             ("dependency_deadline_ms", "INTEGER"),
             ("dependency_notice_state", "TEXT"),
             ("dependency_notice_started_at_ms", "INTEGER"),
+            ("dependency_period_generation", "INTEGER NOT NULL DEFAULT 1"),
+            ("dependency_notice_generation", "INTEGER"),
             ("dependency_notice_after_ms", "INTEGER"),
             ("dependency_notice_reason", "TEXT"),
         ] {
@@ -660,7 +662,7 @@ fn record_dependency_progress(
     now: i64,
 ) -> Result<usize> {
     let changed = db.execute(
-        "UPDATE subscriptions SET dependency_progress_at_ms=?1,dependency_deadline_ms=?1+dependency_timeout_secs*1000, \
+        "UPDATE subscriptions SET dependency_progress_at_ms=?1,dependency_deadline_ms=?1+dependency_timeout_secs*1000,dependency_period_generation=dependency_period_generation+1, \
          dependency_notice_state=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_state END, \
          dependency_notice_after_ms=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_after_ms END, \
          dependency_notice_reason=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_reason END,updated=CURRENT_TIMESTAMP \
@@ -1124,18 +1126,18 @@ fn dependency_tick_with(
     loop {
         let row = immediate(db, || {
             let row = db.query_row(
-                "SELECT id,repo,resource,thread,dependency_timeout_secs,execution_json FROM subscriptions \
+                "SELECT id,repo,resource,thread,dependency_timeout_secs,execution_json,dependency_period_generation FROM subscriptions \
                  WHERE kind='dependency' AND event='recovered' AND state='waiting' AND dependency_deadline_ms<=?1 \
                  AND (dependency_notice_state IS NULL OR (dependency_notice_state='pending' AND COALESCE(dependency_notice_after_ms,0)<=?1)) ORDER BY dependency_deadline_ms,id LIMIT 1",
                 [now],
-                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,Option<String>>(5)?)),
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,i64>(6)?)),
             ).optional()?;
-            if let Some((id, ..)) = &row {
-                db.execute("UPDATE subscriptions SET dependency_notice_state='sending',dependency_notice_reason=NULL,dependency_notice_after_ms=NULL,dependency_notice_started_at_ms=?2 WHERE id=?1 AND (dependency_notice_state IS NULL OR dependency_notice_state='pending')", params![id, now])?;
+            if let Some((id, .., generation)) = &row {
+                db.execute("UPDATE subscriptions SET dependency_notice_state='sending',dependency_notice_generation=?2,dependency_notice_reason=NULL,dependency_notice_after_ms=NULL,dependency_notice_started_at_ms=?3 WHERE id=?1 AND (dependency_notice_state IS NULL OR dependency_notice_state='pending')", params![id, generation, now])?;
             }
             Ok(row)
         })?;
-        let Some((id, repo, resource, thread, seconds, execution_json)) = row else {
+        let Some((id, repo, resource, thread, seconds, execution_json, generation)) = row else {
             break;
         };
         let message = format!(
@@ -1187,7 +1189,15 @@ fn dependency_tick_with(
                 ),
             },
         };
-        db.execute("UPDATE subscriptions SET dependency_notice_state=?1,dependency_notice_reason=?2,dependency_notice_after_ms=?3 WHERE id=?4 AND dependency_notice_state='sending'", params![state, reason, retry_after, id])?;
+        if state == "queued" || state == "pending" {
+            // Progress during delivery advances the period. A successful or
+            // known-unsent old-period attempt must not consume that new period.
+            db.execute("UPDATE subscriptions SET dependency_notice_state=CASE WHEN dependency_period_generation=?1 THEN ?2 ELSE NULL END,dependency_notice_reason=CASE WHEN dependency_period_generation=?1 THEN ?3 ELSE NULL END,dependency_notice_after_ms=CASE WHEN dependency_period_generation=?1 AND ?2='pending' THEN ?4 ELSE NULL END,dependency_notice_generation=CASE WHEN dependency_period_generation=?1 THEN dependency_notice_generation ELSE NULL END WHERE id=?5 AND dependency_notice_state='sending' AND dependency_notice_generation=?1", params![generation, state, reason, retry_after, id])?;
+        } else {
+            // An uncertain send is never replayed, even if newer progress
+            // arrived while delivery was in flight.
+            db.execute("UPDATE subscriptions SET dependency_notice_state=?1,dependency_notice_reason=?2,dependency_notice_after_ms=NULL WHERE id=?3 AND dependency_notice_state='sending' AND dependency_notice_generation=?4", params![state, reason, id, generation])?;
+        }
         attempted += 1;
         if retry_after.is_some() {
             break;
@@ -1440,6 +1450,129 @@ mod tests {
         assert_eq!(state, "needs_attention");
         assert!(reason.starts_with("send_outcome_unknown:"));
         assert_eq!(sends, 1);
+    }
+
+    #[test]
+    fn concurrent_progress_during_paused_send_rearms_the_next_period() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe_with_delivery(
+            &db,
+            "dependency",
+            "provider",
+            "paused",
+            "recovered",
+            THREAD,
+            DeliveryConfig { progress_timeout_secs: Some(10), ..DeliveryConfig::default() },
+        ).unwrap();
+        let deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        let worker_path = file.path().to_owned();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let db = Connection::open(worker_path).unwrap();
+            dependency_tick_with(&db, deadline, |_, _, _| {
+                claimed_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                Ok(("queued".into(), None))
+            }).unwrap()
+        });
+        claimed_rx.recv().unwrap();
+        let progress_db = Connection::open(file.path()).unwrap();
+        record_dependency_progress(&progress_db, "provider", "paused", deadline).unwrap();
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), 1);
+        let next_deadline: i64 = progress_db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        let (state, generation, claimed_generation): (Option<String>, i64, Option<i64>) = progress_db.query_row("SELECT dependency_notice_state,dependency_period_generation,dependency_notice_generation FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(state, None);
+        assert_eq!(generation, 2);
+        assert_eq!(claimed_generation, None);
+        let mut sends = 0;
+        assert_eq!(dependency_tick_with(&progress_db, next_deadline - 1, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        assert_eq!(dependency_tick_with(&progress_db, next_deadline, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 1);
+        assert_eq!(sends, 1);
+    }
+
+    #[test]
+    fn concurrent_progress_does_not_replay_uncertain_delivery() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe_with_delivery(
+            &db,
+            "dependency",
+            "provider",
+            "uncertain-progress",
+            "recovered",
+            THREAD,
+            DeliveryConfig { progress_timeout_secs: Some(1), ..DeliveryConfig::default() },
+        ).unwrap();
+        let deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        let worker_path = file.path().to_owned();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let db = Connection::open(worker_path).unwrap();
+            dependency_tick_with(&db, deadline, |_, _, _| {
+                claimed_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                anyhow::bail!("connection lost after send")
+            }).unwrap()
+        });
+        claimed_rx.recv().unwrap();
+        let progress_db = Connection::open(file.path()).unwrap();
+        record_dependency_progress(&progress_db, "provider", "uncertain-progress", deadline).unwrap();
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), 1);
+        let next_deadline: i64 = progress_db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        let (state, reason): (String, String) = progress_db.query_row("SELECT dependency_notice_state,dependency_notice_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(state, "needs_attention");
+        assert!(reason.starts_with("send_outcome_unknown:"));
+        assert_eq!(dependency_tick_with(&progress_db, next_deadline, |_, _, _| panic!("uncertain delivery must not be replayed")).unwrap(), 0);
+    }
+
+    #[test]
+    fn service_restart_after_claim_marks_delivery_uncertain_without_replay() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe_with_delivery(
+            &db,
+            "dependency",
+            "provider",
+            "crash-after-claim",
+            "recovered",
+            THREAD,
+            DeliveryConfig { progress_timeout_secs: Some(1), ..DeliveryConfig::default() },
+        ).unwrap();
+        let deadline: i64 = db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
+        drop(db);
+        let worker_path = file.path().to_owned();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (crash_tx, crash_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let db = Connection::open(worker_path).unwrap();
+            dependency_tick_with(&db, deadline, |_, _, _| {
+                claimed_tx.send(()).unwrap();
+                crash_rx.recv().unwrap();
+                panic!("simulated service crash after durable claim")
+            }).unwrap()
+        });
+        claimed_rx.recv().unwrap();
+        let progress_db = Connection::open(file.path()).unwrap();
+        record_dependency_progress(&progress_db, "provider", "crash-after-claim", deadline + 1).unwrap();
+        crash_tx.send(()).unwrap();
+        assert!(worker.join().is_err());
+        drop(progress_db);
+        let db = Connection::open(file.path()).unwrap();
+        initialize(&db).unwrap();
+        let mut sends = 0;
+        assert_eq!(dependency_tick_with(&db, deadline + 120_001, |_, _, _| { sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        let (state, reason): (String, String) = db.query_row("SELECT dependency_notice_state,dependency_notice_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(state, "needs_attention");
+        assert!(reason.starts_with("send_outcome_unknown:"));
+        assert_eq!(sends, 0);
     }
 
     #[test]
