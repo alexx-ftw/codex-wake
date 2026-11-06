@@ -134,7 +134,32 @@ fn background_file_observation_queues_once_without_http_receiver_or_model() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["producer"]["type"], "automatic_configured");
     let id = result["subscription_id"].as_str().unwrap();
+    let unknown = command()
+        .args([
+            "subscribe",
+            "--kind",
+            "artifact",
+            "--repo",
+            "build",
+            "--resource",
+            "other",
+            "--event",
+            "available",
+            "--thread",
+            "22222222-2222-4222-8222-222222222222",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        unknown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+    let unknown: Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(unknown["producer"]["type"], "unknown");
+    assert!(unknown["producer"]["warning"].is_string());
     fs::write(&artifact, b"published atomically for this test").unwrap();
     let mut service = Service(
         command()

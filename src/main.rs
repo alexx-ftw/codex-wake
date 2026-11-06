@@ -1250,7 +1250,8 @@ async fn run_command(
             if matches!(kind.as_str(), "thread" | "subagent") {
                 native_poll::arm(&database(&config)?, &id, &config.codex)?;
             }
-            println!("{}", json!({"subscription_id":id}));
+            let producer = producers::status(&database(&config)?, &id)?;
+            println!("{}", json!({"subscription_id":id,"producer":producer}));
         }
         "publish" => {
             let kind = required(&mut args, "--kind")?;
