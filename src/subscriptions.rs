@@ -153,6 +153,8 @@ pub fn initialize(db: &Connection) -> Result<()> {
             ("dependency_notice_started_at_ms", "INTEGER"),
             ("dependency_period_generation", "INTEGER NOT NULL DEFAULT 1"),
             ("dependency_notice_generation", "INTEGER"),
+            ("dependency_notice_uncertain_generation", "INTEGER"),
+            ("dependency_notice_uncertain_reason", "TEXT"),
             ("dependency_notice_after_ms", "INTEGER"),
             ("dependency_notice_reason", "TEXT"),
         ] {
@@ -162,6 +164,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
                 ))?;
             }
         }
+        db.execute("UPDATE subscriptions SET dependency_notice_uncertain_generation=COALESCE(dependency_notice_generation,dependency_period_generation),dependency_notice_uncertain_reason=dependency_notice_reason WHERE dependency_notice_state='needs_attention' AND substr(dependency_notice_reason,1,21)='send_outcome_unknown:' AND dependency_notice_uncertain_generation IS NULL", [])?;
         let now = epoch_ms()?;
         db.execute(
             "UPDATE subscriptions SET dependency_timeout_secs=?1,dependency_progress_at_ms=?2,dependency_deadline_ms=?3 \
@@ -663,9 +666,9 @@ fn record_dependency_progress(
 ) -> Result<usize> {
     let changed = db.execute(
         "UPDATE subscriptions SET dependency_progress_at_ms=?1,dependency_deadline_ms=?1+dependency_timeout_secs*1000,dependency_period_generation=dependency_period_generation+1, \
-         dependency_notice_state=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_state END, \
-         dependency_notice_after_ms=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_after_ms END, \
-         dependency_notice_reason=CASE WHEN dependency_notice_state IN ('pending','queued') THEN NULL ELSE dependency_notice_reason END,updated=CURRENT_TIMESTAMP \
+         dependency_notice_state=CASE WHEN dependency_notice_state IN ('pending','queued') OR (dependency_notice_state='needs_attention' AND dependency_notice_uncertain_generation<dependency_period_generation+1) THEN NULL ELSE dependency_notice_state END, \
+         dependency_notice_after_ms=CASE WHEN dependency_notice_state IN ('pending','queued') OR (dependency_notice_state='needs_attention' AND dependency_notice_uncertain_generation<dependency_period_generation+1) THEN NULL ELSE dependency_notice_after_ms END, \
+         dependency_notice_reason=CASE WHEN dependency_notice_state IN ('pending','queued') OR (dependency_notice_state='needs_attention' AND dependency_notice_uncertain_generation<dependency_period_generation+1) THEN NULL ELSE dependency_notice_reason END,updated=CURRENT_TIMESTAMP \
          WHERE kind='dependency' AND repo=?2 AND resource=?3 AND event='recovered' AND state='waiting' AND dependency_timeout_secs IS NOT NULL",
         params![now, repo, resource],
     )?;
@@ -1121,7 +1124,7 @@ fn dependency_tick_with(
 ) -> Result<usize> {
     initialize(db)?;
     // A sender left in this state across a service restart has an unknown delivery outcome.
-    db.execute("UPDATE subscriptions SET dependency_notice_state='needs_attention',dependency_notice_reason='send_outcome_unknown: sender stopped while delivery was in progress' WHERE dependency_notice_state='sending' AND dependency_notice_started_at_ms<=?1", [now.saturating_sub(120_000)])?;
+    db.execute("UPDATE subscriptions SET dependency_notice_uncertain_generation=COALESCE(dependency_notice_generation,dependency_period_generation),dependency_notice_uncertain_reason='send_outcome_unknown: sender stopped while delivery was in progress',dependency_notice_state=CASE WHEN COALESCE(dependency_notice_generation,dependency_period_generation)<dependency_period_generation THEN NULL ELSE 'needs_attention' END,dependency_notice_reason=CASE WHEN COALESCE(dependency_notice_generation,dependency_period_generation)<dependency_period_generation THEN NULL ELSE 'send_outcome_unknown: sender stopped while delivery was in progress' END,dependency_notice_generation=CASE WHEN COALESCE(dependency_notice_generation,dependency_period_generation)<dependency_period_generation THEN NULL ELSE dependency_notice_generation END WHERE dependency_notice_state='sending' AND dependency_notice_started_at_ms<=?1", [now.saturating_sub(120_000)])?;
     let mut attempted = 0;
     loop {
         let row = immediate(db, || {
@@ -1193,9 +1196,13 @@ fn dependency_tick_with(
             // Progress during delivery advances the period. A successful or
             // known-unsent old-period attempt must not consume that new period.
             db.execute("UPDATE subscriptions SET dependency_notice_state=CASE WHEN dependency_period_generation=?1 THEN ?2 ELSE NULL END,dependency_notice_reason=CASE WHEN dependency_period_generation=?1 THEN ?3 ELSE NULL END,dependency_notice_after_ms=CASE WHEN dependency_period_generation=?1 AND ?2='pending' THEN ?4 ELSE NULL END,dependency_notice_generation=CASE WHEN dependency_period_generation=?1 THEN dependency_notice_generation ELSE NULL END WHERE id=?5 AND dependency_notice_state='sending' AND dependency_notice_generation=?1", params![generation, state, reason, retry_after, id])?;
+        } else if state == "needs_attention"
+            && reason.as_deref().is_some_and(|reason| reason.starts_with("send_outcome_unknown:"))
+        {
+            // Keep the uncertain outcome tied to its claimed generation. If
+            // progress advanced during delivery, leave the new period eligible.
+            db.execute("UPDATE subscriptions SET dependency_notice_uncertain_generation=?1,dependency_notice_uncertain_reason=?2,dependency_notice_state=CASE WHEN dependency_period_generation=?1 THEN 'needs_attention' ELSE NULL END,dependency_notice_reason=CASE WHEN dependency_period_generation=?1 THEN ?2 ELSE NULL END,dependency_notice_after_ms=NULL,dependency_notice_generation=CASE WHEN dependency_period_generation=?1 THEN dependency_notice_generation ELSE NULL END WHERE id=?3 AND dependency_notice_state='sending' AND dependency_notice_generation=?1", params![generation, reason, id])?;
         } else {
-            // An uncertain send is never replayed, even if newer progress
-            // arrived while delivery was in flight.
             db.execute("UPDATE subscriptions SET dependency_notice_state=?1,dependency_notice_reason=?2,dependency_notice_after_ms=NULL WHERE id=?3 AND dependency_notice_state='sending' AND dependency_notice_generation=?4", params![state, reason, id, generation])?;
         }
         attempted += 1;
@@ -1248,6 +1255,20 @@ mod tests {
             (uncertain.as_str(), reason.as_str()),
             ("needs_attention", "send_outcome_unknown: prior delivery")
         );
+    }
+
+    #[test]
+    fn migration_preserves_uncertainty_generation_from_existing_notice_state() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE subscriptions (id TEXT PRIMARY KEY,kind TEXT NOT NULL,repo TEXT NOT NULL,resource TEXT NOT NULL,event TEXT NOT NULL,thread TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT,reason TEXT,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,message_template TEXT,source_json TEXT,execution_json TEXT,required_source TEXT,dependency_timeout_secs INTEGER,dependency_progress_at_ms INTEGER,dependency_deadline_ms INTEGER,dependency_notice_state TEXT,dependency_notice_started_at_ms INTEGER,dependency_period_generation INTEGER NOT NULL DEFAULT 1,dependency_notice_generation INTEGER,dependency_notice_after_ms INTEGER,dependency_notice_reason TEXT); INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,dependency_timeout_secs,dependency_progress_at_ms,dependency_deadline_ms,dependency_notice_state,dependency_period_generation,dependency_notice_generation,dependency_notice_reason) VALUES ('old-uncertain','dependency','provider','queue','recovered','11111111-1111-4111-8111-111111111111','waiting',10,1000,11000,'needs_attention',2,1,'send_outcome_unknown: prior attempt');").unwrap();
+        initialize(&db).unwrap();
+        let (generation, reason): (i64, String) = db.query_row("SELECT dependency_notice_uncertain_generation,dependency_notice_uncertain_reason FROM subscriptions WHERE id='old-uncertain'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(reason, "send_outcome_unknown: prior attempt");
+        record_dependency_progress(&db, "provider", "queue", 2_000).unwrap();
+        let (state, generation): (Option<String>, i64) = db.query_row("SELECT dependency_notice_state,dependency_notice_uncertain_generation FROM subscriptions WHERE id='old-uncertain'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(state, None);
+        assert_eq!(generation, 1);
     }
 
     #[test]
@@ -1495,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_progress_does_not_replay_uncertain_delivery() {
+    fn uncertain_old_generation_is_preserved_while_next_period_notifies_once() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = Connection::open(file.path()).unwrap();
         initialize(&db).unwrap();
@@ -1526,10 +1547,18 @@ mod tests {
         resume_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), 1);
         let next_deadline: i64 = progress_db.query_row("SELECT dependency_deadline_ms FROM subscriptions WHERE id=?1", [&id], |r| r.get(0)).unwrap();
-        let (state, reason): (String, String) = progress_db.query_row("SELECT dependency_notice_state,dependency_notice_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        assert_eq!(state, "needs_attention");
-        assert!(reason.starts_with("send_outcome_unknown:"));
-        assert_eq!(dependency_tick_with(&progress_db, next_deadline, |_, _, _| panic!("uncertain delivery must not be replayed")).unwrap(), 0);
+        let (state, uncertain_generation, uncertain_reason): (Option<String>, i64, String) = progress_db.query_row("SELECT dependency_notice_state,dependency_notice_uncertain_generation,dependency_notice_uncertain_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(state, None);
+        assert_eq!(uncertain_generation, 1);
+        assert!(uncertain_reason.starts_with("send_outcome_unknown:"));
+        let mut new_period_sends = 0;
+        assert_eq!(dependency_tick_with(&progress_db, next_deadline - 1, |_, _, _| { new_period_sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        assert_eq!(dependency_tick_with(&progress_db, next_deadline, |_, _, _| { new_period_sends += 1; Ok(("queued".into(), None)) }).unwrap(), 1);
+        assert_eq!(dependency_tick_with(&progress_db, next_deadline + 1, |_, _, _| { new_period_sends += 1; Ok(("queued".into(), None)) }).unwrap(), 0);
+        assert_eq!(new_period_sends, 1);
+        let (uncertain_generation, uncertain_reason): (i64, String) = progress_db.query_row("SELECT dependency_notice_uncertain_generation,dependency_notice_uncertain_reason FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(uncertain_generation, 1);
+        assert!(uncertain_reason.starts_with("send_outcome_unknown:"));
     }
 
     #[test]
