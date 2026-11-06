@@ -1143,7 +1143,7 @@ impl WakeTools {
     ) -> CallToolResult {
         tool_result((|| {
             let mut db = database(&self.config)?;
-            let transfer = obligations::propose_transfer(
+            let mut transfer = obligations::propose_transfer(
                 &mut db,
                 &input.obligation_id,
                 &input.source_thread,

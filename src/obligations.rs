@@ -496,7 +496,11 @@ fn dispatch_with(
         )?;
         crate::observability::emit(
             "obligation_transfer.notify",
-            &state,
+            match state.as_str() {
+                "queued" => "queued",
+                "ready" => "ready",
+                _ => "needs_attention",
+            },
             reason.as_deref().unwrap_or(""),
             Some(&id),
             Duration::ZERO,

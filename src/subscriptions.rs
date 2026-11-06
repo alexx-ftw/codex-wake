@@ -1164,7 +1164,8 @@ fn dependency_tick_with(
         );
         let options = execution_json
             .as_deref()
-            .map(serde_json::from_str::<crate::execution::ExecutionOptions>);
+            .map(serde_json::from_str::<crate::execution::ExecutionOptions>)
+            .transpose();
         let result = match options {
             Err(error) => Ok((
                 "needs_attention".to_owned(),
