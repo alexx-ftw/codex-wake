@@ -354,6 +354,11 @@ resolved wait creates a new episode. `get_status.circular_waits` exposes waits
 and notice states. The receiver and `recover_ready` dispatch notices; a stopped
 receiver leaves them ready. Queued means accepted, not read or executed. Sending
 and uncertain notices are never retried automatically; inspect status first.
+After five minutes in `sending`, `get_status` reports `sending_outcome_unknown`
+and includes the notice in `actionable`. This is a read-only diagnostic: the
+sender may still be running, and a later result can still update the notice.
+An unreadable or future timestamp is also reported as uncertain. Inspect the
+sender and destination before acting; elapsed time does not prove failure.
 
 For an expected result, `register_obligation` records the responsible chat and
 the exact publication kind, namespace, resource and outcome. At an eligible

@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
+// The CLI send timeout is 120s; status remains observational even beyond this grace period.
+const SENDING_DIAGNOSTIC_SECONDS: i64 = 300;
+
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS circular_waits (
         id TEXT PRIMARY KEY, thread TEXT NOT NULL, waits_for TEXT NOT NULL,
@@ -106,8 +109,13 @@ pub fn resolve(db: &mut Connection, id: &str) -> Result<bool> {
 pub fn status(db: &Connection) -> Result<Value> {
     let mut stmt = db.prepare("SELECT id,thread,waits_for,evidence,continuation,continuation_ref FROM circular_waits WHERE active=1 ORDER BY rowid")?;
     let waits = stmt.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"thread":r.get::<_,String>(1)?,"waits_for":r.get::<_,String>(2)?,"evidence":r.get::<_,String>(3)?,"continuation":r.get::<_,String>(4)?,"continuation_ref":r.get::<_,Option<String>>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut stmt = db.prepare("SELECT id,first_wait,second_wait,thread,state,reason,updated,message FROM circular_notices ORDER BY rowid")?;
-    let notices = stmt.query_map([], |r| Ok(json!({"id":r.get::<_,String>(0)?,"first_wait":r.get::<_,String>(1)?,"second_wait":r.get::<_,String>(2)?,"thread":r.get::<_,String>(3)?,"state":r.get::<_,String>(4)?,"reason":r.get::<_,Option<String>>(5)?,"updated":r.get::<_,String>(6)?,"message":r.get::<_,String>(7)?,"execution_verified":false})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut stmt = db.prepare("SELECT id,first_wait,second_wait,thread,state,reason,updated,message,unixepoch()-unixepoch(updated) FROM circular_notices ORDER BY rowid")?;
+    let notices = stmt.query_map([], |r| {
+        let state: String = r.get(4)?;
+        let age: Option<i64> = r.get(8)?;
+        let uncertain = state == "sending" && age.is_none_or(|seconds| seconds < 0 || seconds >= SENDING_DIAGNOSTIC_SECONDS);
+        Ok(json!({"id":r.get::<_,String>(0)?,"first_wait":r.get::<_,String>(1)?,"second_wait":r.get::<_,String>(2)?,"thread":r.get::<_,String>(3)?,"state":state,"reason":r.get::<_,Option<String>>(5)?,"updated":r.get::<_,String>(6)?,"message":r.get::<_,String>(7)?,"sending_age_seconds":if state == "sending" { age } else { None },"diagnostic":if uncertain { Some("sending_outcome_unknown") } else { None },"execution_verified":false}))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!({"waits":waits,"notices":notices}))
 }
 
@@ -293,6 +301,97 @@ mod tests {
             ))
             .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn old_sending_is_diagnosed_without_mutation_or_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        register(&mut db, A, B, "first", "unknown", None).unwrap();
+        register(&mut db, B, A, "second", "unknown", None).unwrap();
+        db.execute("UPDATE circular_notices SET state='sending',updated=datetime('now','-301 seconds') WHERE thread=?1", [A]).unwrap();
+        db.execute(
+            "UPDATE circular_notices SET state='sending',updated=CURRENT_TIMESTAMP WHERE thread=?1",
+            [B],
+        )
+        .unwrap();
+        drop(db);
+        let mut db = Connection::open(&path).unwrap();
+        let output = status(&db).unwrap();
+        let notices = output["notices"].as_array().unwrap();
+        let old = notices.iter().find(|row| row["thread"] == A).unwrap();
+        let recent = notices.iter().find(|row| row["thread"] == B).unwrap();
+        assert_eq!(old["state"], "sending");
+        assert_eq!(old["diagnostic"], "sending_outcome_unknown");
+        assert!(old["sending_age_seconds"].as_i64().unwrap() >= 300);
+        assert!(recent["diagnostic"].is_null());
+        assert!(status_view_check(&output));
+        assert_eq!(
+            dispatch_with(&mut db, &mut |_, _| panic!("sending must not replay")).unwrap(),
+            0
+        );
+        let stored: (String, Option<String>) = db
+            .query_row(
+                "SELECT state,reason FROM circular_notices WHERE thread=?1",
+                [A],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("sending".into(), None));
+        for timestamp in ["invalid", "2999-01-01 00:00:00"] {
+            db.execute(
+                "UPDATE circular_notices SET updated=?1 WHERE thread=?2",
+                params![timestamp, B],
+            )
+            .unwrap();
+            let result = status(&db).unwrap();
+            let row = result["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["thread"] == B)
+                .unwrap();
+            assert_eq!(row["diagnostic"], "sending_outcome_unknown");
+        }
+    }
+
+    fn status_view_check(value: &Value) -> bool {
+        let items = crate::status_view::circular_notices(value);
+        items.len() == 1
+            && items[0]["next_action"]
+                .as_str()
+                .is_some_and(|text| text.contains("do not blindly retry"))
+    }
+
+    #[test]
+    fn long_running_send_can_complete_after_it_was_diagnosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        register(&mut db, A, B, "first", "unknown", None).unwrap();
+        register(&mut db, B, A, "second", "unknown", None).unwrap();
+        let mut calls = 0;
+        dispatch_with(&mut db, &mut |thread, _| {
+            calls += 1;
+            if calls == 1 {
+                let observer = Connection::open(&path).unwrap();
+                observer.execute("UPDATE circular_notices SET updated=datetime('now','-301 seconds') WHERE thread=?1 AND state='sending'", [thread]).unwrap();
+                let output = status(&observer).unwrap();
+                assert!(status_view_check(&output));
+            }
+            Ok(("queued".into(), None))
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert!(
+            status(&db).unwrap()["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|notice| notice["state"] == "queued" && notice["diagnostic"].is_null())
         );
     }
 

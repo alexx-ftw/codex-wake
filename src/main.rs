@@ -1137,9 +1137,14 @@ impl WakeTools {
             let waits = bridge::status(&db)?;
             let subscriptions = producers::subscriptions_status(&db)?;
             let rules = rules::status(&db)?;
-            let actionable = status_view::actionable(&waits, &subscriptions, &rules);
+            let mut actionable = status_view::actionable(&waits, &subscriptions, &rules);
+            let circular = circular_waits::status(&db)?;
+            actionable
+                .as_array_mut()
+                .unwrap()
+                .extend(status_view::circular_notices(&circular));
             Ok(
-                json!({"actionable":actionable,"receiver": manager::status(&self.config)?, "waits": waits, "subscriptions":subscriptions,"rules":rules,"steers":steer::status(&db)?,"circular_waits":circular_waits::status(&db)?,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
+                json!({"actionable":actionable,"receiver": manager::status(&self.config)?, "waits": waits, "subscriptions":subscriptions,"rules":rules,"steers":steer::status(&db)?,"circular_waits":circular,"polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},"supported_events":subscriptions::ALLOWED_EVENTS,"diagnostics":diagnostics(&self.config,42)?}),
             )
         })())
     }

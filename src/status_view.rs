@@ -49,6 +49,13 @@ pub fn actionable(waits: &Value, subscriptions: &Value, rules: &Value) -> Value 
     json!(items)
 }
 
+pub fn circular_notices(circular: &Value) -> Vec<Value> {
+    circular["notices"].as_array().into_iter().flatten().filter(|notice| notice["diagnostic"] == "sending_outcome_unknown").map(|notice| {
+        let thread = notice["thread"].as_str();
+        json!({"source":"circular_notice","evidence":notice,"thread_link":thread.map(|id| format!("codex://threads/{id}")),"next_action":"The delivery outcome is unknown and it may still be in progress. Inspect the destination and sender before deciding what to do; do not blindly retry."})
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
