@@ -1,0 +1,122 @@
+{
+  "codex_cli_version": "0.166.0",
+  "wake_base_commit": "bfe5b59946fab39ca93057f9324aefbf472761dd",
+  "synthetic_provider": true,
+  "mcp_systemd_bootstrap_bypassed": true,
+  "exit_code": 0,
+  "model_requests": 4,
+  "thread": "01a1b424-3811-7d91-bc81-1e37512c3c62",
+  "obligation": "cf2e416f-85d6-44ce-a233-700363a66224",
+  "stop_before_resolution": true,
+  "stop_receipts": [
+    {
+      "hook_event_name": "Stop",
+      "session_id": "01a1b424-3811-7d91-bc81-1e37512c3c62",
+      "turn_id": "01a1b424-3830-7bc0-971c-d98c4dbd138d",
+      "stop_hook_active": false,
+      "last_assistant_message": "READY",
+      "decision": "block",
+      "reason": "Wake: 1 publication or validation obligation(s) remain pending for chat 01a1b424-3811-7d91-bc81-1e37512c3c62. Call list_obligations with this chat ID to review them. Publish only when a result is available; resolve a validation only with evidence of the check performed. If work is ongoing or blocked, continue or report that status without inventing a result. Existing authorization only.",
+      "exit": 0
+    },
+    {
+      "hook_event_name": "Stop",
+      "session_id": "01a1b424-3811-7d91-bc81-1e37512c3c62",
+      "turn_id": "01a1b424-3830-7bc0-971c-d98c4dbd138d",
+      "stop_hook_active": true,
+      "last_assistant_message": "DONE",
+      "exit": 0
+    }
+  ],
+  "validation_tool_events": [
+    {
+      "type": "item.started",
+      "item": {
+        "id": "item_3",
+        "type": "mcp_tool_call",
+        "server": "codex-wake",
+        "tool": "register_validation",
+        "arguments": {
+          "thread": "01a1b424-3811-7d91-bc81-1e37512c3c62",
+          "description": "Fixture: verify 2 + 2 = 4"
+        },
+        "result": null,
+        "error": null,
+        "status": "in_progress"
+      }
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "id": "item_3",
+        "type": "mcp_tool_call",
+        "server": "codex-wake",
+        "tool": "register_validation",
+        "arguments": {
+          "thread": "01a1b424-3811-7d91-bc81-1e37512c3c62",
+          "description": "Fixture: verify 2 + 2 = 4"
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"obligation_id\":\"cf2e416f-85d6-44ce-a233-700363a66224\"}"
+            }
+          ],
+          "structured_content": {
+            "obligation_id": "cf2e416f-85d6-44ce-a233-700363a66224"
+          }
+        },
+        "error": null,
+        "status": "completed"
+      }
+    },
+    {
+      "type": "item.started",
+      "item": {
+        "id": "item_5",
+        "type": "mcp_tool_call",
+        "server": "codex-wake",
+        "tool": "resolve_validation",
+        "arguments": {
+          "obligation_id": "cf2e416f-85d6-44ce-a233-700363a66224",
+          "evidence": "Fixture arithmetic check: 2 + 2 = 4."
+        },
+        "result": null,
+        "error": null,
+        "status": "in_progress"
+      }
+    },
+    {
+      "type": "item.completed",
+      "item": {
+        "id": "item_5",
+        "type": "mcp_tool_call",
+        "server": "codex-wake",
+        "tool": "resolve_validation",
+        "arguments": {
+          "obligation_id": "cf2e416f-85d6-44ce-a233-700363a66224",
+          "evidence": "Fixture arithmetic check: 2 + 2 = 4."
+        },
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"resolved\":true}"
+            }
+          ],
+          "structured_content": {
+            "resolved": true
+          }
+        },
+        "error": null,
+        "status": "completed"
+      }
+    }
+  ],
+  "final_record": {
+    "id": "cf2e416f-85d6-44ce-a233-700363a66224",
+    "resolved": 1,
+    "evidence": "Fixture arithmetic check: 2 + 2 = 4."
+  }
+}
