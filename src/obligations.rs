@@ -125,9 +125,31 @@ pub fn initialize(db: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     if !collision_columns.iter().any(|column| column == "claim_id") {
-        db.execute_batch("ALTER TABLE coordinator_alert_legacy_collisions ADD COLUMN claim_id TEXT; UPDATE coordinator_alert_legacy_collisions SET claim_id=alert_id WHERE claim_id IS NULL;")?;
+        // Recheck after taking the write lock: another startup may have migrated it.
+        let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let current = {
+            let mut stmt = tx.prepare("PRAGMA table_info(coordinator_alert_legacy_collisions)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !current.iter().any(|column| column == "claim_id") {
+            tx.execute_batch(
+                "ALTER TABLE coordinator_alert_legacy_collisions ADD COLUMN claim_id TEXT",
+            )?;
+        }
+        tx.execute("UPDATE coordinator_alert_legacy_collisions SET claim_id=alert_id WHERE claim_id IS NULL", [])?;
+        tx.commit()?;
     }
     db.execute_batch("CREATE INDEX IF NOT EXISTS coordinator_collision_claim ON coordinator_alert_legacy_collisions(claim_id)")?;
+    // Complete a partially applied migration from an earlier interrupted startup.
+    let incomplete: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE claim_id IS NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    if incomplete {
+        db.execute("UPDATE coordinator_alert_legacy_collisions SET claim_id=alert_id WHERE claim_id IS NULL", [])?;
+    }
     let columns = {
         let mut statement = db.prepare("PRAGMA table_info(coordinator_alerts)")?;
         statement
@@ -2158,6 +2180,56 @@ mod mixed_alert_version_tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE coordinator_alert_legacy_collisions(alert_id TEXT PRIMARY KEY,legacy_alert_id TEXT NOT NULL,observations INTEGER NOT NULL DEFAULT 1); INSERT INTO coordinator_alert_legacy_collisions(alert_id,legacy_alert_id) VALUES('prior','old');").unwrap();
         initialize(&db).unwrap();
+        let claim: String = db
+            .query_row(
+                "SELECT claim_id FROM coordinator_alert_legacy_collisions WHERE alert_id='prior'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim, "prior");
+        db.execute(
+            "UPDATE coordinator_alert_legacy_collisions SET claim_id=NULL WHERE alert_id='prior'",
+            [],
+        )
+        .unwrap();
+        initialize(&db).unwrap();
+        let recovered: String = db
+            .query_row(
+                "SELECT claim_id FROM coordinator_alert_legacy_collisions WHERE alert_id='prior'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovered, "prior");
+    }
+    #[test]
+    fn concurrent_startups_serialize_collision_schema_migration() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        db.execute_batch("DROP TABLE coordinator_alert_legacy_collisions; CREATE TABLE coordinator_alert_legacy_collisions(alert_id TEXT PRIMARY KEY,legacy_alert_id TEXT NOT NULL,observations INTEGER NOT NULL DEFAULT 1); INSERT INTO coordinator_alert_legacy_collisions(alert_id,legacy_alert_id) VALUES('prior','old');").unwrap();
+        drop(db);
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = Connection::open(path).unwrap();
+                    db.busy_timeout(Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    initialize(&db)
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let db = Connection::open(path).unwrap();
         let claim: String = db
             .query_row(
                 "SELECT claim_id FROM coordinator_alert_legacy_collisions WHERE alert_id='prior'",
