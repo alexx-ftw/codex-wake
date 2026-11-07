@@ -292,12 +292,45 @@ pub fn register_coordinator(db: &Connection, responsible: &str, coordinator: &st
     Ok(())
 }
 
+/// Hash every pending obligation in canonical ID order without retaining the whole set.
+/// Run inside the same transaction as the alert claim.
+pub fn pending_digest(db: &Connection, thread: &str) -> Result<(i64, String)> {
+    let mut stmt = db.prepare(
+        "SELECT id,kind,repo,resource,outcome,description FROM obligations \
+         WHERE thread=?1 AND resolved=0 ORDER BY id COLLATE BINARY",
+    )?;
+    let mut rows = stmt.query([thread])?;
+    let mut hash = Sha256::new();
+    let mut count = 0_i64;
+    while let Some(row) = rows.next()? {
+        for index in 0..6 {
+            let value: String = row.get(index)?;
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        count += 1;
+    }
+    Ok((count, format!("{:x}", hash.finalize())))
+}
+
 /// Persist before sending. Existing event IDs are never sent again, including after an uncertain result.
+#[cfg(test)]
 pub fn claim_coordinator_alert(
     db: &Connection,
     responsible: &str,
     fingerprint: &str,
     message: &str,
+) -> Result<Option<(String, String)>> {
+    claim_coordinator_alert_with_legacy(db, responsible, fingerprint, message, None)
+}
+
+/// Caller holds an immediate transaction covering the snapshot and this claim.
+pub fn claim_coordinator_alert_with_legacy(
+    db: &Connection,
+    responsible: &str,
+    fingerprint: &str,
+    message: &str,
+    legacy_fingerprint: Option<&str>,
 ) -> Result<Option<(String, String)>> {
     let responsible = Uuid::parse_str(responsible)?.to_string();
     let Some(coordinator) = db
@@ -314,6 +347,20 @@ pub fn claim_coordinator_alert(
         "{:x}",
         Sha256::digest(format!("{responsible}:{coordinator}:{fingerprint}").as_bytes())
     );
+    if let Some(legacy) = legacy_fingerprint {
+        let old_id = format!(
+            "{:x}",
+            Sha256::digest(format!("{responsible}:{coordinator}:{legacy}").as_bytes())
+        );
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_alerts WHERE id=?1)",
+            [&old_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(None);
+        }
+    }
     let sender_pid = i64::from(std::process::id());
     let sender_start =
         process_start_time(std::process::id()).and_then(|started| i64::try_from(started).ok());
@@ -1720,5 +1767,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(persisted, "sending");
+    }
+}
+
+#[cfg(test)]
+mod full_snapshot_tests {
+    use super::*;
+    use std::{sync::mpsc, thread, time::Duration};
+
+    const OWNER: &str = "11111111-1111-4111-8111-111111111111";
+    const COORDINATOR: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn digest_is_independent_of_insert_order_and_includes_changed_content() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let insert = |id: &str| {
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','resource','available','pending')", params![id, OWNER]).unwrap()
+        };
+        insert("b");
+        insert("a");
+        let before = pending_digest(&db, OWNER).unwrap();
+        db.execute("DELETE FROM obligations", []).unwrap();
+        insert("a");
+        insert("b");
+        assert_eq!(before, pending_digest(&db, OWNER).unwrap());
+        db.execute(
+            "UPDATE obligations SET description='changed' WHERE id='b'",
+            [],
+        )
+        .unwrap();
+        assert_ne!(before, pending_digest(&db, OWNER).unwrap());
+        db.execute("UPDATE obligations SET resolved=1 WHERE id='b'", [])
+            .unwrap();
+        assert_eq!(pending_digest(&db, OWNER).unwrap().0, 1);
+    }
+
+    #[test]
+    fn snapshot_and_claim_serialize_with_modification_and_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, OWNER, COORDINATOR).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('a',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        for sql in [
+            "UPDATE obligations SET description='changed' WHERE id='a'",
+            "UPDATE obligations SET resolved=1 WHERE id='a'",
+        ] {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            let before = pending_digest(&tx, OWNER).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let path = path.clone();
+            let worker = thread::spawn(move || {
+                let other = Connection::open(path).unwrap();
+                other.busy_timeout(Duration::from_secs(5)).unwrap();
+                started_tx.send(()).unwrap();
+                other.execute(sql, []).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(before, pending_digest(&tx, OWNER).unwrap());
+            let fingerprint = format!("snapshot-{}", before.1);
+            assert!(
+                claim_coordinator_alert_with_legacy(&tx, OWNER, &fingerprint, "snapshot", None)
+                    .unwrap()
+                    .is_some()
+            );
+            tx.commit().unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            assert_ne!(before, pending_digest(&db, OWNER).unwrap());
+        }
+        assert_eq!(pending_digest(&db, OWNER).unwrap().0, 0);
     }
 }

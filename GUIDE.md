@@ -444,9 +444,15 @@ Stop-loop hooks, and chats without an explicit coordinator do not trigger this
 alert. Wake persists the alert before sending and never retries the same
 fingerprinted event automatically. An uncertain send remains recorded for
 inspection; queue acceptance still does not prove that the coordinator read it.
-If the hook has no turn ID, Wake sends at most one alert for the same pending
-obligation set and last assistant message; a changed message can identify a
-later Stop, while an identical reentrant hook remains deduplicated. In `get_status`,
+The alert fingerprint includes a canonical digest of every pending obligation,
+while its message remains limited to the first eight descriptions. The digest
+and alert claim share one database transaction; a later change may produce a
+new alert, but an identical uncertain claim is never replayed. If the hook has
+no turn ID, the last assistant message also distinguishes alerts. Before
+upgrading from the older fingerprint format, finish controller-owned turns and
+keep the existing upgrade barrier: old hashed claims cannot reliably be mapped
+back to a changed pending set. A matching legacy claim is conservatively honored,
+which can suppress a changed set during the same old turn. In `get_status`,
 a `sending` alert whose sender process is no longer verifiably alive appears as
 `uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
 not resend it. A live sender remains `sending`; this read-only diagnosis does

@@ -439,15 +439,21 @@ fn notify_coordinator(
     db: &rusqlite::Connection,
     source: &str,
     payload: &Value,
-    count: i64,
 ) -> Result<Option<(String, String)>> {
-    let (obligations, _) = obligations::pending_page(db, source, None)?;
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let (count, digest) = obligations::pending_digest(&tx, source)?;
+    if count == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let (obligations, _) = obligations::pending_page(&tx, source, None)?;
     let last = payload["last_assistant_message"]
         .as_str()
         .map(|message| message.chars().take(2048).collect::<String>())
         .filter(|message| !message.trim().is_empty())
         .unwrap_or_else(|| "Unavailable in the Stop hook payload.".into());
-    let fingerprint = coordinator_alert_fingerprint(source, payload, &obligations, &last)?;
+    let legacy = coordinator_alert_fingerprint(source, payload, &obligations, &last)?;
+    let fingerprint = coordinator_alert_full_fingerprint(source, payload, &digest, &last)?;
     let descriptions = obligations
         .iter()
         .map(|obligation| {
@@ -472,11 +478,18 @@ fn notify_coordinator(
         },
         last
     );
-    let Some((id, coordinator)) =
-        obligations::claim_coordinator_alert(db, source, &fingerprint, &message)?
+    let Some((id, coordinator)) = obligations::claim_coordinator_alert_with_legacy(
+        &tx,
+        source,
+        &fingerprint,
+        &message,
+        Some(&legacy),
+    )?
     else {
+        tx.commit()?;
         return Ok(None);
     };
+    tx.commit()?;
     let (mut state, reason) = match bridge::send_mode(
         &config.codex,
         Duration::from_secs(30),
@@ -508,6 +521,20 @@ fn notify_coordinator(
         1,
     );
     Ok(Some((coordinator, state)))
+}
+
+fn coordinator_alert_full_fingerprint(
+    source: &str,
+    payload: &Value,
+    digest: &str,
+    last_message: &str,
+) -> Result<String> {
+    let turn_id = payload["turn_id"].as_str().filter(|id| !id.is_empty());
+    let mut event = json!({"version": 2, "source":source, "turn":turn_id.unwrap_or("no_turn_id"), "pending_digest":digest});
+    if turn_id.is_none() {
+        event["last_assistant_message"] = json!(last_message);
+    }
+    Ok(serde_json::to_string(&event)?)
 }
 
 fn coordinator_alert_fingerprint(
@@ -698,12 +725,11 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
             "{previous} Delivery recovery is deferred to the receiver; inspect status if it is unavailable."
         ));
     }
-    let coordinator_alert = if reminder_count > 0
-        && payload["hook_event_name"] == "Stop"
+    let coordinator_alert = if payload["hook_event_name"] == "Stop"
         && payload["stop_hook_active"] != true
         && payload["agent_id"].as_str().is_none_or(|id| id == resource)
     {
-        notify_coordinator(config, &db, &resource, payload, reminder_count)?
+        notify_coordinator(config, &db, &resource, payload)?
     } else {
         None
     };
