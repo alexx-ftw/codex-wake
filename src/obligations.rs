@@ -87,7 +87,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS coordinator_alert_legacy_collisions (
             alert_id TEXT PRIMARY KEY, legacy_alert_id TEXT NOT NULL,
-            observations INTEGER NOT NULL DEFAULT 1
+            claim_id TEXT NOT NULL, observations INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS coordinator_alert_collision_items (
             alert_id TEXT NOT NULL, id TEXT NOT NULL, thread TEXT NOT NULL,
@@ -119,6 +119,15 @@ pub fn initialize(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS obligation_transfers_target
             ON obligation_transfers(target_thread, state);",
     )?;
+    let collision_columns = {
+        let mut stmt = db.prepare("PRAGMA table_info(coordinator_alert_legacy_collisions)")?;
+        stmt.query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !collision_columns.iter().any(|column| column == "claim_id") {
+        db.execute_batch("ALTER TABLE coordinator_alert_legacy_collisions ADD COLUMN claim_id TEXT; UPDATE coordinator_alert_legacy_collisions SET claim_id=alert_id WHERE claim_id IS NULL;")?;
+    }
+    db.execute_batch("CREATE INDEX IF NOT EXISTS coordinator_collision_claim ON coordinator_alert_legacy_collisions(claim_id)")?;
     let columns = {
         let mut statement = db.prepare("PRAGMA table_info(coordinator_alerts)")?;
         statement
@@ -371,33 +380,56 @@ pub fn claim_coordinator_alert_with_legacy(
             |row| row.get(0),
         )?;
         if exists {
+            let existing: Option<String> = db.query_row(
+                "SELECT alert_id FROM coordinator_alert_legacy_collisions WHERE claim_id=?1 AND legacy_alert_id=?2 LIMIT 1",
+                params![id, old_id], |row| row.get(0),
+            ).optional()?;
+            let diagnostic_id = existing.unwrap_or_else(|| {
+                format!(
+                    "{:x}",
+                    Sha256::digest(format!("legacy-collision:{id}:{old_id}").as_bytes())
+                )
+            });
             let inserted = db.execute(
                 "INSERT OR IGNORE INTO coordinator_alerts(id,responsible,coordinator,message,state,reason)
                  VALUES (?1,?2,?3,?4,'needs_attention','legacy_collision_delivery_unknown')",
-                params![id, responsible, coordinator, message],
+                params![diagnostic_id, responsible, coordinator, message],
             )?;
             if inserted == 1 {
                 db.execute(
-                    "INSERT INTO coordinator_alert_legacy_collisions(alert_id,legacy_alert_id) VALUES (?1,?2)",
-                    params![id, old_id],
+                    "INSERT INTO coordinator_alert_legacy_collisions(alert_id,legacy_alert_id,claim_id) VALUES (?1,?2,?3)",
+                    params![diagnostic_id, old_id, id],
                 )?;
                 db.execute(
                     "INSERT INTO coordinator_alert_collision_items(alert_id,id,thread,kind,repo,resource,outcome,description)
                      SELECT ?1,id,thread,kind,repo,resource,outcome,description FROM obligations
                      WHERE thread=?2 AND resolved=0",
-                    params![id, responsible],
+                    params![diagnostic_id, responsible],
                 )?;
+            } else {
+                let recorded: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE alert_id=?1 AND claim_id=?2 AND legacy_alert_id=?3)",
+                    params![diagnostic_id,id,old_id], |row| row.get(0),
+                )?;
+                ensure!(
+                    recorded,
+                    "Collision diagnostic ID already belongs to another alert"
+                );
+                record_collision_observation(db, &diagnostic_id)?;
             }
-            if inserted == 0 {
-                db.execute("UPDATE coordinator_alert_legacy_collisions SET observations=observations+1 WHERE alert_id=?1", [&id])?;
-                db.execute("UPDATE coordinator_alerts SET updated=CURRENT_TIMESTAMP WHERE id=?1 AND EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE alert_id=?1)", [&id])?;
-            }
-            let is_collision: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE alert_id=?1)",
-                [&id], |row| row.get(0),
-            )?;
-            return Ok(is_collision.then_some((id, coordinator, true)));
+            return Ok(Some((diagnostic_id, coordinator, true)));
         }
+    }
+    let prior_collision: Option<String> = db
+        .query_row(
+            "SELECT alert_id FROM coordinator_alert_legacy_collisions WHERE claim_id=?1 LIMIT 1",
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(diagnostic_id) = prior_collision {
+        record_collision_observation(db, &diagnostic_id)?;
+        return Ok(Some((diagnostic_id, coordinator, true)));
     }
     let sender_pid = i64::from(std::process::id());
     let sender_start =
@@ -416,6 +448,15 @@ pub fn claim_coordinator_alert_with_legacy(
         ],
     )?;
     Ok((inserted == 1).then_some((id, coordinator, false)))
+}
+
+fn record_collision_observation(db: &Connection, id: &str) -> Result<()> {
+    db.execute("UPDATE coordinator_alert_legacy_collisions SET observations=observations+1 WHERE alert_id=?1", [id])?;
+    db.execute(
+        "UPDATE coordinator_alerts SET updated=CURRENT_TIMESTAMP WHERE id=?1",
+        [id],
+    )?;
+    Ok(())
 }
 
 pub fn finish_coordinator_alert(
@@ -2046,5 +2087,76 @@ mod legacy_collision_tests {
             )
             .unwrap();
         assert_eq!((count, collisions), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod mixed_alert_version_tests {
+    use super::*;
+    const OWNER: &str = "11111111-1111-4111-8111-111111111111";
+    const COORDINATOR: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn existing_new_claim_does_not_hide_collision_or_change_send_state() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, OWNER, COORDINATOR).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('item',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        let (new_id, _) = claim_coordinator_alert(&db, OWNER, "new", "new message")
+            .unwrap()
+            .unwrap();
+        finish_coordinator_alert(&db, &new_id, "queued", None).unwrap();
+        let (old_id, _) = claim_coordinator_alert(&db, OWNER, "legacy", "old message")
+            .unwrap()
+            .unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (diagnostic_id, _, collision) =
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        assert!(collision);
+        assert_ne!(diagnostic_id, new_id);
+        tx.commit().unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "queued");
+        db.execute("DELETE FROM coordinator_alerts WHERE id=?1", [&old_id])
+            .unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (again, _, collision) =
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        assert!(collision);
+        assert_eq!(again, diagnostic_id);
+        tx.commit().unwrap();
+        let observations: i64 = db
+            .query_row(
+                "SELECT observations FROM coordinator_alert_legacy_collisions WHERE alert_id=?1",
+                [&diagnostic_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 2);
+    }
+
+    #[test]
+    fn initial_collision_schema_migrates_existing_claim_identity() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE coordinator_alert_legacy_collisions(alert_id TEXT PRIMARY KEY,legacy_alert_id TEXT NOT NULL,observations INTEGER NOT NULL DEFAULT 1); INSERT INTO coordinator_alert_legacy_collisions(alert_id,legacy_alert_id) VALUES('prior','old');").unwrap();
+        initialize(&db).unwrap();
+        let claim: String = db
+            .query_row(
+                "SELECT claim_id FROM coordinator_alert_legacy_collisions WHERE alert_id='prior'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim, "prior");
     }
 }
