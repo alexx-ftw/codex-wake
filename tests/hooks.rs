@@ -637,3 +637,151 @@ fn launcher_rejects_unsupported_platform_before_download() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Linux x86_64 only"));
 }
+
+#[test]
+fn evidence_distinct_turns_notify_for_unchanged_pending_obligation() {
+    for uncertain in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let responsible = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        let codex = temp.path().join("codex");
+        executable(
+            &codex,
+            if uncertain {
+                "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\nexit 1\n"
+            } else {
+                "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n"
+            },
+        );
+        let init = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"init"});
+        assert!(
+            invoke_with_codex(init, temp.path(), codex.to_str().unwrap())
+                .status
+                .success()
+        );
+        let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Pending')", [responsible]).unwrap();
+        db.execute(
+            "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+            [responsible, coordinator],
+        )
+        .unwrap();
+        for turn in ["turn-1", "turn-1", "turn-2"] {
+            let payload = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":turn});
+            assert!(
+                invoke_with_codex(payload, temp.path(), codex.to_str().unwrap())
+                    .status
+                    .success()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+            "attempt\nattempt\n"
+        );
+        let states: Vec<String> = db
+            .prepare("SELECT state FROM coordinator_alerts ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                if uncertain {
+                    "needs_attention"
+                } else {
+                    "queued"
+                };
+                2
+            ]
+        );
+    }
+}
+
+#[test]
+fn evidence_ninth_pending_obligation_is_outside_current_fingerprint_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let responsible = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n",
+    );
+    let payload = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [responsible, coordinator],
+    )
+    .unwrap();
+    for n in 0..8 {
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','release','available','Pending')", rusqlite::params![format!("fixture-{n}"), responsible]).unwrap();
+    }
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture-8',?1,'artifact','repo','release','available','New ninth obligation')", [responsible]).unwrap();
+    assert!(
+        invoke_with_codex(payload, temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "attempt\n"
+    );
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM obligations WHERE resolved=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 9);
+}
+
+#[test]
+fn evidence_unidentified_stops_with_new_last_message_are_distinct() {
+    let temp = tempfile::tempdir().unwrap();
+    let responsible = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n",
+    );
+    let init = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"init"});
+    assert!(
+        invoke_with_codex(init, temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Pending')", [responsible]).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [responsible, coordinator],
+    )
+    .unwrap();
+    for last in ["First status", "First status", "Later status"] {
+        let payload = json!({"hook_event_name":"Stop","session_id":responsible,"last_assistant_message":last});
+        assert!(
+            invoke_with_codex(payload, temp.path(), codex.to_str().unwrap())
+                .status
+                .success()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "attempt\nattempt\n"
+    );
+}
