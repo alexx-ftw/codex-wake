@@ -178,6 +178,9 @@ pub(crate) fn source_digest() -> String {
     for source in [
         include_bytes!("main.rs").as_slice(),
         include_bytes!("manager.rs").as_slice(),
+        include_bytes!("coordination_view.rs").as_slice(),
+        include_bytes!("conditions.rs").as_slice(),
+        include_bytes!("condition_alerts.rs").as_slice(),
         include_bytes!("bridge.rs").as_slice(),
         include_bytes!("circular_waits.rs").as_slice(),
         include_bytes!("delivery_evidence.rs").as_slice(),
@@ -996,6 +999,11 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             let result = (|| -> Result<()> {
                 let mut db = crate::bridge::connect(&config.db)?;
                 crate::subscriptions::initialize(&db)?;
+                crate::subscriptions::expiration_tick(
+                    &db,
+                    &config.codex,
+                    Duration::from_secs(120),
+                )?;
                 crate::subscriptions::dependency_tick(
                     &db,
                     &config.codex,
@@ -1008,6 +1016,8 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 crate::process_interrupts(&config, &db)?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::conditions::initialize(&db)?;
+                crate::dispatch_conditions(&db, &config.codex)?;
                 crate::obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::obligations::dispatch_coordinator_alerts(
                     &mut db,

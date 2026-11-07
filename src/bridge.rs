@@ -604,7 +604,36 @@ pub fn send_mode(
     message: &str,
     resume: bool,
 ) -> Result<(String, Option<String>)> {
-    let delivery = match invoke_codex(codex, thread, message, timeout, resume) {
+    send_mode_with_socket(
+        codex,
+        timeout,
+        thread,
+        message,
+        resume,
+        crate::goals::runtime_rpc_socket(),
+    )
+}
+
+/// Send through the CLI's local daemon, without selecting Wake's configured socket.
+pub fn send_local_mode(
+    codex: &Path,
+    timeout: Duration,
+    thread: &str,
+    message: &str,
+    resume: bool,
+) -> Result<(String, Option<String>)> {
+    send_mode_with_socket(codex, timeout, thread, message, resume, None)
+}
+
+fn send_mode_with_socket(
+    codex: &Path,
+    timeout: Duration,
+    thread: &str,
+    message: &str,
+    resume: bool,
+    socket: Option<std::ffi::OsString>,
+) -> Result<(String, Option<String>)> {
+    let delivery = match invoke_codex(codex, thread, message, timeout, resume, socket) {
         Ok(delivery) => delivery,
         Err(error)
             if error
@@ -651,6 +680,7 @@ fn invoke_codex(
     message: &str,
     timeout: Duration,
     resume: bool,
+    socket: Option<std::ffi::OsString>,
 ) -> Result<Delivery> {
     let started = Instant::now();
     let mut stdout = private_tempfile()?;
@@ -660,7 +690,7 @@ fn invoke_codex(
     if resume {
         command.arg("--resume");
     }
-    if let Some(socket) = crate::goals::runtime_rpc_socket() {
+    if let Some(socket) = socket {
         command
             .arg("--remote")
             .arg(format!("unix://{}", Path::new(&socket).display()));
@@ -1473,6 +1503,48 @@ mod tests {
         let args = fs::read_to_string(capture).unwrap();
         assert!(args.contains("queue --thread "));
         assert!(!args.contains("--resume"));
+    }
+
+    #[test]
+    fn local_cli_mode_omits_remote_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("argv");
+        let codex = fake_codex(
+            dir.path(),
+            &format!("printf '%s\\n' \"$*\" > '{}'", capture.display()),
+        );
+        assert_eq!(
+            send_local_mode(&codex, Duration::from_secs(2), THREAD, "test", true).unwrap(),
+            ("queued".to_owned(), None)
+        );
+        let args = fs::read_to_string(capture).unwrap();
+        assert!(args.contains("queue --thread "));
+        assert!(args.contains("--resume"));
+        assert!(!args.contains("--remote"));
+    }
+
+    #[test]
+    fn cli_mode_keeps_explicit_remote_argument() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("argv");
+        let codex = fake_codex(
+            dir.path(),
+            &format!("printf '%s\\n' \"$*\" > '{}'", capture.display()),
+        );
+        assert_eq!(
+            send_mode_with_socket(
+                &codex,
+                Duration::from_secs(2),
+                THREAD,
+                "test",
+                true,
+                Some("/tmp/wake.sock".into()),
+            )
+            .unwrap(),
+            ("queued".to_owned(), None)
+        );
+        let args = fs::read_to_string(capture).unwrap();
+        assert!(args.contains("--remote unix:///tmp/wake.sock"));
     }
 
     #[test]

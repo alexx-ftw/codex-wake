@@ -1,6 +1,6 @@
 //! Identify the registered source of a waiting subscription.
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 pub fn subscriptions_status(db: &Connection) -> Result<Value> {
@@ -47,7 +47,19 @@ pub fn status(db: &Connection, id: &str) -> Result<Value> {
         |row| row.get(0),
     )?;
     if observed {
-        return Ok(json!({"type":"automatic_configured", "health":"unverified"}));
+        let mut producer = json!({"type":"automatic_configured", "health":"unverified"});
+        let observation: Option<(Option<String>, Option<i64>)> = db
+            .query_row(
+                "SELECT last_reason,last_check FROM observers WHERE subscription_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(reason), checked)) = observation {
+            producer["last_observation"] = json!(reason);
+            producer["last_check"] = json!(checked);
+        }
+        return Ok(producer);
     }
     if matches!(
         kind.as_str(),
@@ -180,6 +192,15 @@ mod tests {
             status(&db, &a).unwrap(),
             json!({"type":"automatic_configured", "health":"unverified"})
         );
+        db.execute(
+            "UPDATE observers SET last_reason='unit_not_found',last_check=42 WHERE subscription_id=?1",
+            [&a],
+        )
+        .unwrap();
+        let producer = status(&db, &a).unwrap();
+        assert_eq!(producer["health"], "unverified");
+        assert_eq!(producer["last_observation"], "unit_not_found");
+        assert_eq!(producer["last_check"], 42);
         db.execute("UPDATE subscriptions SET state='ready' WHERE id=?1", [&a])
             .unwrap();
         assert!(status(&db, &a).unwrap().is_null());

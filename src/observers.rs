@@ -19,10 +19,29 @@ const POLL_SECONDS: i64 = 60;
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Observation {
-    File { path: String },
-    Http { url: String },
-    FileLock { path: String },
-    Systemd { unit: String, invocation_id: String },
+    File {
+        path: String,
+    },
+    Http {
+        url: String,
+    },
+    FileLock {
+        path: String,
+    },
+    Systemd {
+        unit: String,
+        invocation_id: String,
+        #[serde(default)]
+        scope: SystemdScope,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemdScope {
+    #[default]
+    User,
+    System,
 }
 
 pub fn validate(kind: &str, event: &str, observation: &Observation) -> Result<()> {
@@ -40,6 +59,7 @@ pub fn validate(kind: &str, event: &str, observation: &Observation) -> Result<()
             Observation::Systemd {
                 unit,
                 invocation_id,
+                ..
             },
         ) => {
             ensure!(
@@ -461,7 +481,8 @@ fn probe_observation(
         Observation::Systemd {
             unit,
             invocation_id,
-        } => probe_systemd(unit, invocation_id, event, codex, runner),
+            scope,
+        } => probe_systemd(unit, invocation_id, *scope, event, codex, runner),
     }
 }
 
@@ -567,15 +588,19 @@ fn probe_file_lock(path: &Path) -> Probe {
 fn probe_systemd(
     unit: &str,
     expected_id: &str,
+    scope: SystemdScope,
     event: &str,
     _codex: &Path,
     runner: &mut dyn FnMut(&mut Command, Duration) -> Result<Output>,
 ) -> Probe {
     let mut command = Command::new("systemctl");
+    command.arg(match scope {
+        SystemdScope::User => "--user",
+        SystemdScope::System => "--system",
+    });
     command.args([
-        "--user",
         "show",
-        "--property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,InvocationID",
+        "--property=LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,InvocationID",
         unit,
     ]);
     let output = match runner(&mut command, Duration::from_secs(10)) {
@@ -594,34 +619,38 @@ fn probe_systemd(
     let Some(raw) = std::str::from_utf8(&output.stdout).ok() else {
         return Probe::Pending("systemd_response_invalid");
     };
-    let mut properties: [Option<&str>; 6] = [None; 6];
+    let mut properties: [Option<&str>; 7] = [None; 7];
     for line in raw.lines() {
         let Some((key, value)) = line.strip_suffix('\r').unwrap_or(line).split_once('=') else {
             return Probe::Pending("systemd_response_invalid");
         };
         let slot = match key {
-            "ActiveState" => &mut properties[0],
-            "SubState" => &mut properties[1],
-            "Result" => &mut properties[2],
-            "ExecMainCode" => &mut properties[3],
-            "ExecMainStatus" => &mut properties[4],
-            "InvocationID" => &mut properties[5],
+            "LoadState" => &mut properties[0],
+            "ActiveState" => &mut properties[1],
+            "SubState" => &mut properties[2],
+            "Result" => &mut properties[3],
+            "ExecMainCode" => &mut properties[4],
+            "ExecMainStatus" => &mut properties[5],
+            "InvocationID" => &mut properties[6],
             _ => return Probe::Pending("systemd_response_invalid"),
         };
         if slot.replace(value).is_some() {
             return Probe::Pending("systemd_response_invalid");
         }
     }
+    if properties[0] == Some("not-found") {
+        return Probe::Pending("unit_not_found");
+    }
     if properties.iter().any(Option::is_none) {
         return Probe::Pending("systemd_response_invalid");
     }
     let (active, sub, result, code, status, invocation) = (
-        properties[0].unwrap(),
         properties[1].unwrap(),
         properties[2].unwrap(),
-        properties[3].unwrap().parse::<i32>().ok(),
+        properties[3].unwrap(),
         properties[4].unwrap().parse::<i32>().ok(),
-        properties[5].unwrap(),
+        properties[5].unwrap().parse::<i32>().ok(),
+        properties[6].unwrap(),
     );
     if !is_hex_id(invocation) || !invocation.eq_ignore_ascii_case(expected_id) {
         return Probe::Pending("generation_mismatch");
@@ -725,6 +754,14 @@ mod tests {
         assert!(
             serde_json::from_str::<Observation>(r#"{"type":"file_lock","path":"/tmp/a"}"#).is_ok()
         );
+        assert_eq!(
+            serde_json::from_str::<Observation>(r#"{"type":"systemd","unit":"task.service","invocation_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#).unwrap(),
+            Observation::Systemd {
+                unit: "task.service".into(),
+                invocation_id: "a".repeat(32),
+                scope: SystemdScope::User,
+            }
+        );
     }
 
     #[test]
@@ -799,7 +836,8 @@ mod tests {
                 "cancelled",
                 &Observation::Systemd {
                     unit: "task.service".into(),
-                    invocation_id: "a".repeat(32)
+                    invocation_id: "a".repeat(32),
+                    scope: SystemdScope::User,
                 }
             )
             .is_err()
@@ -810,7 +848,8 @@ mod tests {
                 "success",
                 &Observation::Systemd {
                     unit: "task.service".into(),
-                    invocation_id: "a".repeat(32)
+                    invocation_id: "a".repeat(32),
+                    scope: SystemdScope::User,
                 }
             )
             .is_ok()
@@ -821,7 +860,8 @@ mod tests {
                 "success",
                 &Observation::Systemd {
                     unit: "--user.service".into(),
-                    invocation_id: "a".repeat(32)
+                    invocation_id: "a".repeat(32),
+                    scope: SystemdScope::User,
                 }
             )
             .is_err()
@@ -921,8 +961,9 @@ mod tests {
         let observation = Observation::Systemd {
             unit: "task.service".into(),
             invocation_id: id.into(),
+            scope: SystemdScope::User,
         };
-        let permuted = "ExecMainStatus=0\nInvocationID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nResult=success\nActiveState=inactive\nExecMainCode=1\nSubState=dead\n";
+        let permuted = "ExecMainStatus=0\nInvocationID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nResult=success\nActiveState=inactive\nExecMainCode=1\nSubState=dead\nLoadState=loaded\n";
         let mut runner = |command: &mut Command, timeout: Duration| {
             assert_eq!(command.get_program(), "systemctl");
             assert_eq!(timeout, Duration::from_secs(10));
@@ -956,10 +997,11 @@ mod tests {
         let observation = Observation::Systemd {
             unit: "task.service".into(),
             invocation_id: id.into(),
+            scope: SystemdScope::User,
         };
         for (result, code, status) in [("signal", 2, 15), ("timeout", 2, 9)] {
             let response = format!(
-                "ActiveState=failed\nSubState=failed\nResult={result}\nExecMainCode={code}\nExecMainStatus={status}\nInvocationID={id}\n"
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult={result}\nExecMainCode={code}\nExecMainStatus={status}\nInvocationID={id}\n"
             );
             let mut runner = |_: &mut Command, _| Ok(output(0, &response));
             assert!(matches!(
@@ -971,6 +1013,35 @@ mod tests {
             ));
         }
         assert!(validate("job", "cancelled", &observation).is_err());
+    }
+
+    #[test]
+    fn systemd_scope_selects_manager_and_missing_units_never_become_results() {
+        let observation = Observation::Systemd {
+            unit: "task.service".into(),
+            invocation_id: "a".repeat(32),
+            scope: SystemdScope::System,
+        };
+        let mut runner = |command: &mut Command, _| {
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert!(args.contains(&"--system".into()));
+            assert!(!args.contains(&"--user".into()));
+            Ok(output(0, "LoadState=not-found\nInvocationID=\n"))
+        };
+        assert!(matches!(
+            probe_observation(&observation, "completed", Path::new("/codex"), &mut runner),
+            Probe::Pending("unit_not_found")
+        ));
+
+        let empty_invocation = "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=1\nExecMainStatus=0\nInvocationID=\n";
+        let mut runner = |_: &mut Command, _| Ok(output(0, empty_invocation));
+        assert!(matches!(
+            probe_observation(&observation, "success", Path::new("/codex"), &mut runner),
+            Probe::Pending("generation_mismatch")
+        ));
     }
 
     #[test]
