@@ -520,8 +520,8 @@ The database is `$XDG_STATE_HOME/codex-wake/state.sqlite3` (default
 `$XDG_DATA_HOME/codex-wake/runtime`. Secrets and database files are private.
 
 States are `waiting`, `ready`, `sending`, `queued` and `needs_attention`.
-`queued` means CLI acceptance, not proof that a chat resumed. Exit zero plus an
-exact queue acknowledgement remains `queued` even if resuming emits a warning;
+`queued` means native or CLI queue acceptance, not proof that a chat resumed.
+An accepted queue remains `queued` even if resuming emits a warning;
 `resume_daemon_unavailable` identifies a missing local daemon. A crash, timeout
 or uncertain warning is never blindly retried. Inspect the target chat before
 resolving ambiguous records. Exactly-once delivery across SQLite and the Codex
