@@ -776,18 +776,15 @@ fn poll_generation(db: &Connection, route: &str) -> Result<i64> {
         .unwrap_or(0))
 }
 
-// Use a separate private inode: closing an extra descriptor to the database can
-// release SQLite's POSIX locks held by this process.
+// Lock the containing directory instead of a sidecar: unlinking a sidecar can
+// otherwise split waiters across two inodes during cleanup.
 struct PollCommitGuard {
     _local: std::sync::MutexGuard<'static, ()>,
     _file: Option<std::fs::File>,
 }
 impl PollCommitGuard {
     fn acquire(db: &Connection) -> Result<Self> {
-        use std::os::{
-            fd::AsRawFd,
-            unix::fs::{MetadataExt, OpenOptionsExt},
-        };
+        use std::os::unix::fs::MetadataExt;
         static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let local = LOCAL
             .lock()
@@ -799,26 +796,14 @@ impl PollCommitGuard {
                 database.is_file() && database.nlink() == 1,
                 "polling database must have one link"
             );
-            let mut lock_path = canonical.into_os_string();
-            lock_path.push(".poll.lock");
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(lock_path)?;
-            let meta = file.metadata()?;
+            let file = lock_database_parent(&canonical, false)?;
+            let after = std::fs::metadata(&canonical)?;
             anyhow::ensure!(
-                meta.is_file()
-                    && meta.uid() == unsafe { libc::geteuid() }
-                    && meta.mode() & 0o077 == 0
-                    && meta.nlink() == 1,
-                "unsafe polling lock file"
+                after.dev() == database.dev()
+                    && after.ino() == database.ino()
+                    && after.nlink() == 1,
+                "polling database changed during lock acquisition"
             );
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
             Some(file)
         } else {
             None
@@ -828,6 +813,22 @@ impl PollCommitGuard {
             _file: file,
         })
     }
+}
+
+pub(crate) fn lock_database_parent(path: &Path, nonblocking: bool) -> Result<std::fs::File> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database has no parent"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(parent)?;
+    let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    if unsafe { libc::flock(file.as_raw_fd(), mode) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(file)
 }
 struct PageUpdate {
     page: usize,
@@ -1328,6 +1329,110 @@ mod tests {
     use super::*;
     type Fetch<'a> =
         dyn FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure> + 'a;
+
+    #[test]
+    fn failed_poll_save_does_not_replay_an_uncertain_wait_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/state.sqlite3");
+        let mut db = crate::bridge::connect(&path).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let sha = "a".repeat(40);
+        crate::bridge::register(
+            &db,
+            "owner/repo",
+            123,
+            1,
+            "11111111-1111-4111-8111-111111111111",
+            &sha,
+        )
+        .unwrap();
+        db.execute_batch("CREATE TRIGGER fail_poll_save BEFORE INSERT ON github_poll_generation BEGIN SELECT RAISE(FAIL,'injected'); END").unwrap();
+        let payload = json!({"action":"completed","repository":{"full_name":"owner/repo"},"workflow_run":{"id":123,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success"}});
+        let run = || response(payload["workflow_run"].clone(), false);
+        let mut fetch = |_: &str, _: Option<&str>| Ok(run());
+        let process = |db: &Connection, _: Option<&str>, _: Vec<Value>, _: i64| {
+            Ok((None, u64::from(bridge_accept(db, &payload)? == "recorded")))
+        };
+        assert!(poll_endpoint(&db, "test-run", 0, 1, &mut fetch, process).is_err());
+        let calls = dir.path().join("calls");
+        let codex = dir.path().join("fake-codex");
+        std::fs::write(
+            &codex,
+            format!("#!/bin/sh\necho attempt >> '{}'\nexit 1\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            crate::bridge::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row("SELECT state FROM waits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+        db.execute_batch("DROP TRIGGER fail_poll_save").unwrap();
+        let outcome = poll_endpoint(&db, "test-run", 0, 1, &mut fetch, process).unwrap();
+        // bridge::accept reports "recorded" for both a new record and a duplicate.
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(
+            crate::bridge::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+        let state: String = db
+            .query_row("SELECT state FROM waits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+    }
+
+    #[test]
+    fn failed_poll_save_does_not_replay_an_uncertain_subscription() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = crate::bridge::connect(&dir.path().join("state/state.sqlite3")).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe(&db, "git_ref", "topic/test", "updated");
+        let value = |sha: &str| {
+            response(
+                json!({"ref":"refs/heads/topic/test","object":{"sha":sha.repeat(40)}}),
+                false,
+            )
+        };
+        tick_with(&db, 1, |_, _| Ok(value("a"))).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_poll_save BEFORE UPDATE ON github_poll_generation BEGIN SELECT RAISE(FAIL,'injected'); END").unwrap();
+        assert!(tick_with(&db, INTERVAL_MS + 1, |_, _| Ok(value("b"))).is_err());
+        let calls = dir.path().join("calls");
+        let codex = dir.path().join("fake-codex");
+        std::fs::write(
+            &codex,
+            format!("#!/bin/sh\necho attempt >> '{}'\nexit 1\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            crate::subscriptions::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            1
+        );
+        assert_eq!(registration_state(&db, &id), "needs_attention");
+        db.execute_batch("DROP TRIGGER fail_poll_save").unwrap();
+        let event = json!({"ref":"refs/heads/topic/test","deleted":false,"after":"b".repeat(40),"repository":{"full_name":"owner/repo"}});
+        assert_eq!(
+            scoped_subscription_accept(&db, "push", &event, "owner/repo", "topic/test", None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::subscriptions::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+        assert_eq!(registration_state(&db, &id), "needs_attention");
+    }
 
     #[test]
     fn polling_rejects_hard_linked_database() {

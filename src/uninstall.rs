@@ -33,6 +33,8 @@ pub fn remove_external_database(path: &Path) -> Result<()> {
     if !path.try_exists()? {
         return Ok(());
     }
+    let _poll_guard = crate::polling::lock_database_parent(&path.canonicalize()?, true)?;
+    validate_external_database(path)?;
     fs::remove_file(path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_owned();
@@ -144,6 +146,48 @@ pub fn remove_unit_file(path: &Path, expected: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn cleanup_refuses_active_poll_lock_and_leaves_no_lock_sidecar() {
+        fn wait_for(path: &Path) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !path.exists() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        if let Some(dir) = std::env::var_os("WAKE_CLEANUP_LOCK_TEST_DIR") {
+            let dir = PathBuf::from(dir);
+            let _held =
+                crate::polling::lock_database_parent(&dir.join("state.sqlite3"), false).unwrap();
+            std::fs::write(dir.join("held"), b"").unwrap();
+            wait_for(&dir.join("release"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        drop(db);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "uninstall::tests::cleanup_refuses_active_poll_lock_and_leaves_no_lock_sidecar",
+            ])
+            .env("WAKE_CLEANUP_LOCK_TEST_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        wait_for(&dir.path().join("held"));
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+        assert!(!dir.path().join("state.sqlite3.poll.lock").exists());
+        std::fs::write(dir.path().join("release"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        remove_external_database(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!dir.path().join("state.sqlite3.poll.lock").exists());
+    }
     #[test]
     fn external_database_cleanup_preserves_foreign_data() {
         let temp = tempfile::tempdir().unwrap();

@@ -1428,6 +1428,16 @@ pub fn cleanup_uninstalled(config: &Config) -> Result<()> {
     }
     systemctl(&["disable", CLEANUP_UNIT])?;
     stop_clients(config)?;
+    // Refuse cleanup while a poll commit is active. Keep this directory lock
+    // until the owned tree is gone, so no waiter can commit against it.
+    let _poll_guard = if !external_db && config.db.try_exists()? {
+        Some(crate::polling::lock_database_parent(
+            &config.db.canonicalize()?,
+            true,
+        )?)
+    } else {
+        None
+    };
     crate::uninstall::remove_unit_file(&config.unit, &unit(config)?)?;
     crate::uninstall::remove_unit_file(&directory.join(CLEANUP_PATH), &cleanup_path)?;
     crate::uninstall::remove_unit_file(&directory.join(CLEANUP_UNIT), &cleanup_service)?;
