@@ -2,7 +2,13 @@ use anyhow::{Context, Result, ensure};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, error::Error, fmt, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    path::Path,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -277,10 +283,29 @@ pub fn queue_with_identity(
     message: &str,
     client_id: &str,
     resume: bool,
+    timeout: Duration,
 ) -> Result<(String, Option<String>)> {
-    queue_with_identity_using(thread, message, client_id, resume, &mut |method, params| {
-        crate::goals::rpc(codex, method, params)
-    })
+    let started = Instant::now();
+    let result =
+        queue_with_identity_using(thread, message, client_id, resume, &mut |method, params| {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            ensure!(!remaining.is_zero(), "Native queue timeout");
+            crate::goals::rpc_with_timeout(codex, method, params, remaining)
+        });
+    if result.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::goals::BeforeConnect>()
+            .is_some()
+    }) {
+        return crate::bridge::send_mode(
+            codex,
+            timeout.saturating_sub(started.elapsed()),
+            thread,
+            message,
+            resume,
+        );
+    }
+    result
 }
 
 fn queue_with_identity_using(
@@ -294,8 +319,28 @@ fn queue_with_identity_using(
         .context("Invalid thread UUID")?
         .to_string();
     Uuid::parse_str(client_id).context("Invalid client message UUID")?;
-    if call("thread/queue/add", json!({"threadId":thread,"clientUserMessageId":client_id,"input":[{"type":"text","text":message,"text_elements":[]}]})).is_err() {
-        return Ok(("needs_attention".into(), Some("native_queue_outcome_unknown".into())));
+    let response = call(
+        "thread/queue/add",
+        json!({"threadId":thread,"clientUserMessageId":client_id,"input":[{"type":"text","text":message,"text_elements":[]}]}),
+    );
+    if response.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::goals::BeforeConnect>()
+            .is_some()
+    }) {
+        return Err(response.unwrap_err());
+    }
+    let accepted = response.is_ok_and(|response| {
+        response
+            .pointer("/queuedSubmission/id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    });
+    if !accepted {
+        return Ok((
+            "needs_attention".into(),
+            Some("native_queue_outcome_unknown".into()),
+        ));
     }
     if resume {
         let result = (|| -> Result<()> {
@@ -456,6 +501,8 @@ mod tests {
                     }
                     Ok(if method == "thread/read" {
                         json!({"thread":{"status":{"type":status}}})
+                    } else if method == "thread/queue/add" {
+                        json!({"queuedSubmission":{"id":"submission"}})
                     } else {
                         json!({})
                     })
@@ -473,11 +520,30 @@ mod tests {
         .unwrap();
         assert_eq!(calls, 1);
         assert_eq!(result.0, "needs_attention");
+        let before_send =
+            queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+                Err(crate::goals::BeforeConnect(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                ))
+                .into())
+            })
+            .unwrap_err();
+        assert!(
+            before_send
+                .downcast_ref::<crate::goals::BeforeConnect>()
+                .is_some()
+        );
+        let malformed =
+            queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+                Ok(json!({}))
+            })
+            .unwrap();
+        assert_eq!(malformed.0, "needs_attention");
         let mut calls = 0;
         let result = queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
             calls += 1;
             if calls == 1 {
-                Ok(json!({}))
+                Ok(json!({"queuedSubmission":{"id":"submission"}}))
             } else {
                 anyhow::bail!("read failed")
             }

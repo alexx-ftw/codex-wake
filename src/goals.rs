@@ -8,6 +8,23 @@ use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Debug)]
+pub(crate) struct BeforeConnect(pub(crate) std::io::Error);
+impl std::fmt::Display for BeforeConnect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "app-server connection failed before sending: {}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for BeforeConnect {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 fn thread_id(thread: &str) -> Result<String> {
     Ok(Uuid::parse_str(thread)
         .context("Invalid thread UUID")?
@@ -97,7 +114,7 @@ pub(crate) fn socket_rpc_with_notifications(
     }
 
     let deadline = Instant::now() + timeout;
-    let stream = UnixStream::connect(socket).context(
+    let stream = UnixStream::connect(socket).map_err(BeforeConnect).context(
         "Connect to app-server Unix socket: check the receiver service and CODEX_WAKE_RPC_SOCKET",
     )?;
     stream.set_read_timeout(Some(timeout))?;
@@ -165,6 +182,15 @@ pub(crate) fn rpc_socket(
 /// The receiver owns the persistent server; this client never starts or stops a process.
 /// The executable argument is retained for API compatibility and is unused.
 pub fn rpc(_codex: &Path, method: &str, params: Value) -> Result<Value> {
+    rpc_with_timeout(_codex, method, params, TIMEOUT)
+}
+
+pub(crate) fn rpc_with_timeout(
+    _codex: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let operation = match method {
         "model/list" => "rpc.model_list",
         "project/list" => "rpc.project_list",
@@ -180,23 +206,33 @@ pub fn rpc(_codex: &Path, method: &str, params: Value) -> Result<Value> {
         _ => "rpc.other",
     };
     let span = crate::observability::Span::new(operation, params["threadId"].as_str());
-    let result = rpc_inner(method, params);
+    let result = rpc_inner(method, params, timeout);
     span.result(&result);
     result
 }
 
-fn rpc_inner(method: &str, params: Value) -> Result<Value> {
+fn rpc_inner(method: &str, params: Value, timeout: Duration) -> Result<Value> {
     let socket = rpc_socket(
         std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
         std::env::var_os("XDG_STATE_HOME"),
         std::env::var_os("HOME"),
-    ).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or set CODEX_WAKE_RPC_SOCKET to its Unix socket"))?;
-    if !Path::new(&socket).try_exists()? {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or correct CODEX_WAKE_RPC_SOCKET").into());
+    )
+    .ok_or_else(|| {
+        BeforeConnect(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Codex Wake app-server socket missing",
+        ))
+    })?;
+    if !Path::new(&socket).try_exists().map_err(BeforeConnect)? {
+        return Err(BeforeConnect(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Codex Wake app-server socket missing",
+        ))
+        .into());
     }
     #[cfg(unix)]
     {
-        socket_rpc(Path::new(&socket), method, params, TIMEOUT)
+        socket_rpc(Path::new(&socket), method, params, timeout)
     }
     #[cfg(not(unix))]
     {
@@ -397,9 +433,9 @@ mod tests {
     #[test]
     fn missing_default_socket_is_typed_not_found() {
         if std::env::var_os("WAKE_TEST_MISSING_DEFAULT_SOCKET").is_some() {
-            let error = rpc_inner("thread/read", json!({"threadId":THREAD})).unwrap_err();
+            let error = rpc_inner("thread/read", json!({"threadId":THREAD}), TIMEOUT).unwrap_err();
             assert_eq!(
-                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                error.downcast_ref::<BeforeConnect>().unwrap().0.kind(),
                 std::io::ErrorKind::NotFound
             );
             return;

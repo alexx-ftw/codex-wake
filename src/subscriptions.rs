@@ -1158,7 +1158,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                     let (client_id, _) =
                         crate::delivery_evidence::begin(db, event_key, &thread, true)?;
                     crate::execution::queue_with_identity(
-                        codex, &thread, &message, &client_id, true,
+                        codex, &thread, &message, &client_id, true, timeout,
                     )
                 } else {
                     crate::execution::deliver(

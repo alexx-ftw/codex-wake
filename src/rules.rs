@@ -450,6 +450,10 @@ fn dispatch_with_identity(
             );
             stage = "prompt_template_failed";
             context["target"]["thread"] = json!(thread);
+            let rendered_prompt = crate::templates::render(&input.prompt, &context)?;
+            if let Some(objective) = &input.goal_objective {
+                input.goal_objective = Some(crate::templates::render(objective, &context)?);
+            }
             let identity = if event_identity_verified
                 && input.goal_objective.is_none()
                 && (execution_options(&input).is_some()
@@ -468,10 +472,6 @@ fn dispatch_with_identity(
             } else {
                 None
             };
-            let rendered_prompt = crate::templates::render(&input.prompt, &context)?;
-            if let Some(objective) = &input.goal_objective {
-                input.goal_objective = Some(crate::templates::render(objective, &context)?);
-            }
             let message = format!(
                 "{}\n\nMatched PR comment event data: repository={}, pr={}, comment_id={}, event={}.",
                 rendered_prompt, input.repo, input.pr, comment_id, header
@@ -545,7 +545,14 @@ pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Res
                 ));
                 Ok((state, reason))
             } else if let Some(client_id) = client_id {
-                crate::execution::queue_with_identity(codex, thread, message, client_id, true)
+                crate::execution::queue_with_identity(
+                    codex,
+                    thread,
+                    message,
+                    client_id,
+                    true,
+                    Duration::from_secs(120),
+                )
             } else {
                 crate::execution::deliver(
                     codex,

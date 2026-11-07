@@ -291,7 +291,7 @@ fn existing_app_server_socket_routes_queue_and_telemetry_stays_private() {
             let result = if method == "thread/read" {
                 json!({"thread":{"status":{"type":"active"}}})
             } else {
-                json!({})
+                json!({"queuedSubmission":{"id":"submission"}})
             };
             methods.push(request);
             ws.send(tungstenite::Message::Text(
