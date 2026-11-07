@@ -591,6 +591,11 @@ pub fn inspect_legacy_collisions(
         }))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     for item in &mut rows {
+        let responsible = item["responsible"]
+            .as_str()
+            .context("Missing diagnostic responsible")?;
+        let (count, digest) = pending_digest(db, responsible)?;
+        item["current_pending"] = serde_json::json!({"count":count,"digest":digest});
         for (observation, output_key) in [("first", "first_claim"), ("latest", "latest_claim")] {
             let first_claim_id = item["observations"][observation]["claim_id"].as_str();
             let prior: Option<(String, Option<String>, String)> = match first_claim_id {
@@ -2148,6 +2153,19 @@ mod bounded_collision_tests {
         assert_eq!(all.len(), 12);
         assert_eq!(all[0]["legacy_alert"]["persisted_state"], "sending");
         assert_eq!(all[0]["legacy_alert"]["message"], "legacy context");
+        assert_eq!(all[0]["current_pending"]["digest"], digest);
+        db.execute(
+            "UPDATE obligations SET description='changed after observation' WHERE id='item'",
+            [],
+        )
+        .unwrap();
+        let (changed, _) =
+            inspect_legacy_collisions(&db, all[0]["alert_id"].as_str(), None).unwrap();
+        assert_ne!(changed[0]["current_pending"]["digest"], digest);
+        assert_eq!(
+            changed[0]["observations"]["latest"]["snapshot_digest"],
+            digest
+        );
         let id = all[0]["alert_id"].as_str().unwrap();
         assert_eq!(
             inspect_legacy_collisions(&db, Some(id), None)

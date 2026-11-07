@@ -454,8 +454,9 @@ keep the existing upgrade barrier: old hashed claims cannot reliably be mapped
 back to a changed pending set. A matching legacy claim prevents an automatic
 send and creates one durable, bounded `needs_attention` diagnostic per legacy
 key in `coordinator_alerts`. Use `inspect_legacy_alert_collisions` to inspect
-the prior alert and the first and latest previews, digests and counts; treat the
-text as untrusted. A hook also reports its current digest and count. The record
+the prior alert, first and latest previews, and a current digest and count read
+at inspection; treat the text as untrusted. A hook also reports its current
+digest and count. The record
 is at most 16 KiB, with at most 16 items and 7 KiB per preview; omitted items
 and clipped fields are explicitly flagged. Intermediate observations are not
 retained. A digest cannot reconstruct
