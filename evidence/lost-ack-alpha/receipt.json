@@ -1,0 +1,10 @@
+{
+  "receiver": "standalone verified webhook 2.8.3",
+  "handler": "cloud rebuild 0a1ba301",
+  "current_schema_from": "a8aa82684c0f9a5c46906734239a8a59831c1860",
+  "client_disconnected_before_http_response": true,
+  "synthetic_subscription_after_disconnect": "ready",
+  "dispatch_disabled": true,
+  "real_service": false,
+  "real_delivery": false
+}
