@@ -12,7 +12,9 @@ pub fn actionable(waits: &Value, subscriptions: &Value, rules: &Value) -> Value 
             let dependency = source == "subscription"
                 && row["kind"] == "dependency"
                 && row["event"] == "recovered";
-            if state != "needs_attention" && !dependency {
+            let goal_delivery =
+                source == "subscription" && state == "sending" && row["resume_goal"] == true;
+            if state != "needs_attention" && !dependency && !goal_delivery {
                 continue;
             }
             let next_action = match state {
@@ -27,6 +29,9 @@ pub fn actionable(waits: &Value, subscriptions: &Value, rules: &Value) -> Value 
                 }
                 "ready" => {
                     "A recovery event matched this subscription and delivery is pending. Check receiver health and use recover_ready if appropriate."
+                }
+                "sending" if goal_delivery => {
+                    "Goal delivery is in progress or its outcome is unknown. Inspect the sender, goal stage and destination; the input may already be accepted, so do not resend it."
                 }
                 "sending" => {
                     "Delivery is in progress. Inspect its eventual status before taking further action."
@@ -131,5 +136,22 @@ mod tests {
                 .unwrap()
                 .contains("recover_ready")
         );
+    }
+
+    #[test]
+    fn in_progress_goal_delivery_warns_against_replaying_input() {
+        let subscriptions = json!([
+            {"kind":"artifact","event":"available","state":"sending","resume_goal":true,"goal_stage":"activating","thread":"t"}
+        ]);
+        let result = actionable(&json!([]), &subscriptions, &json!({"deliveries":[]}));
+        let items = result.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0]["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("do not resend")
+        );
+        assert_eq!(items[0]["thread_link"], "codex://threads/t");
     }
 }

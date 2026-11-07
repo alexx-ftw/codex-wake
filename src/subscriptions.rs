@@ -130,6 +130,10 @@ pub fn initialize(db: &Connection) -> Result<()> {
             goal_stage TEXT,
             goal_before_status TEXT,
             goal_before_updated INTEGER,
+            goal_sender_pid INTEGER,
+            goal_sender_start INTEGER,
+            goal_sender_boot TEXT,
+            goal_sender_namespace TEXT,
             UNIQUE(kind,repo,resource,event,thread)
         );
         CREATE INDEX IF NOT EXISTS subscriptions_ready ON subscriptions(state,updated);",
@@ -173,6 +177,10 @@ pub fn initialize(db: &Connection) -> Result<()> {
             ("goal_stage", "TEXT"),
             ("goal_before_status", "TEXT"),
             ("goal_before_updated", "INTEGER"),
+            ("goal_sender_pid", "INTEGER"),
+            ("goal_sender_start", "INTEGER"),
+            ("goal_sender_boot", "TEXT"),
+            ("goal_sender_namespace", "TEXT"),
         ] {
             if !columns.iter().any(|existing| existing == column) {
                 db.execute_batch(&format!(
@@ -1126,14 +1134,60 @@ fn resume_after_queue(
 }
 
 // The accepted input is never queued again: one dispatcher claims only its goal activation.
+fn goal_sender_identity() -> Option<(i64, i64, String, String)> {
+    let pid = std::process::id();
+    let proc_pid = std::fs::read_link("/proc/self").ok()?;
+    if proc_pid.to_str()?.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let start = i64::try_from(crate::obligations::process_start_time(pid)?).ok()?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let namespace = std::fs::read_link("/proc/self/ns/pid").ok()?;
+    Some((
+        i64::from(pid),
+        start,
+        boot.trim().to_owned(),
+        namespace.to_str()?.to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn goal_sender_confirmed_gone(pid: i64, start: i64, boot: &str, namespace: &str) -> bool {
+    let Some((_, _, current_boot, current_namespace)) = goal_sender_identity() else {
+        return false;
+    };
+    // A shared database may also be accessed from a different host or PID namespace.
+    if current_boot != boot || current_namespace != namespace || pid <= 0 || start < 0 {
+        return false;
+    }
+    let Ok(pid) = u32::try_from(pid) else {
+        return false;
+    };
+    if pid > i32::MAX as u32 {
+        return false;
+    }
+    if let Some(current) = crate::obligations::process_start_time(pid) {
+        return current != start as u64;
+    }
+    // Signal 0 only checks existence; an unreadable process is not proof of exit.
+    (unsafe { libc::kill(pid as libc::pid_t, 0) == -1 })
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn goal_sender_confirmed_gone(_: i64, _: i64, _: &str, _: &str) -> bool {
+    false
+}
+
 fn activate_queued_goal_with(
     db: &Connection,
     id: &str,
     activate: impl FnOnce(&str) -> Result<Value>,
 ) -> Result<bool> {
+    let sender = goal_sender_identity();
     let claim = db.query_row(
-        "UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='input_queued' RETURNING thread,reason",
-        [id],
+        "UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP,goal_sender_pid=?2,goal_sender_start=?3,goal_sender_boot=?4,goal_sender_namespace=?5 WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='input_queued' RETURNING thread,reason",
+        params![id, sender.as_ref().map(|s| s.0), sender.as_ref().map(|s| s.1), sender.as_ref().map(|s| &s.2), sender.as_ref().map(|s| &s.3)],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     ).optional()?;
     let Some((thread, queue_reason)) = claim else {
@@ -1195,9 +1249,80 @@ fn activate_queued_goal(db: &Connection, id: &str, codex: &Path) -> Result<bool>
     })
 }
 
+fn reconcile_interrupted_goal_with(
+    db: &Connection,
+    id: &str,
+    read_goal: impl FnOnce(&str) -> Result<Value>,
+) -> Result<bool> {
+    let owner = db.query_row(
+        "SELECT thread,goal_sender_pid,goal_sender_start,goal_sender_boot,goal_sender_namespace FROM subscriptions WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='activating'",
+        [id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?)),
+    ).optional()?;
+    let Some((thread, Some(pid), Some(start), Some(boot), Some(namespace))) = owner else {
+        return Ok(false);
+    };
+    if !goal_sender_confirmed_gone(pid, start, &boot, &namespace) {
+        return Ok(false);
+    }
+    let goal = match read_goal(&thread) {
+        Ok(goal) => goal,
+        Err(error) => {
+            db.execute("UPDATE subscriptions SET reason='goal_reconcile_unavailable',updated=CURRENT_TIMESTAMP WHERE id=?1 AND state='sending' AND goal_stage='activating' AND goal_sender_pid=?2 AND goal_sender_start=?3 AND goal_sender_boot=?4 AND goal_sender_namespace=?5", params![id, pid, start, boot, namespace])?;
+            crate::observability::emit(
+                "delivery.goal_reconcile",
+                "needs_attention",
+                crate::observability::error_class(&error),
+                Some(&thread),
+                Duration::ZERO,
+                1,
+            );
+            return Ok(false);
+        }
+    };
+    let active = goal["status"] == "active";
+    let changed = db.execute(
+        "UPDATE subscriptions SET state=?1,reason=?2,goal_stage=?3,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='sending' AND goal_stage='activating' AND goal_sender_pid=?5 AND goal_sender_start=?6 AND goal_sender_boot=?7 AND goal_sender_namespace=?8",
+        params![if active { "queued" } else { "needs_attention" }, if active { "goal_active_after_interrupted_activation" } else { "goal_activation_interrupted_input_queued" }, if active { "active" } else { "activation_unconfirmed" }, id, pid, start, boot, namespace],
+    )?;
+    Ok(changed == 1)
+}
+
+fn reconcile_interrupted_goals(db: &Connection, codex: &Path) -> Result<()> {
+    let mut statement = db.prepare("SELECT id,goal_sender_pid,goal_sender_start,goal_sender_boot,goal_sender_namespace FROM subscriptions WHERE resume_goal=1 AND state='sending' AND goal_stage='activating' AND goal_sender_pid IS NOT NULL AND updated<=datetime('now','-15 seconds') ORDER BY updated,id")?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut attempted = 0;
+    for candidate in candidates {
+        let (id, Some(pid), Some(start), Some(boot), Some(namespace)) = candidate else {
+            continue;
+        };
+        if !goal_sender_confirmed_gone(pid, start, &boot, &namespace) {
+            continue;
+        }
+        if attempted == 16 {
+            break;
+        }
+        attempted += 1;
+        reconcile_interrupted_goal_with(db, &id, |thread| crate::goals::get(codex, thread))?;
+    }
+    Ok(())
+}
+
 /// Claim and send ready events once. A non-successful/ambiguous send is never retried automatically.
 pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<usize> {
     initialize(db)?;
+    reconcile_interrupted_goals(db, codex)?;
     let mut attempted = 0;
     loop {
         let queued_goal = db.query_row(
@@ -1691,6 +1816,96 @@ mod tests {
         assert!(
             !activate_queued_goal_with(&db, &id, |_| panic!("uncertain activation repeated"))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn goal_sender_identity_detects_real_child_exit() {
+        let (_, _, boot, namespace) = goal_sender_identity().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::obligations::process_start_time(pid);
+        let live = start.is_some_and(|start| {
+            !goal_sender_confirmed_gone(i64::from(pid), start as i64, &boot, &namespace)
+        });
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let gone = start.is_some_and(|start| {
+            goal_sender_confirmed_gone(i64::from(pid), start as i64, &boot, &namespace)
+        });
+        assert!(live && gone);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interrupted_activation_is_reconciled_without_changing_goal_or_input() {
+        let db = db();
+        let id = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        let (pid, start, boot, namespace) = goal_sender_identity().unwrap();
+        assert!(!goal_sender_confirmed_gone(
+            2147483647,
+            1,
+            "other-boot",
+            &namespace
+        ));
+        assert!(!goal_sender_confirmed_gone(
+            2147483647,
+            1,
+            &boot,
+            "other-namespace"
+        ));
+        db.execute(
+            "UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='activating',goal_sender_pid=?2,goal_sender_start=?3,goal_sender_boot=?4,goal_sender_namespace=?5 WHERE id=?1",
+            params![id, pid, start, boot, namespace],
+        ).unwrap();
+        assert!(
+            !reconcile_interrupted_goal_with(&db, &id, |_| panic!("live sender was reclaimed"))
+                .unwrap()
+        );
+        db.execute(
+            "UPDATE subscriptions SET goal_sender_pid=2147483647,goal_sender_start=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        assert!(!reconcile_interrupted_goal_with(&db, &id, |_| anyhow::bail!("offline")).unwrap());
+        assert_eq!(status_for_id(&db, &id).unwrap()["state"], "sending");
+        assert!(
+            reconcile_interrupted_goal_with(&db, &id, |thread| {
+                assert_eq!(thread, THREAD);
+                Ok(json!({"status":"active"}))
+            })
+            .unwrap()
+        );
+        let status = status_for_id(&db, &id).unwrap();
+        assert_eq!(status["state"], "queued");
+        assert_eq!(status["goal_stage"], "active");
+        assert!(
+            !reconcile_interrupted_goal_with(&db, &id, |_| panic!("reconciled twice")).unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interrupted_activation_with_paused_goal_requires_attention() {
+        let db = db();
+        let id = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        let (_, _, boot, namespace) = goal_sender_identity().unwrap();
+        db.execute(
+            "UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='activating',goal_sender_pid=2147483647,goal_sender_start=1,goal_sender_boot=?2,goal_sender_namespace=?3 WHERE id=?1",
+            params![id, boot, namespace],
+        ).unwrap();
+        assert!(
+            reconcile_interrupted_goal_with(&db, &id, |_| Ok(json!({"status":"paused"}))).unwrap()
+        );
+        let status = status_for_id(&db, &id).unwrap();
+        assert_eq!(status["state"], "needs_attention");
+        assert_eq!(status["goal_stage"], "activation_unconfirmed");
+        assert!(
+            !reconcile_interrupted_goal_with(&db, &id, |_| panic!("activation retried")).unwrap()
         );
     }
 
@@ -3627,6 +3842,14 @@ mod tests {
             "execution_json",
             "required_source",
             "source_event_key",
+        ] {
+            assert!(columns.iter().any(|existing| existing == column));
+        }
+        for column in [
+            "goal_sender_pid",
+            "goal_sender_start",
+            "goal_sender_boot",
+            "goal_sender_namespace",
         ] {
             assert!(columns.iter().any(|existing| existing == column));
         }

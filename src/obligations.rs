@@ -268,7 +268,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn process_start_time(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat.rsplit_once(')')?
         .1

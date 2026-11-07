@@ -198,7 +198,10 @@ without replaying the input. A queued input or active goal does not prove the
 agent has run. `goal_stage` records preparation, queue acceptance, activation,
 or an unconfirmed activation. The receiver can complete a pending activation
 after queue acceptance without sending the input again. An activation already
-started is not retried if its outcome is unknown. Goal changes made outside
+started is not retried if its outcome is unknown. On Linux, if the sender is
+confirmed gone, Wake reads the goal: an active goal is confirmed; otherwise the
+delivery needs attention. If the sender's identity cannot be verified, Wake
+leaves the delivery in progress. Goal changes made outside
 Wake are not atomic with this operation: before activation Wake compares the
 goal's status and `updatedAt` with the pre-queue snapshot and requires review if
 they differ or the timestamp is missing. A change can still race with the final
