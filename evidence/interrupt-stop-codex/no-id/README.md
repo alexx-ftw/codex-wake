@@ -1,0 +1,5 @@
+# Counterexample: Stop without turn ID
+
+This isolated, manually injected hook test exercises experimental parent commit `bb21680a3c2d1ea830d6be071781478d9a2c5b60`. The first injected event is Interrupt with `turn_id: turn-one`; the second is Stop for the same synthetic chat without a turn ID. The fake queue logs calls and exits nonzero, representing an uncertain delivery, not a confirmed failure to deliver. The receipt records two attempts and two `needs_attention` rows. No real subscriptions, model, Codex hook runtime or delivery service were involved.
+
+The test demonstrates why the experimental implementation cannot be integrated as satisfying no unsafe retries for a Stop payload lacking a stable ID. It cannot tell whether the no-ID Stop corresponds to the same event or a different turn. Suppressing every such Stop would instead change the prior Stop notification behavior. A reliable shared correlation or a different explicitly agreed contract is needed. This is a counterexample, not a passing proof of the requested behavior. The harness snapshot depends on local fixture paths and the previously built experimental binary.

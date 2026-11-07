@@ -1,0 +1,17 @@
+{
+  "mode": "manually_injected_hook_payloads",
+  "queue": "fake_failure",
+  "interrupt_turn_id": "turn-one",
+  "stop_turn_id": null,
+  "attempts": 2,
+  "alerts": [
+    {
+      "state": "needs_attention",
+      "reason": "cli_warning_or_nonzero_exit"
+    },
+    {
+      "state": "needs_attention",
+      "reason": "cli_warning_or_nonzero_exit"
+    }
+  ]
+}
