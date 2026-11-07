@@ -22,7 +22,9 @@ pub fn initialize(db: &Connection) -> Result<()> {
         cursor TEXT, has_next INTEGER NOT NULL DEFAULT 0,
         next_poll_ms INTEGER NOT NULL DEFAULT 0, backoff_ms INTEGER NOT NULL DEFAULT 60000,
         last_success_ms INTEGER, error_category TEXT, calls INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(endpoint,page));",
+        PRIMARY KEY(endpoint,page));
+        CREATE TABLE IF NOT EXISTS github_poll_generation (
+            endpoint TEXT PRIMARY KEY, generation INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -571,6 +573,7 @@ where
             skipped: true,
         });
     }
+    let generation = poll_generation(db, route)?;
     let root = state(db, route, first)?;
     if root.as_ref().is_some_and(|s| s.next_poll > now) {
         return Ok(EndpointOutcome {
@@ -598,7 +601,7 @@ where
         let response = match fetch(&url, cached.as_ref().and_then(|s| s.etag.as_deref())) {
             Ok(r) => r,
             Err(e) => {
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -610,7 +613,7 @@ where
         };
         if response.status != 200 && response.status != 304 {
             let e = response.failure();
-            record_failure(db, route, first, now, &e, requests)?;
+            record_fetch_failure(db, route, first, now, &e, requests, generation)?;
             return Ok(EndpointOutcome {
                 error: Some(e.category),
                 calls: requests,
@@ -622,7 +625,7 @@ where
         let (body, etag, has_next) = if response.status == 304 {
             let Some(old) = cached.as_ref().and_then(|s| s.body.clone()) else {
                 let e = Failure::new("cache_miss");
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -641,7 +644,7 @@ where
         } else {
             if response.body.len() >= MAX_OUTPUT {
                 let e = Failure::new("output_limit");
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -654,7 +657,7 @@ where
                 Ok(body) => body,
                 Err(_) => {
                     let e = Failure::new("invalid_response");
-                    record_failure(db, route, first, now, &e, requests)?;
+                    record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                     return Ok(EndpointOutcome {
                         error: Some(e.category),
                         calls: requests,
@@ -671,7 +674,7 @@ where
             Ok(v) => v,
             Err(_) => {
                 let e = Failure::new("invalid_response");
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -687,7 +690,7 @@ where
             all.extend(items.iter().cloned());
         } else {
             let e = Failure::new("invalid_response");
-            record_failure(db, route, first, now, &e, requests)?;
+            record_fetch_failure(db, route, first, now, &e, requests, generation)?;
             return Ok(EndpointOutcome {
                 error: Some(e.category),
                 calls: requests,
@@ -708,7 +711,7 @@ where
         page += 1;
         if page > 10_000 {
             let e = Failure::new("pagination_limit");
-            record_failure(db, route, first, now, &e, requests)?;
+            record_fetch_failure(db, route, first, now, &e, requests, generation)?;
             return Ok(EndpointOutcome {
                 error: Some(e.category),
                 calls: requests,
@@ -717,6 +720,17 @@ where
                 skipped: false,
             });
         }
+    }
+    // Serialize acceptance and discard a response fetched before another commit.
+    let _guard = PollCommitGuard::acquire(db)?;
+    if poll_generation(db, route)? != generation {
+        return Ok(EndpointOutcome {
+            error: None,
+            calls: requests,
+            pages: requests,
+            accepted: 0,
+            skipped: true,
+        });
     }
     let (cursor, accepted) = match process(db, cursor, all, now) {
         Ok(v) => v,
@@ -750,6 +764,72 @@ struct State {
     next_poll: i64,
     backoff: i64,
 }
+
+fn poll_generation(db: &Connection, route: &str) -> Result<i64> {
+    Ok(db
+        .query_row(
+            "SELECT generation FROM github_poll_generation WHERE endpoint=?1",
+            [route],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+// Lock the containing directory instead of a sidecar: unlinking a sidecar can
+// otherwise split waiters across two inodes during cleanup.
+struct PollCommitGuard {
+    _local: std::sync::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+impl PollCommitGuard {
+    fn acquire(db: &Connection) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let local = LOCAL
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poll commit lock poisoned"))?;
+        let file = if let Some(path) = db.path().filter(|p| !p.is_empty()) {
+            let canonical = std::fs::canonicalize(path)?;
+            let database = std::fs::metadata(&canonical)?;
+            anyhow::ensure!(
+                database.is_file() && database.nlink() == 1,
+                "polling database must have one link"
+            );
+            let file = lock_database_parent(&canonical, false)?;
+            let after = std::fs::metadata(&canonical)?;
+            anyhow::ensure!(
+                after.dev() == database.dev()
+                    && after.ino() == database.ino()
+                    && after.nlink() == 1,
+                "polling database changed during lock acquisition"
+            );
+            Some(file)
+        } else {
+            None
+        };
+        Ok(Self {
+            _local: local,
+            _file: file,
+        })
+    }
+}
+
+pub(crate) fn lock_database_parent(path: &Path, nonblocking: bool) -> Result<std::fs::File> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database has no parent"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(parent)?;
+    let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    if unsafe { libc::flock(file.as_raw_fd(), mode) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(file)
+}
 struct PageUpdate {
     page: usize,
     body: String,
@@ -777,6 +857,7 @@ fn save_success(
             "DELETE FROM github_poll_state WHERE endpoint=?1 AND page>?2",
             params![route, pages.last().map_or(first as i64, |p| p.page as i64)],
         )?;
+        db.execute("INSERT INTO github_poll_generation(endpoint,generation) VALUES(?1,1) ON CONFLICT(endpoint) DO UPDATE SET generation=generation+1", [route])?;
         Ok(())
     })();
     match res {
@@ -789,6 +870,21 @@ fn save_success(
             Err(e)
         }
     }
+}
+fn record_fetch_failure(
+    db: &Connection,
+    route: &str,
+    page: usize,
+    now: i64,
+    e: &Failure,
+    calls: u64,
+    generation: i64,
+) -> Result<()> {
+    let _guard = PollCommitGuard::acquire(db)?;
+    if poll_generation(db, route)? == generation {
+        record_failure(db, route, page, now, e, calls)?;
+    }
+    Ok(())
 }
 fn record_failure(
     db: &Connection,
@@ -986,7 +1082,7 @@ fn scoped_subscription_accept(
     let candidate = Connection::open_in_memory().map_err(|_| Failure::new("database"))?;
     crate::subscriptions::initialize(&candidate).map_err(|_| Failure::new("database"))?;
     // GitHub dates have second precision; include ties rather than permanently dropping them.
-    let mut s=db.prepare("SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json FROM subscriptions WHERE state='waiting' AND kind=?1 AND repo=?2 AND resource=?3 AND (?4 IS NULL OR datetime(updated)<=datetime(?4))").map_err(|_|Failure::new("database"))?;
+    let mut s=db.prepare("SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json,required_source FROM subscriptions WHERE state='waiting' AND kind=?1 AND repo=?2 AND resource=?3 AND (?4 IS NULL OR datetime(updated)<=datetime(?4))").map_err(|_|Failure::new("database"))?;
     let rows = s
         .query_map(params![kind, repo, resource, event_time], |r| {
             Ok((
@@ -1003,19 +1099,20 @@ fn scoped_subscription_accept(
                 r.get::<_, Option<String>>(10)?,
                 r.get::<_, Option<String>>(11)?,
                 r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<String>>(13)?,
             ))
         })
         .map_err(|_| Failure::new("database"))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| Failure::new("database"))?;
     for row in rows {
-        candidate.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![row.0,row.1,row.2,row.3,row.4,row.5,row.6,row.7,row.8,row.9,row.10,row.11,row.12]).map_err(|_|Failure::new("database"))?;
+        candidate.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome,reason,updated,message_template,source_json,execution_json,required_source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![row.0,row.1,row.2,row.3,row.4,row.5,row.6,row.7,row.8,row.9,row.10,row.11,row.12,row.13]).map_err(|_|Failure::new("database"))?;
     }
     crate::subscriptions::accept(&candidate, header, payload)
         .map_err(|_| Failure::new("accept"))?;
     let ready = {
         let mut s = candidate
-            .prepare("SELECT id,outcome,reason,source_json FROM subscriptions WHERE state='ready'")
+            .prepare("SELECT id,outcome,reason,source_json,source_event_key FROM subscriptions WHERE state='ready'")
             .map_err(|_| Failure::new("database"))?;
         s.query_map([], |r| {
             Ok((
@@ -1023,6 +1120,7 @@ fn scoped_subscription_accept(
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(|_| Failure::new("database"))?
@@ -1033,8 +1131,8 @@ fn scoped_subscription_accept(
         .unchecked_transaction()
         .map_err(|_| Failure::new("database"))?;
     let mut count = 0;
-    for (id, outcome, reason, source) in ready {
-        count+=tx.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=?2,source_json=CASE WHEN message_template IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,reason,source,id]).map_err(|_|Failure::new("database"))?;
+    for (id, outcome, reason, source, source_event_key) in ready {
+        count+=tx.execute("UPDATE subscriptions SET state='ready',outcome=?1,reason=?2,source_event_key=?5,source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='waiting'",params![outcome,reason,source,id,source_event_key]).map_err(|_|Failure::new("database"))?;
     }
     tx.commit().map_err(|_| Failure::new("database"))?;
     Ok(count)
@@ -1081,7 +1179,7 @@ fn rules_accept_scoped(
     crate::rules::accept(&candidate, header, payload).map_err(|_| Failure::new("accept"))?;
     let pending = {
         let mut s = candidate
-            .prepare("SELECT rule_id,event_header,comment_id,source FROM rule_deliveries")
+            .prepare("SELECT rule_id,event_header,comment_id,source,source_event_key,event_identity_verified FROM rule_deliveries")
             .map_err(|_| Failure::new("database"))?;
         s.query_map([], |r| {
             Ok((
@@ -1089,6 +1187,8 @@ fn rules_accept_scoped(
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })
         .map_err(|_| Failure::new("database"))?
@@ -1099,8 +1199,8 @@ fn rules_accept_scoped(
         .unchecked_transaction()
         .map_err(|_| Failure::new("database"))?;
     let mut count = 0;
-    for (id, event, comment, source) in pending {
-        count+=tx.execute("INSERT OR IGNORE INTO rule_deliveries(rule_id,event_header,comment_id,source) VALUES(?1,?2,?3,?4)",params![id,event,comment,source]).map_err(|_|Failure::new("database"))?;
+    for (id, event, comment, source, source_event_key, identity_verified) in pending {
+        count+=tx.execute("INSERT OR IGNORE INTO rule_deliveries(rule_id,event_header,comment_id,source,source_event_key,event_identity_verified) VALUES(?1,?2,?3,?4,?5,?6)",params![id,event,comment,source,source_event_key,identity_verified]).map_err(|_|Failure::new("database"))?;
     }
     tx.commit().map_err(|_| Failure::new("database"))?;
     Ok(count)
@@ -1230,6 +1330,186 @@ mod tests {
     type Fetch<'a> =
         dyn FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure> + 'a;
 
+    #[test]
+    fn failed_poll_save_does_not_replay_an_uncertain_wait_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/state.sqlite3");
+        let mut db = crate::bridge::connect(&path).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let sha = "a".repeat(40);
+        crate::bridge::register(
+            &db,
+            "owner/repo",
+            123,
+            1,
+            "11111111-1111-4111-8111-111111111111",
+            &sha,
+        )
+        .unwrap();
+        db.execute_batch("CREATE TRIGGER fail_poll_save BEFORE INSERT ON github_poll_generation BEGIN SELECT RAISE(FAIL,'injected'); END").unwrap();
+        let payload = json!({"action":"completed","repository":{"full_name":"owner/repo"},"workflow_run":{"id":123,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success"}});
+        let run = || response(payload["workflow_run"].clone(), false);
+        let mut fetch = |_: &str, _: Option<&str>| Ok(run());
+        let process = |db: &Connection, _: Option<&str>, _: Vec<Value>, _: i64| {
+            Ok((None, u64::from(bridge_accept(db, &payload)? == "recorded")))
+        };
+        assert!(poll_endpoint(&db, "test-run", 0, 1, &mut fetch, process).is_err());
+        let calls = dir.path().join("calls");
+        let codex = dir.path().join("fake-codex");
+        std::fs::write(
+            &codex,
+            format!("#!/bin/sh\necho attempt >> '{}'\nexit 1\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            crate::bridge::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row("SELECT state FROM waits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+        db.execute_batch("DROP TRIGGER fail_poll_save").unwrap();
+        let outcome = poll_endpoint(&db, "test-run", 0, 1, &mut fetch, process).unwrap();
+        // bridge::accept reports "recorded" for both a new record and a duplicate.
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(
+            crate::bridge::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+        let state: String = db
+            .query_row("SELECT state FROM waits", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+    }
+
+    #[test]
+    fn failed_poll_save_does_not_replay_an_uncertain_subscription() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = crate::bridge::connect(&dir.path().join("state/state.sqlite3")).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe(&db, "git_ref", "topic/test", "updated");
+        let value = |sha: &str| {
+            response(
+                json!({"ref":"refs/heads/topic/test","object":{"sha":sha.repeat(40)}}),
+                false,
+            )
+        };
+        tick_with(&db, 1, |_, _| Ok(value("a"))).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_poll_save BEFORE UPDATE ON github_poll_generation BEGIN SELECT RAISE(FAIL,'injected'); END").unwrap();
+        assert!(tick_with(&db, INTERVAL_MS + 1, |_, _| Ok(value("b"))).is_err());
+        let calls = dir.path().join("calls");
+        let codex = dir.path().join("fake-codex");
+        std::fs::write(
+            &codex,
+            format!("#!/bin/sh\necho attempt >> '{}'\nexit 1\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            crate::subscriptions::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            1
+        );
+        assert_eq!(registration_state(&db, &id), "needs_attention");
+        db.execute_batch("DROP TRIGGER fail_poll_save").unwrap();
+        let event = json!({"ref":"refs/heads/topic/test","deleted":false,"after":"b".repeat(40),"repository":{"full_name":"owner/repo"}});
+        assert_eq!(
+            scoped_subscription_accept(&db, "push", &event, "owner/repo", "topic/test", None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::subscriptions::dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+        assert_eq!(registration_state(&db, &id), "needs_attention");
+    }
+
+    #[test]
+    fn polling_rejects_hard_linked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let db = Connection::open(&path).unwrap();
+        std::fs::hard_link(&path, dir.path().join("alias.sqlite")).unwrap();
+        assert!(PollCommitGuard::acquire(&db).is_err());
+    }
+
+    #[test]
+    fn stale_response_from_another_process_does_not_regress_cursor() {
+        use std::{process::Command, thread};
+        fn wait_for(path: &Path) {
+            let end = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    Instant::now() < end,
+                    "timed out waiting for {}",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let value = |sha: &str| {
+            response(
+                json!({"ref":"refs/heads/topic/test","object":{"sha":sha.repeat(40)}}),
+                false,
+            )
+        };
+        if let Some(dir) = std::env::var_os("WAKE_STALE_POLL_TEST_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let db = Connection::open(dir.join("state.sqlite")).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let result = tick_with(&db, INTERVAL_MS + 1, |_, _| {
+                std::fs::write(dir.join("started"), b"").unwrap();
+                wait_for(&dir.join("release"));
+                Ok(value("b"))
+            })
+            .unwrap();
+            assert_eq!(result["accepted"], 0);
+            assert_eq!(result["skipped"], 1);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+        )
+        .unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe(&db, "git_ref", "topic/test", "updated");
+        tick_with(&db, 1, |_, _| Ok(value("a"))).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "polling::tests::stale_response_from_another_process_does_not_regress_cursor",
+                "--nocapture",
+            ])
+            .env("WAKE_STALE_POLL_TEST_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        wait_for(&dir.path().join("started"));
+        tick_with(&db, INTERVAL_MS + 1, |_, _| Ok(value("c"))).unwrap();
+        std::fs::write(dir.path().join("release"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        let route = "/repos/owner/repo/git/ref/heads/topic/test";
+        assert_eq!(
+            state(&db, route, 0).unwrap().unwrap().cursor.as_deref(),
+            Some("c".repeat(40).as_str())
+        );
+        assert_eq!(registration_state(&db, &id), "ready");
+    }
+
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
@@ -1277,9 +1557,146 @@ mod tests {
     }
 
     #[test]
+    fn scoped_polling_copies_the_stable_event_key_from_its_candidate_database() {
+        let db = db();
+        let id = subscribe(&db, "review", "42", "approved");
+        let source = json!({
+            "action":"submitted",
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":42},
+            "review":{"id":77,"state":"approved"}
+        });
+        assert_eq!(
+            scoped_subscription_accept(
+                &db,
+                "pull_request_review",
+                &source,
+                "owner/repo",
+                "42",
+                None,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(registration_state(&db, &id), "ready");
+        let stored: String = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(stored),
+            crate::delivery_evidence::subscription_event_identity(
+                "review",
+                "owner/repo",
+                "42",
+                "approved",
+                "approved",
+                &source,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_comment_polling_copies_event_identity_to_rule_delivery() {
+        let db = db();
+        let rule: crate::rules::RuleInput = serde_json::from_value(json!({
+            "repo":"owner/repo",
+            "pr":42,
+            "author":"alice",
+            "author_type":"User",
+            "contains":"ship it",
+            "prompt":"Review the existing task",
+            "target_thread":"11111111-1111-4111-8111-111111111111"
+        }))
+        .unwrap();
+        let rule_id = crate::rules::configure(&db, rule).unwrap();
+        db.execute(
+            "UPDATE rules SET updated='2025-01-01 00:00:00' WHERE id=?1",
+            [&rule_id],
+        )
+        .unwrap();
+        let source = json!({
+            "action":"created",
+            "repository":{"full_name":"owner/repo"},
+            "issue":{"number":42,"pull_request":{"url":"https://api.github.com/repos/owner/repo/pulls/42"}},
+            "comment":{"id":77,"user":{"login":"alice","type":"User"},"body":"please ship it"}
+        });
+        assert_eq!(
+            rules_accept_scoped(
+                &db,
+                "issue_comment",
+                &source,
+                "owner/repo",
+                42,
+                "2026-01-02T00:00:00Z",
+            )
+            .unwrap(),
+            1
+        );
+        let stored: (String, bool) = db
+            .query_row(
+                "SELECT source_event_key,event_identity_verified FROM rule_deliveries WHERE rule_id=?1",
+                [&rule_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            Some(stored.0),
+            crate::delivery_evidence::github_comment_event_identity("issue_comment", &source)
+                .unwrap()
+        );
+        assert!(stored.1);
+    }
+
+    #[test]
     fn no_listeners_make_no_network_requests() {
         let report = tick_with(&db(), 1, |_, _| panic!("unexpected request")).unwrap();
         assert_eq!(report["calls"], 0);
+    }
+
+    #[test]
+    fn github_scoped_accept_preserves_source_and_required_fields() {
+        let db = db();
+        let paths = vec!["pull_request.html_url".to_string()];
+        let id = crate::subscriptions::subscribe_with_delivery(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "merged",
+            "11111111-1111-4111-8111-111111111111",
+            crate::subscriptions::DeliveryConfig {
+                required_source: Some(&paths),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payload = json!({"action":"closed","number":7,"pull_request":{"merged":true},"repository":{"full_name":"owner/repo"}});
+        assert_eq!(
+            scoped_subscription_accept(&db, "pull_request", &payload, "owner/repo", "7", None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            scoped_subscription_accept(&db, "pull_request", &payload, "owner/repo", "7", None)
+                .unwrap(),
+            0
+        );
+        let row = crate::subscriptions::status(&db).unwrap();
+        assert_eq!(row[0]["id"], id);
+        assert_eq!(row[0]["missing_source"], json!(["pull_request.html_url"]));
+        let source: String = db
+            .query_row(
+                "SELECT source_json FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&source).unwrap(), payload);
     }
 
     #[test]
@@ -1462,6 +1879,14 @@ mod tests {
             .unwrap();
             assert_eq!(registration_state(&db, &id), expected);
         }
+        let event_key: Option<String> = db
+            .query_row(
+                "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_key, None);
     }
 
     #[test]
@@ -1482,6 +1907,16 @@ mod tests {
             assert_eq!(calls, 1);
             assert_eq!(registration_state(&db, &head), expected);
             assert_eq!(registration_state(&db, &base), expected);
+        }
+        for id in [&head, &base] {
+            let event_key: Option<String> = db
+                .query_row(
+                    "SELECT source_event_key FROM subscriptions WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(event_key, None);
         }
     }
 

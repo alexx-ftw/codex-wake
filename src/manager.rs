@@ -179,7 +179,11 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("main.rs").as_slice(),
         include_bytes!("manager.rs").as_slice(),
         include_bytes!("bridge.rs").as_slice(),
+        include_bytes!("circular_waits.rs").as_slice(),
+        include_bytes!("delivery_evidence.rs").as_slice(),
         include_bytes!("subscriptions.rs").as_slice(),
+        include_bytes!("producers.rs").as_slice(),
+        include_bytes!("result_conflicts.rs").as_slice(),
         include_bytes!("probe.rs").as_slice(),
         include_bytes!("goals.rs").as_slice(),
         include_bytes!("templates.rs").as_slice(),
@@ -188,11 +192,16 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("uninstall.rs").as_slice(),
         include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("observability.rs").as_slice(),
+        include_bytes!("obligations.rs").as_slice(),
+        include_bytes!("validation_obligations.rs").as_slice(),
         include_bytes!("telemetry.rs").as_slice(),
         include_bytes!("polling.rs").as_slice(),
         include_bytes!("observers.rs").as_slice(),
         include_bytes!("native_poll.rs").as_slice(),
         include_bytes!("steer.rs").as_slice(),
+        include_bytes!("status_view.rs").as_slice(),
+        include_bytes!("../hooks/hooks.json").as_slice(),
+        include_bytes!("../scripts/interrupt.sh").as_slice(),
         include_bytes!("../Cargo.lock").as_slice(),
         HOOKS.as_bytes(),
     ] {
@@ -793,13 +802,58 @@ impl Drop for ChildGuard {
 }
 
 fn remove_stale_socket(path: &Path) -> Result<()> {
+    remove_stale_socket_in(path, &env::temp_dir())
+}
+
+fn remove_stale_socket_in(path: &Path, temp: &Path) -> Result<()> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    let uid = fs::metadata("/proc/self")?.uid();
+    if meta.file_type().is_symlink() && meta.uid() == uid {
+        let target = fs::read_link(path)?;
+        let daemon_dir = temp.join(format!("codex-daemon-{uid}"));
+        let is_daemon_target = target.parent() == Some(daemon_dir.as_path())
+            && target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+        if is_daemon_target {
+            match fs::symlink_metadata(&target) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::remove_file(path)?;
+                    return Ok(());
+                }
+                Ok(target_meta)
+                    if target_meta.file_type().is_socket() && target_meta.uid() == uid =>
+                {
+                    let dir = fs::symlink_metadata(&daemon_dir)?;
+                    ensure!(
+                        dir.is_dir() && dir.uid() == uid && dir.mode() & 0o077 == 0,
+                        "Codex daemon directory is not private"
+                    );
+                    match UnixStream::connect(&target) {
+                        Ok(_) => {
+                            bail!("Controller socket is already active; it was left untouched")
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            fs::remove_file(path)?;
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+                _ => {}
+            }
+        }
+    }
     ensure!(
-        meta.file_type().is_socket() && meta.uid() == fs::metadata("/proc/self")?.uid(),
+        meta.file_type().is_socket() && meta.uid() == uid,
         "Controller path is not an owned socket"
     );
     match UnixStream::connect(path) {
@@ -887,12 +941,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
-    for source in ["github", "external", "native"] {
+    for source in ["github", "external", "native", "delivery"] {
         let poll_config = config.clone();
         thread::spawn(move || {
+            let mut history_scans = std::collections::HashMap::new();
             loop {
                 let result = (|| -> Result<()> {
-                    let db = crate::bridge::connect(&poll_config.db)?;
+                    let mut db = crate::bridge::connect(&poll_config.db)?;
                     crate::subscriptions::initialize(&db)?;
                     crate::rules::initialize(&db)?;
                     match source {
@@ -901,6 +956,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         }
                         "external" => {
                             crate::observers::tick(&db, &poll_config.codex)?;
+                        }
+                        "delivery" => {
+                            crate::delivery_evidence::poll_history(
+                                &mut db,
+                                &poll_config.codex,
+                                &mut history_scans,
+                            )?;
                         }
                         _ => {
                             crate::native_poll::tick(&db, &poll_config.codex)?;
@@ -918,19 +980,42 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         1,
                     );
                 }
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_secs(if source == "delivery" {
+                    5
+                } else {
+                    1
+                }));
             }
         });
     }
     let config = config.clone();
     thread::spawn(move || {
         let mut heartbeat = Instant::now() - Duration::from_secs(60);
+        let mut obligations_initialized = false;
         loop {
             let result = (|| -> Result<()> {
                 let mut db = crate::bridge::connect(&config.db)?;
                 crate::subscriptions::initialize(&db)?;
+                crate::subscriptions::dependency_tick(
+                    &db,
+                    &config.codex,
+                    Duration::from_secs(120),
+                )?;
+                if !obligations_initialized {
+                    crate::obligations::initialize(&db)?;
+                    obligations_initialized = true;
+                }
+                crate::process_interrupts(&config, &db)?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::obligations::dispatch_coordinator_alerts(
+                    &mut db,
+                    &config.codex,
+                    Duration::from_secs(30),
+                )?;
+                crate::circular_waits::initialize(&db)?;
+                crate::circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::rules::initialize(&db)?;
                 crate::rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?;
                 Ok(())
@@ -1009,11 +1094,15 @@ pub fn run_receiver(config: &Config) -> Result<()> {
 fn observe_queues(config: &Config) -> Result<()> {
     let db = crate::bridge::connect(&config.db)?;
     crate::steer::initialize(&db)?;
+    crate::circular_waits::initialize(&db)?;
+    crate::obligations::initialize(&db)?;
     for (table, operation) in [
         ("waits", "queue.waits"),
         ("subscriptions", "queue.subscriptions"),
         ("rule_deliveries", "queue.rules"),
         ("steers", "queue.steers"),
+        ("circular_notices", "queue.circular_notices"),
+        ("coordinator_alerts", "queue.coordinator_alerts"),
     ] {
         let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table} GROUP BY state"))?;
         let rows = statement.query_map([], |r| {
@@ -1347,6 +1436,16 @@ pub fn cleanup_uninstalled(config: &Config) -> Result<()> {
     }
     systemctl(&["disable", CLEANUP_UNIT])?;
     stop_clients(config)?;
+    // Refuse cleanup while a poll commit is active. Keep this directory lock
+    // until the owned tree is gone, so no waiter can commit against it.
+    let _poll_guard = if !external_db && config.db.try_exists()? {
+        Some(crate::polling::lock_database_parent(
+            &config.db.canonicalize()?,
+            true,
+        )?)
+    } else {
+        None
+    };
     crate::uninstall::remove_unit_file(&config.unit, &unit(config)?)?;
     crate::uninstall::remove_unit_file(&directory.join(CLEANUP_PATH), &cleanup_path)?;
     crate::uninstall::remove_unit_file(&directory.join(CLEANUP_UNIT), &cleanup_service)?;
@@ -1521,6 +1620,48 @@ mod tests {
         fs::write(&socket, "unrelated").unwrap();
         assert!(remove_stale_socket(&socket).is_err());
         assert_eq!(fs::read_to_string(&socket).unwrap(), "unrelated");
+    }
+    #[test]
+    fn socket_cleanup_removes_only_stale_codex_daemon_links() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("controller.sock");
+        let uid = fs::metadata("/proc/self").unwrap().uid();
+        let daemon_dir = temp.path().join(format!("codex-daemon-{uid}"));
+        fs::create_dir(&daemon_dir).unwrap();
+        fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = daemon_dir.join(format!(
+            "{}{}",
+            "0".repeat(32),
+            uuid::Uuid::new_v4().simple()
+        ));
+        assert!(!target.exists());
+        symlink(&target, &socket).unwrap();
+        remove_stale_socket_in(&socket, temp.path()).unwrap();
+        assert!(fs::symlink_metadata(&socket).is_err());
+        let listener = UnixListener::bind(&target).unwrap();
+        symlink(&target, &socket).unwrap();
+        assert!(remove_stale_socket_in(&socket, temp.path()).is_err());
+        drop(listener.accept().unwrap());
+        drop(listener);
+        fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(remove_stale_socket_in(&socket, temp.path()).is_err());
+        fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_stale_socket_in(&socket, temp.path()).unwrap();
+        assert!(!socket.exists());
+        assert!(
+            target.exists(),
+            "Codex retains ownership of its target socket"
+        );
+        symlink(temp.path().join("unrelated"), &socket).unwrap();
+        assert!(remove_stale_socket_in(&socket, temp.path()).is_err());
+        assert!(
+            fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
     #[test]
     fn persistent_private_secret() {

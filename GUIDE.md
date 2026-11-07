@@ -144,7 +144,17 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `register_wait` | Register exact CI repo/run/attempt/SHA and destination chat |
 | `subscribe` | Register another exact source/resource/event and destination |
 | `publish_result` | Publish a verified provider result and dispatch matching waits |
-| `get_status` | Inspect local receiver health, CI waits and subscriptions |
+| `register_obligation` | Record a chat's pending result publication |
+| `register_resource_wait` | Record a wait on a non-chat resource and its declared continuation |
+| `update_wait_continuation` | Update an active wait’s declared continuation without resolving it |
+| `register_coordinator` | Explicitly set the coordinator for a responsible chat |
+| `list_obligations` | List a chat's pending publications |
+| `resolve_obligation` | Resolve a pending obligation explicitly |
+| `propose_obligation_transfer` | Propose transferring a pending obligation to another chat |
+| `list_obligation_transfers` | List transfer proposals addressed to a chat |
+| `accept_obligation_transfer` | Accept a proposal and become responsible |
+| `get_result_conflicts` | Read paginated evidence for an exact job execution and attempt |
+| `get_status` | Inspect local receiver health, CI waits, subscriptions and recent coordinator alert states |
 | `recover_ready` | Dispatch stored ready events; never retry ambiguous deliveries |
 | `configure_rule` | Match a PR comment and create or message a thread |
 | `queue_thread` | Render and queue an input, optionally resuming the thread |
@@ -155,6 +165,23 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `edit_goal` | Edit an existing objective or explicitly requested budget |
 | `resume_goal` | Resume an authorized existing goal and separately report queue acceptance |
 
+For conflicting job reports, provide both `execution_id` and the positive `attempt`
+to `publish_result`, together with the publisher and supporting evidence in
+`source`. Wake compares only reports for the same namespace, resource, execution
+and attempt. The response lists up to ten reports when success, failure or
+cancellation disagree; use `get_result_conflicts` with the same identity and its
+`next` cursor for all pages. It does not determine which is correct or undo any
+earlier delivery.
+Publications without an execution identity remain supported and are not compared.
+A terminal job outcome (`success`, `failure`, or `cancelled`) matches both its
+exact event and `completed` subscriptions and resolves matching publication
+obligations for both outcomes atomically. Each route retains its own delivery
+identity. When no matching subscription is waiting, evidence for
+an earlier `completed` subscription includes the outcome it actually received;
+it does not prove that the new result was delivered.
+If no subscription is waiting but an earlier one matches, the publisher receives
+`no_waiting_subscriber` and the available delivery evidence for inspection.
+
 Stored subscriptions and CI waits with a model preset remain ready when the target
 is active or `thread/resume` definitively rejects its active writer before input
 submission, or when transport fails during preparation before any input-bearing
@@ -164,6 +191,21 @@ RPC. They retry after 15 seconds, preserving the preset. An uncertain
 Every subscription is independent and one-shot. Completing one doesn't cancel
 the others. Re-registering the same subscription is idempotent; it does not rearm
 a consumed subscription. Source events received before registration aren't replayed.
+Set `resume_goal` to true to queue the event input and then activate the target's
+existing goal. If queuing is uncertain, Wake does not activate the goal. If
+activation is unconfirmed after queue acceptance, it reports `needs_attention`
+without replaying the input. A queued input or active goal does not prove the
+agent has run. `goal_stage` records preparation, queue acceptance, activation,
+or an unconfirmed activation. The receiver can complete a pending activation
+after queue acceptance without sending the input again. An activation already
+started is not retried if its outcome is unknown. On Linux, if the sender is
+confirmed gone, Wake reads the goal: an active goal is confirmed; otherwise the
+delivery needs attention. If the sender's identity cannot be verified, Wake
+leaves the delivery in progress. Goal changes made outside
+Wake are not atomic with this operation: before activation Wake compares the
+goal's status and `updatedAt` with the pre-queue snapshot and requires review if
+they differ or the timestamp is missing. A change can still race with the final
+request. The CLI accepts `--resume-goal true`.
 
 | Source (`kind`) | Resource | Supported event |
 |---|---|---|
@@ -176,15 +218,30 @@ a consumed subscription. Source events received before registration aren't repla
 | `chat` | Source chat UUID | `completed`, `blocked`, `failed` reported by its owner |
 | `thread` | Source chat UUID | `turn_completed` from the `Stop` lifecycle signal |
 | `subagent` | Source agent UUID | `completed` from `SubagentStop` |
-| `dependency` | Namespace and dependency ID | `recovered` after provider health verification |
+| `dependency` | Namespace and dependency ID | `progress` resets the inactivity deadline; `recovered` after provider health verification |
 | `resource` | Namespace and resource ID | `released` by its owner |
 | `artifact` | Namespace and exact artifact ID | `available` |
+
+Dependency subscriptions use `progress_timeout_secs` (default 3600) and persist
+the last explicit progress signal and its deadline. When it expires, Wake sends
+one request to investigate for that inactivity period; silence is not treated as failure. Publish
+`dependency/progress` only when progress is observed and `dependency/recovered`
+after recovery is verified. An ambiguous notice delivery is retained as
+`needs_attention` and is never replayed automatically.
 
 Subscribe to `git_ref updated` for changes to a PR's base branch. A PR's
 `base_changed` reports its base selection changing, a distinct event.
 Other provider results remain explicit unless the subscription specifies an
 observation below. The plugin does not infer backup health or task success from
 silence. A producer can still call `publish_result` for any supported custom source.
+Wake reports whether a waiting subscription has a configured automatic observer,
+GitHub polling capability, matching pending publication obligations, or no
+recorded publisher. An unknown publisher is a warning, not a registration error.
+Automatic-source health is unverified: capability and configuration do not prove
+that credentials, polling or delivery work, nor that an event will arrive.
+After MCP registration, `registration_error` identifies a failed observer setup
+and `subscription_error` identifies a failed status lookup; `subscription_id`
+still identifies the saved subscription.
 
 ## GitHub and external events
 
@@ -253,6 +310,13 @@ replayed. A turn ending is not proof that the task is done. Non-native subagent 
 and `chat/completed`, `chat/blocked` or `chat/failed` still need their trusted hook
 or explicit owner signal. Polling payloads contain observed IDs and statuses, not
 the full original hook payload; hook-only template fields may be unavailable.
+An interrupted status is not itself conclusive: Wake checks up to the last MiB of
+the matching, user-owned Codex session log for a complete `turn_aborted` record.
+The native observer reports `turn_aborted_recorded`, `interrupted_unconfirmed`,
+or `interruption_evidence_unavailable`; it does not notify the coordinator or
+consume a completion subscription based on this record. This relies on the local
+app-server and user-owned session files; it cannot authenticate fabricated local
+records.
 
 ## Conditional thread actions and templates
 
@@ -279,13 +343,35 @@ CI and other subscriptions accept `message_template` and optional `execution`
 can also specify their input. Goal edits and input delivery are reported
 separately so a failed queue never conceals a successful goal mutation.
 
-New threads default to `gpt-6.1-sol` with effort `low`; explicit presets are
+New threads default to `gpt-6.1-terra` with effort `medium`; explicit presets are
 validated against the owning server's model catalog. Native `codex queue` uses
-the existing thread's model and has no per-message model/effort field. An
+the existing thread's model and has no per-message model/effort field. Rules
+targeting an existing chat omit execution overrides unless configured. An
 explicit execution preset for an immediate message uses `turn/start` on an idle/resumable
 thread. Goal actions first persist and read back the preset, then mutate the goal.
 A busy thread or unavailable API produces an error rather than silently
 discarding the preset. A queue-only input cannot carry a per-turn override.
+
+## Duplicate recipient-delivery evidence
+
+Wake only labels a delivery duplicated after observing two distinct native
+`userMessage` item IDs with the same stable source event, destination chat, and
+`clientId`. The `item/started` and `item/completed` notifications for one item
+ID count once. An incoming webhook repeated by itself is not delivery evidence.
+
+Correlation uses live notifications and incremental scans of persisted native
+chat history. Rules, waits, and subscription dispatch can be observed when
+their source has a stable event ID. Polling can supply source event IDs to those
+dispatch paths; a poll result alone is not recipient evidence. Sources without
+a stable event ID and CLI fallback sends remain `unknown`. An isolated `queue/add` case
+confirmed the `clientUserMessageId`-to-`clientId` mapping; it does not prove
+coverage for every Codex version. Scans restart from the newest page after an
+error or service restart, refresh the newest page during long scans, and stop a
+scan after 1,024 cursors or a cursor cycle. Missing observations remain unknown.
+Subscription identity includes its exact event and outcome. Base/ref transitions
+and pull request synchronization remain unknown when only old/new refs or commit
+SHAs are available, since those values can recur.
+Queue acceptance is not confirmation that a warning was delivered.
 
 For an explicitly requested deferred handoff, `queue_thread` accepts
 `steer: true` (default `false`). It is incompatible with `resume: true` and
@@ -317,6 +403,128 @@ API has no atomic goal-plus-input operation: an automatic continuation may start
 before that input is queued, so it can be consumed by a subsequent turn.
 
 ## Thread and subagent signals
+
+`register_resource_wait` records an explicit wait for a non-chat resource using
+the same continuation declaration. Its resource is shown as `resource:<name>` in
+`get_status.circular_waits`; it cannot form a chat-to-chat cycle. Update its
+declaration with `update_wait_continuation` without resolving the
+wait; use `resolve_circular_wait` when the wait ends. A `none` or `unknown`
+declaration triggers the same eligible Stop reminder; Wake does not infer
+whether mechanisms exist outside the explicit record.
+
+`register_circular_wait` records an explicit wait from `thread` to `waits_for`,
+with evidence supplied by the caller. Ordinary subscriptions do not create waits.
+When both directions are active, Wake records a notice for each chat containing
+both wait IDs and their evidence. A mutual registration is a possible circular
+dependency, not proof of deadlock. `continuation` is the caller's declaration:
+`none`, `registered`, or `unknown` (the default); `registered` requires
+`continuation_ref` identifying the declared subscription, event, or other
+mechanism. Wake does not verify that it works. An eligible Stop continues the
+agent once when a wait is declared `none` or `unknown`, asking it to verify the
+continuation; neither declaration proves that no mechanism exists outside Wake.
+Use `update_wait_continuation` to record a known mechanism without resolving the
+wait or changing existing notices. The reentrant Stop does not continue again for that warning.
+Use `resolve_circular_wait` when a wait ends; ready notices for that cycle are
+cancelled, but a notice already being sent cannot be recalled. Re-registering a
+resolved wait creates a new episode. `get_status.circular_waits` exposes waits
+and notice states. The receiver and `recover_ready` dispatch notices; a stopped
+receiver leaves them ready. Queued means accepted, not read or executed. Sending
+and uncertain notices are never retried automatically; inspect status first.
+After five minutes in `sending`, `get_status` reports `sending_outcome_unknown`
+and includes the notice in `actionable`. This is a read-only diagnostic: the
+sender may still be running, and a later result can still update the notice.
+An unreadable or future timestamp is also reported as uncertain. Inspect the
+sender and destination before acting; elapsed time does not prove failure.
+
+For an expected result, `register_obligation` records the responsible chat and
+the exact publication kind, namespace, resource and outcome. At an eligible
+`Stop`, Wake reminds that chat of pending obligations; it does not infer that
+work has finished or that a result is successful. A matching explicit
+`publish_result` (or `publish` CLI invocation) resolves those obligations in
+the same transaction that accepts the publication. Delivery to subscribers is
+separate and can still require attention. `list_obligations` shows pending
+records in pages of eight (`next_cursor` is supplied as `after`);
+`resolve_obligation` permits an agent to resolve one explicitly. Local MCP or
+CLI callers can register and publish obligations; Wake does not authenticate
+their agent identity. An emitted hook response is not proof that Codex consumed
+it, and the loop guard permits a pending obligation to survive the current turn.
+The hook checks a database snapshot: an obligation registered after that check
+is eligible for a later stop. Delivery recovery failures are reported
+separately from a publication already committed.
+
+`propose_obligation_transfer` records a proposed recipient, goal, status, tests,
+and next step while leaving responsibility with the source chat. The recipient
+can inspect it with `list_obligation_transfers` and take ownership only by
+calling `accept_obligation_transfer` from that chat.
+
+`register_coordinator` explicitly associates a responsible chat with its
+coordinator. On a root `Stop` hook with pending obligations, Wake queues one
+alert to that coordinator with the pending descriptions and the hook's
+`last_assistant_message` when available. The alert says that a turn stopped;
+`Stop` does not establish completion or abandonment. `SubagentStop`, repeated
+Stop-loop hooks, and chats without an explicit coordinator do not trigger this
+alert. Wake persists the alert before sending and never retries the same
+fingerprinted event automatically. An uncertain send remains recorded for
+inspection; queue acceptance still does not prove that the coordinator read it.
+An approved `Interrupt` hook saves a short-lived local record for the receiver,
+which prepares the coordinator alert without marking the turn completed. The
+receiver sends only newly prepared alerts; historical and uncertain records are
+not replayed. Stop and Interrupt alerts are correlated when both include the
+same turn ID. The hook requires the private Wake state directory to be present.
+If an installation or cleanup operation holds the lifecycle lock for two
+seconds, the hook fails instead of writing into a changing installation; that
+interruption is not automatically recovered from the hook record.
+The alert fingerprint includes a canonical digest of every pending obligation,
+while its message remains limited to the first eight descriptions. The digest
+and alert claim share one database transaction; a later change may produce a
+new alert, but an identical uncertain claim is never replayed. If the hook has
+no turn ID, Wake records the alert as `needs_attention` without sending it;
+the last assistant message also distinguishes such diagnostics. Before
+upgrading from the older fingerprint format, finish controller-owned turns and
+keep the existing upgrade barrier: old hashed claims cannot reliably be mapped
+back to a changed pending set. A matching legacy claim prevents an automatic
+send and creates one durable, bounded `needs_attention` diagnostic per legacy
+key in `coordinator_alerts`. Use `inspect_legacy_alert_collisions` to inspect
+the prior alert, first and latest previews, and a current digest and count read
+at inspection; treat the text as untrusted. A hook also reports its current
+digest and count. The record
+is at most 16 KiB, with at most 16 items and 7 KiB per preview; omitted items
+and clipped fields are explicitly flagged. Intermediate observations are not
+retained. A digest cannot reconstruct
+missing historical details or prove receipt. Use `list_obligations` for current
+work and independently verify delivery before any manual action. Records do not
+expire automatically; with old producers stopped, new collision diagnostics are
+bounded by the pre-existing legacy keys. An old process can still send after a
+new claim, so do not enable this runtime while old hooks or launchers can run.
+A turn barrier does not prevent later no-ID collisions with the same message,
+and different old fingerprints cannot be reliably correlated. In `get_status`,
+a `sending` alert whose sender process is no longer verifiably alive appears as
+`uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
+not resend it. A live sender remains `sending`; this read-only diagnosis does
+not establish receipt or execution and does not alter the sending record.
+`get_status` includes the latest 25 persisted alerts and their send state.
+`uncertain` is a read-only interpretation of a persisted `sending` row whose
+recorded sender PID and process start time no longer match a live process; older
+rows without that identity are also uncertain. It does not prove whether the
+coordinator received or acted on the message.
+
+An agent can explicitly register a committed, pending check with
+`register_validation`. Wake does not infer checks from conversation. The same
+eligible `Stop` reminds the responsible chat; `list_obligations` includes these
+checks. After performing a check, `resolve_validation` requires nonempty
+evidence of what was checked and observed, and stores it atomically with the
+resolution. A publication or `resolve_obligation` does not resolve a validation.
+Wake stores the agent's evidence; it does not independently verify the claim.
+For an explicit scope comparison at publication time, register the validation
+with both a structured `link` (`kind`, `repo`, `resource`) and `scope` object,
+then include the corresponding `scope` in `publish_result`. Wake warns when the
+declared scope differs for that exact linked publication and leaves the
+validation pending. It compares declarations only; it does not verify the
+published result or either scope. Legacy registrations and publications without
+these fields remain supported and are not compared.
+When a reminder is due, the hook leaves lifecycle deliveries ready for the
+receiver's background dispatcher instead of waiting for unrelated sends. If the
+receiver is unavailable, they remain ready until it restarts or recovery runs.
 
 Bundled `SessionStart` checks the shared receiver. `Stop` and `SubagentStop` command hooks publish local lifecycle signals
 without asking a model to interpret instructions. Codex requires users to review
@@ -364,6 +572,11 @@ cargo run --locked -- register --repo owner/repo --run 123 --attempt 1 \
 cargo run --locked -- subscribe --kind artifact --repo release-pipeline \
   --resource package-1.2.3 --event available \
   --thread 11111111-1111-4111-8111-111111111111
+cargo run --locked -- subscribe --kind dependency --repo payments \
+  --resource database --event recovered --progress-timeout-seconds 1800 \
+  --thread 11111111-1111-4111-8111-111111111111
+cargo run --locked -- publish --kind dependency --repo payments \
+  --resource database --outcome progress
 cargo run --locked -- status
 cargo run --locked -- subscriptions
 cargo run --locked -- recover
@@ -376,12 +589,19 @@ The database is `$XDG_STATE_HOME/codex-wake/state.sqlite3` (default
 `$XDG_DATA_HOME/codex-wake/runtime`. Secrets and database files are private.
 
 States are `waiting`, `ready`, `sending`, `queued` and `needs_attention`.
-`queued` means CLI acceptance, not proof that a chat resumed. Exit zero plus an
-exact queue acknowledgement remains `queued` even if resuming emits a warning;
+`queued` means native or CLI queue acceptance, not proof that a chat resumed.
+An accepted queue remains `queued` even if resuming emits a warning;
 `resume_daemon_unavailable` identifies a missing local daemon. A crash, timeout
 or uncertain warning is never blindly retried. Inspect the target chat before
 resolving ambiguous records. Exactly-once delivery across SQLite and the Codex
 CLI cannot be guaranteed without an idempotent acknowledgement protocol.
+
+MCP `get_status` places deliveries needing attention and dependency recovery
+subscriptions in `actionable`. Each entry includes the original status evidence,
+an optional link to the destination chat, and a suggested next action. The
+underlying `waits`, `subscriptions` and `rules` inventories remain available.
+An event matching a recovery subscription does not by itself prove that the
+destination chat resumed or that its work completed.
 
 Every continuation contains fixed routing metadata rather than webhook message
 text. It grants no new authority. The receiving agent verifies the event at its

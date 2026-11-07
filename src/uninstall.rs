@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -33,6 +33,8 @@ pub fn remove_external_database(path: &Path) -> Result<()> {
     if !path.try_exists()? {
         return Ok(());
     }
+    let _poll_guard = crate::polling::lock_database_parent(&path.canonicalize()?, true)?;
+    validate_external_database(path)?;
     fs::remove_file(path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_owned();
@@ -144,6 +146,48 @@ pub fn remove_unit_file(path: &Path, expected: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn cleanup_refuses_active_poll_lock_and_leaves_no_lock_sidecar() {
+        fn wait_for(path: &Path) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !path.exists() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        if let Some(dir) = std::env::var_os("WAKE_CLEANUP_LOCK_TEST_DIR") {
+            let dir = PathBuf::from(dir);
+            let _held =
+                crate::polling::lock_database_parent(&dir.join("state.sqlite3"), false).unwrap();
+            std::fs::write(dir.join("held"), b"").unwrap();
+            wait_for(&dir.join("release"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        drop(db);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "uninstall::tests::cleanup_refuses_active_poll_lock_and_leaves_no_lock_sidecar",
+            ])
+            .env("WAKE_CLEANUP_LOCK_TEST_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        wait_for(&dir.path().join("held"));
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+        assert!(!dir.path().join("state.sqlite3.poll.lock").exists());
+        std::fs::write(dir.path().join("release"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        remove_external_database(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!dir.path().join("state.sqlite3.poll.lock").exists());
+    }
     #[test]
     fn external_database_cleanup_preserves_foreign_data() {
         let temp = tempfile::tempdir().unwrap();
@@ -166,6 +210,22 @@ mod tests {
     }
 
     #[test]
+    fn evidence_named_foreign_table_does_not_acquire_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE validation_evidence(value TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(crate::bridge::connect(&path).unwrap());
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
     fn polling_schema_cleanup_removes_only_plugin_state() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -175,9 +235,50 @@ mod tests {
         fs::write(&artifact, b"keep").unwrap();
         let db = crate::bridge::connect(&path).unwrap();
         crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
         crate::polling::initialize(&db).unwrap();
         crate::native_poll::initialize(&db).unwrap();
         crate::observers::initialize(&db).unwrap();
+        crate::steer::initialize(&db).unwrap();
+        crate::obligations::initialize(&db).unwrap();
+        crate::validation_obligations::initialize(&db).unwrap();
+        crate::circular_waits::initialize(&db).unwrap();
+        let application_id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, DATABASE_ID);
+        let transfer_table: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='obligation_transfers')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(transfer_table);
+        for table in [
+            "coordinators",
+            "coordinator_alerts",
+            "dependency_notice_uncertainties",
+        ] {
+            let exists: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table}");
+        }
+        crate::result_conflicts::record(
+            &db,
+            "ci",
+            "build",
+            "run",
+            1,
+            "success",
+            &serde_json::json!({}),
+        )
+        .unwrap();
         let id = crate::subscriptions::subscribe(
             &db,
             "artifact",
@@ -200,6 +301,120 @@ mod tests {
         remove_external_database(&path).unwrap();
         assert!(!path.exists());
         assert_eq!(fs::read(&artifact).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn foreign_result_reports_table_does_not_establish_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE result_reports(value TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = crate::bridge::connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn foreign_validation_scope_links_table_does_not_establish_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE validation_scope_links(value TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = crate::bridge::connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        drop(db);
+        assert!(validate_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn wake_validation_scope_links_table_is_accepted_for_uninstall() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state").join("state.sqlite3");
+        let db = crate::bridge::connect(&path).unwrap();
+        crate::obligations::initialize(&db).unwrap();
+        crate::validation_obligations::initialize(&db).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, DATABASE_ID);
+        let has_scope_links: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='validation_scope_links')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_scope_links);
+        drop(db);
+        validate_external_database(&path).unwrap();
+    }
+
+    #[test]
+    fn transfer_table_does_not_bypass_application_id_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE obligation_transfers(id TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let application_id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(application_id, 0);
+    }
+
+    #[test]
+    fn wake_metadata_tables_are_allowed_for_uninstall_only_when_database_is_identified() {
+        for table in [
+            "coordinators",
+            "coordinator_alerts",
+            "coordinator_hook_events",
+            "dependency_notice_uncertainties",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.sqlite3");
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(&format!("CREATE TABLE {table} (value TEXT)"))
+                .unwrap();
+            drop(db);
+
+            assert!(validate_external_database(&path).is_err(), "{table}");
+            assert!(path.exists());
+
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.pragma_update(None, "application_id", DATABASE_ID)
+                .unwrap();
+            drop(db);
+            validate_external_database(&path).unwrap();
+            remove_external_database(&path).unwrap();
+            assert!(!path.exists());
+        }
     }
 
     #[test]

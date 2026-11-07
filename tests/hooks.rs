@@ -17,6 +17,10 @@ fn invoke(payload: Value) -> std::process::Output {
 }
 
 fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
+    invoke_with_codex(payload, temp, "/nonexistent/codex-wake-test-codex")
+}
+
+fn invoke_with_codex(payload: Value, temp: &std::path::Path, codex: &str) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(temp, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_codex-wake"))
@@ -24,10 +28,11 @@ fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
             "--db",
             temp.join("state.sqlite3").to_str().unwrap(),
             "--codex",
-            "/nonexistent/codex-wake-test-codex",
+            codex,
             "hook",
         ])
         .env("XDG_STATE_HOME", temp)
+        .env("WAKE_TEST_CALLS", temp.join("codex-calls"))
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .stdin(Stdio::piped())
@@ -42,6 +47,83 @@ fn invoke_at(payload: Value, temp: &std::path::Path) -> std::process::Output {
         .write_all(payload.to_string().as_bytes())
         .unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn stop_notifies_only_the_explicit_coordinator_once_with_obligation_and_last_info() {
+    let temp = tempfile::tempdir().unwrap();
+    let responsible = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$WAKE_TEST_CALLS\"\n",
+    );
+    let initial = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(initial.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Publish signed release notes')", [responsible]).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [responsible, coordinator],
+    )
+    .unwrap();
+
+    for ignored in [
+        json!({"hook_event_name":"SubagentStop","session_id":responsible,"agent_id":"33333333-3333-4333-8333-333333333333","turn_id":"turn-1"}),
+        json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1","stop_hook_active":true}),
+    ] {
+        let result = invoke_with_codex(ignored, temp.path(), codex.to_str().unwrap());
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!temp.path().join("codex-calls").exists());
+    }
+
+    let payload = json!({"hook_event_name":"Stop","session_id":responsible,"turn_id":"turn-1","last_assistant_message":"Release notes are still waiting on signing."});
+    let first = invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap());
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let output: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains(coordinator)
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "queue\n"
+    );
+
+    let again = invoke_with_codex(payload, temp.path(), codex.to_str().unwrap());
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "queue\n"
+    );
+    let (message, state): (String, String) = db
+        .query_row("SELECT message,state FROM coordinator_alerts", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert!(message.contains("Publish signed release notes"));
+    assert!(message.contains("Release notes are still waiting on signing."));
+    assert!(message.contains("not establish task completion or abandonment"));
+    assert_eq!(state, "queued");
 }
 
 #[test]
@@ -98,6 +180,67 @@ fn concurrent_hook_processes_emit_one_context_and_never_replay_it() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&invoke_at(payload, temp.path()).stdout).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
+fn stop_combines_steer_and_pending_publication_without_resolving_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let thread = "11111111-1111-4111-8111-111111111111";
+    let payload = json!({"hook_event_name":"Stop","session_id":thread,"turn_id":"turn1"});
+    assert!(invoke_at(payload.clone(), temp.path()).status.success());
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','artifact1','available','report ready')", [thread]).unwrap();
+    db.execute(
+        "INSERT INTO steers(id,thread,message) VALUES('steer1',?1,'review input')",
+        [thread],
+    )
+    .unwrap();
+    db.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state) VALUES('sub','thread','',?1,'turn_completed','22222222-2222-4222-8222-222222222222','waiting')", [thread]).unwrap();
+    let result = invoke_at(payload.clone(), temp.path());
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(output["decision"], "block");
+    let reason = output["reason"].as_str().unwrap();
+    assert!(reason.contains("review input") && reason.contains("list_obligations"));
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("deferred to the receiver")
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM subscriptions WHERE id='sub'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "ready"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT resolved FROM obligations WHERE id='one'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    db.execute("DELETE FROM subscriptions WHERE id='sub'", [])
+        .unwrap();
+    let again = invoke_at(
+        json!({"hook_event_name":"Stop","session_id":thread,"turn_id":"turn1","stop_hook_active":true}),
+        temp.path(),
+    );
+    assert!(again.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&again.stdout).unwrap(),
         json!({})
     );
 }
@@ -493,4 +636,350 @@ fn launcher_rejects_unsupported_platform_before_download() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Linux x86_64 only"));
+}
+
+#[test]
+fn full_fingerprint_detects_ninth_change_and_never_replays_uncertain_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\nexit 1\n",
+    );
+    let payload = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [owner, coordinator],
+    )
+    .unwrap();
+    for n in 0..8 {
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','release','available','Pending')", rusqlite::params![format!("fixture-{n}"), owner]).unwrap();
+    }
+    for _ in 0..2 {
+        assert!(
+            invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+                .status
+                .success()
+        );
+    }
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture-8',?1,'artifact','repo','release','available','Ninth')", [owner]).unwrap();
+    for _ in 0..2 {
+        assert!(
+            invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+                .status
+                .success()
+        );
+    }
+    db.execute(
+        "UPDATE obligations SET description='Ninth modified' WHERE id='fixture-8'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    db.execute("UPDATE obligations SET resolved=1 WHERE id='fixture-8'", [])
+        .unwrap();
+    assert!(
+        invoke_with_codex(payload, temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "attempt\nattempt\nattempt\n"
+    );
+    let states: Vec<String> = db
+        .prepare("SELECT state FROM coordinator_alerts ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(states, vec!["needs_attention"; 3]);
+    let messages: Vec<String> = db
+        .prepare("SELECT message FROM coordinator_alerts ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(messages[1].contains("1 more pending item(s)"));
+    assert!(!messages[1].contains("Ninth modified"));
+}
+
+#[test]
+fn existing_legacy_uncertain_alert_is_not_replayed() {
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n",
+    );
+    let payload = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Pending')", [owner]).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [owner, coordinator],
+    )
+    .unwrap();
+    let legacy = json!({"source":owner,"turn":"turn-1","pending_ids":["one"]}).to_string();
+    let id = format!(
+        "{:x}",
+        Sha256::digest(format!("{owner}:{coordinator}:{legacy}").as_bytes())
+    );
+    db.execute("INSERT INTO coordinator_alerts(id,responsible,coordinator,message,state,reason) VALUES(?1,?2,?3,'old','needs_attention','delivery_unknown')", rusqlite::params![id,owner,coordinator]).unwrap();
+    assert!(
+        invoke_with_codex(payload, temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    assert!(!temp.path().join("codex-calls").exists());
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+    let state: String = db
+        .query_row(
+            "SELECT state FROM coordinator_alerts WHERE reason LIKE 'legacy_collision:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "needs_attention");
+}
+
+#[test]
+fn concurrent_identical_stops_claim_one_uncertain_alert() {
+    use std::sync::{Arc, Barrier};
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\nexit 1\n",
+    );
+    let payload = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Pending')", [owner]).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [owner, coordinator],
+    )
+    .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let tasks: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let path = temp.path().to_path_buf();
+            let codex = codex.clone();
+            let payload = payload.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                invoke_with_codex(payload, &path, codex.to_str().unwrap())
+            })
+        })
+        .collect();
+    for task in tasks {
+        assert!(task.join().unwrap().status.success());
+    }
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("codex-calls")).unwrap(),
+        "attempt\n"
+    );
+    let (count, state): (i64, String) = db
+        .query_row(
+            "SELECT count(*),min(state) FROM coordinator_alerts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((count, state.as_str()), (1, "needs_attention"));
+}
+
+#[test]
+fn bounded_legacy_collision_survives_changes_and_never_resends() {
+    use sha2::{Digest, Sha256};
+    for has_turn in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        let codex = temp.path().join("codex");
+        executable(
+            &codex,
+            "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n",
+        );
+        let init = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"init"});
+        assert!(
+            invoke_with_codex(init, temp.path(), codex.to_str().unwrap())
+                .status
+                .success()
+        );
+        let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        db.execute(
+            "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+            [owner, coordinator],
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            let id = format!("fixture-{n}");
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','release','available','Pending')", rusqlite::params![id,owner]).unwrap();
+            ids.push(id);
+        }
+        let legacy = if has_turn {
+            json!({"source":owner,"turn":"turn-1","pending_ids":ids})
+        } else {
+            json!({"source":owner,"turn":"no_turn_id","pending_ids":ids,"last_assistant_message":"same message"})
+        };
+        let legacy_id = format!(
+            "{:x}",
+            Sha256::digest(format!("{owner}:{coordinator}:{legacy}").as_bytes())
+        );
+        db.execute("INSERT INTO coordinator_alerts(id,responsible,coordinator,message,state,reason) VALUES(?1,?2,?3,'old','needs_attention','delivery_unknown')", rusqlite::params![legacy_id,owner,coordinator]).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture-8',?1,'artifact','repo','release','available','Ninth')", [owner]).unwrap();
+        let payload = if has_turn {
+            json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"turn-1","last_assistant_message":"same message"})
+        } else {
+            json!({"hook_event_name":"Stop","session_id":owner,"last_assistant_message":"same message"})
+        };
+        let result = invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap());
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let warning = output["systemMessage"].as_str().unwrap();
+        assert!(warning.contains("delivery is not confirmed"));
+        assert!(warning.contains("no automatic send was attempted for this collision"));
+        let (id, message): (String, String) = db
+            .query_row(
+                "SELECT id,message FROM coordinator_alerts WHERE reason LIKE 'legacy_collision:%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let record: Value = serde_json::from_str(&message).unwrap();
+        let first = &record["first"];
+        assert_eq!(first["pending_count"], 9);
+        assert_eq!(first["omitted"], 0);
+        assert!(
+            first["preview"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["id"] == "fixture-8")
+        );
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture-9',?1,'artifact','repo','release','available','Tenth')", [owner]).unwrap();
+        db.execute("DELETE FROM coordinator_alerts WHERE id=?1", [&legacy_id])
+            .unwrap();
+        for _ in 0..2 {
+            let output = invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap());
+            assert!(output.status.success());
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let warning = value["systemMessage"].as_str().unwrap();
+            assert!(warning.contains("Only bounded first and latest previews are retained"));
+            let details = warning
+                .split("Diagnostic ID, current digest and current count: ")
+                .nth(1)
+                .unwrap();
+            let current_digest = details.split(':').nth(1).unwrap();
+            assert_ne!(current_digest, first["snapshot_digest"].as_str().unwrap());
+        }
+        assert!(!temp.path().join("codex-calls").exists());
+        let (count, saved): (i64,String) = db.query_row("SELECT count(*),min(message) FROM coordinator_alerts WHERE reason LIKE 'legacy_collision:%'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(count, 1);
+        let saved_record: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved_record["first"], record["first"]);
+        assert_eq!(saved_record["latest"]["pending_count"], 10);
+        assert_ne!(
+            saved_record["latest"]["snapshot_digest"],
+            record["first"]["snapshot_digest"]
+        );
+        assert!(!id.is_empty());
+    }
+}
+
+#[test]
+fn simultaneous_legacy_collisions_create_one_diagnostic_without_sending() {
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Barrier};
+    let temp = tempfile::tempdir().unwrap();
+    let owner = "11111111-1111-4111-8111-111111111111";
+    let coordinator = "22222222-2222-4222-8222-222222222222";
+    let codex = temp.path().join("codex");
+    executable(
+        &codex,
+        "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n",
+    );
+    let payload = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"turn-1"});
+    assert!(
+        invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap())
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','release','available','Pending')", [owner]).unwrap();
+    db.execute(
+        "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+        [owner, coordinator],
+    )
+    .unwrap();
+    let legacy = json!({"source":owner,"turn":"turn-1","pending_ids":["one"]}).to_string();
+    let id = format!(
+        "{:x}",
+        Sha256::digest(format!("{owner}:{coordinator}:{legacy}").as_bytes())
+    );
+    db.execute("INSERT INTO coordinator_alerts(id,responsible,coordinator,message,state,reason) VALUES(?1,?2,?3,'old','needs_attention','delivery_unknown')", rusqlite::params![id,owner,coordinator]).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let tasks: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let path = temp.path().to_path_buf();
+            let codex = codex.clone();
+            let payload = payload.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                invoke_with_codex(payload, &path, codex.to_str().unwrap())
+            })
+        })
+        .collect();
+    for task in tasks {
+        assert!(task.join().unwrap().status.success());
+    }
+    assert!(!temp.path().join("codex-calls").exists());
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM coordinator_alerts WHERE reason LIKE 'legacy_collision:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }

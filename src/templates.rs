@@ -26,7 +26,7 @@ pub fn validate(template: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     ensure!(!path.is_empty(), "Template variable path is empty");
     for segment in path.split('.') {
         ensure!(
@@ -78,7 +78,7 @@ pub fn render(template: &str, context: &Value) -> Result<String> {
     Ok(rendered)
 }
 
-fn lookup<'a>(context: &'a Value, path: &str) -> Result<&'a Value> {
+pub(crate) fn lookup<'a>(context: &'a Value, path: &str) -> Result<&'a Value> {
     let mut value = context;
     for segment in path.split('.') {
         value = match value {

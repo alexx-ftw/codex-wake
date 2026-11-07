@@ -2,7 +2,13 @@ use anyhow::{Context, Result, ensure};
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, error::Error, fmt, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    error::Error,
+    fmt,
+    path::Path,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -21,7 +27,7 @@ pub(crate) fn is_target_busy(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug)]
-struct TargetUnavailableBeforeSend;
+pub(crate) struct TargetUnavailableBeforeSend;
 
 impl fmt::Display for TargetUnavailableBeforeSend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -32,6 +38,12 @@ impl fmt::Display for TargetUnavailableBeforeSend {
 impl Error for TargetUnavailableBeforeSend {}
 
 fn preparation_transport_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<crate::goals::BeforeConnect>()
+        .is_some()
+    {
+        return true;
+    }
     let io = error.downcast_ref::<std::io::Error>().or_else(|| {
         match error.downcast_ref::<tungstenite::Error>() {
             Some(tungstenite::Error::Io(io)) => Some(io),
@@ -270,10 +282,100 @@ pub fn queue_prepared(
     })
 }
 
-fn deliver_with(
+/// Submit a known event identity without changing the chat's execution settings.
+pub fn queue_with_identity(
+    codex: &Path,
+    thread: &str,
+    message: &str,
+    client_id: &str,
+    resume: bool,
+    timeout: Duration,
+) -> Result<(String, Option<String>)> {
+    let started = Instant::now();
+    let result =
+        queue_with_identity_using(thread, message, client_id, resume, &mut |method, params| {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            ensure!(!remaining.is_zero(), "Native queue timeout");
+            crate::goals::rpc_with_timeout(codex, method, params, remaining)
+        });
+    if result.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::goals::BeforeConnect>()
+            .is_some()
+    }) {
+        return Err(TargetUnavailableBeforeSend.into());
+    }
+    result
+}
+
+fn queue_with_identity_using(
+    thread: &str,
+    message: &str,
+    client_id: &str,
+    resume: bool,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<(String, Option<String>)> {
+    let thread = Uuid::parse_str(thread)
+        .context("Invalid thread UUID")?
+        .to_string();
+    Uuid::parse_str(client_id).context("Invalid client message UUID")?;
+    let response = call(
+        "thread/queue/add",
+        json!({"threadId":thread,"clientUserMessageId":client_id,"input":[{"type":"text","text":message,"text_elements":[]}]}),
+    );
+    if response.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<crate::goals::BeforeConnect>()
+            .is_some()
+    }) {
+        return Err(response.unwrap_err());
+    }
+    let accepted = response.is_ok_and(|response| {
+        response
+            .pointer("/queuedSubmission/id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+    });
+    if !accepted {
+        return Ok((
+            "needs_attention".into(),
+            Some("native_queue_outcome_unknown".into()),
+        ));
+    }
+    if resume {
+        let result = (|| -> Result<()> {
+            let read = call(
+                "thread/read",
+                json!({"threadId":thread,"includeTurns":false}),
+            )?;
+            let status = read
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                .context("Missing thread status")?;
+            if status == "notLoaded" {
+                call(
+                    "thread/resume",
+                    json!({"threadId":thread,"excludeTurns":true}),
+                )?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            return Ok(("queued".into(), Some("native_queue_resume_warning".into())));
+        }
+    }
+    Ok(("queued".into(), Some("native_queue_accepted".into())))
+}
+
+pub fn native_queue_available() -> bool {
+    crate::goals::runtime_rpc_socket().is_some_and(|socket| Path::new(&socket).exists())
+}
+
+fn deliver_with_id(
     thread: &str,
     message: &str,
     options: &ExecutionOptions,
+    client_user_message_id: &str,
     call: &mut impl FnMut(&str, Value) -> Result<Value>,
 ) -> Result<(String, Option<String>)> {
     let thread = prepare_with(thread, options, false, call)?;
@@ -284,13 +386,29 @@ fn deliver_with(
             "model":options.model,
             "effort":options.reasoning_effort,
             "input":[{"type":"text","text":message,"text_elements":[]}],
-            "clientUserMessageId":Uuid::new_v4().to_string()
+            "clientUserMessageId":client_user_message_id
         }),
     );
     match result {
         Ok(_) => Ok(("queued".into(), Some("turn_start_accepted".into()))),
+        Err(error)
+            if error
+                .downcast_ref::<crate::goals::BeforeConnect>()
+                .is_some() =>
+        {
+            Err(TargetUnavailableBeforeSend.into())
+        }
         Err(_) => Ok(("needs_attention".into(), Some("execution_api_error".into()))),
     }
+}
+
+fn deliver_with(
+    thread: &str,
+    message: &str,
+    options: &ExecutionOptions,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<(String, Option<String>)> {
+    deliver_with_id(thread, message, options, &Uuid::new_v4().to_string(), call)
 }
 
 /// Deliver a message, applying explicit execution options to the resumed thread and turn.
@@ -315,11 +433,135 @@ pub fn deliver(
     })
 }
 
+/// Native delivery variant that retains notifications observed before the
+/// matching turn/start response. It does not infer missing notifications.
+pub fn deliver_with_identity_observed(
+    codex: &Path,
+    thread: &str,
+    message: &str,
+    options: &ExecutionOptions,
+    client_user_message_id: &str,
+) -> Result<(String, Option<String>, Vec<Value>)> {
+    let thread = prepare_with(thread, options, false, &mut |method, params| {
+        crate::goals::rpc(codex, method, params)
+    })?;
+    match crate::goals::rpc_with_notifications(
+        codex,
+        "turn/start",
+        json!({
+            "threadId":thread,
+            "model":options.model,
+            "effort":options.reasoning_effort,
+            "input":[{"type":"text","text":message,"text_elements":[]}],
+            "clientUserMessageId":client_user_message_id
+        }),
+    ) {
+        Ok((_, notifications)) => Ok((
+            "queued".into(),
+            Some("turn_start_accepted".into()),
+            notifications,
+        )),
+        Err(error)
+            if error
+                .downcast_ref::<crate::goals::BeforeConnect>()
+                .is_some() =>
+        {
+            Err(TargetUnavailableBeforeSend.into())
+        }
+        Err(_) => Ok((
+            "needs_attention".into(),
+            Some("execution_api_error".into()),
+            Vec::new(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const THREAD: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn identified_queue_preserves_resume_order_and_never_retries_unknown_send() {
+        let client_id = "22222222-2222-4222-8222-222222222222";
+        for (resume, status, methods) in [
+            (false, "idle", vec!["thread/queue/add"]),
+            (true, "active", vec!["thread/queue/add", "thread/read"]),
+            (true, "idle", vec!["thread/queue/add", "thread/read"]),
+            (
+                true,
+                "notLoaded",
+                vec!["thread/queue/add", "thread/read", "thread/resume"],
+            ),
+        ] {
+            let mut calls = Vec::new();
+            let result = queue_with_identity_using(
+                THREAD,
+                "message",
+                client_id,
+                resume,
+                &mut |method, params| {
+                    calls.push(method.to_owned());
+                    assert!(params.get("model").is_none());
+                    assert!(params.get("effort").is_none());
+                    if method == "thread/queue/add" {
+                        assert_eq!(params["clientUserMessageId"], client_id);
+                    }
+                    Ok(if method == "thread/read" {
+                        json!({"thread":{"status":{"type":status}}})
+                    } else if method == "thread/queue/add" {
+                        json!({"queuedSubmission":{"id":"submission"}})
+                    } else {
+                        json!({})
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, methods);
+            assert_eq!(result.0, "queued");
+        }
+        let mut calls = 0;
+        let result = queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+            calls += 1;
+            anyhow::bail!("response lost")
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.0, "needs_attention");
+        let before_send =
+            queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+                Err(crate::goals::BeforeConnect("connection refused".into()).into())
+            })
+            .unwrap_err();
+        assert!(
+            before_send
+                .downcast_ref::<crate::goals::BeforeConnect>()
+                .is_some()
+        );
+        assert!(preparation_transport_error(&before_send));
+        let malformed =
+            queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+                Ok(json!({}))
+            })
+            .unwrap();
+        assert_eq!(malformed.0, "needs_attention");
+        let mut calls = 0;
+        let result = queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Ok(json!({"queuedSubmission":{"id":"submission"}}))
+            } else {
+                anyhow::bail!("read failed")
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            ("queued".into(), Some("native_queue_resume_warning".into()))
+        );
+        assert_eq!(calls, 2);
+    }
 
     fn catalog_page(model: &str, id: &str, effort: &str, cursor: Option<&str>) -> Value {
         json!({
@@ -457,6 +699,45 @@ mod tests {
         .unwrap_err();
         assert!(is_target_busy(&error));
         assert_eq!(methods, ["model/list", "thread/read"]);
+    }
+
+    #[test]
+    fn configured_turn_start_retries_only_failures_proven_before_submission() {
+        for before in [true, false] {
+            let mut calls = Vec::new();
+            let result = deliver_with(
+                THREAD,
+                "run",
+                &ExecutionOptions::default(),
+                &mut |method, _| {
+                    calls.push(method.to_owned());
+                    match method {
+                        "model/list" => Ok(catalog_page("gpt-6.1-sol", "sol", "low", None)),
+                        "thread/read" => Ok(json!({"thread":{"status":{"type":"idle"}}})),
+                        "turn/start" if before => {
+                            Err(crate::goals::BeforeConnect("initialize failed".into()).into())
+                        }
+                        "turn/start" => anyhow::bail!("response lost"),
+                        _ => unreachable!(),
+                    }
+                },
+            );
+            if before {
+                assert_eq!(
+                    before_send_retry_reason(&result.unwrap_err()),
+                    Some("target_unavailable_before_send")
+                );
+            } else {
+                assert_eq!(result.unwrap().0, "needs_attention");
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|method| *method == "turn/start")
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

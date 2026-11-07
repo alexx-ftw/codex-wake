@@ -54,9 +54,9 @@ pub struct RuleInput {
     pub goal_objective: Option<String>,
     /// Set only when explicitly requested; requires goal_objective.
     pub token_budget: Option<i64>,
-    /// Execution model; defaults to gpt-6.1-sol.
+    /// Execution model; new chats default to gpt-6.1-terra.
     pub model: Option<String>,
-    /// Execution reasoning effort; defaults to low.
+    /// Execution reasoning effort; new chats default to medium.
     pub reasoning_effort: Option<String>,
 }
 
@@ -89,16 +89,20 @@ fn validate(input: &mut RuleInput) -> Result<()> {
     ensure!(input.pr > 0, "PR number must be positive");
     ensure!(bounded(&input.prompt, 16384), "Invalid trusted prompt");
     crate::templates::validate(&input.prompt)?;
-    let model = input.model.get_or_insert_with(|| "gpt-6.1-sol".into());
-    ensure!(
-        bounded(model, 255) && model.bytes().all(|b| b.is_ascii_graphic()),
-        "Invalid model"
-    );
-    let effort = input.reasoning_effort.get_or_insert_with(|| "low".into());
-    ensure!(
-        bounded(effort, 100) && effort.bytes().all(|b| b.is_ascii_graphic()),
-        "Invalid reasoning effort"
-    );
+    if input.target_thread.is_none() || input.model.is_some() || input.reasoning_effort.is_some() {
+        let model = input.model.get_or_insert_with(|| "gpt-6.1-terra".into());
+        ensure!(
+            bounded(model, 255) && model.bytes().all(|b| b.is_ascii_graphic()),
+            "Invalid model"
+        );
+        let effort = input
+            .reasoning_effort
+            .get_or_insert_with(|| "medium".into());
+        ensure!(
+            bounded(effort, 100) && effort.bytes().all(|b| b.is_ascii_graphic()),
+            "Invalid reasoning effort"
+        );
+    }
     if let Some(author) = &input.author {
         ensure!(
             bounded(author, 100)
@@ -154,9 +158,21 @@ pub fn initialize(db: &Connection) -> Result<()> {
         updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS rule_deliveries (
         rule_id TEXT NOT NULL, event_header TEXT NOT NULL, comment_id TEXT NOT NULL, source TEXT NOT NULL,
+        source_event_key TEXT, event_identity_verified INTEGER NOT NULL DEFAULT 0,
         state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready','creating','queued','needs_attention')),
         thread_id TEXT, reason TEXT, updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(rule_id,event_header,comment_id));")?;
+    let mut columns = db.prepare("PRAGMA table_info(rule_deliveries)")?;
+    let names = columns
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(columns);
+    if !names.iter().any(|name| name == "source_event_key") {
+        db.execute_batch("ALTER TABLE rule_deliveries ADD COLUMN source_event_key TEXT")?;
+    }
+    if !names.iter().any(|name| name == "event_identity_verified") {
+        db.execute_batch("ALTER TABLE rule_deliveries ADD COLUMN event_identity_verified INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(())
 }
 
@@ -249,6 +265,9 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
         .and_then(Value::as_str)
         .context("Missing author type")?;
     let body = comment["body"].as_str().context("Missing comment body")?;
+    let source_event_key =
+        crate::delivery_evidence::github_comment_event_identity(event_header, payload)?;
+    let event_identity_verified = source_event_key.is_some();
     initialize(db)?;
     let mut statement = db.prepare("SELECT id,input FROM rules WHERE enabled=1")?;
     let rules = statement
@@ -259,7 +278,7 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
     for (rule_id, raw) in rules {
         let input: RuleInput = serde_json::from_str(&raw)?;
         if input.repo == repo && input.pr == pr && matches(&input, author, author_type, body) {
-            count += transaction.execute("INSERT OR IGNORE INTO rule_deliveries(rule_id,event_header,comment_id,source) VALUES(?1,?2,?3,?4)", params![rule_id,event_header,id,serde_json::to_string(payload)?])?;
+            count += transaction.execute("INSERT OR IGNORE INTO rule_deliveries(rule_id,event_header,comment_id,source,source_event_key,event_identity_verified) VALUES(?1,?2,?3,?4,?5,?6)", params![rule_id,event_header,id,serde_json::to_string(payload)?,source_event_key,event_identity_verified])?;
         }
     }
     transaction.commit()?;
@@ -293,11 +312,12 @@ pub fn status(db: &Connection) -> Result<Value> {
             Ok(json!({"id":id,"input":serde_json::from_str::<Value>(&input)?,"enabled":enabled}))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut deliveries = db.prepare("SELECT rule_id,event_header,comment_id,state,thread_id,reason FROM rule_deliveries ORDER BY rule_id,event_header,comment_id")?;
-    let deliveries = deliveries.query_map([], |r| Ok(json!({"rule_id":r.get::<_,String>(0)?,"event_header":r.get::<_,String>(1)?,"comment_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"thread_id":r.get::<_,Option<String>>(4)?,"reason":r.get::<_,Option<String>>(5)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut deliveries = db.prepare("SELECT rule_id,event_header,comment_id,state,thread_id,reason,event_identity_verified FROM rule_deliveries ORDER BY rule_id,event_header,comment_id")?;
+    let deliveries = deliveries.query_map([], |r| Ok(json!({"rule_id":r.get::<_,String>(0)?,"event_header":r.get::<_,String>(1)?,"comment_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"thread_id":r.get::<_,Option<String>>(4)?,"reason":r.get::<_,Option<String>>(5)?,"event_identity_verified":r.get::<_,bool>(6)?,"receipt_coverage":if r.get::<_,bool>(6)? {"unknown"} else {"unknown_source_identity"}})))?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!({"rules":rules,"deliveries":deliveries}))
 }
 
+#[cfg(test)]
 fn dispatch_with(
     db: &mut Connection,
     workspace_base: &Path,
@@ -305,12 +325,44 @@ fn dispatch_with(
     finish: &mut impl FnMut(&str, &RuleInput, &str) -> Result<(String, Option<String>)>,
     check_execution: &mut impl FnMut(&RuleInput) -> Result<()>,
 ) -> Result<usize> {
+    dispatch_with_identity(
+        db,
+        workspace_base,
+        rpc,
+        &mut |thread, input, message, _, _| finish(thread, input, message),
+        check_execution,
+    )
+}
+
+fn dispatch_with_identity(
+    db: &mut Connection,
+    workspace_base: &Path,
+    rpc: &mut impl FnMut(&str, Value) -> Result<Value>,
+    finish: &mut impl FnMut(
+        &str,
+        &RuleInput,
+        &str,
+        Option<&str>,
+        Option<&str>,
+    ) -> Result<(String, Option<String>)>,
+    check_execution: &mut impl FnMut(&RuleInput) -> Result<()>,
+) -> Result<usize> {
     initialize(db)?;
     let mut count = 0;
     loop {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 ORDER BY d.updated,d.rule_id LIMIT 1", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))).optional()?;
-        let Some((rule_id, header, comment_id, raw, source)) = row else {
+        let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source,d.source_event_key,d.event_identity_verified,d.thread_id FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 AND (d.reason IS NULL OR d.reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR d.updated<=datetime('now','-15 seconds')) ORDER BY d.updated,d.rule_id LIMIT 1", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?))).optional()?;
+        let Some((
+            rule_id,
+            header,
+            comment_id,
+            raw,
+            source,
+            stored_event_key,
+            event_identity_verified,
+            existing_thread,
+        )) = row
+        else {
             tx.commit()?;
             return Ok(count);
         };
@@ -320,6 +372,7 @@ fn dispatch_with(
         let _trace = crate::observability::TraceGuard::new();
         let span = crate::observability::Span::new("dispatch.rule", Some(&subject));
         let mut stage = "invalid_configuration";
+        let mut may_retry = false;
         let result = (|| -> Result<(String, Option<String>)> {
             let mut input: RuleInput = serde_json::from_str(&raw)?;
             validate(&mut input)?;
@@ -337,7 +390,9 @@ fn dispatch_with(
             crate::templates::render(&input.prompt, &context)?;
             stage = "execution_validation_failed";
             check_execution(&input)?;
-            let thread = if let Some(thread) = &input.target_thread {
+            let thread = if let Some(thread) = &existing_thread {
+                Uuid::parse_str(thread)?.to_string()
+            } else if let Some(thread) = &input.target_thread {
                 thread.clone()
             } else {
                 let cwd = if let Some(project_id) = &input.project_id {
@@ -376,10 +431,12 @@ fn dispatch_with(
                     cwd
                 };
                 stage = "thread_creation_outcome_unknown";
+                may_retry = true;
                 let response = rpc(
                     "thread/start",
                     json!({"model":input.model,"config":{"model_reasoning_effort":input.reasoning_effort},"allowProviderModelFallback":false,"projectId":input.project_id,"cwd":cwd}),
                 )?;
+                may_retry = false;
                 Uuid::parse_str(
                     response
                         .pointer("/thread/id")
@@ -403,12 +460,36 @@ fn dispatch_with(
             if let Some(objective) = &input.goal_objective {
                 input.goal_objective = Some(crate::templates::render(objective, &context)?);
             }
+            let identity = if event_identity_verified
+                && (execution_options(&input).is_some()
+                    || crate::execution::native_queue_available())
+            {
+                stored_event_key
+                    .map(|event_key| {
+                        let delivery_key = crate::delivery_evidence::source_fields_identity(
+                            "codex-wake/rule-delivery/v1",
+                            &[&rule_id, &event_key],
+                        )?;
+                        crate::delivery_evidence::begin(db, &delivery_key, &thread, true)
+                            .map(|(client_id, _)| (delivery_key, client_id))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let message = format!(
                 "{}\n\nMatched PR comment event data: repository={}, pr={}, comment_id={}, event={}.",
                 rendered_prompt, input.repo, input.pr, comment_id, header
             );
             stage = "goal_or_delivery_outcome_unknown";
-            finish(&thread, &input, &message)
+            may_retry = input.goal_objective.is_none();
+            finish(
+                &thread,
+                &input,
+                &message,
+                identity.as_ref().map(|(event, _)| event.as_str()),
+                identity.as_ref().map(|(_, client)| client.as_str()),
+            )
         })();
         let (state, reason) = match result {
             Ok((state, reason)) if state == "queued" => (state, reason),
@@ -416,6 +497,23 @@ fn dispatch_with(
                 "needs_attention".into(),
                 reason.or(Some("delivery_not_queued".into())),
             ),
+            Err(error)
+                if may_retry
+                    && (crate::execution::before_send_retry_reason(&error).is_some()
+                        || (stage == "thread_creation_outcome_unknown"
+                            && error
+                                .downcast_ref::<crate::goals::BeforeConnect>()
+                                .is_some())) =>
+            {
+                (
+                    "ready".into(),
+                    Some(
+                        crate::execution::before_send_retry_reason(&error)
+                            .unwrap_or("target_unavailable_before_send")
+                            .to_owned(),
+                    ),
+                )
+            }
             Err(error) => (
                 "needs_attention".into(),
                 Some(format!("{stage}: {error}").chars().take(1024).collect()),
@@ -423,10 +521,10 @@ fn dispatch_with(
         };
         db.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5",params![state,reason,rule_id,header,comment_id])?;
         span.finish(
-            if state == "queued" {
-                "queued"
-            } else {
-                "needs_attention"
+            match state.as_str() {
+                "queued" => "queued",
+                "ready" => "ready",
+                _ => "needs_attention",
             },
             crate::observability::reason(reason.as_deref()),
             1,
@@ -435,38 +533,88 @@ fn dispatch_with(
     }
 }
 
-fn execution_options(input: &RuleInput) -> crate::execution::ExecutionOptions {
-    crate::execution::ExecutionOptions {
-        model: input.model.clone().unwrap_or_else(|| "gpt-6.1-sol".into()),
-        reasoning_effort: input
-            .reasoning_effort
-            .clone()
-            .unwrap_or_else(|| "low".into()),
-    }
+fn execution_options(input: &RuleInput) -> Option<crate::execution::ExecutionOptions> {
+    Some(crate::execution::ExecutionOptions {
+        model: input.model.clone()?,
+        reasoning_effort: input.reasoning_effort.clone()?,
+    })
 }
 
 pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Result<usize> {
-    dispatch_with(
+    let mut live_signals: Vec<(String, String, String, Vec<Value>)> = Vec::new();
+    let dispatched = dispatch_with_identity(
         db,
         workspace_base,
         &mut |method, params| crate::goals::rpc(codex, method, params),
-        &mut |thread, input, message| {
+        &mut |thread, input, message, event_key, client_id| {
             if let Some(objective) = &input.goal_objective {
                 crate::goals::create(codex, thread, objective, input.token_budget)?;
                 // Goal activation can already start a turn; leave continuation to Codex.
-                return crate::execution::queue_prepared(codex, thread, message);
+                return if let Some(client_id) = client_id {
+                    crate::execution::queue_with_identity(
+                        codex,
+                        thread,
+                        message,
+                        client_id,
+                        false,
+                        Duration::from_secs(120),
+                    )
+                } else {
+                    crate::execution::queue_prepared(codex, thread, message)
+                };
             }
-            crate::execution::deliver(
-                codex,
-                Duration::from_secs(120),
-                thread,
-                message,
-                true,
-                Some(&execution_options(input)),
-            )
+            if let (Some(event_key), Some(client_id), Some(options)) =
+                (event_key, client_id, execution_options(input))
+            {
+                let (state, reason, notifications) =
+                    crate::execution::deliver_with_identity_observed(
+                        codex, thread, message, &options, client_id,
+                    )?;
+                live_signals.push((
+                    event_key.to_owned(),
+                    thread.to_owned(),
+                    client_id.to_owned(),
+                    notifications,
+                ));
+                Ok((state, reason))
+            } else if let Some(client_id) = client_id {
+                crate::execution::queue_with_identity(
+                    codex,
+                    thread,
+                    message,
+                    client_id,
+                    true,
+                    Duration::from_secs(120),
+                )
+            } else {
+                crate::execution::deliver(
+                    codex,
+                    Duration::from_secs(120),
+                    thread,
+                    message,
+                    true,
+                    execution_options(input).as_ref(),
+                )
+            }
         },
-        &mut |input| crate::execution::validate(codex, &execution_options(input)),
-    )
+        &mut |input| match execution_options(input) {
+            Some(options) => crate::execution::validate(codex, &options),
+            None => Ok(()),
+        },
+    );
+    for (event_key, thread, client_id, notifications) in live_signals {
+        let (_, should_warn) = crate::delivery_evidence::record_notifications(
+            db,
+            &event_key,
+            &thread,
+            &client_id,
+            &notifications,
+        )?;
+        if should_warn {
+            crate::delivery_evidence::warn_once(db, codex, &event_key, &thread)?;
+        }
+    }
+    dispatched
 }
 
 #[cfg(test)]
@@ -481,8 +629,8 @@ mod tests {
     ) -> Result<usize> {
         super::dispatch_with(db, base, rpc, finish, &mut |input| {
             ensure!(
-                input.model.as_deref() == Some("gpt-6.1-sol")
-                    && input.reasoning_effort.as_deref() == Some("low"),
+                input.model.as_deref() == Some("gpt-6.1-terra")
+                    && input.reasoning_effort.as_deref() == Some("medium"),
                 "simulated unsupported execution selection"
             );
             Ok(())
@@ -494,6 +642,169 @@ mod tests {
     fn payload() -> Value {
         json!({"action":"created","repository":{"full_name":"owner/repo"},"issue":{"number":42,"pull_request":{}},"comment":{"id":7,"user":{"login":"alice","type":"User"},"body":"ship it untrusted body"}})
     }
+    #[test]
+    fn existing_target_without_preset_keeps_its_execution_settings() {
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        validate(&mut rule).unwrap();
+        assert!(execution_options(&rule).is_none());
+        assert!(rule.model.is_none());
+        assert!(rule.reasoning_effort.is_none());
+
+        let mut new_chat = input();
+        validate(&mut new_chat).unwrap();
+        let options = execution_options(&new_chat).unwrap();
+        assert_eq!(options.model, "gpt-6.1-terra");
+        assert_eq!(options.reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn separate_rules_for_same_event_and_chat_have_distinct_delivery_ids() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for prompt in ["first", "second"] {
+            let mut rule = input();
+            rule.target_thread = Some(THREAD.into());
+            rule.model = Some("test-model".into());
+            rule.reasoning_effort = Some("medium".into());
+            rule.prompt = prompt.into();
+            configure(&db, rule).unwrap();
+        }
+        assert_eq!(accept(&db, "issue_comment", &payload()).unwrap(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        dispatch_with_identity(
+            &mut db,
+            dir.path(),
+            &mut |_, _| unreachable!(),
+            &mut |_, _, _, _, client| {
+                ids.push(client.unwrap().to_owned());
+                Ok(("queued".into(), None))
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn retry_before_send_reuses_new_chat_without_creating_another() {
+        let mut db = Connection::open_in_memory().unwrap();
+        configure(&db, input()).unwrap();
+        accept(&db, "issue_comment", &payload()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut starts = 0;
+        let mut rpc = |method: &str, _: Value| {
+            assert_eq!(method, "thread/start");
+            starts += 1;
+            Ok(json!({"thread":{"id":THREAD}}))
+        };
+        let mut attempts = 0;
+        let mut send = |_: &str, _: &RuleInput, _: &str, _: Option<&str>, _: Option<&str>| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(crate::execution::TargetUnavailableBeforeSend.into())
+            } else {
+                Ok(("queued".into(), None))
+            }
+        };
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "ready");
+        db.execute(
+            "UPDATE rule_deliveries SET updated=datetime('now','-16 seconds')",
+            [],
+        )
+        .unwrap();
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(starts, 1);
+        assert_eq!(attempts, 2);
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
+    }
+
+    #[test]
+    fn retry_creation_only_when_failure_precedes_thread_start() {
+        let mut db = Connection::open_in_memory().unwrap();
+        configure(&db, input()).unwrap();
+        accept(&db, "issue_comment", &payload()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut starts = 0;
+        let mut rpc = |_: &str, _: Value| {
+            starts += 1;
+            if starts == 1 {
+                Err(crate::goals::BeforeConnect("initialize failed".into()).into())
+            } else {
+                Ok(json!({"thread":{"id":THREAD}}))
+            }
+        };
+        let mut sends = 0;
+        let mut send = |_: &str, _: &RuleInput, _: &str, _: Option<&str>, _: Option<&str>| {
+            sends += 1;
+            Ok(("queued".into(), None))
+        };
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "ready");
+        db.execute(
+            "UPDATE rule_deliveries SET updated=datetime('now','-16 seconds')",
+            [],
+        )
+        .unwrap();
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(starts, 2);
+        assert_eq!(sends, 1);
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
+
+        let mut uncertain = Connection::open_in_memory().unwrap();
+        configure(&uncertain, input()).unwrap();
+        accept(&uncertain, "issue_comment", &payload()).unwrap();
+        dispatch_with_identity(
+            &mut uncertain,
+            dir.path(),
+            &mut |_, _| anyhow::bail!("response lost"),
+            &mut |_, _, _, _, _| unreachable!(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            status(&uncertain).unwrap()["deliveries"][0]["state"],
+            "needs_attention"
+        );
+    }
+    #[test]
+    fn legacy_ready_deliveries_remain_without_verified_event_identity() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE rules (
+                id TEXT PRIMARY KEY, input TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE rule_deliveries (
+                rule_id TEXT NOT NULL, event_header TEXT NOT NULL,
+                comment_id TEXT NOT NULL, source TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'ready', thread_id TEXT,
+                reason TEXT, updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(rule_id,event_header,comment_id)
+            );
+            INSERT INTO rule_deliveries(rule_id,event_header,comment_id,source,state)
+            VALUES('legacy-rule','issue_comment','77','{}','ready');",
+        )
+        .unwrap();
+
+        initialize(&db).unwrap();
+
+        let (state, key, verified): (String, Option<String>, bool) = db
+            .query_row(
+                "SELECT state,source_event_key,event_identity_verified
+                 FROM rule_deliveries WHERE rule_id='legacy-rule'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(key, None);
+        assert!(!verified);
+    }
+
     #[test]
     fn matching_all_any_bot_and_non_pr() {
         let mut i = input();
@@ -523,8 +834,8 @@ mod tests {
         let mut creates = 0;
         let mut rpc = |method: &str, params: Value| {
             assert_eq!(method, "thread/start");
-            assert_eq!(params["model"], "gpt-6.1-sol");
-            assert_eq!(params["config"]["model_reasoning_effort"], "low");
+            assert_eq!(params["model"], "gpt-6.1-terra");
+            assert_eq!(params["config"]["model_reasoning_effort"], "medium");
             creates += 1;
             Ok(json!({"thread":{"id":THREAD}}))
         };
@@ -752,7 +1063,7 @@ mod tests {
                     Ok(json!({"thread":{"id":Uuid::new_v4().to_string()}}))
                 },
                 &mut |_, input, _| {
-                    let options = execution_options(input);
+                    let options = execution_options(input).unwrap();
                     assert_eq!(options.model, "configured-model");
                     assert_eq!(options.reasoning_effort, "high");
                     sends += 1;

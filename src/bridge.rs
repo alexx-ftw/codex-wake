@@ -3,7 +3,6 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
-    env,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::Path,
@@ -71,7 +70,7 @@ pub fn connect(path: &Path) -> Result<Connection> {
     let migration = (|| -> Result<()> {
         let application_id: i32 =
             db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers')", [], |row| row.get(0))?;
+        let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
         if application_id == 0 && unrelated == 0 {
             db.pragma_update(None, "application_id", crate::uninstall::DATABASE_ID)?;
         }
@@ -478,6 +477,21 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
             .as_deref()
             .map(serde_json::from_str::<crate::execution::ExecutionOptions>)
             .transpose();
+        let source_run = run_id.to_string();
+        let source_attempt = attempt.to_string();
+        let event_key = crate::delivery_evidence::source_fields_identity(
+            "github.workflow_run.completed",
+            &[&repo, &source_run, &source_attempt],
+        )?;
+        let identity = if message.is_ok()
+            && options.as_ref().is_ok_and(|options| {
+                options.is_some() || crate::execution::native_queue_available()
+            }) {
+            Some(crate::delivery_evidence::begin(db, &event_key, &thread, true)?.0)
+        } else {
+            None
+        };
+        let mut observed_notifications = None;
         let (state, reason) = match (message, options) {
             (Err(error), _) => (
                 "needs_attention".to_owned(),
@@ -490,32 +504,69 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                     &error.to_string(),
                 )),
             ),
-            (Ok(message), Ok(options)) => match crate::execution::deliver(
-                codex,
-                timeout,
-                &thread,
-                &message,
-                true,
-                options.as_ref(),
-            ) {
-                Ok((state, reason))
-                    if matches!(state.as_str(), "queued" | "ready" | "needs_attention") =>
-                {
-                    (state, reason)
+            (Ok(message), Ok(Some(options))) => {
+                let client_id = identity
+                    .as_deref()
+                    .context("Native delivery identity missing")?;
+                match crate::execution::deliver_with_identity_observed(
+                    codex, &thread, &message, &options, client_id,
+                ) {
+                    Ok((state, reason, notifications)) => {
+                        observed_notifications = Some(notifications);
+                        (state, reason)
+                    }
+                    Err(error) => match crate::execution::before_send_retry_reason(&error) {
+                        Some(reason) => ("ready".to_owned(), Some(reason.to_owned())),
+                        None => (
+                            "needs_attention".to_owned(),
+                            Some(bounded_reason("send_outcome_unknown", &error.to_string())),
+                        ),
+                    },
                 }
-                Ok(_) => (
-                    "needs_attention".to_owned(),
-                    Some("invalid_send_classification".to_owned()),
-                ),
-                Err(error) => match crate::execution::before_send_retry_reason(&error) {
-                    Some(reason) => ("ready".to_owned(), Some(reason.to_owned())),
-                    None => (
-                        "needs_attention".to_owned(),
-                        Some(bounded_reason("send_outcome_unknown", &error.to_string())),
+            }
+            (Ok(message), Ok(None)) => {
+                let delivery = match identity.as_deref() {
+                    Some(client_id) => crate::execution::queue_with_identity(
+                        codex, &thread, &message, client_id, true, timeout,
                     ),
-                },
-            },
+                    None => {
+                        crate::execution::deliver(codex, timeout, &thread, &message, true, None)
+                    }
+                };
+                match delivery {
+                    Ok((state, reason))
+                        if matches!(state.as_str(), "queued" | "ready" | "needs_attention") =>
+                    {
+                        (state, reason)
+                    }
+                    Ok(_) => (
+                        "needs_attention".to_owned(),
+                        Some("invalid_send_classification".to_owned()),
+                    ),
+                    Err(error) => match crate::execution::before_send_retry_reason(&error) {
+                        Some(reason) => ("ready".to_owned(), Some(reason.to_owned())),
+                        None => (
+                            "needs_attention".to_owned(),
+                            Some(bounded_reason("send_outcome_unknown", &error.to_string())),
+                        ),
+                    },
+                }
+            }
         };
+        if let (Some(client_id), Some(notifications)) =
+            (identity.as_deref(), observed_notifications)
+        {
+            let (_, should_warn) = crate::delivery_evidence::record_notifications(
+                db,
+                &event_key,
+                &thread,
+                client_id,
+                &notifications,
+            )?;
+            if should_warn {
+                crate::delivery_evidence::warn_once(db, codex, &event_key, &thread)?;
+            }
+        }
         db.execute(
             "UPDATE waits SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP \
              WHERE repo=?3 AND run_id=?4 AND attempt=?5",
@@ -609,11 +660,7 @@ fn invoke_codex(
     if resume {
         command.arg("--resume");
     }
-    if let Some(socket) = crate::goals::rpc_socket(
-        env::var_os("CODEX_WAKE_RPC_SOCKET"),
-        env::var_os("XDG_STATE_HOME"),
-        env::var_os("HOME"),
-    ) {
+    if let Some(socket) = crate::goals::runtime_rpc_socket() {
         command
             .arg("--remote")
             .arg(format!("unix://{}", Path::new(&socket).display()));
@@ -723,7 +770,7 @@ fn queued_with_active_writer(stdout: &[u8], stderr: &[u8], thread: &str) -> bool
 /// Return all registrations in update order as a JSON array.
 pub fn status(db: &Connection) -> Result<Value> {
     let mut statement = db.prepare(
-        "SELECT repo,run_id,attempt,thread,sha,state,conclusion,reason,updated \
+        "SELECT repo,run_id,attempt,thread,sha,state,conclusion,reason,updated,execution_json \
          FROM waits ORDER BY updated",
     )?;
     let rows = statement.query_map([], |row| {
@@ -733,6 +780,7 @@ pub fn status(db: &Connection) -> Result<Value> {
             "sha": row.get::<_, String>(4)?, "state": row.get::<_, String>(5)?,
             "conclusion": row.get::<_, Option<String>>(6)?, "reason": row.get::<_, Option<String>>(7)?,
             "updated": row.get::<_, String>(8)?,
+            "receipt_coverage": if row.get::<_, Option<String>>(9)?.is_some() { "unknown_until_native_userMessage_evidence" } else { "unknown_cli_delivery_has_no_native_userMessage_evidence" },
         }))
     })?;
     Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
@@ -887,6 +935,131 @@ mod tests {
             register_with_template(&db, "owner/repo", 123, 1, THREAD, SHA, None, Some(&changed),)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn connect_does_not_adopt_unmarked_obligations_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE obligations (unrelated TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn connect_does_not_adopt_unmarked_circular_tables() {
+        for table in [
+            "circular_waits",
+            "circular_notices",
+            "github_poll_generation",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("state");
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = parent.join("state.sqlite3");
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE {table} (unrelated TEXT); INSERT INTO {table} VALUES ('keep');"
+            ))
+            .unwrap();
+            drop(db);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let db = connect(&path).unwrap();
+            let id: i32 = db
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .unwrap();
+            assert_eq!(id, 0, "unmarked database with {table} was adopted");
+            let value: String = db
+                .query_row(&format!("SELECT unrelated FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(value, "keep");
+            drop(db);
+            assert!(crate::uninstall::remove_external_database(&path).is_err());
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn connect_does_not_adopt_unmarked_obligation_transfers_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE obligation_transfers (id TEXT)")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn connect_does_not_adopt_unmarked_dependency_uncertainties_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE dependency_notice_uncertainties (subscription_id TEXT,generation INTEGER,reason TEXT,recorded_at_ms INTEGER); INSERT INTO dependency_notice_uncertainties VALUES ('foreign',7,'keep',42);").unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let db = connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        let preserved: (String, i64, String, i64) = db.query_row("SELECT subscription_id,generation,reason,recorded_at_ms FROM dependency_notice_uncertainties", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(preserved, ("foreign".into(), 7, "keep".into(), 42));
+    }
+
+    #[test]
+    fn connect_does_not_adopt_either_unmarked_coordinator_table() {
+        for table in ["coordinators", "coordinator_alerts"] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("state");
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = parent.join("state.sqlite3");
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(&format!(
+                "CREATE TABLE {table} (value TEXT); INSERT INTO {table} VALUES ('preserve');"
+            ))
+            .unwrap();
+            drop(db);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let db = connect(&path).unwrap();
+            let id: i32 = db
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .unwrap();
+            assert_eq!(id, 0, "{table}");
+            assert_eq!(
+                db.query_row(&format!("SELECT value FROM {table}"), [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "preserve",
+                "{table}"
+            );
+        }
     }
 
     #[test]
@@ -1300,6 +1473,28 @@ mod tests {
         let args = fs::read_to_string(capture).unwrap();
         assert!(args.contains("queue --thread "));
         assert!(!args.contains("--resume"));
+    }
+
+    #[test]
+    fn resume_mode_passes_resume_flag_to_wake_idle_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("argv");
+        let codex = fake_codex(
+            dir.path(),
+            &format!("printf '%s\\n' \"$*\" > '{}'", capture.display()),
+        );
+        let result = send_mode(
+            &codex,
+            Duration::from_secs(2),
+            THREAD,
+            "transfer notice",
+            true,
+        )
+        .unwrap();
+        assert_eq!(result, ("queued".to_owned(), None));
+        let args = fs::read_to_string(capture).unwrap();
+        assert!(args.contains("queue --thread "));
+        assert!(args.contains("--resume"));
     }
 
     #[test]

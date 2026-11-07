@@ -1,0 +1,29 @@
+{
+  "codex_version": "0.166.0",
+  "transport": "isolated local app-server websocket",
+  "started_thread": "01a1b68a-8c2e-7d12-bafe-fd6dd4c235c5",
+  "started_turn": "01a1b68a-8c3f-7c73-92ac-539ac157b6ba",
+  "signals": [
+    {
+      "method": "turn/completed",
+      "thread_id": "01a1b68a-8c2e-7d12-bafe-fd6dd4c235c5",
+      "turn_id": "01a1b68a-8c3f-7c73-92ac-539ac157b6ba",
+      "status": "interrupted"
+    },
+    {
+      "method": "turn/completed",
+      "thread_id": "01a1b68a-8c2e-7d12-bafe-fd6dd4c235c5",
+      "turn_id": "01a1b68a-8c3f-7c73-92ac-539ac157b6ba",
+      "status": "interrupted"
+    }
+  ],
+  "separate_server": {
+    "resume_status": null,
+    "resume_error": "active_writer",
+    "completion_notifications": []
+  },
+  "synthetic_provider": true,
+  "real_codex": true,
+  "stop_hook_tested": false,
+  "delivery_tested": false
+}
