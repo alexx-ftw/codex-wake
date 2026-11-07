@@ -3,7 +3,17 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::{
-    path::Path,
+    ffi::CString,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -138,9 +148,139 @@ fn first_turn(call: &mut Rpc, thread: &str) -> Result<Option<Turn>> {
     Ok(turns_page(call, thread, None)?.0.into_iter().next())
 }
 
-fn observation_reason(turn: Option<&Turn>) -> Option<&'static str> {
-    turn.filter(|turn| turn.status == "interrupted")
-        .map(|_| "interrupted_unconfirmed")
+fn recorded_interruption(sessions: &Path, path: &Path, thread: &str, turn: &str) -> Result<bool> {
+    const TAIL_BYTES: u64 = 1024 * 1024;
+    let root = fs::canonicalize(sessions)?;
+    let canonical = fs::canonicalize(path)?;
+    ensure!(
+        !fs::symlink_metadata(path)?.file_type().is_symlink(),
+        "Rollout symlink"
+    );
+    let relative = canonical
+        .strip_prefix(&root)
+        .context("Rollout is outside Codex sessions")?;
+    let name = canonical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("Rollout has no file name")?;
+    let stamp = name
+        .strip_prefix("rollout-")
+        .and_then(|s| s.strip_suffix(&format!("-{thread}.jsonl")))
+        .context("Rollout identity mismatch")?;
+    ensure!(
+        stamp.len() == 19
+            && stamp.bytes().enumerate().all(|(i, c)| match i {
+                4 | 7 | 13 | 16 => c == b'-',
+                10 => c == b'T',
+                _ => c.is_ascii_digit(),
+            }),
+        "Invalid rollout timestamp"
+    );
+    let open_child = |parent: &File, name: &std::ffi::OsStr, flags: i32| -> Result<File> {
+        let name = CString::new(name.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | flags,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    };
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    for component in root.strip_prefix("/")?.components() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("Invalid sessions directory")
+        };
+        directory = open_child(&directory, name, libc::O_DIRECTORY)?;
+    }
+    for component in relative
+        .parent()
+        .context("Rollout has no parent")?
+        .components()
+    {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("Invalid rollout directory")
+        };
+        directory = open_child(&directory, name, libc::O_DIRECTORY)?;
+    }
+    let mut file = open_child(
+        &directory,
+        relative.file_name().context("Rollout has no name")?,
+        libc::O_NONBLOCK,
+    )?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1,
+        "Unsafe rollout file"
+    );
+    let mut header = Vec::new();
+    (&mut file).take(64 * 1024).read_to_end(&mut header)?;
+    let header_end = header
+        .iter()
+        .position(|b| *b == b'\n')
+        .context("Incomplete rollout header")?;
+    let header: Value = serde_json::from_slice(&header[..header_end])?;
+    ensure!(
+        header["type"] == "session_meta" && header["payload"]["id"] == thread,
+        "Rollout header identity mismatch"
+    );
+    let offset = metadata.len().saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut bytes)?;
+    let start = if offset == 0 {
+        0
+    } else {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |n| n + 1)
+    };
+    Ok(bytes[start..]
+        .split_inclusive(|b| *b == b'\n')
+        .filter(|line| line.last() == Some(&b'\n'))
+        .any(|line| {
+            serde_json::from_slice::<Value>(line).is_ok_and(|v| {
+                v["type"] == "event_msg"
+                    && v["payload"]["type"] == "turn_aborted"
+                    && v["payload"]["turn_id"] == turn
+                    && v["payload"]["reason"] == "interrupted"
+            })
+        }))
+}
+
+fn observation_reason(call: &mut Rpc, thread: &str, turn: Option<&Turn>) -> Option<&'static str> {
+    let turn = turn.filter(|turn| turn.status == "interrupted")?;
+    let evidence = (|| -> Result<bool> {
+        let metadata = call(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":false}),
+        )?;
+        ensure!(
+            metadata["thread"]["id"] == thread,
+            "Rollout thread mismatch"
+        );
+        let path = metadata["thread"]["path"]
+            .as_str()
+            .context("Rollout path unavailable")?;
+        let home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+            .context("Codex home unavailable")?;
+        recorded_interruption(&home.join("sessions"), Path::new(path), thread, &turn.id)
+    })();
+    Some(match evidence {
+        Ok(true) => "turn_aborted_recorded",
+        Ok(false) => "interrupted_unconfirmed",
+        Err(_) => "interruption_evidence_unavailable",
+    })
 }
 
 fn record_unknown(
@@ -169,11 +309,12 @@ fn arm_with(db: &Connection, id: &str, call: &mut Rpc) -> Result<()> {
     }
     match source_parent(call, &kind, &resource).and_then(|_| first_turn(call, &resource)) {
         Ok(turn) => {
-            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=?5,updated_ms=?3 WHERE subscription_id=?4 AND state='unknown' AND reason='baseline_unavailable'", params![turn.as_ref().map(|t|t.id.as_str()),turn.as_ref().map(|t|t.status.as_str()),now+INTERVAL_MS,id,observation_reason(turn.as_ref())])?;
+            let reason = observation_reason(call, &resource, turn.as_ref());
+            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=?5,updated_ms=?3 WHERE subscription_id=?4 AND state='unknown' AND reason='baseline_unavailable'", params![turn.as_ref().map(|t|t.id.as_str()),turn.as_ref().map(|t|t.status.as_str()),now+INTERVAL_MS,id,reason])?;
             crate::observability::emit(
                 "native_poll.arm",
                 "ok",
-                observation_reason(turn.as_ref()).unwrap_or("baseline"),
+                reason.unwrap_or("baseline"),
                 None,
                 Duration::ZERO,
                 1,
@@ -266,12 +407,13 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
         let latest = latest_page.first().cloned();
         if state.as_deref() == Some("unknown") || (state.is_none() && base_id.is_none()) {
             let observed = latest.as_ref();
-            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=?5,updated_ms=?3 WHERE subscription_id=?4",params![observed.map(|t|t.id.as_str()),observed.map(|t|t.status.as_str()),stamp+INTERVAL_MS,id,observation_reason(observed)])?;
+            let reason = observation_reason(call, &resource, observed);
+            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=?5,updated_ms=?3 WHERE subscription_id=?4",params![observed.map(|t|t.id.as_str()),observed.map(|t|t.status.as_str()),stamp+INTERVAL_MS,id,reason])?;
             report["baselined"] = json!(report["baselined"].as_u64().unwrap_or(0) + 1);
             crate::observability::emit(
                 "native_poll.tick",
                 "ok",
-                observation_reason(observed).unwrap_or("baseline"),
+                reason.unwrap_or("baseline"),
                 None,
                 Duration::ZERO,
                 1,
@@ -346,6 +488,7 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
             }
             previous_status = Some(turn.status);
         }
+        let reason = observation_reason(call, &resource, latest.as_ref());
         if let Some(turn) = event_turn {
             let source = if kind == "subagent" {
                 json!({"session_id":parent.context("Native subagent parent missing")?,"agent_id":resource,"turnId":turn.id,"status":turn.status})
@@ -376,7 +519,7 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
             crate::observability::emit(
                 "native_poll.tick",
                 "ok",
-                observation_reason(latest.as_ref()).unwrap_or("unchanged"),
+                reason.unwrap_or("unchanged"),
                 None,
                 Duration::ZERO,
                 1,
@@ -392,7 +535,7 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
         let reason = if last_status == Some("completed") {
             None
         } else {
-            observation_reason(latest.as_ref())
+            reason
         };
         db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='observed',reason=?5,updated_ms=?3 WHERE subscription_id=?4",params![latest.as_ref().map(|t|t.id.as_str()),last_status,stamp+INTERVAL_MS,id,reason])?;
     }
@@ -412,6 +555,150 @@ mod tests {
     use super::*;
     const SOURCE: &str = "11111111-1111-4111-8111-111111111111";
     const TARGET: &str = "22222222-2222-4222-8222-222222222222";
+    #[test]
+    #[ignore = "requires an isolated real-Codex interruption proof in WAKE_PROOF_ROOT"]
+    fn recorded_interruption_reads_real_codex_fixture() {
+        let root = PathBuf::from(std::env::var_os("WAKE_PROOF_ROOT").expect("WAKE_PROOF_ROOT"));
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(root.join("result.json")).unwrap()).unwrap();
+        assert_eq!(receipt["persisted_abort"]["before"], 0);
+        assert_eq!(receipt["persisted_abort"]["after"], 1);
+        assert!(
+            recorded_interruption(
+                &root.join("codex/sessions"),
+                Path::new(receipt["rollout_path"].as_str().unwrap()),
+                receipt["started_thread"].as_str().unwrap(),
+                receipt["started_turn"].as_str().unwrap(),
+            )
+            .unwrap()
+        );
+    }
+    #[test]
+    fn persisted_interruption_requires_a_complete_matching_record() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-2026-11-07T15-38-19-{SOURCE}.jsonl"));
+        fs::write(&path, format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SOURCE}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"t1\"}}}}\n")).unwrap();
+        assert!(!recorded_interruption(&sessions, &path, SOURCE, "t1").unwrap());
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\",\"turn_id\":\"t1\",\"reason\":\"interrupted\"}}}}").unwrap();
+        assert!(!recorded_interruption(&sessions, &path, SOURCE, "t1").unwrap());
+        writeln!(file).unwrap();
+        assert!(!recorded_interruption(&sessions, &path, SOURCE, "another-turn").unwrap());
+        assert!(recorded_interruption(&sessions, &path, SOURCE, "t1").unwrap());
+    }
+
+    #[test]
+    fn persisted_interruption_rejects_foreign_paths_and_links() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let foreign = dir
+            .path()
+            .join(format!("rollout-2026-11-07T15-38-19-{SOURCE}.jsonl"));
+        fs::write(&foreign, b"{}\n").unwrap();
+        assert!(recorded_interruption(&sessions, &foreign, SOURCE, "t1").is_err());
+        let foreign_directory = sessions.join("foreign");
+        symlink(dir.path(), &foreign_directory).unwrap();
+        assert!(
+            recorded_interruption(
+                &sessions,
+                &foreign_directory.join(foreign.file_name().unwrap()),
+                SOURCE,
+                "t1"
+            )
+            .is_err()
+        );
+        let inside = sessions.join(format!("rollout-2026-11-07T15-38-19-{SOURCE}.jsonl"));
+        fs::write(&inside, b"{}\n").unwrap();
+        assert!(recorded_interruption(&sessions, &inside, SOURCE, "t1").is_err());
+        let alias = sessions.join(format!("alias-{SOURCE}.jsonl"));
+        symlink(&inside, &alias).unwrap();
+        assert!(recorded_interruption(&sessions, &alias, SOURCE, "t1").is_err());
+        fs::remove_file(&alias).unwrap();
+        fs::hard_link(&inside, &alias).unwrap();
+        assert!(recorded_interruption(&sessions, &inside, SOURCE, "t1").is_err());
+        fs::remove_file(&inside).unwrap();
+        fs::remove_file(&alias).unwrap();
+        let fifo = CString::new(inside.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(recorded_interruption(&sessions, &inside, SOURCE, "t1").is_err());
+    }
+    #[test]
+    fn persisted_interruption_search_is_bounded_to_complete_tail_records() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let path = sessions.join(format!("rollout-2026-11-07T15-38-19-{SOURCE}.jsonl"));
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SOURCE}\"}}}}"
+        )
+        .unwrap();
+        file.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        file.write_all(b"\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"t1\",\"reason\":\"interrupted\"}}\n").unwrap();
+        assert!(recorded_interruption(&sessions, &path, SOURCE, "t1").unwrap());
+        file.write_all(&vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(!recorded_interruption(&sessions, &path, SOURCE, "t1").unwrap());
+    }
+    #[test]
+    fn interruption_reason_uses_the_verified_thread_rollout() {
+        if let Some(root) = std::env::var_os("WAKE_TEST_ROLLOUT_HOME") {
+            let path = PathBuf::from(root)
+                .join("sessions")
+                .join(format!("rollout-2026-11-07T15-38-19-{SOURCE}.jsonl"));
+            let mut rpc = |method: &str, params: Value| -> Result<Value> {
+                assert_eq!(params["threadId"], SOURCE);
+                match method {
+                    "thread/read" => Ok(json!({"thread":{"id":SOURCE,"path":path}})),
+                    "thread/turns/list" => {
+                        Ok(json!({"data":[turn("t1", "interrupted")],"nextCursor":null}))
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            assert_eq!(
+                observation_reason(&mut rpc, SOURCE, Some(&turn("t1", "interrupted"))),
+                Some("turn_aborted_recorded")
+            );
+            assert_eq!(
+                observation_reason(&mut rpc, SOURCE, Some(&turn("t2", "interrupted"))),
+                Some("interrupted_unconfirmed")
+            );
+            let db = db();
+            let id = sub(&db);
+            arm_with(&db, &id, &mut rpc).unwrap();
+            assert_eq!(status(&db).unwrap()[0]["reason"], "turn_aborted_recorded");
+            assert_eq!(
+                crate::subscriptions::status(&db).unwrap()[0]["state"],
+                "waiting"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        fs::write(sessions.join(format!("rollout-2026-11-07T15-38-19-{SOURCE}.jsonl")), format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SOURCE}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\",\"turn_id\":\"t1\",\"reason\":\"interrupted\"}}}}\n")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_poll::tests::interruption_reason_uses_the_verified_thread_rollout",
+            ])
+            .env("WAKE_TEST_ROLLOUT_HOME", dir.path())
+            .env("CODEX_HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
     #[test]
     fn slow_arming_cannot_overwrite_a_newer_poll_baseline() {
         let db = db();
@@ -506,8 +793,11 @@ mod tests {
     fn page(expected_thread: &str, turns: Vec<Turn>) -> impl FnMut(&str, Value) -> Result<Value> {
         let expected_thread = expected_thread.to_owned();
         move |method, params| {
-            assert_eq!(method, "thread/turns/list");
             assert_eq!(params["threadId"], expected_thread);
+            if method == "thread/read" {
+                return Ok(json!({"thread":{"id":expected_thread,"path":null}}));
+            }
+            assert_eq!(method, "thread/turns/list");
             assert_eq!(params["itemsView"], "notLoaded");
             Ok(json!({"data":turns.clone(),"nextCursor":null}))
         }
@@ -809,7 +1099,10 @@ mod tests {
         let db = db();
         let id = sub(&db);
         arm_with(&db, &id, &mut page(SOURCE, vec![turn("t1", "interrupted")])).unwrap();
-        assert_eq!(status(&db).unwrap()[0]["reason"], "interrupted_unconfirmed");
+        assert_eq!(
+            status(&db).unwrap()[0]["reason"],
+            "interruption_evidence_unavailable"
+        );
         db.execute("UPDATE native_observers SET next_poll_ms=0", [])
             .unwrap();
         assert_eq!(
@@ -820,7 +1113,10 @@ mod tests {
             crate::subscriptions::status(&db).unwrap()[0]["state"],
             "waiting"
         );
-        assert_eq!(status(&db).unwrap()[0]["reason"], "interrupted_unconfirmed");
+        assert_eq!(
+            status(&db).unwrap()[0]["reason"],
+            "interruption_evidence_unavailable"
+        );
         db.execute("UPDATE native_observers SET next_poll_ms=0", [])
             .unwrap();
         assert_eq!(
@@ -845,7 +1141,10 @@ mod tests {
             tick_with(&db, &mut page(SOURCE, vec![turn("t1", "interrupted")])).unwrap()["published"],
             0
         );
-        assert_eq!(status(&db).unwrap()[0]["reason"], "interrupted_unconfirmed");
+        assert_eq!(
+            status(&db).unwrap()[0]["reason"],
+            "interruption_evidence_unavailable"
+        );
         assert_eq!(
             crate::subscriptions::status(&db).unwrap()[0]["state"],
             "waiting"

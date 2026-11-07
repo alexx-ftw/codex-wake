@@ -295,6 +295,13 @@ replayed. A turn ending is not proof that the task is done. Non-native subagent 
 and `chat/completed`, `chat/blocked` or `chat/failed` still need their trusted hook
 or explicit owner signal. Polling payloads contain observed IDs and statuses, not
 the full original hook payload; hook-only template fields may be unavailable.
+An interrupted status is not itself conclusive: Wake checks up to the last MiB of
+the matching, user-owned Codex session log for a complete `turn_aborted` record.
+The native observer reports `turn_aborted_recorded`, `interrupted_unconfirmed`,
+or `interruption_evidence_unavailable`; it does not notify the coordinator or
+consume a completion subscription based on this record. This relies on the local
+app-server and user-owned session files; it cannot authenticate fabricated local
+records.
 
 ## Conditional thread actions and templates
 
