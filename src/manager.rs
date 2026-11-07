@@ -939,12 +939,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
-    for source in ["github", "external", "native"] {
+    for source in ["github", "external", "native", "delivery"] {
         let poll_config = config.clone();
         thread::spawn(move || {
+            let mut history_scans = std::collections::HashMap::new();
             loop {
                 let result = (|| -> Result<()> {
-                    let db = crate::bridge::connect(&poll_config.db)?;
+                    let mut db = crate::bridge::connect(&poll_config.db)?;
                     crate::subscriptions::initialize(&db)?;
                     crate::rules::initialize(&db)?;
                     match source {
@@ -953,6 +954,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         }
                         "external" => {
                             crate::observers::tick(&db, &poll_config.codex)?;
+                        }
+                        "delivery" => {
+                            crate::delivery_evidence::poll_history(
+                                &mut db,
+                                &poll_config.codex,
+                                &mut history_scans,
+                            )?;
                         }
                         _ => {
                             crate::native_poll::tick(&db, &poll_config.codex)?;
@@ -970,7 +978,11 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         1,
                     );
                 }
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_secs(if source == "delivery" {
+                    5
+                } else {
+                    1
+                }));
             }
         });
     }

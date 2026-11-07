@@ -54,9 +54,9 @@ pub struct RuleInput {
     pub goal_objective: Option<String>,
     /// Set only when explicitly requested; requires goal_objective.
     pub token_budget: Option<i64>,
-    /// Execution model; defaults to gpt-6.1-sol.
+    /// Execution model; new chats default to gpt-6.1-terra.
     pub model: Option<String>,
-    /// Execution reasoning effort; defaults to low.
+    /// Execution reasoning effort; new chats default to medium.
     pub reasoning_effort: Option<String>,
 }
 
@@ -89,16 +89,20 @@ fn validate(input: &mut RuleInput) -> Result<()> {
     ensure!(input.pr > 0, "PR number must be positive");
     ensure!(bounded(&input.prompt, 16384), "Invalid trusted prompt");
     crate::templates::validate(&input.prompt)?;
-    let model = input.model.get_or_insert_with(|| "gpt-6.1-sol".into());
-    ensure!(
-        bounded(model, 255) && model.bytes().all(|b| b.is_ascii_graphic()),
-        "Invalid model"
-    );
-    let effort = input.reasoning_effort.get_or_insert_with(|| "low".into());
-    ensure!(
-        bounded(effort, 100) && effort.bytes().all(|b| b.is_ascii_graphic()),
-        "Invalid reasoning effort"
-    );
+    if input.target_thread.is_none() || input.model.is_some() || input.reasoning_effort.is_some() {
+        let model = input.model.get_or_insert_with(|| "gpt-6.1-terra".into());
+        ensure!(
+            bounded(model, 255) && model.bytes().all(|b| b.is_ascii_graphic()),
+            "Invalid model"
+        );
+        let effort = input
+            .reasoning_effort
+            .get_or_insert_with(|| "medium".into());
+        ensure!(
+            bounded(effort, 100) && effort.bytes().all(|b| b.is_ascii_graphic()),
+            "Invalid reasoning effort"
+        );
+    }
     if let Some(author) = &input.author {
         ensure!(
             bounded(author, 100)
@@ -446,7 +450,10 @@ fn dispatch_with_identity(
             );
             stage = "prompt_template_failed";
             context["target"]["thread"] = json!(thread);
-            let identity = if event_identity_verified && input.goal_objective.is_none() {
+            let identity = if event_identity_verified
+                && input.goal_objective.is_none()
+                && execution_options(&input).is_some()
+            {
                 stored_event_key
                     .map(|event_key| {
                         crate::delivery_evidence::begin(db, &event_key, &thread, true)
@@ -498,14 +505,11 @@ fn dispatch_with_identity(
     }
 }
 
-fn execution_options(input: &RuleInput) -> crate::execution::ExecutionOptions {
-    crate::execution::ExecutionOptions {
-        model: input.model.clone().unwrap_or_else(|| "gpt-6.1-sol".into()),
-        reasoning_effort: input
-            .reasoning_effort
-            .clone()
-            .unwrap_or_else(|| "low".into()),
-    }
+fn execution_options(input: &RuleInput) -> Option<crate::execution::ExecutionOptions> {
+    Some(crate::execution::ExecutionOptions {
+        model: input.model.clone()?,
+        reasoning_effort: input.reasoning_effort.clone()?,
+    })
 }
 
 pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Result<usize> {
@@ -521,14 +525,12 @@ pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Res
                 // queue/add clientId correlation has not been qualified; leave its evidence unknown.
                 return crate::execution::queue_prepared(codex, thread, message);
             }
-            if let (Some(event_key), Some(client_id)) = (event_key, client_id) {
+            if let (Some(event_key), Some(client_id), Some(options)) =
+                (event_key, client_id, execution_options(input))
+            {
                 let (state, reason, notifications) =
                     crate::execution::deliver_with_identity_observed(
-                        codex,
-                        thread,
-                        message,
-                        &execution_options(input),
-                        client_id,
+                        codex, thread, message, &options, client_id,
                     )?;
                 live_signals.push((
                     event_key.to_owned(),
@@ -544,11 +546,14 @@ pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Res
                     thread,
                     message,
                     true,
-                    Some(&execution_options(input)),
+                    execution_options(input).as_ref(),
                 )
             }
         },
-        &mut |input| crate::execution::validate(codex, &execution_options(input)),
+        &mut |input| match execution_options(input) {
+            Some(options) => crate::execution::validate(codex, &options),
+            None => Ok(()),
+        },
     );
     for (event_key, thread, client_id, notifications) in live_signals {
         let (_, should_warn) = crate::delivery_evidence::record_notifications(
@@ -577,8 +582,8 @@ mod tests {
     ) -> Result<usize> {
         super::dispatch_with(db, base, rpc, finish, &mut |input| {
             ensure!(
-                input.model.as_deref() == Some("gpt-6.1-sol")
-                    && input.reasoning_effort.as_deref() == Some("low"),
+                input.model.as_deref() == Some("gpt-6.1-terra")
+                    && input.reasoning_effort.as_deref() == Some("medium"),
                 "simulated unsupported execution selection"
             );
             Ok(())
@@ -589,6 +594,21 @@ mod tests {
     }
     fn payload() -> Value {
         json!({"action":"created","repository":{"full_name":"owner/repo"},"issue":{"number":42,"pull_request":{}},"comment":{"id":7,"user":{"login":"alice","type":"User"},"body":"ship it untrusted body"}})
+    }
+    #[test]
+    fn existing_target_without_preset_keeps_its_execution_settings() {
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        validate(&mut rule).unwrap();
+        assert!(execution_options(&rule).is_none());
+        assert!(rule.model.is_none());
+        assert!(rule.reasoning_effort.is_none());
+
+        let mut new_chat = input();
+        validate(&mut new_chat).unwrap();
+        let options = execution_options(&new_chat).unwrap();
+        assert_eq!(options.model, "gpt-6.1-terra");
+        assert_eq!(options.reasoning_effort, "medium");
     }
     #[test]
     fn legacy_ready_deliveries_remain_without_verified_event_identity() {
@@ -655,8 +675,8 @@ mod tests {
         let mut creates = 0;
         let mut rpc = |method: &str, params: Value| {
             assert_eq!(method, "thread/start");
-            assert_eq!(params["model"], "gpt-6.1-sol");
-            assert_eq!(params["config"]["model_reasoning_effort"], "low");
+            assert_eq!(params["model"], "gpt-6.1-terra");
+            assert_eq!(params["config"]["model_reasoning_effort"], "medium");
             creates += 1;
             Ok(json!({"thread":{"id":THREAD}}))
         };
@@ -884,7 +904,7 @@ mod tests {
                     Ok(json!({"thread":{"id":Uuid::new_v4().to_string()}}))
                 },
                 &mut |_, input, _| {
-                    let options = execution_options(input);
+                    let options = execution_options(input).unwrap();
                     assert_eq!(options.model, "configured-model");
                     assert_eq!(options.reasoning_effort, "high");
                     sends += 1;

@@ -1485,10 +1485,9 @@ fn cli_execution(args: &mut Vec<String>) -> Result<Option<execution::ExecutionOp
     if model.is_none() && effort.is_none() {
         return Ok(None);
     }
-    let defaults = execution::ExecutionOptions::default();
     Ok(Some(execution::ExecutionOptions {
-        model: model.unwrap_or(defaults.model),
-        reasoning_effort: effort.unwrap_or(defaults.reasoning_effort),
+        model: model.unwrap_or_else(|| "gpt-6.1-terra".into()),
+        reasoning_effort: effort.unwrap_or_else(|| "medium".into()),
     }))
 }
 

@@ -5,9 +5,13 @@
 //! same deterministic event/destination client ID.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use uuid::Uuid;
 
 fn now_ms() -> i64 {
@@ -449,6 +453,153 @@ pub fn record_notifications(
     Ok((matching, should_warn))
 }
 
+/// Record only matching identifiers from persisted history; message text is never stored.
+fn record_history_page(
+    db: &mut Connection,
+    thread: &str,
+    page: &Value,
+    warn: &mut dyn FnMut(&Connection, &str) -> Result<()>,
+) -> Result<()> {
+    let turns = page["data"]
+        .as_array()
+        .context("History page has no turns")?;
+    ensure!(turns.len() <= 50, "History page exceeds requested size");
+    for turn in turns {
+        let turn_id = turn["id"].as_str().context("History turn has no id")?;
+        let items = turn["items"]
+            .as_array()
+            .context("History turn has no items")?;
+        for item in items {
+            if item["type"] != "userMessage" {
+                continue;
+            }
+            let Some(client_id) = item["clientId"].as_str() else {
+                continue;
+            };
+            let event_key: Option<String> = db.query_row(
+                "SELECT event_key FROM delivery_evidence WHERE target_thread=?1 AND client_user_message_id=?2 AND identity_verified=1",
+                params![thread, client_id], |row| row.get(0),
+            ).optional()?;
+            let Some(event_key) = event_key else { continue };
+            let item_id = item["id"].as_str().context("History message has no id")?;
+            if observe_user_message(db, &event_key, thread, client_id, item_id, turn_id)?
+                .should_warn
+            {
+                warn(db, &event_key)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+pub struct HistoryScan {
+    cursor: Option<String>,
+    next_poll: Option<Instant>,
+    next_head: Option<Instant>,
+    seen: HashSet<String>,
+}
+
+/// Scan one bounded history page per due chat. A restarted scan begins at the newest page.
+pub fn poll_history(
+    db: &mut Connection,
+    codex: &Path,
+    scans: &mut HashMap<String, HistoryScan>,
+) -> Result<()> {
+    poll_history_with(
+        db,
+        scans,
+        &mut |method, params| crate::goals::rpc(codex, method, params),
+        &mut |db, event, thread| warn_once(db, codex, event, thread),
+    )
+}
+
+fn poll_history_with(
+    db: &mut Connection,
+    scans: &mut HashMap<String, HistoryScan>,
+    call: &mut dyn FnMut(&str, Value) -> Result<Value>,
+    warn: &mut dyn FnMut(&Connection, &str, &str) -> Result<()>,
+) -> Result<()> {
+    initialize(db)?;
+    let threads = {
+        let mut statement = db.prepare("SELECT DISTINCT target_thread FROM delivery_evidence WHERE identity_verified=1 AND coverage_state!='duplicate_confirmed' ORDER BY target_thread")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let active: HashSet<_> = threads.iter().collect();
+    scans.retain(|thread, _| active.contains(thread));
+    for thread in threads {
+        let state = scans.entry(thread.clone()).or_default();
+        if state.next_poll.is_some_and(|due| Instant::now() < due) {
+            continue;
+        }
+        let refresh_head =
+            state.cursor.is_some() && state.next_head.is_some_and(|due| Instant::now() >= due);
+        let mut params =
+            json!({"threadId":thread,"limit":50,"sortDirection":"desc","itemsView":"full"});
+        if let Some(cursor) = &state.cursor
+            && !refresh_head
+        {
+            params["cursor"] = json!(cursor);
+        }
+        let response = call("thread/turns/list", params);
+        let result = response.and_then(|page| {
+            record_history_page(db, &thread, &page, &mut |db, event_key| {
+                warn(db, event_key, &thread)
+            })?;
+            if refresh_head {
+                return Ok(state.cursor.clone());
+            }
+            let next = match &page["nextCursor"] {
+                Value::Null => None,
+                Value::String(cursor)
+                    if !cursor.is_empty()
+                        && cursor.len() <= 2048
+                        && !state.seen.contains(cursor)
+                        && state.seen.len() < 1024 =>
+                {
+                    Some(cursor.clone())
+                }
+                _ => anyhow::bail!("Invalid history cursor"),
+            };
+            Ok(next)
+        });
+        match result {
+            Ok(next) => {
+                let delay = if next.is_some() { 5 } else { 60 };
+                if refresh_head || state.next_head.is_none() {
+                    state.next_head = Some(Instant::now() + Duration::from_secs(60));
+                }
+                if !refresh_head {
+                    if let Some(cursor) = &next {
+                        state.seen.insert(cursor.clone());
+                    } else {
+                        state.seen.clear();
+                    }
+                    state.cursor = next;
+                }
+                state.next_poll = Some(Instant::now() + Duration::from_secs(delay));
+            }
+            Err(error) => {
+                *state = HistoryScan {
+                    next_poll: Some(Instant::now() + Duration::from_secs(60)),
+                    ..HistoryScan::default()
+                };
+                crate::observability::emit(
+                    "delivery.history",
+                    "error",
+                    crate::observability::error_class(&error),
+                    Some(&thread),
+                    Duration::ZERO,
+                    1,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Queue one warning after duplicate evidence is durably claimed. The original
 /// event input is never resent, and queue acceptance remains unconfirmed.
 pub fn warn_once(
@@ -503,13 +654,13 @@ pub fn status(db: &Connection) -> Result<Value> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(serde_json::json!({
         "deliveries":rows,
-        "evidence_source":"live_native_userMessage_notifications",
+        "evidence_source":"native_userMessage_notifications_and_history",
         "coverage_limits":{
-            "turn_start":"Only matching notifications read on the request socket are captured; absence is unknown.",
-            "queue_add":"Unknown. clientUserMessageId-to-clientId is not qualified for queue/add; no duplicate conclusion is drawn.",
+            "turn_start":"Matching live notifications and persisted history are observed; absence is unknown.",
+            "queue_add":"The client ID mapping was qualified in one isolated case; ordinary CLI deliveries do not register a native identity and remain unknown.",
             "cli":"Unknown. CLI queue output does not expose native userMessage item identities.",
-            "subscriptions":"Configured native turn/start sends are observed only when the source supplies a stable event ID. CLI sends and source events without such IDs remain unknown.",
-            "polling":"Polling can supply stable source IDs to rules, waits, and subscription dispatch; it is not recipient receipt evidence. Only distinct native userMessage item IDs confirm a duplicate."
+            "subscriptions":"Configured native turn/start sends are observed only when the source supplies a stable event ID. Default CLI sends and events without such IDs remain unknown.",
+            "polling":"History pages are scanned incrementally and restarted after errors or service restart; only distinct matching native userMessage item IDs confirm a duplicate."
         }
     }))
 }
@@ -857,6 +1008,188 @@ mod tests {
             status(&db).unwrap()["deliveries"][0]["coverage"],
             "duplicate_confirmed"
         );
+    }
+
+    #[test]
+    fn history_pages_record_only_matching_messages_and_warn_once() {
+        let mut db = db();
+        let event = comment_event_key(12);
+        let (client, _) = begin(&db, &event, THREAD, true).unwrap();
+        let page = |turn: &str, item: &str, id: &str| {
+            json!({"data":[{"id":turn,"items":[
+                {"type":"userMessage","id":item,"clientId":id,"content":[{"text":"private"}]}
+            ]}]})
+        };
+        let mut warned = Vec::new();
+        let mut warn = |_: &Connection, key: &str| {
+            warned.push(key.to_owned());
+            Ok(())
+        };
+        record_history_page(
+            &mut db,
+            THREAD,
+            &page("turn-1", "item-1", &client),
+            &mut warn,
+        )
+        .unwrap();
+        record_history_page(
+            &mut db,
+            THREAD,
+            &page("turn-other", "foreign", "other"),
+            &mut warn,
+        )
+        .unwrap();
+        record_history_page(
+            &mut db,
+            THREAD,
+            &page("turn-1", "item-1", &client),
+            &mut warn,
+        )
+        .unwrap();
+        record_history_page(
+            &mut db,
+            THREAD,
+            &page("turn-2", "item-2", &client),
+            &mut warn,
+        )
+        .unwrap();
+        record_history_page(
+            &mut db,
+            THREAD,
+            &page("turn-2", "item-2", &client),
+            &mut warn,
+        )
+        .unwrap();
+        assert_eq!(warned, vec![event]);
+        assert_eq!(
+            status(&db).unwrap()["deliveries"][0]["distinct_user_message_items"],
+            2
+        );
+    }
+
+    #[test]
+    fn history_poll_advances_pages_and_restarts_after_invalid_cursor() {
+        let mut db = db();
+        let event = comment_event_key(13);
+        let (client, _) = begin(&db, &event, THREAD, true).unwrap();
+        let mut scans = HashMap::new();
+        let mut calls = 0;
+        let mut call = |method: &str, params: Value| {
+            assert_eq!(method, "thread/turns/list");
+            assert_eq!(params["itemsView"], "full");
+            calls += 1;
+            if calls == 1 {
+                assert!(params["cursor"].is_null());
+                Ok(
+                    json!({"data":[{"id":"turn-1","items":[{"type":"userMessage","id":"item-1","clientId":client}]}],"nextCursor":"page-2"}),
+                )
+            } else if calls == 2 {
+                assert_eq!(params["cursor"], "page-2");
+                Ok(
+                    json!({"data":[{"id":"turn-2","items":[{"type":"userMessage","id":"item-2","clientId":client}]}],"nextCursor":null}),
+                )
+            } else {
+                anyhow::bail!("invalid cursor")
+            }
+        };
+        let mut warnings = Vec::new();
+        let mut warn = |_: &Connection, event: &str, _: &str| {
+            warnings.push(event.to_owned());
+            Ok(())
+        };
+        poll_history_with(&mut db, &mut scans, &mut call, &mut warn).unwrap();
+        assert_eq!(scans[THREAD].cursor.as_deref(), Some("page-2"));
+        scans.get_mut(THREAD).unwrap().next_poll = None;
+        poll_history_with(&mut db, &mut scans, &mut call, &mut warn).unwrap();
+        assert_eq!(scans[THREAD].cursor, None);
+
+        let (other, _) = begin(&db, &comment_event_key(14), THREAD, true).unwrap();
+        assert_ne!(other, client);
+        scans.insert(
+            THREAD.to_owned(),
+            HistoryScan {
+                cursor: Some("stale".into()),
+                ..HistoryScan::default()
+            },
+        );
+        poll_history_with(&mut db, &mut scans, &mut call, &mut warn).unwrap();
+        assert_eq!(warnings, vec![event]);
+        assert_eq!(scans[THREAD].cursor, None);
+        let state = status(&db).unwrap();
+        let record = state["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["client_user_message_id"] == other)
+            .unwrap();
+        assert_eq!(record["coverage"], "unknown");
+    }
+
+    #[test]
+    fn history_poll_refreshes_recent_page_while_scanning_older_pages() {
+        let mut db = db();
+        let event = comment_event_key(15);
+        let (client, _) = begin(&db, &event, THREAD, true).unwrap();
+        let mut scans = HashMap::new();
+        scans.insert(
+            THREAD.to_owned(),
+            HistoryScan {
+                cursor: Some("older".into()),
+                next_head: Some(Instant::now()),
+                ..HistoryScan::default()
+            },
+        );
+        let mut calls = 0;
+        let mut call = |_: &str, params: Value| {
+            calls += 1;
+            if calls == 1 {
+                assert!(params["cursor"].is_null());
+            } else {
+                assert_eq!(params["cursor"], "older");
+            }
+            Ok(
+                json!({"data":[{"id":format!("turn-{calls}"),"items":[{"type":"userMessage","id":format!("item-{calls}"),"clientId":client}]}],"nextCursor":null}),
+            )
+        };
+        let mut warnings = Vec::new();
+        let mut warn = |_: &Connection, key: &str, _: &str| {
+            warnings.push(key.to_owned());
+            Ok(())
+        };
+        poll_history_with(&mut db, &mut scans, &mut call, &mut warn).unwrap();
+        assert_eq!(scans[THREAD].cursor.as_deref(), Some("older"));
+        scans.get_mut(THREAD).unwrap().next_poll = None;
+        poll_history_with(&mut db, &mut scans, &mut call, &mut warn).unwrap();
+        assert_eq!(warnings, vec![event]);
+    }
+
+    #[test]
+    fn history_poll_records_receipts_before_rejecting_cursor_cycle() {
+        let mut db = db();
+        let event = comment_event_key(16);
+        let (client, _) = begin(&db, &event, THREAD, true).unwrap();
+        let mut scans = HashMap::from([(
+            THREAD.to_owned(),
+            HistoryScan {
+                cursor: Some("second".into()),
+                seen: HashSet::from(["first".into(), "second".into()]),
+                ..HistoryScan::default()
+            },
+        )]);
+        let mut warnings = Vec::new();
+        let mut call = |_: &str, _: Value| {
+            Ok(json!({"data":[{"id":"turn-1","items":[
+            {"type":"userMessage","id":"item-1","clientId":client},
+            {"type":"userMessage","id":"item-2","clientId":client}
+        ]}],"nextCursor":"first"}))
+        };
+        poll_history_with(&mut db, &mut scans, &mut call, &mut |_, key, _| {
+            warnings.push(key.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(warnings, vec![event]);
+        assert_eq!(scans[THREAD].cursor, None);
     }
 
     #[test]

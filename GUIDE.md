@@ -313,9 +313,10 @@ CI and other subscriptions accept `message_template` and optional `execution`
 can also specify their input. Goal edits and input delivery are reported
 separately so a failed queue never conceals a successful goal mutation.
 
-New threads default to `gpt-6.1-sol` with effort `low`; explicit presets are
+New threads default to `gpt-6.1-terra` with effort `medium`; explicit presets are
 validated against the owning server's model catalog. Native `codex queue` uses
-the existing thread's model and has no per-message model/effort field. An
+the existing thread's model and has no per-message model/effort field. Rules
+targeting an existing chat omit execution overrides unless configured. An
 explicit execution preset for an immediate message uses `turn/start` on an idle/resumable
 thread. Goal actions first persist and read back the preset, then mutate the goal.
 A busy thread or unavailable API produces an error rather than silently
@@ -328,12 +329,15 @@ Wake only labels a delivery duplicated after observing two distinct native
 `clientId`. The `item/started` and `item/completed` notifications for one item
 ID count once. An incoming webhook repeated by itself is not delivery evidence.
 
-Correlation uses live notifications received on the same native `turn/start`
-request socket. Rules, waits, and subscription dispatch can be observed when
+Correlation uses live notifications and incremental scans of persisted native
+chat history. Rules, waits, and subscription dispatch can be observed when
 their source has a stable event ID. Polling can supply source event IDs to those
 dispatch paths; a poll result alone is not recipient evidence. Sources without
-a stable event ID, CLI sends, and `queue/add` remain `unknown`; the
-`clientUserMessageId`-to-`clientId` mapping for `queue/add` is unqualified.
+a stable event ID and CLI sends remain `unknown`. An isolated `queue/add` case
+confirmed the `clientUserMessageId`-to-`clientId` mapping; it does not prove
+coverage for every Codex version. Scans restart from the newest page after an
+error or service restart, refresh the newest page during long scans, and stop a
+scan after 1,024 cursors or a cursor cycle. Missing observations remain unknown.
 Subscription identity includes its exact event and outcome. Base/ref transitions
 and pull request synchronization remain unknown when only old/new refs or commit
 SHAs are available, since those values can recur.
