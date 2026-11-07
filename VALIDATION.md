@@ -1,5 +1,13 @@
 # Validation
 
+## Validation reminders, 2026-11-07
+
+An isolated Codex CLI run exercised `register_validation`, an automatic Stop
+that returned a reminder, and `resolve_validation`. The [receipt](evidence/validation-reminders-real-codex/README.md)
+records the exact revision and important limits: a synthetic model provider,
+an isolated database, and a bypassed MCP service bootstrap. The ordinary CI
+workflow also includes the separate process-level `validation_hooks` test.
+
 ## Command skills, 2026-11-04
 
 The manifest now exposes 13 short command skills, one per MCP tool. An isolated
