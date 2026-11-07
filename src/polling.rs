@@ -22,7 +22,9 @@ pub fn initialize(db: &Connection) -> Result<()> {
         cursor TEXT, has_next INTEGER NOT NULL DEFAULT 0,
         next_poll_ms INTEGER NOT NULL DEFAULT 0, backoff_ms INTEGER NOT NULL DEFAULT 60000,
         last_success_ms INTEGER, error_category TEXT, calls INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(endpoint,page));",
+        PRIMARY KEY(endpoint,page));
+        CREATE TABLE IF NOT EXISTS github_poll_generation (
+            endpoint TEXT PRIMARY KEY, generation INTEGER NOT NULL);",
     )?;
     Ok(())
 }
@@ -571,6 +573,7 @@ where
             skipped: true,
         });
     }
+    let generation = poll_generation(db, route)?;
     let root = state(db, route, first)?;
     if root.as_ref().is_some_and(|s| s.next_poll > now) {
         return Ok(EndpointOutcome {
@@ -598,7 +601,7 @@ where
         let response = match fetch(&url, cached.as_ref().and_then(|s| s.etag.as_deref())) {
             Ok(r) => r,
             Err(e) => {
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -610,7 +613,7 @@ where
         };
         if response.status != 200 && response.status != 304 {
             let e = response.failure();
-            record_failure(db, route, first, now, &e, requests)?;
+            record_fetch_failure(db, route, first, now, &e, requests, generation)?;
             return Ok(EndpointOutcome {
                 error: Some(e.category),
                 calls: requests,
@@ -622,7 +625,7 @@ where
         let (body, etag, has_next) = if response.status == 304 {
             let Some(old) = cached.as_ref().and_then(|s| s.body.clone()) else {
                 let e = Failure::new("cache_miss");
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -641,7 +644,7 @@ where
         } else {
             if response.body.len() >= MAX_OUTPUT {
                 let e = Failure::new("output_limit");
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -654,7 +657,7 @@ where
                 Ok(body) => body,
                 Err(_) => {
                     let e = Failure::new("invalid_response");
-                    record_failure(db, route, first, now, &e, requests)?;
+                    record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                     return Ok(EndpointOutcome {
                         error: Some(e.category),
                         calls: requests,
@@ -671,7 +674,7 @@ where
             Ok(v) => v,
             Err(_) => {
                 let e = Failure::new("invalid_response");
-                record_failure(db, route, first, now, &e, requests)?;
+                record_fetch_failure(db, route, first, now, &e, requests, generation)?;
                 return Ok(EndpointOutcome {
                     error: Some(e.category),
                     calls: requests,
@@ -687,7 +690,7 @@ where
             all.extend(items.iter().cloned());
         } else {
             let e = Failure::new("invalid_response");
-            record_failure(db, route, first, now, &e, requests)?;
+            record_fetch_failure(db, route, first, now, &e, requests, generation)?;
             return Ok(EndpointOutcome {
                 error: Some(e.category),
                 calls: requests,
@@ -708,7 +711,7 @@ where
         page += 1;
         if page > 10_000 {
             let e = Failure::new("pagination_limit");
-            record_failure(db, route, first, now, &e, requests)?;
+            record_fetch_failure(db, route, first, now, &e, requests, generation)?;
             return Ok(EndpointOutcome {
                 error: Some(e.category),
                 calls: requests,
@@ -717,6 +720,17 @@ where
                 skipped: false,
             });
         }
+    }
+    // Serialize acceptance and discard a response fetched before another commit.
+    let _guard = PollCommitGuard::acquire(db)?;
+    if poll_generation(db, route)? != generation {
+        return Ok(EndpointOutcome {
+            error: None,
+            calls: requests,
+            pages: requests,
+            accepted: 0,
+            skipped: true,
+        });
     }
     let (cursor, accepted) = match process(db, cursor, all, now) {
         Ok(v) => v,
@@ -750,6 +764,64 @@ struct State {
     next_poll: i64,
     backoff: i64,
 }
+
+fn poll_generation(db: &Connection, route: &str) -> Result<i64> {
+    Ok(db
+        .query_row(
+            "SELECT generation FROM github_poll_generation WHERE endpoint=?1",
+            [route],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+// Use a separate private inode: closing an extra descriptor to the database can
+// release SQLite's POSIX locks held by this process.
+struct PollCommitGuard {
+    _local: std::sync::MutexGuard<'static, ()>,
+    _file: Option<std::fs::File>,
+}
+impl PollCommitGuard {
+    fn acquire(db: &Connection) -> Result<Self> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        static LOCAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let local = LOCAL
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poll commit lock poisoned"))?;
+        let file = if let Some(path) = db.path().filter(|p| !p.is_empty()) {
+            let lock_path = format!("{path}.poll.lock");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(lock_path)?;
+            let meta = file.metadata()?;
+            anyhow::ensure!(
+                meta.is_file()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o077 == 0
+                    && meta.nlink() == 1,
+                "unsafe polling lock file"
+            );
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Some(file)
+        } else {
+            None
+        };
+        Ok(Self {
+            _local: local,
+            _file: file,
+        })
+    }
+}
 struct PageUpdate {
     page: usize,
     body: String,
@@ -777,6 +849,7 @@ fn save_success(
             "DELETE FROM github_poll_state WHERE endpoint=?1 AND page>?2",
             params![route, pages.last().map_or(first as i64, |p| p.page as i64)],
         )?;
+        db.execute("INSERT INTO github_poll_generation(endpoint,generation) VALUES(?1,1) ON CONFLICT(endpoint) DO UPDATE SET generation=generation+1", [route])?;
         Ok(())
     })();
     match res {
@@ -789,6 +862,21 @@ fn save_success(
             Err(e)
         }
     }
+}
+fn record_fetch_failure(
+    db: &Connection,
+    route: &str,
+    page: usize,
+    now: i64,
+    e: &Failure,
+    calls: u64,
+    generation: i64,
+) -> Result<()> {
+    let _guard = PollCommitGuard::acquire(db)?;
+    if poll_generation(db, route)? == generation {
+        record_failure(db, route, page, now, e, calls)?;
+    }
+    Ok(())
 }
 fn record_failure(
     db: &Connection,
@@ -1233,6 +1321,73 @@ mod tests {
     use super::*;
     type Fetch<'a> =
         dyn FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure> + 'a;
+
+    #[test]
+    fn stale_response_from_another_process_does_not_regress_cursor() {
+        use std::{process::Command, thread};
+        fn wait_for(path: &Path) {
+            let end = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    Instant::now() < end,
+                    "timed out waiting for {}",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let value = |sha: &str| {
+            response(
+                json!({"ref":"refs/heads/topic/test","object":{"sha":sha.repeat(40)}}),
+                false,
+            )
+        };
+        if let Some(dir) = std::env::var_os("WAKE_STALE_POLL_TEST_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let db = Connection::open(dir.join("state.sqlite")).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let result = tick_with(&db, INTERVAL_MS + 1, |_, _| {
+                std::fs::write(dir.join("started"), b"").unwrap();
+                wait_for(&dir.join("release"));
+                Ok(value("b"))
+            })
+            .unwrap();
+            assert_eq!(result["accepted"], 0);
+            assert_eq!(result["skipped"], 1);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+        )
+        .unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe(&db, "git_ref", "topic/test", "updated");
+        tick_with(&db, 1, |_, _| Ok(value("a"))).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "polling::tests::stale_response_from_another_process_does_not_regress_cursor",
+                "--nocapture",
+            ])
+            .env("WAKE_STALE_POLL_TEST_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        wait_for(&dir.path().join("started"));
+        tick_with(&db, INTERVAL_MS + 1, |_, _| Ok(value("c"))).unwrap();
+        std::fs::write(dir.path().join("release"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        let route = "/repos/owner/repo/git/ref/heads/topic/test";
+        assert_eq!(
+            state(&db, route, 0).unwrap().unwrap().cursor.as_deref(),
+            Some("c".repeat(40).as_str())
+        );
+        assert_eq!(registration_state(&db, &id), "ready");
+    }
 
     fn db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
