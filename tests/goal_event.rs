@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 use std::{
+    os::unix::fs::PermissionsExt,
     os::unix::net::UnixListener,
     path::Path,
     process::Command,
@@ -13,6 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tungstenite::Message;
+
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
 
 fn cli(root: &Path, socket: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_codex-wake"))
@@ -42,7 +49,7 @@ fn exercise(
     pause_after_queue: bool,
     omit_timestamp: bool,
 ) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = private_tempdir();
     let socket = temp.path().join("app.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -266,7 +273,7 @@ fn event_queues_before_activating_goal_and_never_replays_uncertain_input() {
 
 #[test]
 fn unavailable_server_before_queue_keeps_event_ready_for_retry() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = private_tempdir();
     let socket = temp.path().join("missing.sock");
     let registered = cli(
         temp.path(),
@@ -287,7 +294,11 @@ fn unavailable_server_before_queue_keeps_event_ready_for_retry() {
             "true",
         ],
     );
-    assert!(registered.status.success());
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
     let published = cli(
         temp.path(),
         &socket,
@@ -383,7 +394,7 @@ fn unavailable_server_before_queue_keeps_event_ready_for_retry() {
 }
 
 fn exercise_recover_accepted_input(changed: bool) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = private_tempdir();
     let socket = temp.path().join("app.sock");
     let registered = cli(
         temp.path(),
@@ -404,7 +415,11 @@ fn exercise_recover_accepted_input(changed: bool) {
             "true",
         ],
     );
-    assert!(registered.status.success());
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
     let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
     db.execute("UPDATE subscriptions SET state='sending',goal_stage='input_queued',reason='native_queue_accepted',goal_before_status='paused',goal_before_updated=100", []).unwrap();
     drop(db);
