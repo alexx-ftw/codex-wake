@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   test:
-    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate'
+    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate' && inputs.probe != 'wake-goal-race'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -52,7 +52,7 @@ jobs:
           cargo test --locked --test http -- --include-ignored
 
   package:
-    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate'
+    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate' && inputs.probe != 'wake-goal-race'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -101,3 +101,19 @@ jobs:
           WAKE_TEST_CODEX: ${{ runner.temp }}/wake-deps/node_modules/.bin/codex
           WAKE_TEST_BINARY: ${{ github.workspace }}/target/debug/codex-wake
         run: node tests/cloud-native-queue-probe.cjs --duplicate
+
+  goal-race-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.probe == 'wake-goal-race'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned tooling
+        run: npm install --prefix "$RUNNER_TEMP/wake-deps" @openai/codex@0.166.0 ws@8.18.3
+      - name: Verify concurrent goal pause behavior in isolation
+        env:
+          NODE_PATH: ${{ runner.temp }}/wake-deps/node_modules
+          WAKE_TEST_CODEX: ${{ runner.temp }}/wake-deps/node_modules/.bin/codex
+        run: node tests/cloud-goal-race.cjs
