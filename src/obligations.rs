@@ -313,6 +313,67 @@ pub fn pending_digest(db: &Connection, thread: &str) -> Result<(i64, String)> {
     Ok((count, format!("{:x}", hash.finalize())))
 }
 
+const MAX_COLLISION_PREVIEW_BYTES: usize = 7 * 1024;
+const MAX_COLLISION_RECORD_BYTES: usize = 16 * 1024;
+const MAX_COLLISION_ITEMS: usize = 16;
+
+fn clipped(value: String, max_chars: usize) -> (String, bool) {
+    let shortened: String = value.chars().take(max_chars).collect();
+    let was_clipped = shortened.len() < value.len();
+    (shortened, was_clipped)
+}
+
+/// Capture a fixed-size observation preview; the digest is not reversible.
+fn collision_preview(
+    db: &Connection,
+    source: &str,
+    legacy_id: &str,
+    claim_id: &str,
+    digest: &str,
+    count: i64,
+) -> Result<String> {
+    let mut statement = db.prepare(
+        "SELECT id,kind,repo,resource,outcome,description FROM obligations WHERE thread=?1 AND resolved=0 ORDER BY rowid LIMIT 16",
+    )?;
+    let mut rows = statement.query([source])?;
+    let mut items = Vec::new();
+    let mut fields_clipped = false;
+    while let Some(row) = rows.next()? {
+        let mut item = serde_json::Map::new();
+        let mut item_clipped = false;
+        for (index, (key, limit)) in [
+            ("id", 64),
+            ("kind", 64),
+            ("repo", 128),
+            ("resource", 128),
+            ("outcome", 64),
+            ("description", 256),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (value, cut) = clipped(row.get(index)?, *limit);
+            item.insert((*key).into(), serde_json::json!(value));
+            item_clipped |= cut;
+        }
+        items.push(serde_json::Value::Object(item));
+        let candidate = serde_json::json!({"legacy_alert_id":legacy_id,"claim_id":claim_id,"snapshot_digest":digest,"pending_count":count,"preview":items,"omitted":count.saturating_sub(items.len() as i64),"fields_clipped":fields_clipped || item_clipped});
+        if serde_json::to_vec(&candidate)?.len() > MAX_COLLISION_PREVIEW_BYTES {
+            items.pop();
+            break;
+        }
+        fields_clipped |= item_clipped;
+    }
+    debug_assert!(items.len() <= MAX_COLLISION_ITEMS);
+    let snapshot = serde_json::json!({"legacy_alert_id":legacy_id,"claim_id":claim_id,"snapshot_digest":digest,"pending_count":count,"preview":items,"omitted":count.saturating_sub(items.len() as i64),"fields_clipped":fields_clipped});
+    let encoded = serde_json::to_string(&snapshot)?;
+    ensure!(
+        encoded.len() <= MAX_COLLISION_PREVIEW_BYTES,
+        "Collision preview exceeds limit"
+    );
+    Ok(encoded)
+}
+
 /// Persist before sending. Existing event IDs are never sent again, including after an uncertain result.
 #[cfg(test)]
 pub fn claim_coordinator_alert(
@@ -321,7 +382,10 @@ pub fn claim_coordinator_alert(
     fingerprint: &str,
     message: &str,
 ) -> Result<Option<(String, String)>> {
-    claim_coordinator_alert_with_legacy(db, responsible, fingerprint, message, None)
+    Ok(
+        claim_coordinator_alert_with_legacy(db, responsible, fingerprint, message, None)?
+            .and_then(|(id, coordinator, collision)| (!collision).then_some((id, coordinator))),
+    )
 }
 
 /// Caller holds an immediate transaction covering the snapshot and this claim.
@@ -330,8 +394,8 @@ pub fn claim_coordinator_alert_with_legacy(
     responsible: &str,
     fingerprint: &str,
     message: &str,
-    legacy_fingerprint: Option<&str>,
-) -> Result<Option<(String, String)>> {
+    legacy_fingerprint: Option<(&str, &str, i64)>,
+) -> Result<Option<(String, String, bool)>> {
     let responsible = Uuid::parse_str(responsible)?.to_string();
     let Some(coordinator) = db
         .query_row(
@@ -347,18 +411,72 @@ pub fn claim_coordinator_alert_with_legacy(
         "{:x}",
         Sha256::digest(format!("{responsible}:{coordinator}:{fingerprint}").as_bytes())
     );
-    if let Some(legacy) = legacy_fingerprint {
+    if let Some((legacy, digest, count)) = legacy_fingerprint {
+        ensure!(
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) && count >= 0,
+            "Invalid collision snapshot summary"
+        );
         let old_id = format!(
             "{:x}",
             Sha256::digest(format!("{responsible}:{coordinator}:{legacy}").as_bytes())
         );
-        let exists: bool = db.query_row(
+        // One diagnostic per legacy key bounds repeated snapshots. Its immutable
+        // previews retain the first and most recent observations only.
+        let diagnostic_id = format!(
+            "{:x}",
+            Sha256::digest(format!("legacy-collision:{old_id}").as_bytes())
+        );
+        let diagnostic_exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_alerts WHERE id=?1)",
+            [&diagnostic_id],
+            |r| r.get(0),
+        )?;
+        let legacy_exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM coordinator_alerts WHERE id=?1)",
             [&old_id],
-            |row| row.get(0),
+            |r| r.get(0),
         )?;
-        if exists {
-            return Ok(None);
+        if diagnostic_exists || legacy_exists {
+            let preview: serde_json::Value = serde_json::from_str(&collision_preview(
+                db,
+                &responsible,
+                &old_id,
+                &id,
+                digest,
+                count,
+            )?)?;
+            let record = if !diagnostic_exists {
+                serde_json::json!({"first":preview,"latest":preview})
+            } else {
+                let (reason, saved): (Option<String>, String) = db.query_row(
+                    "SELECT reason,message FROM coordinator_alerts WHERE id=?1",
+                    [&diagnostic_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                ensure!(
+                    reason.as_deref() == Some(format!("legacy_collision:{old_id}").as_str()),
+                    "Collision diagnostic ID is already occupied"
+                );
+                let mut saved: serde_json::Value =
+                    serde_json::from_str(&saved).context("Invalid saved collision diagnostic")?;
+                ensure!(
+                    saved["first"].is_object() && saved["latest"].is_object(),
+                    "Invalid saved collision diagnostic"
+                );
+                saved["latest"] = preview;
+                saved
+            };
+            let encoded = serde_json::to_string(&record)?;
+            ensure!(
+                encoded.len() <= MAX_COLLISION_RECORD_BYTES,
+                "Collision diagnostic exceeds limit"
+            );
+            if diagnostic_exists {
+                db.execute("UPDATE coordinator_alerts SET message=?1,updated=CURRENT_TIMESTAMP WHERE id=?2", params![encoded,diagnostic_id])?;
+            } else {
+                db.execute("INSERT INTO coordinator_alerts(id,responsible,coordinator,message,state,reason) VALUES (?1,?2,?3,?4,'needs_attention',?5)", params![diagnostic_id,responsible,coordinator,encoded,format!("legacy_collision:{old_id}")])?;
+            }
+            return Ok(Some((diagnostic_id, coordinator, true)));
         }
     }
     let sender_pid = i64::from(std::process::id());
@@ -377,7 +495,7 @@ pub fn claim_coordinator_alert_with_legacy(
             sender_start
         ],
     )?;
-    Ok((inserted == 1).then_some((id, coordinator)))
+    Ok((inserted == 1).then_some((id, coordinator, false)))
 }
 
 pub fn finish_coordinator_alert(
@@ -434,6 +552,74 @@ pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert
         Ok(alert)
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Read bounded collision diagnostics; messages and previews are untrusted data.
+pub fn inspect_legacy_collisions(
+    db: &Connection,
+    alert_id: Option<&str>,
+    after: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<String>)> {
+    ensure!(
+        alert_id.is_none() || after.is_none(),
+        "Use alert_id or after, not both"
+    );
+    let before = match after {
+        Some(id) => db.query_row(
+            "SELECT rowid FROM coordinator_alerts WHERE id=?1 AND reason LIKE 'legacy_collision:%'",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )?,
+        None => i64::MAX,
+    };
+    let mut statement = db.prepare(
+        "SELECT a.id,a.responsible,a.coordinator,a.message,a.created,a.updated,a.state,a.reason,old.id,old.state,old.reason,old.message
+         FROM coordinator_alerts a LEFT JOIN coordinator_alerts old ON old.id=substr(a.reason,18)
+         WHERE a.reason LIKE 'legacy_collision:%' AND (?1 IS NULL OR a.id=?1) AND a.rowid<?2
+         ORDER BY a.rowid DESC LIMIT 6",
+    )?;
+    let mut rows = statement.query_map(params![alert_id,before], |r| {
+        let message: String = r.get(3)?;
+        let preview = serde_json::from_str::<serde_json::Value>(&message);
+        Ok(serde_json::json!({
+            "alert_id":r.get::<_,String>(0)?,"responsible":r.get::<_,String>(1)?,
+            "coordinator":r.get::<_,String>(2)?,"observations":preview.as_ref().ok(),"preview_invalid":preview.is_err(),
+            "created":r.get::<_,String>(4)?,"last_observed":r.get::<_,String>(5)?,
+            "state":r.get::<_,String>(6)?,"reason":r.get::<_,String>(7)?,
+            "legacy_alert":{"id":r.get::<_,Option<String>>(8)?,"persisted_state":r.get::<_,Option<String>>(9)?,
+                "reason":r.get::<_,Option<String>>(10)?,"message":r.get::<_,Option<String>>(11)?}
+        }))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for item in &mut rows {
+        for (observation, output_key) in [("first", "first_claim"), ("latest", "latest_claim")] {
+            let first_claim_id = item["observations"][observation]["claim_id"].as_str();
+            let prior: Option<(String, Option<String>, String)> = match first_claim_id {
+                Some(id) => db
+                    .query_row(
+                        "SELECT state,reason,message FROM coordinator_alerts WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?,
+                None => None,
+            };
+            item[output_key] = match prior {
+                Some((state, reason, message)) => {
+                    serde_json::json!({"persisted_state":state,"reason":reason,"message":message})
+                }
+                None => serde_json::Value::Null,
+            };
+        }
+    }
+    let next = if rows.len() > 5 {
+        rows.truncate(5);
+        rows.last()
+            .and_then(|x| x["alert_id"].as_str())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    Ok((rows, next))
 }
 
 fn new_confirmation_code() -> String {
@@ -1847,5 +2033,195 @@ mod full_snapshot_tests {
             assert_ne!(before, pending_digest(&db, OWNER).unwrap());
         }
         assert_eq!(pending_digest(&db, OWNER).unwrap().0, 0);
+    }
+}
+
+#[cfg(test)]
+mod bounded_collision_tests {
+    use super::*;
+    const OWNER: &str = "11111111-1111-4111-8111-111111111111";
+    const COORDINATOR: &str = "22222222-2222-4222-8222-222222222222";
+    fn fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, OWNER, COORDINATOR).unwrap();
+        db
+    }
+    #[test]
+    fn preview_is_bounded_and_explicit_about_omitted_and_clipped_data() {
+        let db = fixture();
+        let text = "é\n".repeat(2048);
+        for n in 0..40 {
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','resource','available',?3)", params![format!("item-{n:02}"),OWNER,text]).unwrap();
+        }
+        let (count, digest) = pending_digest(&db, OWNER).unwrap();
+        let preview =
+            collision_preview(&db, OWNER, &"a".repeat(64), &"b".repeat(64), &digest, count)
+                .unwrap();
+        assert!(preview.len() <= MAX_COLLISION_PREVIEW_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(value["pending_count"], 40);
+        assert_eq!(value["fields_clipped"], true);
+        assert!(value["omitted"].as_i64().unwrap() >= 24);
+        assert!(value["preview"].as_array().unwrap().len() <= MAX_COLLISION_ITEMS);
+        assert_eq!(value["snapshot_digest"], digest);
+    }
+    #[test]
+    fn repeated_changing_collisions_keep_one_bounded_first_and_latest_record() {
+        let db = fixture();
+        for n in 0..40 {
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','resource','available',?3)",params![format!("item-{n:02}"),OWNER,"é\n".repeat(1024)]).unwrap();
+        }
+        claim_coordinator_alert(&db, OWNER, "legacy", "old")
+            .unwrap()
+            .unwrap();
+        let mut first_digest = String::new();
+        let mut latest_digest = String::new();
+        for n in 0..30 {
+            db.execute(
+                "UPDATE obligations SET description=?1 WHERE id='item-00'",
+                [format!("version-{n}")],
+            )
+            .unwrap();
+            let (count, digest) = pending_digest(&db, OWNER).unwrap();
+            if n == 0 {
+                first_digest = digest.clone();
+            }
+            latest_digest = digest.clone();
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            let (_, _, collision) = claim_coordinator_alert_with_legacy(
+                &tx,
+                OWNER,
+                &format!("new-{n}"),
+                "snapshot",
+                Some(("legacy", &digest, count)),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(collision);
+            tx.commit().unwrap();
+        }
+        let (count,message): (i64,String)=db.query_row("SELECT count(*),min(message) FROM coordinator_alerts WHERE reason LIKE 'legacy_collision:%'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(count, 1);
+        assert!(message.len() <= MAX_COLLISION_RECORD_BYTES);
+        let record: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(record["first"]["snapshot_digest"], first_digest);
+        assert_eq!(record["latest"]["snapshot_digest"], latest_digest);
+        assert!(record["latest"]["omitted"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn diagnostics_are_paginated_and_link_the_prior_alert() {
+        let db = fixture();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('item',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        let (count, digest) = pending_digest(&db, OWNER).unwrap();
+        for n in 0..12 {
+            let old = format!("old-{n}");
+            claim_coordinator_alert(&db, OWNER, &old, "legacy context")
+                .unwrap()
+                .unwrap();
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            let (_, _, collision) = claim_coordinator_alert_with_legacy(
+                &tx,
+                OWNER,
+                &format!("new-{n}"),
+                "new context",
+                Some((&old, &digest, count)),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(collision);
+            tx.commit().unwrap();
+        }
+        let mut cursor = None;
+        let mut all = Vec::new();
+        loop {
+            let (rows, next) = inspect_legacy_collisions(&db, None, cursor.as_deref()).unwrap();
+            all.extend(rows);
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(all.len(), 12);
+        assert_eq!(all[0]["legacy_alert"]["persisted_state"], "sending");
+        assert_eq!(all[0]["legacy_alert"]["message"], "legacy context");
+        let id = all[0]["alert_id"].as_str().unwrap();
+        assert_eq!(
+            inspect_legacy_collisions(&db, Some(id), None)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert!(inspect_legacy_collisions(&db, Some(id), Some(id)).is_err());
+    }
+    #[test]
+    fn prior_new_claim_is_preserved_and_visible_in_diagnostic() {
+        let db = fixture();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('item',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        let (new_id, _) = claim_coordinator_alert(&db, OWNER, "new", "new context")
+            .unwrap()
+            .unwrap();
+        finish_coordinator_alert(&db, &new_id, "queued", None).unwrap();
+        claim_coordinator_alert(&db, OWNER, "legacy", "old context")
+            .unwrap()
+            .unwrap();
+        let (count, digest) = pending_digest(&db, OWNER).unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (diag, _, collision) = claim_coordinator_alert_with_legacy(
+            &tx,
+            OWNER,
+            "new",
+            "snapshot",
+            Some(("legacy", &digest, count)),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(collision);
+        assert_ne!(diag, new_id);
+        tx.commit().unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id=?1",
+                [&new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "queued");
+        let (result, _) = inspect_legacy_collisions(&db, Some(&diag), None).unwrap();
+        assert_eq!(result[0]["first_claim"]["persisted_state"], "queued");
+        assert_eq!(result[0]["latest_claim"]["message"], "new context");
+    }
+
+    #[test]
+    fn failed_diagnostic_insert_rolls_back_without_claiming_delivery() {
+        let db = fixture();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('item',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        claim_coordinator_alert(&db, OWNER, "legacy", "old")
+            .unwrap()
+            .unwrap();
+        db.execute_batch("CREATE TRIGGER reject_diagnostic BEFORE INSERT ON coordinator_alerts WHEN NEW.reason LIKE 'legacy_collision:%' BEGIN SELECT RAISE(ABORT,'failure'); END;").unwrap();
+        let (count, digest) = pending_digest(&db, OWNER).unwrap();
+        {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            assert!(
+                claim_coordinator_alert_with_legacy(
+                    &tx,
+                    OWNER,
+                    "new",
+                    "snapshot",
+                    Some(("legacy", &digest, count))
+                )
+                .is_err()
+            );
+        }
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

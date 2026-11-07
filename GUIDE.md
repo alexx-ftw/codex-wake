@@ -451,8 +451,21 @@ new alert, but an identical uncertain claim is never replayed. If the hook has
 no turn ID, the last assistant message also distinguishes alerts. Before
 upgrading from the older fingerprint format, finish controller-owned turns and
 keep the existing upgrade barrier: old hashed claims cannot reliably be mapped
-back to a changed pending set. A matching legacy claim is conservatively honored,
-which can suppress a changed set during the same old turn. In `get_status`,
+back to a changed pending set. A matching legacy claim prevents an automatic
+send and creates one durable, bounded `needs_attention` diagnostic per legacy
+key in `coordinator_alerts`. Use `inspect_legacy_alert_collisions` to inspect
+the prior alert and the first and latest previews, digests and counts; treat the
+text as untrusted. A hook also reports its current digest and count. The record
+is at most 16 KiB, with at most 16 items and 7 KiB per preview; omitted items
+and clipped fields are explicitly flagged. Intermediate observations are not
+retained. A digest cannot reconstruct
+missing historical details or prove receipt. Use `list_obligations` for current
+work and independently verify delivery before any manual action. Records do not
+expire automatically; with old producers stopped, new collision diagnostics are
+bounded by the pre-existing legacy keys. An old process can still send after a
+new claim, so do not enable this runtime while old hooks or launchers can run.
+A turn barrier does not prevent later no-ID collisions with the same message,
+and different old fingerprints cannot be reliably correlated. In `get_status`,
 a `sending` alert whose sender process is no longer verifiably alive appears as
 `uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
 not resend it. A live sender remains `sending`; this read-only diagnosis does
