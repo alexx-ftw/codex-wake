@@ -2028,59 +2028,61 @@ mod tests {
                 0
             );
         }
-        let db = db();
-        crate::obligations::initialize(&db).unwrap();
-        crate::result_conflicts::record(&db, "ci", "seed", "seed", 1, "success", &json!({}))
-            .unwrap();
-        let obligation = crate::obligations::register(
-            &db,
-            THREAD,
-            "job",
-            "ci",
-            "rollback",
-            "completed",
-            "any completion",
-        )
-        .unwrap();
-        let generic = subscribe(&db, "job", "ci", "rollback", "completed", THREAD).unwrap();
-        let exact = subscribe(&db, "job", "ci", "rollback", "success", CHAT).unwrap();
-        db.execute_batch("CREATE TRIGGER fail_completed_obligation BEFORE UPDATE ON obligations WHEN OLD.outcome='completed' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
-        assert!(
-            publish_report(
+        for outcome in ["success", "failure", "cancelled"] {
+            let db = db();
+            crate::obligations::initialize(&db).unwrap();
+            crate::result_conflicts::record(&db, "ci", "seed", "seed", 1, "success", &json!({}))
+                .unwrap();
+            let obligation = crate::obligations::register(
                 &db,
+                THREAD,
                 "job",
                 "ci",
                 "rollback",
-                "success",
-                &json!({}),
-                Some(("run", 1))
+                "completed",
+                "any completion",
             )
-            .is_err()
-        );
-        for id in [generic, exact] {
-            let state: String = db
-                .query_row("SELECT state FROM subscriptions WHERE id=?1", [id], |r| {
-                    r.get(0)
-                })
+            .unwrap();
+            let generic = subscribe(&db, "job", "ci", "rollback", "completed", THREAD).unwrap();
+            let exact = subscribe(&db, "job", "ci", "rollback", outcome, CHAT).unwrap();
+            db.execute_batch("CREATE TRIGGER fail_completed_obligation BEFORE UPDATE ON obligations WHEN OLD.outcome='completed' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+            assert!(
+                publish_report(
+                    &db,
+                    "job",
+                    "ci",
+                    "rollback",
+                    outcome,
+                    &json!({}),
+                    Some(("run", 1))
+                )
+                .is_err()
+            );
+            for id in [generic, exact] {
+                let state: String = db
+                    .query_row("SELECT state FROM subscriptions WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(state, "waiting");
+            }
+            let resolved: i64 = db
+                .query_row(
+                    "SELECT resolved FROM obligations WHERE id=?1",
+                    [obligation],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(state, "waiting");
+            assert_eq!(resolved, 0);
+            let reports: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM result_reports WHERE resource='rollback'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(reports, 0);
         }
-        let resolved: i64 = db
-            .query_row(
-                "SELECT resolved FROM obligations WHERE id=?1",
-                [obligation],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(resolved, 0);
-        let reports: i64 = db
-            .query_row(
-                "SELECT count(*) FROM result_reports WHERE resource='rollback'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(reports, 0);
     }
 
     #[test]
