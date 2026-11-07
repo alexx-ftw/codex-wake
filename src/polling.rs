@@ -1705,6 +1705,8 @@ mod tests {
     #[test]
     fn outage_catchup_finds_retained_exact_workflow_run_once() {
         let dir = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let db = crate::bridge::connect(&dir.path().join("state.sqlite3")).unwrap();
         crate::subscriptions::initialize(&db).unwrap();
         crate::rules::initialize(&db).unwrap();
