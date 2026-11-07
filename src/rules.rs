@@ -431,10 +431,12 @@ fn dispatch_with_identity(
                     cwd
                 };
                 stage = "thread_creation_outcome_unknown";
+                may_retry = true;
                 let response = rpc(
                     "thread/start",
                     json!({"model":input.model,"config":{"model_reasoning_effort":input.reasoning_effort},"allowProviderModelFallback":false,"projectId":input.project_id,"cwd":cwd}),
                 )?;
+                may_retry = false;
                 Uuid::parse_str(
                     response
                         .pointer("/thread/id")
@@ -496,11 +498,20 @@ fn dispatch_with_identity(
                 reason.or(Some("delivery_not_queued".into())),
             ),
             Err(error)
-                if may_retry && crate::execution::before_send_retry_reason(&error).is_some() =>
+                if may_retry
+                    && (crate::execution::before_send_retry_reason(&error).is_some()
+                        || (stage == "thread_creation_outcome_unknown"
+                            && error
+                                .downcast_ref::<crate::goals::BeforeConnect>()
+                                .is_some())) =>
             {
                 (
                     "ready".into(),
-                    crate::execution::before_send_retry_reason(&error).map(str::to_owned),
+                    Some(
+                        crate::execution::before_send_retry_reason(&error)
+                            .unwrap_or("target_unavailable_before_send")
+                            .to_owned(),
+                    ),
                 )
             }
             Err(error) => (
@@ -708,6 +719,55 @@ mod tests {
         assert_eq!(starts, 1);
         assert_eq!(attempts, 2);
         assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
+    }
+
+    #[test]
+    fn retry_creation_only_when_failure_precedes_thread_start() {
+        let mut db = Connection::open_in_memory().unwrap();
+        configure(&db, input()).unwrap();
+        accept(&db, "issue_comment", &payload()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut starts = 0;
+        let mut rpc = |_: &str, _: Value| {
+            starts += 1;
+            if starts == 1 {
+                Err(crate::goals::BeforeConnect("initialize failed".into()).into())
+            } else {
+                Ok(json!({"thread":{"id":THREAD}}))
+            }
+        };
+        let mut sends = 0;
+        let mut send = |_: &str, _: &RuleInput, _: &str, _: Option<&str>, _: Option<&str>| {
+            sends += 1;
+            Ok(("queued".into(), None))
+        };
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "ready");
+        db.execute(
+            "UPDATE rule_deliveries SET updated=datetime('now','-16 seconds')",
+            [],
+        )
+        .unwrap();
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(starts, 2);
+        assert_eq!(sends, 1);
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
+
+        let mut uncertain = Connection::open_in_memory().unwrap();
+        configure(&uncertain, input()).unwrap();
+        accept(&uncertain, "issue_comment", &payload()).unwrap();
+        dispatch_with_identity(
+            &mut uncertain,
+            dir.path(),
+            &mut |_, _| anyhow::bail!("response lost"),
+            &mut |_, _, _, _, _| unreachable!(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            status(&uncertain).unwrap()["deliveries"][0]["state"],
+            "needs_attention"
+        );
     }
     #[test]
     fn legacy_ready_deliveries_remain_without_verified_event_identity() {
