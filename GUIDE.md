@@ -451,8 +451,15 @@ new alert, but an identical uncertain claim is never replayed. If the hook has
 no turn ID, the last assistant message also distinguishes alerts. Before
 upgrading from the older fingerprint format, finish controller-owned turns and
 keep the existing upgrade barrier: old hashed claims cannot reliably be mapped
-back to a changed pending set. A matching legacy claim is conservatively honored,
-which can suppress a changed set during the same old turn. In `get_status`,
+back to a changed pending set. A matching legacy claim prevents automatic send
+and produces a durable `needs_attention` collision, without asserting delivery.
+Use `list_coordinator_alert_collisions` and `list_coordinator_alert_collision_items`
+to inspect the original alert reference, its persisted state and message, and the
+captured pending snapshot; `sending` and `queued` do not establish receipt. Verify
+what was delivered before taking any manual action. A turn barrier does not
+prevent future collisions when Stop has no turn ID and reuses the same last
+message. Such collisions remain visible and are never automatically resent. Observation
+counts include repeated hooks and do not establish distinct turns. In `get_status`,
 a `sending` alert whose sender process is no longer verifiably alive appears as
 `uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
 not resend it. A live sender remains `sending`; this read-only diagnosis does

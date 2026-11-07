@@ -85,6 +85,16 @@ pub fn initialize(db: &Connection) -> Result<()> {
             sender_pid INTEGER,
             sender_start INTEGER
         );
+        CREATE TABLE IF NOT EXISTS coordinator_alert_legacy_collisions (
+            alert_id TEXT PRIMARY KEY, legacy_alert_id TEXT NOT NULL,
+            observations INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS coordinator_alert_collision_items (
+            alert_id TEXT NOT NULL, id TEXT NOT NULL, thread TEXT NOT NULL,
+            kind TEXT NOT NULL, repo TEXT NOT NULL, resource TEXT NOT NULL,
+            outcome TEXT NOT NULL, description TEXT NOT NULL,
+            PRIMARY KEY(alert_id, id)
+        );
         CREATE TABLE IF NOT EXISTS obligation_transfers (
             id TEXT PRIMARY KEY,
             obligation_id TEXT NOT NULL,
@@ -321,7 +331,10 @@ pub fn claim_coordinator_alert(
     fingerprint: &str,
     message: &str,
 ) -> Result<Option<(String, String)>> {
-    claim_coordinator_alert_with_legacy(db, responsible, fingerprint, message, None)
+    Ok(
+        claim_coordinator_alert_with_legacy(db, responsible, fingerprint, message, None)?
+            .and_then(|(id, coordinator, collision)| (!collision).then_some((id, coordinator))),
+    )
 }
 
 /// Caller holds an immediate transaction covering the snapshot and this claim.
@@ -331,7 +344,7 @@ pub fn claim_coordinator_alert_with_legacy(
     fingerprint: &str,
     message: &str,
     legacy_fingerprint: Option<&str>,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(String, String, bool)>> {
     let responsible = Uuid::parse_str(responsible)?.to_string();
     let Some(coordinator) = db
         .query_row(
@@ -358,7 +371,32 @@ pub fn claim_coordinator_alert_with_legacy(
             |row| row.get(0),
         )?;
         if exists {
-            return Ok(None);
+            let inserted = db.execute(
+                "INSERT OR IGNORE INTO coordinator_alerts(id,responsible,coordinator,message,state,reason)
+                 VALUES (?1,?2,?3,?4,'needs_attention','legacy_collision_delivery_unknown')",
+                params![id, responsible, coordinator, message],
+            )?;
+            if inserted == 1 {
+                db.execute(
+                    "INSERT INTO coordinator_alert_legacy_collisions(alert_id,legacy_alert_id) VALUES (?1,?2)",
+                    params![id, old_id],
+                )?;
+                db.execute(
+                    "INSERT INTO coordinator_alert_collision_items(alert_id,id,thread,kind,repo,resource,outcome,description)
+                     SELECT ?1,id,thread,kind,repo,resource,outcome,description FROM obligations
+                     WHERE thread=?2 AND resolved=0",
+                    params![id, responsible],
+                )?;
+            }
+            if inserted == 0 {
+                db.execute("UPDATE coordinator_alert_legacy_collisions SET observations=observations+1 WHERE alert_id=?1", [&id])?;
+                db.execute("UPDATE coordinator_alerts SET updated=CURRENT_TIMESTAMP WHERE id=?1 AND EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE alert_id=?1)", [&id])?;
+            }
+            let is_collision: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE alert_id=?1)",
+                [&id], |row| row.get(0),
+            )?;
+            return Ok(is_collision.then_some((id, coordinator, true)));
         }
     }
     let sender_pid = i64::from(std::process::id());
@@ -377,7 +415,7 @@ pub fn claim_coordinator_alert_with_legacy(
             sender_start
         ],
     )?;
-    Ok((inserted == 1).then_some((id, coordinator)))
+    Ok((inserted == 1).then_some((id, coordinator, false)))
 }
 
 pub fn finish_coordinator_alert(
@@ -434,6 +472,84 @@ pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert
         Ok(alert)
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Page through durable legacy-collision diagnostics, newest first.
+pub fn coordinator_collisions(
+    db: &Connection,
+    after: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, Option<String>)> {
+    let before = match after {
+        Some(id) => db.query_row(
+            "SELECT a.rowid FROM coordinator_alerts a JOIN coordinator_alert_legacy_collisions c ON c.alert_id=a.id WHERE a.id=?1",
+            [id], |row| row.get::<_, i64>(0),
+        )?,
+        None => i64::MAX,
+    };
+    let mut stmt = db.prepare(
+        "SELECT a.id,a.responsible,a.coordinator,a.message,a.state,a.reason,a.created,c.legacy_alert_id,c.observations,a.updated,old.state,old.reason,old.message
+         FROM coordinator_alerts a JOIN coordinator_alert_legacy_collisions c ON c.alert_id=a.id
+         LEFT JOIN coordinator_alerts old ON old.id=c.legacy_alert_id
+         WHERE a.rowid<?1 ORDER BY a.rowid DESC LIMIT 11",
+    )?;
+    let mut rows = stmt
+        .query_map([before], |r| {
+            Ok(serde_json::json!({
+                "alert_id":r.get::<_,String>(0)?,"responsible":r.get::<_,String>(1)?,
+                "coordinator":r.get::<_,String>(2)?,"message":r.get::<_,String>(3)?,
+                "state":r.get::<_,String>(4)?,"reason":r.get::<_,String>(5)?,
+                "created":r.get::<_,String>(6)?,"legacy_alert_id":r.get::<_,String>(7)?,
+                "observations":r.get::<_,i64>(8)?,"last_observed":r.get::<_,String>(9)?,
+                "legacy_persisted_state":r.get::<_,Option<String>>(10)?,
+                "legacy_reason":r.get::<_,Option<String>>(11)?,
+                "legacy_message":r.get::<_,Option<String>>(12)?
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let next = if rows.len() > 10 {
+        rows.truncate(10);
+        rows.last()
+            .and_then(|x| x["alert_id"].as_str())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    Ok((rows, next))
+}
+
+/// Page the exact pending snapshot captured when the collision was diagnosed.
+pub fn coordinator_collision_items(
+    db: &Connection,
+    alert_id: &str,
+    after: Option<&str>,
+) -> Result<(Vec<Obligation>, Option<String>)> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM coordinator_alert_legacy_collisions WHERE alert_id=?1)",
+        [alert_id],
+        |r| r.get(0),
+    )?;
+    ensure!(exists, "Unknown collision alert");
+    let mut stmt = db.prepare("SELECT id,thread,kind,repo,resource,outcome,description FROM coordinator_alert_collision_items WHERE alert_id=?1 AND id COLLATE BINARY>?2 ORDER BY id COLLATE BINARY LIMIT 21")?;
+    let mut rows = stmt
+        .query_map(params![alert_id, after.unwrap_or("")], |r| {
+            Ok(Obligation {
+                id: r.get(0)?,
+                thread: r.get(1)?,
+                kind: r.get(2)?,
+                repo: r.get(3)?,
+                resource: r.get(4)?,
+                outcome: r.get(5)?,
+                description: r.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let next = if rows.len() > 20 {
+        rows.truncate(20);
+        rows.last().map(|x| x.id.clone())
+    } else {
+        None
+    };
+    Ok((rows, next))
 }
 
 fn new_confirmation_code() -> String {
@@ -1847,5 +1963,88 @@ mod full_snapshot_tests {
             assert_ne!(before, pending_digest(&db, OWNER).unwrap());
         }
         assert_eq!(pending_digest(&db, OWNER).unwrap().0, 0);
+    }
+}
+
+#[cfg(test)]
+mod legacy_collision_tests {
+    use super::*;
+    const OWNER: &str = "11111111-1111-4111-8111-111111111111";
+    const COORDINATOR: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, OWNER, COORDINATOR).unwrap();
+        claim_coordinator_alert(&db, OWNER, "legacy", "old")
+            .unwrap()
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn collisions_and_snapshots_are_discoverable_beyond_status_limit() {
+        let db = fixture();
+        for n in 0..25 {
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','resource','available','pending')", params![format!("item-{n:02}"), OWNER]).unwrap();
+        }
+        for n in 0..26 {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            let result = claim_coordinator_alert_with_legacy(
+                &tx,
+                OWNER,
+                &format!("new-{n}"),
+                "snapshot",
+                Some("legacy"),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(result.2);
+            tx.commit().unwrap();
+        }
+        let mut cursor = None;
+        let mut found = Vec::new();
+        loop {
+            let (rows, next) = coordinator_collisions(&db, cursor.as_deref()).unwrap();
+            found.extend(rows);
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(found.len(), 26);
+        let id = found[0]["alert_id"].as_str().unwrap();
+        let (first, next) = coordinator_collision_items(&db, id, None).unwrap();
+        let (second, end) = coordinator_collision_items(&db, id, next.as_deref()).unwrap();
+        assert_eq!((first.len(), second.len()), (20, 5));
+        assert!(end.is_none());
+        assert!(coordinator_collision_items(&db, "unknown", None).is_err());
+    }
+
+    #[test]
+    fn failed_snapshot_insert_rolls_back_collision_record() {
+        let db = fixture();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('item',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_collision BEFORE INSERT ON coordinator_alert_collision_items BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+        {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            assert!(
+                claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                    .is_err()
+            );
+        }
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
+            .unwrap();
+        let collisions: i64 = db
+            .query_row(
+                "SELECT count(*) FROM coordinator_alert_legacy_collisions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((count, collisions), (1, 0));
     }
 }

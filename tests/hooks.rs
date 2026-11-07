@@ -757,7 +757,7 @@ fn existing_legacy_uncertain_alert_is_not_replayed() {
     let count: i64 = db
         .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
 }
 
 #[test]
@@ -812,4 +812,94 @@ fn concurrent_identical_stops_claim_one_uncertain_alert() {
         )
         .unwrap();
     assert_eq!((count, state.as_str()), (1, "needs_attention"));
+}
+
+#[test]
+fn legacy_collision_with_ninth_is_durable_visible_and_never_sent() {
+    use sha2::{Digest, Sha256};
+    for has_turn in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        let codex = temp.path().join("codex");
+        executable(
+            &codex,
+            "#!/bin/sh\nprintf 'attempt\\n' >> \"$WAKE_TEST_CALLS\"\n",
+        );
+        let init = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"init"});
+        assert!(
+            invoke_with_codex(init, temp.path(), codex.to_str().unwrap())
+                .status
+                .success()
+        );
+        let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+        db.execute(
+            "INSERT INTO coordinators(responsible,coordinator) VALUES(?1,?2)",
+            [owner, coordinator],
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            let id = format!("fixture-{n}");
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','release','available','Pending')", rusqlite::params![id, owner]).unwrap();
+            ids.push(id);
+        }
+        let legacy = if has_turn {
+            json!({"source":owner,"turn":"turn-1","pending_ids":ids})
+        } else {
+            json!({"source":owner,"turn":"no_turn_id","pending_ids":ids,"last_assistant_message":"same message"})
+        };
+        let legacy_id = format!(
+            "{:x}",
+            Sha256::digest(format!("{owner}:{coordinator}:{legacy}").as_bytes())
+        );
+        db.execute("INSERT INTO coordinator_alerts(id,responsible,coordinator,message,state,reason) VALUES(?1,?2,?3,'old','needs_attention','delivery_unknown')", rusqlite::params![legacy_id,owner,coordinator]).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture-8',?1,'artifact','repo','release','available','Ninth')", [owner]).unwrap();
+        let payload = if has_turn {
+            json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"turn-1","last_assistant_message":"same message"})
+        } else {
+            json!({"hook_event_name":"Stop","session_id":owner,"last_assistant_message":"same message"})
+        };
+        for _ in 0..2 {
+            let output = invoke_with_codex(payload.clone(), temp.path(), codex.to_str().unwrap());
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let text = value["systemMessage"].as_str().unwrap();
+            assert!(text.contains("Delivery of this snapshot is not confirmed"));
+            assert!(text.contains("no automatic send was attempted"));
+        }
+        assert!(!temp.path().join("codex-calls").exists());
+        let (alert_id, reason, state, old_id): (String,String,String,String) = db.query_row("SELECT a.id,a.reason,a.state,c.legacy_alert_id FROM coordinator_alerts a JOIN coordinator_alert_legacy_collisions c ON c.alert_id=a.id", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            (reason.as_str(), state.as_str(), old_id.as_str()),
+            (
+                "legacy_collision_delivery_unknown",
+                "needs_attention",
+                legacy_id.as_str()
+            )
+        );
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let observations: i64 = db
+            .query_row(
+                "SELECT observations FROM coordinator_alert_legacy_collisions WHERE alert_id=?1",
+                [&alert_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 2);
+        db.execute(
+            "UPDATE obligations SET resolved=1,description='Changed later' WHERE id='fixture-8'",
+            [],
+        )
+        .unwrap();
+        let description: String = db.query_row("SELECT description FROM coordinator_alert_collision_items WHERE alert_id=?1 AND id='fixture-8'", [&alert_id], |r| r.get(0)).unwrap();
+        assert_eq!(description, "Ninth");
+    }
 }
