@@ -1072,4 +1072,25 @@ mod tests {
         assert_eq!(observer[0]["last_error"], "published");
         assert_eq!(observer[0]["last_outcome"], "recovered");
     }
+    #[test]
+    fn transient_file_during_outage_is_not_reconstructed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        let obs = Observation::File {
+            path: path.to_string_lossy().into_owned(),
+        };
+        let probe = |obs: &Observation| {
+            probe_observation(
+                obs,
+                "available",
+                Path::new("/codex"),
+                &mut |_, _| unreachable!(),
+            )
+        };
+        assert!(matches!(probe(&obs), Probe::Pending("not_found")));
+        fs::write(&path, b"fixture").unwrap();
+        fs::remove_file(&path).unwrap();
+        // No observer ran while the file existed.
+        assert!(matches!(probe(&obs), Probe::Pending("not_found")));
+    }
 }

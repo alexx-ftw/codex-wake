@@ -1,0 +1,11 @@
+{
+  "systemd": false,
+  "webhook_binary": "verified-2.8.3",
+  "gap_error": "ECONNREFUSED",
+  "state_after_restart_without_retry": "waiting",
+  "attempts_without_retry": 0,
+  "synthetic_manual_retry_status": 200,
+  "state_after_manual_retry": "queued",
+  "attempts_after_manual_retry": 1,
+  "queue_simulated": true
+}

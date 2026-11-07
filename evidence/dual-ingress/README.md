@@ -1,0 +1,30 @@
+# Isolated ingress, claim and outage evidence
+
+These probes use temporary Cloud databases, synthetic subscriptions, synthetic HMAC secrets and a fake Codex queue. They never touch the deployed service, subscriptions or recipients. They use the verified `adnanh/webhook` 2.8.3 executable (SHA-256 `12c895f29250cbc4289ca45838235d334b39af6cf49d8e17fb43d8efed10372d`) and Wake executables rebuilt from `0a1ba30162265efda9ffacf4f304602409873d11` and `520109dbbf69332fafaa6cdccdee9e85b26c30d1`. The rebuilt old binary is not byte-identical to the reported active binary; see [alpha receiver compatibility](../alpha-receiver-compatibility/README.md). The harness snapshots depend on local paths and separately prepared executables, and are not standalone reproductions.
+
+## Two isolated ingress processes and competing dispatchers
+
+[race-receipt.json](race-receipt.json) and [race-harness.cjs](race-harness.cjs) record two standalone webhook processes on different temporary localhost ports, configured to run the old and new Wake `handle` commands against the same SQLite database. The harness sent the same signed synthetic `codex_wake` artifact event concurrently to both ports, then ran old and new `recover` commands concurrently and explicitly repeated the event. Both HTTP requests returned 200; one subscription was claimed and the fake queue was called once. An unrelated subscription stayed waiting. With fake acceptance the triggered row ended `queued`; with fake nonzero exit it ended `needs_attention`, with no second attempt.
+
+This is one specific artifact event and one run of each queue outcome. It demonstrates the tested SQLite claim/one-shot behavior, not full semantic compatibility: the old receiver ignores newer required-source warnings, as the separate alpha counterexample shows. These were standalone ingress processes and manually invoked dispatchers, not two systemd-managed receiver instances. No stable proxy or actual traffic handoff was tested. The shipped receiver hard-codes port 9000 and also manages/connects the controller; starting a normal second instance on a distinct port is not a supported configuration in this revision.
+
+## Unbuffered ingress gap
+
+[gap-receipt.json](gap-receipt.json) and [gap-harness.cjs](gap-harness.cjs) record an old standalone ingress stopping before a new one started on the same temporary port. A signed synthetic event sent in the gap received `ECONNREFUSED`. After the new ingress started, with no sender retry, the subscription remained waiting and there were zero fake queue attempts. An explicitly simulated manual retry after the definite connection refusal returned 200 and produced one fake queue attempt. No real webhook was retried. This shows that the shipped components alone did not recover this missing custom event; no assumption is made about a real sender's retry policy or about an ambiguous acknowledgement.
+
+## Source-specific recovery limits
+
+The added unit tests run against synthetic responses and local temporary files; they are not tests of live GitHub or systemd:
+
+- `outage_catchup_finds_retained_exact_workflow_run_once`: when a registered run, attempt and SHA remain retrievable from the API, polling after a simulated outage observes the terminal result and a duplicate acceptance does not create a second wait row. This depends on API availability, identity and retention.
+- `ref_that_changes_and_returns_during_outage_is_not_reconstructed`: polling A before and A after cannot observe a transient B in between. Current PR head/base and latest deployment status similarly do not constitute a complete event history.
+- Reviews and comments use API pages, cursors and timestamps; catch-up depends on retained history, permissions, pagination and rate limits. The existing tests cover selected cursor and retry behavior, not an unlimited outage or every event.
+- `transient_file_during_outage_is_not_reconstructed`: a file appearing and disappearing between observations is missed. HTTP health and file-lock checks likewise observe current state; systemd observations require the configured invocation identity. No general historical replay is implied.
+- `interruption_after_outage_does_not_prove_completion`: a native turn observed as interrupted remains waiting and is not published as completed. Existing native tests cover selected observed completions and Stop/poll races, not reliable coordinator notification on interruption.
+- Custom `codex_wake` events and explicit publications have no general GitHub history that the receiver can reconstruct. Webhook retry depends on the actual sender; the gap probe demonstrates no autonomous retry.
+
+## Remaining cutover requirements
+
+Two webhook ports and transactional delivery claims do not provide a stable ingress switch, a durable in-flight buffer, source coverage or safe mixed-version semantics. Moreover, `overlapping_pollers_can_overwrite_a_newer_cursor_with_an_older_response` deterministically holds one mocked API response, lets another poller save cursor C, then lets the first save older cursor B. Both pollers use 520 code and a shared SQLite database. This establishes cursor regression in that scenario, not an observed duplicate delivery. `save_success` serializes its own write, but that does not fence the earlier fetch or processing. Do not run two polling/dispatch loops as a general cutover mechanism on the basis of the artifact test.
+
+A real lossless transition remains unproven. It would need an externally verifiable gate for old hooks and pollers, a stable ingress mechanism with durable acceptance or source-specific proven replay, a single appropriately versioned dispatcher, and explicit handling of in-flight/uncertain claims without blind retries. Such a mechanism must be tested for every configured source and failure boundary. The previously reported absence of a conditional goal-set operation and the uncertainty of an interrupted native turn remain; these probes do not implement automatic goal reactivation or a coordinator Interrupt notice. No live runtime or subscriptions were modified.

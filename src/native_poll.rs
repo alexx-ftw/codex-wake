@@ -868,4 +868,24 @@ mod tests {
             "waiting"
         );
     }
+    #[test]
+    fn interruption_after_outage_does_not_prove_completion() {
+        let db = db();
+        let id = sub(&db);
+        arm_with(
+            &db,
+            &id,
+            &mut page(SOURCE, vec![turn("fixture", "inProgress")]),
+        )
+        .unwrap();
+        db.execute("UPDATE native_observers SET next_poll_ms=0", [])
+            .unwrap();
+        let report =
+            tick_with(&db, &mut page(SOURCE, vec![turn("fixture", "interrupted")])).unwrap();
+        assert_eq!(report["published"], 0);
+        assert_eq!(
+            crate::subscriptions::status(&db).unwrap()[0]["state"],
+            "waiting"
+        );
+    }
 }

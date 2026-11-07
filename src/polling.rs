@@ -1702,4 +1702,116 @@ mod tests {
             "output_limit"
         );
     }
+    #[test]
+    fn outage_catchup_finds_retained_exact_workflow_run_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::bridge::connect(&dir.path().join("state.sqlite3")).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let sha = "a".repeat(40);
+        crate::bridge::register(
+            &db,
+            "owner/repo",
+            123,
+            1,
+            "11111111-1111-4111-8111-111111111111",
+            &sha,
+        )
+        .unwrap();
+        let first = tick_with(&db, 1, |route, _| {
+            assert_eq!(route, "/repos/owner/repo/actions/runs/123/attempts/1");
+            Ok(response(
+                json!({"id":123,"run_attempt":1,"head_sha":sha,"status":"in_progress"}),
+                false,
+            ))
+        })
+        .unwrap();
+        assert_eq!(first["accepted"], 0);
+        // No polling takes place during the simulated outage. The API retains the terminal result.
+        let later = tick_with(&db,INTERVAL_MS*10+1,|_,_| Ok(response(json!({"id":123,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success"}),false))).unwrap();
+        assert_eq!(later["accepted"], 1);
+        let payload = json!({"action":"completed","workflow_run":{"id":123,"run_attempt":1,"head_sha":sha,"status":"completed","conclusion":"success"},"repository":{"full_name":"owner/repo"}});
+        crate::bridge::accept(&db, &payload).unwrap();
+        let (count, state): (i64, String) = db
+            .query_row("SELECT count(*),min(state) FROM waits", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((count, state.as_str()), (1, "ready"));
+    }
+
+    #[test]
+    fn ref_that_changes_and_returns_during_outage_is_not_reconstructed() {
+        let db = db();
+        let id = subscribe(&db, "git_ref", "topic/test", "updated");
+        let observed = |db: &Connection, now| {
+            tick_with(db, now, |_, _| {
+                Ok(response(
+                    json!({"ref":"refs/heads/topic/test","object":{"sha":"a".repeat(40)}}),
+                    false,
+                ))
+            })
+            .unwrap()
+        };
+        assert_eq!(observed(&db, 1)["accepted"], 0);
+        // A transient B followed by A happens entirely between the two API observations.
+        let transient = "b".repeat(40);
+        assert_ne!(transient, "a".repeat(40));
+        assert_eq!(observed(&db, INTERVAL_MS * 10 + 1)["accepted"], 0);
+        assert_eq!(registration_state(&db, &id), "waiting");
+    }
+    #[test]
+    fn overlapping_pollers_can_overwrite_a_newer_cursor_with_an_older_response() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poll.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+        )
+        .unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe(&db, "git_ref", "topic/test", "updated");
+        let value = |sha: &str| {
+            response(
+                json!({"ref":"refs/heads/topic/test","object":{"sha":sha.repeat(40)}}),
+                false,
+            )
+        };
+        tick_with(&db, 1, |_, _| Ok(value("a"))).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let slow_path = path.clone();
+        let slow = std::thread::spawn(move || {
+            let db = Connection::open(slow_path).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            tick_with(&db, INTERVAL_MS + 1, |_, _| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(response(
+                    json!({"ref":"refs/heads/topic/test","object":{"sha":"b".repeat(40)}}),
+                    false,
+                ))
+            })
+            .unwrap();
+        });
+        started_rx.recv().unwrap();
+        tick_with(&db, INTERVAL_MS + 1, |_, _| Ok(value("c"))).unwrap();
+        let route = "/repos/owner/repo/git/ref/heads/topic/test";
+        assert_eq!(
+            state(&db, route, 0).unwrap().unwrap().cursor.as_deref(),
+            Some("c".repeat(40).as_str())
+        );
+        release_tx.send(()).unwrap();
+        slow.join().unwrap();
+        assert_eq!(
+            state(&db, route, 0).unwrap().unwrap().cursor.as_deref(),
+            Some("b".repeat(40).as_str())
+        );
+        assert_eq!(registration_state(&db, &id), "ready");
+    }
 }
