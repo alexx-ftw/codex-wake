@@ -1937,6 +1937,153 @@ mod tests {
     }
 
     #[test]
+    fn terminal_job_publication_resolves_matching_completed_obligations_atomically() {
+        for outcome in ["success", "failure", "cancelled"] {
+            let db = db();
+            crate::obligations::initialize(&db).unwrap();
+            crate::validation_obligations::initialize(&db).unwrap();
+            let completed = crate::obligations::register(
+                &db,
+                THREAD,
+                "job",
+                "ci",
+                "build",
+                "completed",
+                "any completion",
+            )
+            .unwrap();
+            let exact = crate::obligations::register(
+                &db,
+                THREAD,
+                "job",
+                "ci",
+                "build",
+                outcome,
+                "specific result",
+            )
+            .unwrap();
+            let other_outcome = if outcome == "success" {
+                "failure"
+            } else {
+                "success"
+            };
+            let other = crate::obligations::register(
+                &db,
+                THREAD,
+                "job",
+                "ci",
+                "build",
+                other_outcome,
+                "other result",
+            )
+            .unwrap();
+            let other_resource = crate::obligations::register(
+                &db,
+                THREAD,
+                "job",
+                "ci",
+                "other",
+                "completed",
+                "other job",
+            )
+            .unwrap();
+            let validation =
+                crate::validation_obligations::register(&db, THREAD, "check", None, None).unwrap();
+            subscribe(&db, "job", "ci", "build", "completed", THREAD).unwrap();
+            subscribe(&db, "job", "ci", "build", outcome, CHAT).unwrap();
+            let result = publish_report(
+                &db,
+                "job",
+                "ci",
+                "build",
+                outcome,
+                &json!({}),
+                Some(("run-42", 1)),
+            )
+            .unwrap();
+            assert_eq!((result.0, result.1), (2, 2));
+            let resolved = |id: &str| {
+                db.query_row("SELECT resolved FROM obligations WHERE id=?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            };
+            assert_eq!(resolved(&completed), 1);
+            assert_eq!(resolved(&exact), 1);
+            assert_eq!(resolved(&other), 0);
+            assert_eq!(resolved(&other_resource), 0);
+            assert_eq!(resolved(&validation), 0);
+            assert_eq!(
+                publish_report(
+                    &db,
+                    "job",
+                    "ci",
+                    "build",
+                    outcome,
+                    &json!({}),
+                    Some(("run-42", 1))
+                )
+                .unwrap()
+                .0,
+                0
+            );
+        }
+        let db = db();
+        crate::obligations::initialize(&db).unwrap();
+        crate::result_conflicts::record(&db, "ci", "seed", "seed", 1, "success", &json!({}))
+            .unwrap();
+        let obligation = crate::obligations::register(
+            &db,
+            THREAD,
+            "job",
+            "ci",
+            "rollback",
+            "completed",
+            "any completion",
+        )
+        .unwrap();
+        let generic = subscribe(&db, "job", "ci", "rollback", "completed", THREAD).unwrap();
+        let exact = subscribe(&db, "job", "ci", "rollback", "success", CHAT).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_completed_obligation BEFORE UPDATE ON obligations WHEN OLD.outcome='completed' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(
+            publish_report(
+                &db,
+                "job",
+                "ci",
+                "rollback",
+                "success",
+                &json!({}),
+                Some(("run", 1))
+            )
+            .is_err()
+        );
+        for id in [generic, exact] {
+            let state: String = db
+                .query_row("SELECT state FROM subscriptions WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(state, "waiting");
+        }
+        let resolved: i64 = db
+            .query_row(
+                "SELECT resolved FROM obligations WHERE id=?1",
+                [obligation],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 0);
+        let reports: i64 = db
+            .query_row(
+                "SELECT count(*) FROM result_reports WHERE resource='rollback'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reports, 0);
+    }
+
+    #[test]
     fn terminal_job_results_match_completed_and_specific_routes_atomically() {
         for outcome in ["success", "failure", "cancelled"] {
             let db = db();

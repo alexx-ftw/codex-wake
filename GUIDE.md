@@ -174,8 +174,9 @@ cancellation disagree; use `get_result_conflicts` with the same identity and its
 earlier delivery.
 Publications without an execution identity remain supported and are not compared.
 A terminal job outcome (`success`, `failure`, or `cancelled`) matches both its
-exact event and `completed` subscriptions atomically. Each route retains its
-own delivery identity. When no matching subscription is waiting, evidence for
+exact event and `completed` subscriptions and resolves matching publication
+obligations for both outcomes atomically. Each route retains its own delivery
+identity. When no matching subscription is waiting, evidence for
 an earlier `completed` subscription includes the outcome it actually received;
 it does not prove that the new result was delivered.
 If no subscription is waiting but an earlier one matches, the publisher receives

@@ -920,7 +920,8 @@ pub fn resolve_publication(
     let resource = publication_resource(kind, repo, resource, outcome)?;
     Ok(db.execute(
         "UPDATE obligations SET resolved=1
-         WHERE kind=?1 AND repo=?2 AND resource=?3 AND outcome=?4 AND resolved=0",
+         WHERE kind=?1 AND repo=?2 AND resource=?3 AND resolved=0
+           AND (outcome=?4 OR (?1='job' AND ?4 IN ('success','failure','cancelled') AND outcome='completed'))",
         params![kind, repo, resource, outcome],
     )?)
 }
