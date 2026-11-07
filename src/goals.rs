@@ -9,7 +9,7 @@ use uuid::Uuid;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
-pub(crate) struct BeforeConnect(pub(crate) std::io::Error);
+pub(crate) struct BeforeConnect(pub(crate) String);
 impl std::fmt::Display for BeforeConnect {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -19,11 +19,7 @@ impl std::fmt::Display for BeforeConnect {
         )
     }
 }
-impl std::error::Error for BeforeConnect {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
+impl std::error::Error for BeforeConnect {}
 
 fn thread_id(thread: &str) -> Result<String> {
     Ok(Uuid::parse_str(thread)
@@ -114,23 +110,29 @@ pub(crate) fn socket_rpc_with_notifications(
     }
 
     let deadline = Instant::now() + timeout;
-    let stream = UnixStream::connect(socket).map_err(BeforeConnect).context(
+    let stream = UnixStream::connect(socket).map_err(|error| BeforeConnect(error.to_string())).context(
         "Connect to app-server Unix socket: check the receiver service and CODEX_WAKE_RPC_SOCKET",
     )?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| BeforeConnect(error.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| BeforeConnect(error.to_string()))?;
     // --listen unix:// uses HTTP Upgrade followed by WebSocket text frames.
     let (mut ws, _) = tungstenite::client("ws://localhost/", stream).map_err(|error| {
-        match error {
+        let error = match error {
             tungstenite::HandshakeError::Failure(error) => anyhow::Error::new(error),
             tungstenite::HandshakeError::Interrupted(_) => {
                 anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::WouldBlock))
             }
         }
-        .context("App-server Unix WebSocket HTTP Upgrade failed")
+        .context("App-server Unix WebSocket HTTP Upgrade failed");
+        BeforeConnect(error.to_string())
     })?;
     let mut notifications = Vec::new();
     let result = (|| {
+        (|| -> Result<()> {
         send(
             &mut ws,
             deadline,
@@ -149,6 +151,8 @@ pub(crate) fn socket_rpc_with_notifications(
             deadline,
             json!({"method":"initialized","params":{}}),
         )?;
+        Ok(())
+        })().map_err(|error| BeforeConnect(error.to_string()))?;
         send(
             &mut ws,
             deadline,
@@ -217,18 +221,12 @@ fn rpc_inner(method: &str, params: Value, timeout: Duration) -> Result<Value> {
         std::env::var_os("XDG_STATE_HOME"),
         std::env::var_os("HOME"),
     )
-    .ok_or_else(|| {
-        BeforeConnect(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Codex Wake app-server socket missing",
-        ))
-    })?;
-    if !Path::new(&socket).try_exists().map_err(BeforeConnect)? {
-        return Err(BeforeConnect(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Codex Wake app-server socket missing",
-        ))
-        .into());
+    .ok_or_else(|| BeforeConnect("Codex Wake app-server socket missing".into()))?;
+    if !Path::new(&socket)
+        .try_exists()
+        .map_err(|error| BeforeConnect(error.to_string()))?
+    {
+        return Err(BeforeConnect("Codex Wake app-server socket missing".into()).into());
     }
     #[cfg(unix)]
     {
@@ -435,8 +433,8 @@ mod tests {
         if std::env::var_os("WAKE_TEST_MISSING_DEFAULT_SOCKET").is_some() {
             let error = rpc_inner("thread/read", json!({"threadId":THREAD}), TIMEOUT).unwrap_err();
             assert_eq!(
-                error.downcast_ref::<BeforeConnect>().unwrap().0.kind(),
-                std::io::ErrorKind::NotFound
+                error.downcast_ref::<BeforeConnect>().unwrap().0,
+                "Codex Wake app-server socket missing"
             );
             return;
         }
@@ -561,6 +559,7 @@ mod tests {
             error.to_string().contains("server denied request"),
             "{error:#}"
         );
+        assert!(error.downcast_ref::<BeforeConnect>().is_none());
         server.join().unwrap();
     }
 
@@ -581,7 +580,9 @@ mod tests {
             thread::sleep(Duration::from_millis(250));
         });
         let started = Instant::now();
-        assert!(socket_rpc(&path, "project/list", json!({}), Duration::from_millis(100)).is_err());
+        let error =
+            socket_rpc(&path, "project/list", json!({}), Duration::from_millis(100)).unwrap_err();
+        assert!(error.downcast_ref::<BeforeConnect>().is_some());
         assert!(started.elapsed() < Duration::from_secs(1));
         server.join().unwrap();
     }

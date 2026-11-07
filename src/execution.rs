@@ -27,7 +27,7 @@ pub(crate) fn is_target_busy(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug)]
-struct TargetUnavailableBeforeSend;
+pub(crate) struct TargetUnavailableBeforeSend;
 
 impl fmt::Display for TargetUnavailableBeforeSend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,6 +38,12 @@ impl fmt::Display for TargetUnavailableBeforeSend {
 impl Error for TargetUnavailableBeforeSend {}
 
 fn preparation_transport_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<crate::goals::BeforeConnect>()
+        .is_some()
+    {
+        return true;
+    }
     let io = error.downcast_ref::<std::io::Error>().or_else(|| {
         match error.downcast_ref::<tungstenite::Error>() {
             Some(tungstenite::Error::Io(io)) => Some(io),
@@ -297,13 +303,7 @@ pub fn queue_with_identity(
             .downcast_ref::<crate::goals::BeforeConnect>()
             .is_some()
     }) {
-        return crate::bridge::send_mode(
-            codex,
-            timeout.saturating_sub(started.elapsed()),
-            thread,
-            message,
-            resume,
-        );
+        return Err(TargetUnavailableBeforeSend.into());
     }
     result
 }
@@ -522,10 +522,7 @@ mod tests {
         assert_eq!(result.0, "needs_attention");
         let before_send =
             queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
-                Err(crate::goals::BeforeConnect(std::io::Error::from(
-                    std::io::ErrorKind::ConnectionRefused,
-                ))
-                .into())
+                Err(crate::goals::BeforeConnect("connection refused".into()).into())
             })
             .unwrap_err();
         assert!(
@@ -533,6 +530,7 @@ mod tests {
                 .downcast_ref::<crate::goals::BeforeConnect>()
                 .is_some()
         );
+        assert!(preparation_transport_error(&before_send));
         let malformed =
             queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
                 Ok(json!({}))

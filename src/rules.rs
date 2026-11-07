@@ -351,7 +351,7 @@ fn dispatch_with_identity(
     let mut count = 0;
     loop {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source,d.source_event_key,d.event_identity_verified FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 ORDER BY d.updated,d.rule_id LIMIT 1", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?))).optional()?;
+        let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source,d.source_event_key,d.event_identity_verified,d.thread_id FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 AND (d.reason IS NULL OR d.reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR d.updated<=datetime('now','-15 seconds')) ORDER BY d.updated,d.rule_id LIMIT 1", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?))).optional()?;
         let Some((
             rule_id,
             header,
@@ -360,6 +360,7 @@ fn dispatch_with_identity(
             source,
             stored_event_key,
             event_identity_verified,
+            existing_thread,
         )) = row
         else {
             tx.commit()?;
@@ -371,6 +372,7 @@ fn dispatch_with_identity(
         let _trace = crate::observability::TraceGuard::new();
         let span = crate::observability::Span::new("dispatch.rule", Some(&subject));
         let mut stage = "invalid_configuration";
+        let mut may_retry = false;
         let result = (|| -> Result<(String, Option<String>)> {
             let mut input: RuleInput = serde_json::from_str(&raw)?;
             validate(&mut input)?;
@@ -388,7 +390,9 @@ fn dispatch_with_identity(
             crate::templates::render(&input.prompt, &context)?;
             stage = "execution_validation_failed";
             check_execution(&input)?;
-            let thread = if let Some(thread) = &input.target_thread {
+            let thread = if let Some(thread) = &existing_thread {
+                Uuid::parse_str(thread)?.to_string()
+            } else if let Some(thread) = &input.target_thread {
                 thread.clone()
             } else {
                 let cwd = if let Some(project_id) = &input.project_id {
@@ -477,6 +481,7 @@ fn dispatch_with_identity(
                 rendered_prompt, input.repo, input.pr, comment_id, header
             );
             stage = "goal_or_delivery_outcome_unknown";
+            may_retry = input.goal_objective.is_none();
             finish(
                 &thread,
                 &input,
@@ -491,6 +496,14 @@ fn dispatch_with_identity(
                 "needs_attention".into(),
                 reason.or(Some("delivery_not_queued".into())),
             ),
+            Err(error)
+                if may_retry && crate::execution::before_send_retry_reason(&error).is_some() =>
+            {
+                (
+                    "ready".into(),
+                    crate::execution::before_send_retry_reason(&error).map(str::to_owned),
+                )
+            }
             Err(error) => (
                 "needs_attention".into(),
                 Some(format!("{stage}: {error}").chars().take(1024).collect()),
@@ -498,10 +511,10 @@ fn dispatch_with_identity(
         };
         db.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5",params![state,reason,rule_id,header,comment_id])?;
         span.finish(
-            if state == "queued" {
-                "queued"
-            } else {
-                "needs_attention"
+            match state.as_str() {
+                "queued" => "queued",
+                "ready" => "ready",
+                _ => "needs_attention",
             },
             crate::observability::reason(reason.as_deref()),
             1,
@@ -652,6 +665,40 @@ mod tests {
         .unwrap();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn retry_before_send_reuses_new_chat_without_creating_another() {
+        let mut db = Connection::open_in_memory().unwrap();
+        configure(&db, input()).unwrap();
+        accept(&db, "issue_comment", &payload()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut starts = 0;
+        let mut rpc = |method: &str, _: Value| {
+            assert_eq!(method, "thread/start");
+            starts += 1;
+            Ok(json!({"thread":{"id":THREAD}}))
+        };
+        let mut attempts = 0;
+        let mut send = |_: &str, _: &RuleInput, _: &str, _: Option<&str>, _: Option<&str>| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(crate::execution::TargetUnavailableBeforeSend.into())
+            } else {
+                Ok(("queued".into(), None))
+            }
+        };
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "ready");
+        db.execute(
+            "UPDATE rule_deliveries SET updated=datetime('now','-16 seconds')",
+            [],
+        )
+        .unwrap();
+        dispatch_with_identity(&mut db, dir.path(), &mut rpc, &mut send, &mut |_| Ok(())).unwrap();
+        assert_eq!(starts, 1);
+        assert_eq!(attempts, 2);
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
     }
     #[test]
     fn legacy_ready_deliveries_remain_without_verified_event_identity() {
