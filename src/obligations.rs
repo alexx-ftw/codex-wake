@@ -528,9 +528,10 @@ pub fn coordinator_collisions(
         None => i64::MAX,
     };
     let mut stmt = db.prepare(
-        "SELECT a.id,a.responsible,a.coordinator,a.message,a.state,a.reason,a.created,c.legacy_alert_id,c.observations,a.updated,old.state,old.reason,old.message
+        "SELECT a.id,a.responsible,a.coordinator,a.message,a.state,a.reason,a.created,c.legacy_alert_id,c.observations,a.updated,old.state,old.reason,old.message,prior.state,prior.reason,prior.message,c.claim_id
          FROM coordinator_alerts a JOIN coordinator_alert_legacy_collisions c ON c.alert_id=a.id
          LEFT JOIN coordinator_alerts old ON old.id=c.legacy_alert_id
+         LEFT JOIN coordinator_alerts prior ON prior.id=c.claim_id
          WHERE a.rowid<?1 ORDER BY a.rowid DESC LIMIT 11",
     )?;
     let mut rows = stmt
@@ -543,7 +544,11 @@ pub fn coordinator_collisions(
                 "observations":r.get::<_,i64>(8)?,"last_observed":r.get::<_,String>(9)?,
                 "legacy_persisted_state":r.get::<_,Option<String>>(10)?,
                 "legacy_reason":r.get::<_,Option<String>>(11)?,
-                "legacy_message":r.get::<_,Option<String>>(12)?
+                "legacy_message":r.get::<_,Option<String>>(12)?,
+                    "prior_claim_persisted_state":r.get::<_,Option<String>>(13)?,
+                    "prior_claim_reason":r.get::<_,Option<String>>(14)?,
+                    "prior_claim_message":r.get::<_,Option<String>>(15)?,
+                    "prior_claim_id":r.get::<_,String>(16)?
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2125,6 +2130,9 @@ mod mixed_alert_version_tests {
             )
             .unwrap();
         assert_eq!(state, "queued");
+        let (rows, _) = coordinator_collisions(&db, None).unwrap();
+        assert_eq!(rows[0]["prior_claim_persisted_state"], "queued");
+        assert_eq!(rows[0]["prior_claim_message"], "new message");
         db.execute("DELETE FROM coordinator_alerts WHERE id=?1", [&old_id])
             .unwrap();
         let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();

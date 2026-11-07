@@ -455,8 +455,8 @@ back to a changed pending set. A matching legacy claim prevents automatic send
 and produces a separate durable `needs_attention` collision, without asserting
 delivery or overwriting the state of an existing newer-format alert.
 Use `list_coordinator_alert_collisions` and `list_coordinator_alert_collision_items`
-to inspect the original alert reference, its persisted state and message, and the
-captured pending snapshot; `sending` and `queued` do not establish receipt. Verify
+to inspect the original alert and any prior newer-format claim, their persisted
+states and messages, and the captured pending snapshot; `sending` and `queued` do not establish receipt. Verify
 what was delivered before taking any manual action. A turn barrier does not
 prevent future collisions when Stop has no turn ID and reuses the same last
 message. Such collisions remain visible and are never automatically resent. Observation
