@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   test:
-    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate' && inputs.probe != 'wake-goal-race'
+    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate' && inputs.probe != 'wake-goal-race' && inputs.probe != 'wake-validation-hooks'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -52,7 +52,7 @@ jobs:
           cargo test --locked --test http -- --include-ignored
 
   package:
-    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate' && inputs.probe != 'wake-goal-race'
+    if: github.event_name != 'workflow_dispatch' || inputs.probe != 'wake-native-duplicate' && inputs.probe != 'wake-goal-race' && inputs.probe != 'wake-validation-hooks'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -117,3 +117,16 @@ jobs:
           NODE_PATH: ${{ runner.temp }}/wake-deps/node_modules
           WAKE_TEST_CODEX: ${{ runner.temp }}/wake-deps/node_modules/.bin/codex
         run: node tests/cloud-goal-race.cjs
+
+  validation-hooks-proof:
+    if: github.event_name == 'workflow_dispatch' && inputs.probe == 'wake-validation-hooks'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Run isolated Stop process integration test
+        run: cargo test --locked --test validation_hooks
