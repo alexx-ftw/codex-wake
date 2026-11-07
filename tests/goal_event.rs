@@ -34,7 +34,14 @@ fn cli(root: &Path, socket: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue: bool) {
+fn exercise(
+    fail_set: bool,
+    initial_active: bool,
+    missing_goal: bool,
+    fail_queue: bool,
+    pause_after_queue: bool,
+    omit_timestamp: bool,
+) {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("app.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -46,6 +53,7 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
     let db_path = temp.path().join("state.sqlite3");
     let server = thread::spawn(move || {
         let mut active = initial_active;
+        let mut updated = 100;
         while !server_done.load(Ordering::SeqCst) {
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
@@ -93,9 +101,15 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
             let result = match method {
                 "thread/goal/get" if missing_goal => json!({"goal":null}),
                 "thread/goal/get" => {
-                    json!({"goal":{"status":if active {"active"} else {"paused"}}})
+                    json!({"goal":{"status":if active {"active"} else {"paused"},"updatedAt":if omit_timestamp {None} else {Some(updated)}}})
                 }
-                "thread/queue/add" if !fail_queue => json!({"queuedSubmission":{"id":"queued-1"}}),
+                "thread/queue/add" if !fail_queue => {
+                    if pause_after_queue {
+                        active = false;
+                        updated += 1;
+                    }
+                    json!({"queuedSubmission":{"id":"queued-1"}})
+                }
                 "thread/queue/add" => {
                     drop(ws);
                     continue;
@@ -171,12 +185,13 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
         vec!["thread/goal/get"]
     } else if fail_queue {
         vec!["thread/goal/get", "thread/queue/add"]
-    } else if initial_active {
+    } else if initial_active || pause_after_queue || omit_timestamp {
         vec!["thread/goal/get", "thread/queue/add", "thread/goal/get"]
     } else if fail_set {
         vec![
             "thread/goal/get",
             "thread/queue/add",
+            "thread/goal/get",
             "thread/goal/get",
             "thread/goal/set",
         ]
@@ -184,6 +199,7 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
         vec![
             "thread/goal/get",
             "thread/queue/add",
+            "thread/goal/get",
             "thread/goal/get",
             "thread/goal/set",
             "thread/goal/get",
@@ -200,7 +216,7 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
         .unwrap();
     assert_eq!(
         state,
-        if fail_set || missing_goal || fail_queue {
+        if fail_set || missing_goal || fail_queue || pause_after_queue || omit_timestamp {
             "needs_attention"
         } else {
             "queued"
@@ -212,6 +228,10 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
             "goal_missing_before_queue"
         } else if fail_queue {
             "native_queue_outcome_unknown"
+        } else if pause_after_queue {
+            "goal_changed_after_queue_input_queued: native_queue_accepted"
+        } else if omit_timestamp {
+            "goal_version_unavailable_after_queue_input_queued: native_queue_accepted"
         } else if fail_set {
             "goal_resume_unconfirmed_input_queued: native_queue_accepted"
         } else {
@@ -222,6 +242,8 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
         stage,
         if missing_goal || fail_queue {
             "preparing"
+        } else if pause_after_queue || omit_timestamp {
+            "activation_blocked"
         } else if fail_set {
             "activation_unconfirmed"
         } else {
@@ -232,11 +254,14 @@ fn exercise(fail_set: bool, initial_active: bool, missing_goal: bool, fail_queue
 
 #[test]
 fn event_queues_before_activating_goal_and_never_replays_uncertain_input() {
-    exercise(false, false, false, false);
-    exercise(true, false, false, false);
-    exercise(false, true, false, false);
-    exercise(false, false, true, false);
-    exercise(false, false, false, true);
+    exercise(false, false, false, false, false, false);
+    exercise(true, false, false, false, false, false);
+    exercise(false, true, false, false, false, false);
+    exercise(false, false, true, false, false, false);
+    exercise(false, false, false, true, false, false);
+    exercise(false, true, false, false, true, false);
+    exercise(false, false, false, false, true, false);
+    exercise(false, false, false, false, false, true);
 }
 
 #[test]
@@ -297,6 +322,7 @@ fn unavailable_server_before_queue_keeps_event_ready_for_retry() {
             "thread/goal/get",
             "thread/queue/add",
             "thread/goal/get",
+            "thread/goal/get",
             "thread/goal/set",
             "thread/goal/get",
         ];
@@ -327,7 +353,7 @@ fn unavailable_server_before_queue_keeps_event_ready_for_retry() {
             assert_eq!(request["method"], method);
             let result = match method {
                 "thread/goal/get" => {
-                    json!({"goal":{"status":if index == 4 {"active"} else {"paused"}}})
+                    json!({"goal":{"status":if index == 5 {"active"} else {"paused"},"updatedAt":100}})
                 }
                 "thread/queue/add" => json!({"queuedSubmission":{"id":"queued-1"}}),
                 _ => json!({}),
@@ -354,4 +380,97 @@ fn unavailable_server_before_queue_keeps_event_ready_for_retry() {
         })
         .unwrap();
     assert_eq!((state.as_str(), stage.as_str()), ("queued", "active"));
+}
+
+fn exercise_recover_accepted_input(changed: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("app.sock");
+    let registered = cli(
+        temp.path(),
+        &socket,
+        &[
+            "subscribe",
+            "--kind",
+            "artifact",
+            "--repo",
+            "ci",
+            "--resource",
+            "build",
+            "--event",
+            "available",
+            "--thread",
+            "11111111-1111-4111-8111-111111111111",
+            "--resume-goal",
+            "true",
+        ],
+    );
+    assert!(registered.status.success());
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    db.execute("UPDATE subscriptions SET state='sending',goal_stage='input_queued',reason='native_queue_accepted',goal_before_status='paused',goal_before_updated=100", []).unwrap();
+    drop(db);
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "missing goal RPC");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut ws = tungstenite::accept(stream).unwrap();
+        let init: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+        ws.send(Message::Text(
+            json!({"id":init["id"],"result":{}}).to_string().into(),
+        ))
+        .unwrap();
+        let _ = ws.read().unwrap();
+        let request: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(request["method"], "thread/goal/get");
+        ws.send(Message::Text(
+            json!({"id":request["id"],"result":{"goal":{"status":if changed {"paused"} else {"active"},"updatedAt":101}}})
+                .to_string()
+                .into(),
+        ))
+        .unwrap();
+    });
+    let recovered = cli(temp.path(), &socket, &["recover"]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    server.join().unwrap();
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    let (state, stage): (String, String) = db
+        .query_row("SELECT state,goal_stage FROM subscriptions", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        (state.as_str(), stage.as_str()),
+        if changed {
+            ("needs_attention", "activation_blocked")
+        } else {
+            ("queued", "active")
+        }
+    );
+    drop(db);
+    let again = cli(temp.path(), &socket, &["recover"]);
+    assert!(again.status.success());
+    let result: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(result["attempted"], 0);
+}
+
+#[test]
+fn recover_accepted_input_without_queuing_it_again() {
+    exercise_recover_accepted_input(false);
+    exercise_recover_accepted_input(true);
 }

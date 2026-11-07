@@ -196,7 +196,13 @@ existing goal. If queuing is uncertain, Wake does not activate the goal. If
 activation is unconfirmed after queue acceptance, it reports `needs_attention`
 without replaying the input. A queued input or active goal does not prove the
 agent has run. `goal_stage` records preparation, queue acceptance, activation,
-or an unconfirmed activation. The CLI accepts `--resume-goal true`.
+or an unconfirmed activation. The receiver can complete a pending activation
+after queue acceptance without sending the input again. An activation already
+started is not retried if its outcome is unknown. Goal changes made outside
+Wake are not atomic with this operation: before activation Wake compares the
+goal's status and `updatedAt` with the pre-queue snapshot and requires review if
+they differ or the timestamp is missing. A change can still race with the final
+request. The CLI accepts `--resume-goal true`.
 
 | Source (`kind`) | Resource | Supported event |
 |---|---|---|

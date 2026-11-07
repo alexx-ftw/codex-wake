@@ -128,6 +128,8 @@ pub fn initialize(db: &Connection) -> Result<()> {
             source_event_key TEXT,
             resume_goal INTEGER NOT NULL DEFAULT 0 CHECK(resume_goal IN (0,1)),
             goal_stage TEXT,
+            goal_before_status TEXT,
+            goal_before_updated INTEGER,
             UNIQUE(kind,repo,resource,event,thread)
         );
         CREATE INDEX IF NOT EXISTS subscriptions_ready ON subscriptions(state,updated);",
@@ -169,6 +171,8 @@ pub fn initialize(db: &Connection) -> Result<()> {
                 "INTEGER NOT NULL DEFAULT 0 CHECK(resume_goal IN (0,1))",
             ),
             ("goal_stage", "TEXT"),
+            ("goal_before_status", "TEXT"),
+            ("goal_before_updated", "INTEGER"),
         ] {
             if !columns.iter().any(|existing| existing == column) {
                 db.execute_batch(&format!(
@@ -911,7 +915,7 @@ fn status_rows(db: &Connection, id: Option<&str>) -> Result<Vec<Value>> {
         uncertainties.entry(subscription_id).or_default().push(uncertainty);
     }
     let mut statement = db.prepare(
-        "SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,required_source,source_json,dependency_timeout_secs,dependency_progress_at_ms,dependency_deadline_ms,dependency_notice_state,dependency_notice_reason,dependency_notice_started_at_ms,resume_goal,goal_stage \
+        "SELECT id,kind,repo,resource,event,thread,state,outcome,reason,updated,required_source,source_json,dependency_timeout_secs,dependency_progress_at_ms,dependency_deadline_ms,dependency_notice_state,dependency_notice_reason,dependency_notice_started_at_ms,resume_goal,goal_stage,goal_before_status,goal_before_updated \
          FROM subscriptions WHERE (?1 IS NULL OR id=?1) ORDER BY updated,id",
     )?;
     let rows = statement.query_map([id], |row| {
@@ -936,6 +940,8 @@ fn status_rows(db: &Connection, id: Option<&str>) -> Result<Vec<Value>> {
             "inactivity_notice_started_at_ms":row.get::<_,Option<i64>>(17)?,
             "resume_goal":row.get::<_,bool>(18)?,
             "goal_stage":row.get::<_,Option<String>>(19)?,
+            "goal_before_status":row.get::<_,Option<String>>(20)?,
+            "goal_before_updated":row.get::<_,Option<i64>>(21)?,
             "inactivity_notice_uncertainties":notice_uncertainties,
         }))
     })?;
@@ -975,6 +981,7 @@ pub fn delivery_warnings(
         let goal_stage: Option<String> = row.get(9)?;
         let missing = missing_source(required.as_deref(), source.as_deref()).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error)))?;
         let warning = match (state.as_str(), goal_stage.as_deref()) {
+            ("needs_attention", Some("activation_blocked")) => "Input queue acceptance is confirmed; goal activation was not attempted because the goal changed or its version could not be verified. Do not resend the input.",
             ("sending" | "needs_attention", Some("input_queued" | "activating" | "activation_unconfirmed")) => "Input queue acceptance is confirmed; goal activation and execution are not confirmed. Do not resend the input.",
             ("queued", _) => "Queue or turn accepted; receipt and execution are not confirmed.",
             ("ready", _) => "Event accepted; delivery is pending.",
@@ -1094,16 +1101,98 @@ fn resume_after_queue(
                     None => "goal_active_input_queued".into(),
                 }),
             )),
-            Err(_) => Ok((
-                "needs_attention".into(),
-                Some(match reason {
-                    Some(reason) => bounded_reason("goal_resume_unconfirmed_input_queued", &reason),
-                    None => "goal_resume_unconfirmed_input_queued".into(),
-                }),
-            )),
+            Err(error) => {
+                let prefix = if error.to_string()
+                    == "Goal changed after the event was prepared; activation needs review"
+                {
+                    "goal_changed_after_queue_input_queued"
+                } else if error.to_string() == "Goal timestamp unavailable; activation needs review"
+                {
+                    "goal_version_unavailable_after_queue_input_queued"
+                } else {
+                    "goal_resume_unconfirmed_input_queued"
+                };
+                Ok((
+                    "needs_attention".into(),
+                    Some(match reason {
+                        Some(reason) => bounded_reason(prefix, &reason),
+                        None => prefix.into(),
+                    }),
+                ))
+            }
         },
         other => other,
     }
+}
+
+// The accepted input is never queued again: one dispatcher claims only its goal activation.
+fn activate_queued_goal_with(
+    db: &Connection,
+    id: &str,
+    activate: impl FnOnce(&str) -> Result<Value>,
+) -> Result<bool> {
+    let claim = db.query_row(
+        "UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='input_queued' RETURNING thread,reason",
+        [id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    ).optional()?;
+    let Some((thread, queue_reason)) = claim else {
+        return Ok(false);
+    };
+    let span = crate::observability::Span::new("delivery.goal_activation", Some(id));
+    let (state, reason) = resume_after_queue(Ok(("queued".into(), queue_reason)), || {
+        activate(&thread).inspect_err(|error| {
+            crate::observability::emit(
+                "delivery.goal_activation.error",
+                "needs_attention",
+                crate::observability::error_class(error),
+                Some(&thread),
+                Duration::ZERO,
+                1,
+            );
+        })
+    })?;
+    ensure!(db.execute(
+        "UPDATE subscriptions SET state=?1,reason=?2,goal_stage=CASE WHEN ?1='queued' THEN 'active' WHEN ?2 GLOB 'goal_changed_after_queue_input_queued*' OR ?2 GLOB 'goal_version_unavailable_after_queue_input_queued*' THEN 'activation_blocked' ELSE 'activation_unconfirmed' END,updated=CURRENT_TIMESTAMP WHERE id=?3 AND state='sending' AND goal_stage='activating'",
+        params![state, reason, id],
+    )? == 1, "Goal activation claim was lost");
+    span.finish(
+        if state == "queued" {
+            "ok"
+        } else {
+            "needs_attention"
+        },
+        crate::observability::reason(reason.as_deref()),
+        1,
+    );
+    Ok(true)
+}
+
+fn activate_queued_goal(db: &Connection, id: &str, codex: &Path) -> Result<bool> {
+    activate_queued_goal_with(db, id, |thread| {
+        let (before_status, before_updated): (Option<String>, Option<i64>) = db.query_row(
+            "SELECT goal_before_status,goal_before_updated FROM subscriptions WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let goal = crate::goals::get(codex, thread)?;
+        ensure!(goal.is_object(), "Goal missing after queue acceptance");
+        if goal["status"] == "active" {
+            Ok(goal)
+        } else {
+            ensure!(
+                before_updated.is_some() && goal["updatedAt"].as_i64().is_some(),
+                "Goal timestamp unavailable; activation needs review"
+            );
+            ensure!(
+                before_status.is_some()
+                    && before_status.as_deref() == goal["status"].as_str()
+                    && before_updated == goal["updatedAt"].as_i64(),
+                "Goal changed after the event was prepared; activation needs review"
+            );
+            crate::goals::resume(codex, thread)
+        }
+    })
 }
 
 /// Claim and send ready events once. A non-successful/ambiguous send is never retried automatically.
@@ -1111,6 +1200,17 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
     initialize(db)?;
     let mut attempted = 0;
     loop {
+        let queued_goal = db.query_row(
+            "SELECT id FROM subscriptions WHERE resume_goal=1 AND state='sending' AND goal_stage='input_queued' ORDER BY updated,id LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        if let Some(id) = queued_goal {
+            if activate_queued_goal(db, &id, codex)? {
+                attempted += 1;
+            }
+            continue;
+        }
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row = transaction
             .query_row(
@@ -1197,13 +1297,18 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                 )),
             )),
             (Ok(message), Ok(options)) if resume_goal => {
-                let prepared = (|| -> Result<Option<bool>> {
+                let prepared = (|| -> Result<Option<(String, Option<i64>)>> {
                     let goal = crate::goals::get(codex, &thread)?;
                     if goal.is_null() {
                         return Ok(None);
                     }
                     ensure!(goal.is_object(), "Invalid goal response");
-                    let active = goal["status"] == "active";
+                    let status = goal["status"]
+                        .as_str()
+                        .context("Goal status missing")?
+                        .to_owned();
+                    let updated = goal["updatedAt"].as_i64();
+                    let active = status == "active";
                     if let Some(options) = &options {
                         if active {
                             return Err(crate::execution::TargetBusyBeforeSend.into());
@@ -1215,7 +1320,7 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                             "Goal changed while preparing execution presets"
                         );
                     }
-                    Ok(Some(active))
+                    Ok(Some((status, updated)))
                 })();
                 match prepared {
                     Ok(None) => Ok((
@@ -1240,7 +1345,8 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                             )),
                         }
                     }
-                    Ok(Some(already_active)) => {
+                    Ok(Some((before_status, before_updated))) => {
+                        ensure!(db.execute("UPDATE subscriptions SET goal_before_status=?2,goal_before_updated=?3 WHERE id=?1 AND state='sending' AND goal_stage='preparing'", params![id, before_status, before_updated])? == 1, "Subscription claim was lost before queueing");
                         let queued = if crate::execution::native_queue_available() {
                             let client_id = if let Some(event_key) = source_event_key.as_deref() {
                                 crate::delivery_evidence::begin(db, event_key, &thread, true)?.0
@@ -1253,17 +1359,16 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                         } else {
                             crate::bridge::send_mode(codex, timeout, &thread, &message, false)
                         };
-                        resume_after_queue(queued, || {
-                            ensure!(db.execute("UPDATE subscriptions SET goal_stage='input_queued',updated=CURRENT_TIMESTAMP WHERE id=?1 AND state='sending'", [&id])? == 1, "Subscription claim was lost after queue acceptance");
-                            if already_active {
-                                let current = crate::goals::get(codex, &thread)?;
-                                if current["status"] == "active" {
-                                    return Ok(current);
-                                }
+                        match queued {
+                            Ok((state, reason)) if state == "queued" => {
+                                ensure!(db.execute("UPDATE subscriptions SET goal_stage='input_queued',reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?1 AND state='sending' AND goal_stage='preparing'", params![id, reason])? == 1, "Subscription claim was lost after queue acceptance");
+                                activate_queued_goal(db, &id, codex)?;
+                                span.finish("observed", "goal_activation_dispatched", 1);
+                                attempted += 1;
+                                continue;
                             }
-                            ensure!(db.execute("UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP WHERE id=?1 AND state='sending' AND goal_stage='input_queued'", [&id])? == 1, "Subscription claim was lost before goal activation");
-                            crate::goals::resume(codex, &thread)
-                        })
+                            other => other,
+                        }
                     }
                 }
             }
@@ -1543,6 +1648,49 @@ mod tests {
                 "needs_attention".into(),
                 Some("goal_resume_unconfirmed_input_queued".into())
             )
+        );
+    }
+
+    #[test]
+    fn accepted_input_activation_is_claimed_once_without_requeue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        let other = Connection::open(&path).unwrap();
+        let id = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        db.execute("UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='input_queued',reason='native_queue_accepted' WHERE id=?1", [&id]).unwrap();
+        let claimed = activate_queued_goal_with(&db, &id, |thread| {
+            assert_eq!(thread, THREAD);
+            assert!(!activate_queued_goal_with(&other, &id, |_| panic!(
+                "duplicate activation"
+            ))?);
+            Ok(json!({"status":"active"}))
+        })
+        .unwrap();
+        assert!(claimed);
+        let status = status_for_id(&db, &id).unwrap();
+        assert_eq!(status["state"], "queued");
+        assert_eq!(status["goal_stage"], "active");
+        assert!(!activate_queued_goal_with(&db, &id, |_| panic!("duplicate activation")).unwrap());
+    }
+
+    #[test]
+    fn uncertain_goal_activation_is_not_repeated() {
+        let db = db();
+        let id = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        db.execute(
+            "UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='input_queued' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        assert!(activate_queued_goal_with(&db, &id, |_| anyhow::bail!("lost response")).unwrap());
+        let status = status_for_id(&db, &id).unwrap();
+        assert_eq!(status["state"], "needs_attention");
+        assert_eq!(status["goal_stage"], "activation_unconfirmed");
+        assert!(
+            !activate_queued_goal_with(&db, &id, |_| panic!("uncertain activation repeated"))
+                .unwrap()
         );
     }
 
@@ -3493,6 +3641,9 @@ mod tests {
         assert_eq!(identity, None);
         assert!(!resume_goal);
         assert_eq!(goal_stage, None);
+        let status = status_for_id(&db, "legacy-ready").unwrap();
+        assert!(status["goal_before_status"].is_null());
+        assert!(status["goal_before_updated"].is_null());
     }
 
     #[test]
