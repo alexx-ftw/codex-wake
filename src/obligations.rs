@@ -7,6 +7,7 @@ use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
 const MAX_DESCRIPTION_BYTES: usize = 2048;
+const LEGACY_GUARD_REASON: &str = "compatibility_guard_not_delivery";
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Obligation {
@@ -396,12 +397,16 @@ pub fn claim_coordinator_alert_with_legacy(
             "{:x}",
             Sha256::digest(format!("{responsible}:{coordinator}:{legacy}").as_bytes())
         );
-        let exists: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM coordinator_alerts WHERE id=?1)",
-            [&old_id],
-            |row| row.get(0),
-        )?;
-        if exists {
+        let old_reason: Option<Option<String>> = db
+            .query_row(
+                "SELECT reason FROM coordinator_alerts WHERE id=?1",
+                [&old_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if old_reason.is_some()
+            && old_reason.as_ref().and_then(|value| value.as_deref()) != Some(LEGACY_GUARD_REASON)
+        {
             let existing: Option<String> = db.query_row(
                 "SELECT alert_id FROM coordinator_alert_legacy_collisions WHERE claim_id=?1 AND legacy_alert_id=?2 LIMIT 1",
                 params![id, old_id], |row| row.get(0),
@@ -441,6 +446,19 @@ pub fn claim_coordinator_alert_with_legacy(
             }
             return Ok(Some((diagnostic_id, coordinator, true)));
         }
+    }
+    // A legacy executable claims only its own key. Reserve that key in the same
+    // transaction as the full claim; this row is a guard, not a delivery.
+    if let Some(legacy) = legacy_fingerprint {
+        let old_id = format!(
+            "{:x}",
+            Sha256::digest(format!("{responsible}:{coordinator}:{legacy}").as_bytes())
+        );
+        db.execute(
+            "INSERT OR IGNORE INTO coordinator_alerts(id,responsible,coordinator,message,state,reason)
+             VALUES (?1,?2,?3,'Compatibility guard; no delivery was attempted.','needs_attention',?4)",
+            params![old_id,responsible,coordinator,LEGACY_GUARD_REASON],
+        )?;
     }
     let prior_collision: Option<String> = db
         .query_row(
@@ -499,10 +517,19 @@ pub fn finish_coordinator_alert(
     Ok(())
 }
 
+/// Guards reserve legacy IDs; they are never evidence of delivery.
+pub fn coordinator_guard_count(db: &Connection) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT count(*) FROM coordinator_alerts WHERE reason=?1",
+        [LEGACY_GUARD_REASON],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert>> {
     let mut statement = db.prepare(
         "SELECT id,responsible,coordinator,state,reason,created,sender_pid,sender_start
-         FROM coordinator_alerts ORDER BY rowid DESC LIMIT 25",
+         FROM coordinator_alerts WHERE reason IS NOT 'compatibility_guard_not_delivery' ORDER BY rowid DESC LIMIT 25",
     )?;
     let rows = statement.query_map([], |row| {
         let mut alert = CoordinatorAlert {
@@ -2238,5 +2265,188 @@ mod mixed_alert_version_tests {
             )
             .unwrap();
         assert_eq!(claim, "prior");
+    }
+}
+
+#[cfg(test)]
+mod legacy_guard_tests {
+    use super::*;
+    const OWNER: &str = "11111111-1111-4111-8111-111111111111";
+    const COORDINATOR: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn fixture() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, OWNER, COORDINATOR).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        db
+    }
+    fn legacy_id(fingerprint: &str) -> String {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{OWNER}:{COORDINATOR}:{fingerprint}").as_bytes())
+        )
+    }
+    fn old_claim(db: &Connection, fingerprint: &str) -> usize {
+        db.execute("INSERT OR IGNORE INTO coordinator_alerts(id,responsible,coordinator,message,state) VALUES(?1,?2,?3,'old','sending')", params![legacy_id(fingerprint),OWNER,COORDINATOR]).unwrap()
+    }
+    #[test]
+    fn guard_blocks_old_claim_and_new_snapshots_reuse_it() {
+        let db = fixture();
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (new_id, _, collision) =
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new-a", "snapshot", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        assert!(!collision);
+        tx.commit().unwrap();
+        assert_eq!(old_claim(&db, "legacy"), 0);
+        let guard: (String, String, String) = db
+            .query_row(
+                "SELECT state,reason,message FROM coordinator_alerts WHERE id=?1",
+                [legacy_id("legacy")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(guard.0, "needs_attention");
+        assert_eq!(guard.1, LEGACY_GUARD_REASON);
+        assert!(guard.2.contains("no delivery was attempted"));
+        assert_eq!(coordinator_guard_count(&db).unwrap(), 1);
+        let status = coordinator_alerts_status(&db).unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].id, new_id);
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (_, _, collision) =
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new-b", "changed", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        assert!(!collision);
+        tx.commit().unwrap();
+        assert_eq!(old_claim(&db, "legacy"), 0);
+    }
+    #[test]
+    fn legacy_first_is_diagnostic_not_a_guard_or_send() {
+        let db = fixture();
+        assert_eq!(old_claim(&db, "legacy"), 1);
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (id, _, collision) =
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        assert!(collision);
+        tx.commit().unwrap();
+        assert_eq!(coordinator_guard_count(&db).unwrap(), 0);
+        let state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+    }
+    #[test]
+    fn rollback_and_restart_never_turn_guard_into_a_verified_delivery() {
+        let db = fixture();
+        {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(coordinator_guard_count(&db).unwrap(), 0);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        let (id, _, _) =
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                .unwrap()
+                .unwrap();
+        tx.commit().unwrap();
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        assert!(
+            claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                .unwrap()
+                .is_none()
+        );
+        tx.commit().unwrap();
+        assert_eq!(old_claim(&db, "legacy"), 0);
+        let state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "sending");
+    }
+    #[test]
+    fn failed_new_claim_rolls_back_legacy_guard() {
+        let db = fixture();
+        db.execute_batch("CREATE TRIGGER fail_new_claim BEFORE INSERT ON coordinator_alerts WHEN NEW.state='sending' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            assert!(
+                claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                    .is_err()
+            );
+        }
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn stale_legacy_snapshot_can_still_claim_a_different_key() {
+        let db = fixture();
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "new snapshot", Some("legacy-b"))
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(old_claim(&db, "legacy-a"), 1);
+    }
+    #[test]
+    fn simultaneous_claims_allow_only_one_sender_for_the_same_legacy_key() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, OWNER, COORDINATOR).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('one',?1,'artifact','repo','resource','available','pending')", [OWNER]).unwrap();
+        drop(db);
+        let barrier = Arc::new(Barrier::new(2));
+        let old_path = path.clone();
+        let old_barrier = barrier.clone();
+        let old = std::thread::spawn(move || {
+            let db = Connection::open(old_path).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            old_barrier.wait();
+            old_claim(&db, "legacy")
+        });
+        let new = std::thread::spawn(move || {
+            let db = Connection::open(path).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            barrier.wait();
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+            let result =
+                claim_coordinator_alert_with_legacy(&tx, OWNER, "new", "snapshot", Some("legacy"))
+                    .unwrap()
+                    .unwrap();
+            tx.commit().unwrap();
+            !result.2
+        });
+        let old_sent = old.join().unwrap();
+        let new_sent = usize::from(new.join().unwrap());
+        assert_eq!(old_sent + new_sent, 1);
     }
 }

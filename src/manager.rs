@@ -1096,7 +1096,12 @@ fn observe_queues(config: &Config) -> Result<()> {
         ("circular_notices", "queue.circular_notices"),
         ("coordinator_alerts", "queue.coordinator_alerts"),
     ] {
-        let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table} GROUP BY state"))?;
+        let filter = if table == "coordinator_alerts" {
+            " WHERE reason IS NOT 'compatibility_guard_not_delivery'"
+        } else {
+            ""
+        };
+        let mut statement = db.prepare(&format!("SELECT state,count(*),coalesce(max(max(0,unixepoch()-unixepoch(updated))),0) FROM {table}{filter} GROUP BY state"))?;
         let rows = statement.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,

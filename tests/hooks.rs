@@ -116,7 +116,7 @@ fn stop_notifies_only_the_explicit_coordinator_once_with_obligation_and_last_inf
         "queue\n"
     );
     let (message, state): (String, String) = db
-        .query_row("SELECT message,state FROM coordinator_alerts", [], |row| {
+        .query_row("SELECT message,state FROM coordinator_alerts WHERE reason IS NOT 'compatibility_guard_not_delivery'", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
@@ -700,7 +700,7 @@ fn full_fingerprint_detects_ninth_change_and_never_replays_uncertain_snapshot() 
         "attempt\nattempt\nattempt\n"
     );
     let states: Vec<String> = db
-        .prepare("SELECT state FROM coordinator_alerts ORDER BY rowid")
+        .prepare("SELECT state FROM coordinator_alerts WHERE reason IS NOT 'compatibility_guard_not_delivery' ORDER BY rowid")
         .unwrap()
         .query_map([], |r| r.get(0))
         .unwrap()
@@ -708,7 +708,7 @@ fn full_fingerprint_detects_ninth_change_and_never_replays_uncertain_snapshot() 
         .collect();
     assert_eq!(states, vec!["needs_attention"; 3]);
     let messages: Vec<String> = db
-        .prepare("SELECT message FROM coordinator_alerts ORDER BY rowid")
+        .prepare("SELECT message FROM coordinator_alerts WHERE reason IS NOT 'compatibility_guard_not_delivery' ORDER BY rowid")
         .unwrap()
         .query_map([], |r| r.get(0))
         .unwrap()
@@ -806,7 +806,7 @@ fn concurrent_identical_stops_claim_one_uncertain_alert() {
     );
     let (count, state): (i64, String) = db
         .query_row(
-            "SELECT count(*),min(state) FROM coordinator_alerts",
+            "SELECT count(*),min(state) FROM coordinator_alerts WHERE reason IS NOT 'compatibility_guard_not_delivery'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )

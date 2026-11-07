@@ -1490,6 +1490,10 @@ impl WakeTools {
                 "steers":steer::status(&db)?,
                 "circular_waits":circular,
                 "coordinator_alerts":obligations::coordinator_alerts_status(&db)?,
+                "coordinator_compatibility_guards":{
+                    "count":obligations::coordinator_guard_count(&db)?,
+                    "meaning":"Reserved legacy keys only; no delivery is implied."
+                },
                 "polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},
                 "supported_events":subscriptions::ALLOWED_EVENTS,
                 "diagnostics":diagnostics(&self.config,42)?

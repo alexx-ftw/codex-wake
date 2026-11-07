@@ -1,0 +1,126 @@
+{
+  "mode": "manually_injected_hooks",
+  "queue": "fake",
+  "results": [
+    {
+      "name": "id-ok-new-old",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "queued"
+      ]
+    },
+    {
+      "name": "id-ok-old-new",
+      "attempts": 1,
+      "guard": 0,
+      "diagnostics": 1,
+      "states": [
+        "queued",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "id-ok-concurrent",
+      "attempts": 1,
+      "guard": 0,
+      "diagnostics": 1,
+      "states": [
+        "queued",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "id-failed-new-old",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "id-failed-old-new",
+      "attempts": 1,
+      "guard": 0,
+      "diagnostics": 1,
+      "states": [
+        "needs_attention",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "id-failed-concurrent",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "noid-ok-new-old",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "queued"
+      ]
+    },
+    {
+      "name": "noid-ok-old-new",
+      "attempts": 1,
+      "guard": 0,
+      "diagnostics": 1,
+      "states": [
+        "queued",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "noid-ok-concurrent",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "queued"
+      ]
+    },
+    {
+      "name": "noid-failed-new-old",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "noid-failed-old-new",
+      "attempts": 1,
+      "guard": 0,
+      "diagnostics": 1,
+      "states": [
+        "needs_attention",
+        "needs_attention"
+      ]
+    },
+    {
+      "name": "noid-failed-concurrent",
+      "attempts": 1,
+      "guard": 1,
+      "diagnostics": 0,
+      "states": [
+        "needs_attention",
+        "needs_attention"
+      ]
+    }
+  ]
+}

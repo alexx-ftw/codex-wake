@@ -1,0 +1,17 @@
+{
+  "mode": "manually_injected_hooks",
+  "queue": "fake_blocking",
+  "killed": true,
+  "exitSignal": "SIGKILL",
+  "attempts": 1,
+  "alerts": [
+    {
+      "state": "needs_attention",
+      "reason": "compatibility_guard_not_delivery"
+    },
+    {
+      "state": "sending",
+      "reason": null
+    }
+  ]
+}

@@ -460,9 +460,15 @@ states and messages, and the captured pending snapshot; `sending` and `queued` d
 what was delivered before taking any manual action. A turn barrier does not
 prevent future collisions when Stop has no turn ID and reuses the same last
 message. Such collisions remain visible and are never automatically resent. Observation
-counts include repeated hooks and do not establish distinct turns. Legacy entries
-with different old fingerprints cannot be reliably correlated; the barrier and
-manual verification remain necessary. In `get_status`,
+counts include repeated hooks and do not establish distinct turns. A new-format
+claim also reserves its corresponding old fingerprint in the same transaction.
+This compatibility guard is not a delivery or proof of receipt; `get_status`
+reports only the number of guards separately, and they are not retried. A legacy
+process using a different fingerprint (for example, after reading a stale
+pending set) can still send separately. Existing uncertain legacy claims remain
+visible as collisions. The barrier and manual verification remain necessary.
+Collision snapshots and guards have no automatic expiry; distinct snapshots can
+consume unbounded storage. In `get_status`,
 a `sending` alert whose sender process is no longer verifiably alive appears as
 `uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
 not resend it. A live sender remains `sending`; this read-only diagnosis does
