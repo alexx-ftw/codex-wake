@@ -451,11 +451,20 @@ Stop-loop hooks, and chats without an explicit coordinator do not trigger this
 alert. Wake persists the alert before sending and never retries the same
 fingerprinted event automatically. An uncertain send remains recorded for
 inspection; queue acceptance still does not prove that the coordinator read it.
+An approved `Interrupt` hook saves a short-lived local record for the receiver,
+which prepares the coordinator alert without marking the turn completed. The
+receiver sends only newly prepared alerts; historical and uncertain records are
+not replayed. Stop and Interrupt alerts are correlated when both include the
+same turn ID. The hook requires the private Wake state directory to be present.
+If an installation or cleanup operation holds the lifecycle lock for two
+seconds, the hook fails instead of writing into a changing installation; that
+interruption is not automatically recovered from the hook record.
 The alert fingerprint includes a canonical digest of every pending obligation,
 while its message remains limited to the first eight descriptions. The digest
 and alert claim share one database transaction; a later change may produce a
 new alert, but an identical uncertain claim is never replayed. If the hook has
-no turn ID, the last assistant message also distinguishes alerts. Before
+no turn ID, Wake records the alert as `needs_attention` without sending it;
+the last assistant message also distinguishes such diagnostics. Before
 upgrading from the older fingerprint format, finish controller-owned turns and
 keep the existing upgrade barrier: old hashed claims cannot reliably be mapped
 back to a changed pending set. A matching legacy claim prevents an automatic

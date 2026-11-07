@@ -7,6 +7,7 @@ use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
 const MAX_DESCRIPTION_BYTES: usize = 2048;
+pub(crate) const COORDINATOR_ALERT_READY_REASON: &str = "interrupt_ready_v1";
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Obligation {
@@ -514,6 +515,87 @@ pub fn finish_coordinator_alert(
         params![state, reason, id],
     )?;
     Ok(())
+}
+
+/// Only the versioned marker proves a new unattempted alert; legacy ready rows stay untouched.
+fn dispatch_coordinator_alerts_with(
+    db: &mut Connection,
+    send: &mut impl FnMut(&str, &str) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
+    let pid = i64::from(std::process::id());
+    let started = process_start_time(std::process::id())
+        .and_then(|started| i64::try_from(started).ok())
+        .context("Could not verify coordinator alert sender identity")?;
+    let mut attempted = 0;
+    loop {
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                "SELECT id,coordinator,message FROM coordinator_alerts
+                 WHERE state='ready' AND reason=?1 ORDER BY rowid LIMIT 1",
+                [COORDINATOR_ALERT_READY_REASON],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, _, _)) = &row {
+            ensure!(
+                transaction.execute(
+                    "UPDATE coordinator_alerts SET state='sending',reason=NULL,
+                        updated=CURRENT_TIMESTAMP,sender_pid=?1,sender_start=?2
+                     WHERE id=?3 AND state='ready'",
+                    params![pid, started, id],
+                )? == 1,
+                "Coordinator alert was claimed concurrently"
+            );
+        }
+        transaction.commit()?;
+        let Some((id, coordinator, message)) = row else {
+            return Ok(attempted);
+        };
+
+        let (state, reason) = match send(&coordinator, &message) {
+            Ok((state, reason)) if state == "queued" => (state, reason),
+            Ok((state, reason)) if state == "needs_attention" => (
+                state,
+                reason.or_else(|| Some("send_needs_attention".into())),
+            ),
+            Ok((_, reason)) => (
+                "needs_attention".into(),
+                reason.or_else(|| Some("invalid_send_classification".into())),
+            ),
+            Err(_) => (
+                "needs_attention".into(),
+                Some("send_error_outcome_unknown".into()),
+            ),
+        };
+        ensure!(
+            db.execute(
+                "UPDATE coordinator_alerts SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP,
+                    sender_pid=NULL,sender_start=NULL
+                 WHERE id=?3 AND state='sending' AND sender_pid=?4 AND sender_start=?5",
+                params![state, reason, id, pid, started],
+            )? == 1,
+            "Coordinator alert claim is no longer owned by this sender"
+        );
+        attempted += 1;
+    }
+}
+
+/// Claim ready alerts once, then queue each with the Codex CLI; uncertain sends are never replayed.
+pub fn dispatch_coordinator_alerts(
+    db: &mut Connection,
+    codex: &Path,
+    timeout: Duration,
+) -> Result<usize> {
+    dispatch_coordinator_alerts_with(db, &mut |coordinator, message| {
+        crate::bridge::send_mode(codex, timeout, coordinator, message, false)
+    })
 }
 
 pub fn coordinator_alerts_status(db: &Connection) -> Result<Vec<CoordinatorAlert>> {
@@ -1191,6 +1273,33 @@ mod tests {
     const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const OTHER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
+    fn insert_coordinator_alert(
+        db: &Connection,
+        id: &str,
+        state: &str,
+        reason: Option<&str>,
+        sender_pid: Option<i64>,
+        sender_start: Option<i64>,
+        message: &str,
+    ) {
+        db.execute(
+            "INSERT INTO coordinator_alerts
+                (id,responsible,coordinator,message,state,reason,sender_pid,sender_start)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                id,
+                THREAD,
+                OTHER,
+                message,
+                state,
+                reason,
+                sender_pid,
+                sender_start
+            ],
+        )
+        .unwrap();
+    }
+
     fn transfer_input(db: &mut Connection) -> (String, String, String) {
         let obligation = register(
             db,
@@ -1852,6 +1961,367 @@ mod tests {
                 "timeout".into()
             )
         );
+    }
+
+    #[test]
+    fn coordinator_alert_dispatch_commits_live_claim_before_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        insert_coordinator_alert(
+            &db,
+            "ready",
+            "ready",
+            Some(COORDINATOR_ALERT_READY_REASON),
+            None,
+            None,
+            "alert",
+        );
+        let inspect_path = path.clone();
+        let mut calls = 0;
+
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |coordinator, message| {
+                calls += 1;
+                assert_eq!(coordinator, OTHER);
+                assert_eq!(message, "alert");
+                let observer = Connection::open(&inspect_path).unwrap();
+                let (state, pid, started): (String, i64, i64) = observer
+                    .query_row(
+                        "SELECT state,sender_pid,sender_start FROM coordinator_alerts WHERE id='ready'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(state, "sending");
+                assert_eq!(pid, i64::from(std::process::id()));
+                assert_eq!(
+                    process_start_time(pid as u32),
+                    u64::try_from(started).ok()
+                );
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+        let saved: (String, Option<String>, Option<i64>, Option<i64>) = db
+            .query_row(
+                "SELECT state,reason,sender_pid,sender_start FROM coordinator_alerts WHERE id='ready'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(saved, ("queued".into(), None, None, None));
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| panic!("must not resend"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_coordinator_alert_dispatchers_claim_only_once() {
+        use std::{sync::mpsc, thread};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        insert_coordinator_alert(
+            &db,
+            "ready",
+            "ready",
+            Some(COORDINATOR_ALERT_READY_REASON),
+            None,
+            None,
+            "alert",
+        );
+        drop(db);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            let mut db = Connection::open(worker_path).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let mut calls = 0;
+            let count = dispatch_coordinator_alerts_with(&mut db, &mut |_, _| {
+                calls += 1;
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(("queued".into(), None))
+            })
+            .unwrap();
+            (count, calls)
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let mut competing_db = Connection::open(path).unwrap();
+        competing_db.busy_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut competing_db, &mut |_, _| {
+                panic!("second dispatcher must not send")
+            })
+            .unwrap(),
+            0
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn coordinator_alert_dispatch_marks_uncertain_error_terminal() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        insert_coordinator_alert(
+            &db,
+            "ready",
+            "ready",
+            Some(COORDINATOR_ALERT_READY_REASON),
+            None,
+            None,
+            "alert",
+        );
+        let mut calls = 0;
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| {
+                calls += 1;
+                Err(anyhow::anyhow!("outcome unknown"))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+        let saved: (String, Option<String>) = db
+            .query_row(
+                "SELECT state,reason FROM coordinator_alerts WHERE id='ready'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            (
+                "needs_attention".into(),
+                Some("send_error_outcome_unknown".into())
+            )
+        );
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| panic!("must not retry"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn coordinator_alert_dispatch_restart_sends_ready_but_never_reclaims_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        insert_coordinator_alert(
+            &db,
+            "ready",
+            "ready",
+            Some(COORDINATOR_ALERT_READY_REASON),
+            None,
+            None,
+            "new alert",
+        );
+        insert_coordinator_alert(
+            &db,
+            "interrupted",
+            "sending",
+            None,
+            Some(i64::MAX),
+            Some(0),
+            "uncertain alert",
+        );
+        drop(db);
+
+        let mut db = Connection::open(path).unwrap();
+        let mut calls = 0;
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, message| {
+                calls += 1;
+                assert_eq!(message, "new alert");
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+        let state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id='interrupted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "sending");
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| panic!("must not replay"))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn coordinator_alert_dispatch_preserves_non_ready_states() {
+        type SavedAlert = (
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        );
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for (id, state) in [
+            ("sending", "sending"),
+            ("queued", "queued"),
+            ("attention", "needs_attention"),
+        ] {
+            insert_coordinator_alert(
+                &db,
+                id,
+                state,
+                Some("preserve me"),
+                Some(123),
+                Some(456),
+                "existing alert",
+            );
+        }
+        let before: Vec<SavedAlert> = db
+            .prepare(
+                "SELECT id,state,reason,sender_pid,sender_start,message
+                 FROM coordinator_alerts ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| panic!("must not send")).unwrap(),
+            0
+        );
+        let after: Vec<SavedAlert> = db
+            .prepare(
+                "SELECT id,state,reason,sender_pid,sender_start,message
+                 FROM coordinator_alerts ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn coordinator_alert_dispatch_preserves_ready_rows_without_new_marker() {
+        type LegacyAlert = (String, Option<String>, Option<i64>, Option<i64>, String);
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        insert_coordinator_alert(&db, "legacy_empty", "ready", None, None, None, "old alert");
+        insert_coordinator_alert(
+            &db,
+            "legacy_reason",
+            "ready",
+            Some("send_outcome_unknown"),
+            Some(123),
+            Some(456),
+            "possibly attempted",
+        );
+        insert_coordinator_alert(
+            &db,
+            "new_interrupt",
+            "ready",
+            Some(COORDINATOR_ALERT_READY_REASON),
+            None,
+            None,
+            "new alert",
+        );
+
+        let legacy_before: Vec<LegacyAlert> = db
+            .prepare(
+                "SELECT id,reason,sender_pid,sender_start,message FROM coordinator_alerts
+                 WHERE id LIKE 'legacy_%' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        let mut calls = 0;
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, message| {
+                calls += 1;
+                assert_eq!(message, "new alert");
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+        let legacy_after: Vec<LegacyAlert> = db
+            .prepare(
+                "SELECT id,reason,sender_pid,sender_start,message FROM coordinator_alerts
+                 WHERE id LIKE 'legacy_%' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        assert_eq!(legacy_after, legacy_before);
+        let new_state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id='new_interrupt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_state, "queued");
     }
 
     #[test]

@@ -200,6 +200,8 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("native_poll.rs").as_slice(),
         include_bytes!("steer.rs").as_slice(),
         include_bytes!("status_view.rs").as_slice(),
+        include_bytes!("../hooks/hooks.json").as_slice(),
+        include_bytes!("../scripts/interrupt.sh").as_slice(),
         include_bytes!("../Cargo.lock").as_slice(),
         HOOKS.as_bytes(),
     ] {
@@ -1003,9 +1005,15 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                     crate::obligations::initialize(&db)?;
                     obligations_initialized = true;
                 }
+                crate::process_interrupts(&config, &db)?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::obligations::dispatch_coordinator_alerts(
+                    &mut db,
+                    &config.codex,
+                    Duration::from_secs(30),
+                )?;
                 crate::circular_waits::initialize(&db)?;
                 crate::circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::rules::initialize(&db)?;
