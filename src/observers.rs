@@ -994,6 +994,7 @@ mod tests {
                 execution: None,
                 required_source: Some(&required),
                 progress_timeout_secs: None,
+                ..Default::default()
             },
         )
         .unwrap();

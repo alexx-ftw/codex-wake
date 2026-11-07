@@ -191,6 +191,12 @@ RPC. They retry after 15 seconds, preserving the preset. An uncertain
 Every subscription is independent and one-shot. Completing one doesn't cancel
 the others. Re-registering the same subscription is idempotent; it does not rearm
 a consumed subscription. Source events received before registration aren't replayed.
+Set `resume_goal` to true to queue the event input and then activate the target's
+existing goal. If queuing is uncertain, Wake does not activate the goal. If
+activation is unconfirmed after queue acceptance, it reports `needs_attention`
+without replaying the input. A queued input or active goal does not prove the
+agent has run. `goal_stage` records preparation, queue acceptance, activation,
+or an unconfirmed activation. The CLI accepts `--resume-goal true`.
 
 | Source (`kind`) | Resource | Supported event |
 |---|---|---|

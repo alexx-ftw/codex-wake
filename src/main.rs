@@ -82,6 +82,9 @@ struct SubscriptionInput {
     required_source: Option<Vec<String>>,
     /// Dependency inactivity timeout in seconds; defaults to 3600 for dependency/recovered.
     progress_timeout_secs: Option<u64>,
+    /// Activate the destination's existing goal after the event input is queued.
+    #[serde(default)]
+    resume_goal: bool,
     /// Optional deterministic file, health endpoint, lock or systemd-job observation.
     observation: Option<observers::Observation>,
 }
@@ -1206,7 +1209,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Subscribe to one source/resource/event. Dependency/recovered subscriptions send one investigation request after progress_timeout_secs (default 3600) without an explicit progress signal. The deadline does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. After registration, registration_error reports an observer setup failure and subscription_error reports a status lookup failure; subscription_id remains valid.",
+        description = "Subscribe to one source/resource/event. Optionally activate the destination's existing goal after queuing the event input. Dependency/recovered subscriptions send one investigation request after progress_timeout_secs (default 3600) without an explicit progress signal; the deadline does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. Registration errors do not invalidate subscription_id.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1231,6 +1234,7 @@ impl WakeTools {
                     execution: input.execution.as_ref(),
                     required_source: input.required_source.as_deref(),
                     progress_timeout_secs: input.progress_timeout_secs,
+                    resume_goal: input.resume_goal,
                 },
             )?;
             let mut result = json!({"subscription_id":id});
@@ -1915,6 +1919,10 @@ async fn run_command(
             let progress_timeout_secs = option(&mut args, "--progress-timeout-seconds")?
                 .map(|value| value.parse::<u64>())
                 .transpose()?;
+            let resume_goal = option(&mut args, "--resume-goal")?
+                .map(|value| value.parse::<bool>())
+                .transpose()?
+                .unwrap_or(false);
             let execution = cli_execution(&mut args)?;
             let observation = option(&mut args, "--observe")?
                 .map(|raw| serde_json::from_str::<observers::Observation>(&raw))
@@ -1938,6 +1946,7 @@ async fn run_command(
                     execution: execution.as_ref(),
                     required_source: required_source.as_deref(),
                     progress_timeout_secs,
+                    resume_goal,
                 },
             )?;
             if let Some(observation) = &observation {
@@ -3131,6 +3140,7 @@ mod hook_output_tests {
                 execution: None,
                 required_source: None,
                 progress_timeout_secs: None,
+                ..Default::default()
             },
         )
         .unwrap();
