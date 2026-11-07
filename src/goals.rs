@@ -247,9 +247,13 @@ pub fn rpc_with_notifications(
         std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
         std::env::var_os("XDG_STATE_HOME"),
         std::env::var_os("HOME"),
-    ).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or set CODEX_WAKE_RPC_SOCKET to its Unix socket"))?;
-    if !Path::new(&socket).try_exists()? {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound,"Codex Wake app-server socket missing: start the receiver service or correct CODEX_WAKE_RPC_SOCKET").into());
+    )
+    .ok_or_else(|| BeforeConnect("Codex Wake app-server socket missing".into()))?;
+    if !Path::new(&socket)
+        .try_exists()
+        .map_err(|error| BeforeConnect(error.to_string()))?
+    {
+        return Err(BeforeConnect("Codex Wake app-server socket missing".into()).into());
     }
     #[cfg(unix)]
     {

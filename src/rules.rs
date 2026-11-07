@@ -459,7 +459,6 @@ fn dispatch_with_identity(
                 input.goal_objective = Some(crate::templates::render(objective, &context)?);
             }
             let identity = if event_identity_verified
-                && input.goal_objective.is_none()
                 && (execution_options(&input).is_some()
                     || crate::execution::native_queue_available())
             {
@@ -540,8 +539,18 @@ pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Res
             if let Some(objective) = &input.goal_objective {
                 crate::goals::create(codex, thread, objective, input.token_budget)?;
                 // Goal activation can already start a turn; leave continuation to Codex.
-                // queue/add clientId correlation has not been qualified; leave its evidence unknown.
-                return crate::execution::queue_prepared(codex, thread, message);
+                return if let Some(client_id) = client_id {
+                    crate::execution::queue_with_identity(
+                        codex,
+                        thread,
+                        message,
+                        client_id,
+                        false,
+                        Duration::from_secs(120),
+                    )
+                } else {
+                    crate::execution::queue_prepared(codex, thread, message)
+                };
             }
             if let (Some(event_key), Some(client_id), Some(options)) =
                 (event_key, client_id, execution_options(input))

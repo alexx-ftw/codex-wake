@@ -396,6 +396,13 @@ fn deliver_with_id(
     );
     match result {
         Ok(_) => Ok(("queued".into(), Some("turn_start_accepted".into()))),
+        Err(error)
+            if error
+                .downcast_ref::<crate::goals::BeforeConnect>()
+                .is_some() =>
+        {
+            Err(TargetUnavailableBeforeSend.into())
+        }
         Err(_) => Ok(("needs_attention".into(), Some("execution_api_error".into()))),
     }
 }
@@ -459,6 +466,13 @@ pub fn deliver_with_identity_observed(
             Some("turn_start_accepted".into()),
             notifications,
         )),
+        Err(error)
+            if error
+                .downcast_ref::<crate::goals::BeforeConnect>()
+                .is_some() =>
+        {
+            Err(TargetUnavailableBeforeSend.into())
+        }
         Err(_) => Ok((
             "needs_attention".into(),
             Some("execution_api_error".into()),
@@ -690,6 +704,45 @@ mod tests {
         .unwrap_err();
         assert!(is_target_busy(&error));
         assert_eq!(methods, ["model/list", "thread/read"]);
+    }
+
+    #[test]
+    fn configured_turn_start_retries_only_failures_proven_before_submission() {
+        for before in [true, false] {
+            let mut calls = Vec::new();
+            let result = deliver_with(
+                THREAD,
+                "run",
+                &ExecutionOptions::default(),
+                &mut |method, _| {
+                    calls.push(method.to_owned());
+                    match method {
+                        "model/list" => Ok(catalog_page("gpt-6.1-sol", "sol", "low", None)),
+                        "thread/read" => Ok(json!({"thread":{"status":{"type":"idle"}}})),
+                        "turn/start" if before => {
+                            Err(crate::goals::BeforeConnect("initialize failed".into()).into())
+                        }
+                        "turn/start" => anyhow::bail!("response lost"),
+                        _ => unreachable!(),
+                    }
+                },
+            );
+            if before {
+                assert_eq!(
+                    before_send_retry_reason(&result.unwrap_err()),
+                    Some("target_unavailable_before_send")
+                );
+            } else {
+                assert_eq!(result.unwrap().0, "needs_attention");
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|method| *method == "turn/start")
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
