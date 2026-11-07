@@ -146,6 +146,7 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `publish_result` | Publish a verified provider result and dispatch matching waits |
 | `register_obligation` | Record a chat's pending result publication |
 | `register_resource_wait` | Record a wait on a non-chat resource and its declared continuation |
+| `update_wait_continuation` | Update an active wait’s declared continuation without resolving it |
 | `register_coordinator` | Explicitly set the coordinator for a responsible chat |
 | `list_obligations` | List a chat's pending publications |
 | `resolve_obligation` | Resolve a pending obligation explicitly |
@@ -172,6 +173,11 @@ cancellation disagree; use `get_result_conflicts` with the same identity and its
 `next` cursor for all pages. It does not determine which is correct or undo any
 earlier delivery.
 Publications without an execution identity remain supported and are not compared.
+A terminal job outcome (`success`, `failure`, or `cancelled`) matches both its
+exact event and `completed` subscriptions atomically. Each route retains its
+own delivery identity. When no matching subscription is waiting, evidence for
+an earlier `completed` subscription includes the outcome it actually received;
+it does not prove that the new result was delivered.
 If no subscription is waiting but an earlier one matches, the publisher receives
 `no_waiting_subscriber` and the available delivery evidence for inspection.
 
@@ -377,9 +383,10 @@ before that input is queued, so it can be consumed by a subsequent turn.
 
 `register_resource_wait` records an explicit wait for a non-chat resource using
 the same continuation declaration. Its resource is shown as `resource:<name>` in
-`get_status.circular_waits`; it cannot form a chat-to-chat cycle. Resolve it with
-`resolve_circular_wait` and register a new wait if the declaration changes. A
-`none` declaration triggers the same eligible Stop reminder; Wake does not infer
+`get_status.circular_waits`; it cannot form a chat-to-chat cycle. Update its
+declaration with `update_wait_continuation` without resolving the
+wait; use `resolve_circular_wait` when the wait ends. A `none` or `unknown`
+declaration triggers the same eligible Stop reminder; Wake does not infer
 whether mechanisms exist outside the explicit record.
 
 `register_circular_wait` records an explicit wait from `thread` to `waits_for`,
@@ -390,8 +397,10 @@ dependency, not proof of deadlock. `continuation` is the caller's declaration:
 `none`, `registered`, or `unknown` (the default); `registered` requires
 `continuation_ref` identifying the declared subscription, event, or other
 mechanism. Wake does not verify that it works. An eligible Stop continues the
-agent once when a wait is declared `none`; this does not prove that no mechanism
-exists outside Wake. The reentrant Stop does not continue again for that warning.
+agent once when a wait is declared `none` or `unknown`, asking it to verify the
+continuation; neither declaration proves that no mechanism exists outside Wake.
+Use `update_wait_continuation` to record a known mechanism without resolving the
+wait or changing existing notices. The reentrant Stop does not continue again for that warning.
 Use `resolve_circular_wait` when a wait ends; ready notices for that cycle are
 cancelled, but a notice already being sent cannot be recalled. Re-registering a
 resolved wait creates a new episode. `get_status.circular_waits` exposes waits

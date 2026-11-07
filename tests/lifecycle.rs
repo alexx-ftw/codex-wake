@@ -59,6 +59,7 @@ fn concurrent_mcp_sessions_share_receiver_and_closing_them_preserves_it() {
         for name in [
             "register_circular_wait",
             "register_resource_wait",
+            "update_wait_continuation",
             "resolve_circular_wait",
             "register_obligation",
             "register_coordinator",

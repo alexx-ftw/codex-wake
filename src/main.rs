@@ -178,6 +178,17 @@ struct ResourceWaitInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct WaitContinuationInput {
+    /// Existing active wait ID.
+    wait_id: String,
+    /// Declared continuation: none, unknown, or registered.
+    continuation: String,
+    /// Identifier required for registered; omit otherwise.
+    continuation_ref: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CircularWaitId {
     wait_id: String,
 }
@@ -670,7 +681,7 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         Ok(count) if count > 0 => {
             let previous = output["systemMessage"].as_str().unwrap_or_default();
             output["systemMessage"] = json!(format!(
-                "{previous} Wake: {count} explicitly registered wait(s) declare no continuation mechanism; inspect circular_waits in get_status."
+                "{previous} Wake: {count} explicitly registered wait(s) have no identified continuation or an unknown declaration; inspect circular_waits in get_status."
             ));
         }
         Err(_) => {
@@ -734,7 +745,7 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         }
         if missing_count > 0 {
             let reminder = format!(
-                "Wake: {missing_count} active wait(s) for chat {resource} were explicitly declared without an identified continuation mechanism. Inspect circular_waits in get_status and establish or report the appropriate continuation within existing authorization. This declaration does not establish that no mechanism exists outside Wake."
+                "Wake: {missing_count} active wait(s) for chat {resource} have continuation declared none or unknown. Inspect circular_waits in get_status, verify whether a continuation exists, and update the declaration within existing authorization. Unknown is not proof that a mechanism is absent."
             );
             let previous = output["reason"].as_str().unwrap_or_default();
             let reason = if previous.is_empty() {
@@ -816,6 +827,25 @@ impl WakeTools {
                 input.continuation_ref.as_deref(),
             )?;
             Ok(json!({"wait_id":id}))
+        })())
+    }
+
+    #[tool(
+        description = "Update the declared continuation of an active chat or resource wait without resolving it. Registered requires an identifier; Wake does not verify the mechanism.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    fn update_wait_continuation(
+        &self,
+        Parameters(input): Parameters<WaitContinuationInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            Ok(
+                json!({"updated":circular_waits::update_continuation(&database(&self.config)?, &input.wait_id, &input.continuation, input.continuation_ref.as_deref())?}),
+            )
         })())
     }
 
@@ -1414,6 +1444,7 @@ impl rmcp::ServerHandler for WakeTools {
             "register_obligation" => "mcp.register_obligation",
             "register_circular_wait" => "mcp.register_circular_wait",
             "register_resource_wait" => "mcp.register_resource_wait",
+            "update_wait_continuation" => "mcp.update_wait_continuation",
             "resolve_circular_wait" => "mcp.resolve_circular_wait",
             "list_obligations" => "mcp.list_obligations",
             "resolve_obligation" => "mcp.resolve_obligation",
@@ -2003,6 +2034,43 @@ mod hook_output_tests {
     }
 
     #[test]
+    fn publication_tool_warns_for_consumed_completed_job_subscription() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        subscriptions::subscribe(
+            &db,
+            "job",
+            "ci",
+            "build",
+            "completed",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        drop(db);
+        let publish = || {
+            let input = serde_json::from_value::<PublicationInput>(
+                json!({"kind":"job","repo":"ci","resource":"build","outcome":"success"}),
+            )
+            .unwrap();
+            let result = tools.publish_result(Parameters(input));
+            assert_ne!(result.is_error, Some(true));
+            result.structured_content.unwrap()
+        };
+        assert_eq!(publish()["matched"], 1);
+        let retry = publish();
+        assert_eq!(retry["matched"], 0);
+        assert!(retry["no_waiting_subscriber"].is_string());
+        assert_eq!(retry["delivery_warnings"][0]["event"], "completed");
+        assert_eq!(retry["delivery_warnings"][0]["outcome"], "success");
+    }
+
+    #[test]
     fn publication_warns_when_only_an_earlier_subscription_exists() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         subscriptions::initialize(&db).unwrap();
@@ -2045,7 +2113,7 @@ mod hook_output_tests {
             thread: owner.into(),
             resource: "provider/build".into(),
             evidence: "waiting for build".into(),
-            continuation: Some("none".into()),
+            continuation: None,
             continuation_ref: None,
         }));
         assert_ne!(response.is_error, Some(true));
@@ -2073,6 +2141,24 @@ mod hook_output_tests {
             json!({"hook_event_name":"Stop","session_id":owner,"stop_hook_active":true});
         assert!(
             run_hook(&tools.config, &reentrant)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        assert!(
+            reminder["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown is not proof")
+        );
+        let changed = tools.update_wait_continuation(Parameters(WaitContinuationInput {
+            wait_id: id.clone(),
+            continuation: "registered".into(),
+            continuation_ref: Some("subscription:known".into()),
+        }));
+        assert_eq!(changed.structured_content.unwrap()["updated"], true);
+        assert!(
+            run_hook(&tools.config, &owner_stop)
                 .unwrap()
                 .get("decision")
                 .is_none()
@@ -2113,11 +2199,13 @@ mod hook_output_tests {
                 .is_none()
         );
         let unknown = circular_waits::register(&mut db, a, b, "Waiting", "unknown", None).unwrap();
+        let result = run_hook(&config, &payload).unwrap();
+        assert_eq!(result["decision"], "block");
         assert!(
-            run_hook(&config, &payload)
+            result["reason"]
+                .as_str()
                 .unwrap()
-                .get("decision")
-                .is_none()
+                .contains("Unknown is not proof")
         );
         circular_waits::resolve(&mut db, &unknown).unwrap();
         let registered = circular_waits::register(
@@ -2150,7 +2238,7 @@ mod hook_output_tests {
             result["reason"]
                 .as_str()
                 .unwrap()
-                .contains("does not establish that no mechanism exists outside Wake")
+                .contains("Unknown is not proof that a mechanism is absent")
         );
         let continued = json!({"hook_event_name":"Stop","session_id":a,"stop_hook_active":true});
         assert!(
@@ -2187,7 +2275,7 @@ mod hook_output_tests {
         assert!(
             reason.contains("Review the input")
                 && reason.contains("publication or validation obligation")
-                && reason.contains("without an identified continuation")
+                && reason.contains("continuation declared none or unknown")
         );
         assert_eq!(output["decision"], "block");
         let again = run_hook(

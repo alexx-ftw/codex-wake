@@ -790,7 +790,7 @@ pub fn publish_report(
     } else {
         Vec::new()
     };
-    let matched = ready_update(
+    let mut matched = ready_update(
         &tx,
         kind,
         repo,
@@ -800,6 +800,36 @@ pub fn publish_report(
         source,
         source_event_key.as_deref(),
     )?;
+    // A completed-job subscription accepts any terminal outcome. Keep a
+    // separate event identity for this subscription route.
+    if kind == "job" && matches!(outcome, "success" | "failure" | "cancelled") {
+        let completed_key = if let Some((execution, attempt)) = identity {
+            let identity_source = json!({"workflow_run":{"id":execution,"run_attempt":attempt}});
+            Some(
+                crate::delivery_evidence::subscription_event_identity(
+                    kind,
+                    repo,
+                    &resource,
+                    "completed",
+                    outcome,
+                    &identity_source,
+                )?
+                .context("Missing stable completed-job event identity")?,
+            )
+        } else {
+            None
+        };
+        matched += ready_update(
+            &tx,
+            kind,
+            repo,
+            &resource,
+            "completed",
+            outcome,
+            source,
+            completed_key.as_deref(),
+        )?;
+    }
     let resolved = crate::obligations::resolve_publication(&tx, kind, repo, &resource, outcome)?;
     tx.commit()?;
     log_accept(kind, repo, &resource, outcome, matched);
@@ -924,7 +954,7 @@ pub fn delivery_warnings(
     } else {
         resource.to_owned()
     };
-    let mut statement = db.prepare("SELECT id,thread,state,reason,updated,required_source,source_json FROM subscriptions WHERE kind=?1 AND repo=?2 AND resource=?3 AND event=?4 AND state!='waiting' ORDER BY id")?;
+    let mut statement = db.prepare("SELECT id,thread,state,reason,updated,required_source,source_json,event,outcome FROM subscriptions WHERE kind=?1 AND repo=?2 AND resource=?3 AND (event=?4 OR (?1='job' AND ?4 IN ('success','failure','cancelled') AND event='completed')) AND state!='waiting' ORDER BY id")?;
     let rows = statement.query_map(params![kind, repo, resource, outcome], |row| {
         let state: String = row.get(2)?;
         let reason: Option<String> = row.get(3)?;
@@ -937,7 +967,7 @@ pub fn delivery_warnings(
             "sending" => "Delivery started; its outcome is unknown.",
             _ => "Delivery requires attention; receipt is not confirmed.",
         };
-        Ok(json!({"subscription_id":row.get::<_,String>(0)?,"thread":row.get::<_,String>(1)?,"state":state,"reason":reason,"updated":row.get::<_,String>(4)?,"warning":warning,"missing_source":missing}))
+        Ok(json!({"subscription_id":row.get::<_,String>(0)?,"thread":row.get::<_,String>(1)?,"state":state,"reason":reason,"updated":row.get::<_,String>(4)?,"event":row.get::<_,String>(7)?,"outcome":row.get::<_,Option<String>>(8)?,"warning":warning,"missing_source":missing}))
     })?;
     Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
 }
@@ -1904,6 +1934,78 @@ mod tests {
         let current: (i64, String) = db.query_row("SELECT dependency_notice_generation,dependency_notice_state FROM subscriptions WHERE id=?1", [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(current, (2, "queued".to_owned()));
         assert_eq!(sends, 1);
+    }
+
+    #[test]
+    fn terminal_job_results_match_completed_and_specific_routes_atomically() {
+        for outcome in ["success", "failure", "cancelled"] {
+            let db = db();
+            crate::obligations::initialize(&db).unwrap();
+            let completed = subscribe(&db, "job", "ci", "build", "completed", THREAD).unwrap();
+            let specific = subscribe(&db, "job", "ci", "build", outcome, CHAT).unwrap();
+            let (matched, _, _) = publish_report(
+                &db,
+                "job",
+                "ci",
+                "build",
+                outcome,
+                &json!({}),
+                Some(("run-42", 1)),
+            )
+            .unwrap();
+            assert_eq!(matched, 2);
+            let read = |id: &str| {
+                db.query_row(
+                    "SELECT state,source_event_key FROM subscriptions WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+            };
+            let first = read(&completed);
+            let second = read(&specific);
+            assert_eq!(first.0, "ready");
+            assert_eq!(second.0, "ready");
+            assert!(first.1.is_some() && second.1.is_some());
+            assert_ne!(first.1, second.1);
+            assert_eq!(
+                publish_report(
+                    &db,
+                    "job",
+                    "ci",
+                    "build",
+                    outcome,
+                    &json!({}),
+                    Some(("run-42", 1))
+                )
+                .unwrap()
+                .0,
+                0
+            );
+            let warnings = delivery_warnings(&db, "job", "ci", "build", outcome).unwrap();
+            assert_eq!(warnings.as_array().unwrap().len(), 2);
+            assert!(
+                warnings
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["event"] == "completed" && row["outcome"] == outcome)
+            );
+        }
+        let db = db();
+        crate::obligations::initialize(&db).unwrap();
+        let exact = subscribe(&db, "job", "ci", "rollback", "success", THREAD).unwrap();
+        subscribe(&db, "job", "ci", "rollback", "completed", CHAT).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_completed BEFORE UPDATE ON subscriptions WHEN OLD.event='completed' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(publish_report(&db, "job", "ci", "rollback", "success", &json!({}), None).is_err());
+        let state: String = db
+            .query_row(
+                "SELECT state FROM subscriptions WHERE id=?1",
+                [exact],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "waiting");
     }
 
     #[test]

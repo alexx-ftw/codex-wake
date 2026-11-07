@@ -747,6 +747,8 @@ mod tests {
     fn stop_and_native_completion_race_claim_one_subscription() {
         use std::sync::{Arc, Barrier};
         let temp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = temp.path().join("state.sqlite3");
         let db = crate::bridge::connect(&path).unwrap();
         crate::subscriptions::initialize(&db).unwrap();

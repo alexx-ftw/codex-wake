@@ -145,6 +145,28 @@ pub fn register_resource(
     Ok(id)
 }
 
+/// Update an explicit declaration without resolving the wait or altering notices.
+pub fn update_continuation(
+    db: &Connection,
+    id: &str,
+    continuation: &str,
+    continuation_ref: Option<&str>,
+) -> Result<bool> {
+    let id = Uuid::parse_str(id)?.to_string();
+    match (continuation, continuation_ref) {
+        ("registered", Some(value)) => ensure!(
+            !value.trim().is_empty() && serde_json::to_vec(value)?.len() <= 2048,
+            "A registered continuation requires a bounded identifier"
+        ),
+        ("none" | "unknown", None) => {}
+        _ => anyhow::bail!("Invalid continuation status or identifier"),
+    }
+    Ok(db.execute(
+        "UPDATE circular_waits SET continuation=?1,continuation_ref=?2 WHERE id=?3 AND active=1",
+        params![continuation, continuation_ref, id],
+    )? > 0)
+}
+
 pub fn resolve(db: &mut Connection, id: &str) -> Result<bool> {
     let id = Uuid::parse_str(id)?.to_string();
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -172,7 +194,7 @@ pub fn status(db: &Connection) -> Result<Value> {
 
 pub fn without_continuation(db: &Connection, thread: &str) -> Result<i64> {
     Ok(db.query_row(
-        "SELECT count(*) FROM circular_waits WHERE thread=?1 AND active=1 AND continuation='none'",
+        "SELECT count(*) FROM circular_waits WHERE thread=?1 AND active=1 AND continuation IN ('none','unknown')",
         [thread],
         |r| r.get(0),
     )?)
@@ -259,7 +281,7 @@ mod tests {
         assert!(register_resource(&db, A, "other", "Waiting", "registered", None).is_err());
         register(&mut db, B, A, "Waiting for A", "unknown", None).unwrap();
         assert_eq!(without_continuation(&db, A).unwrap(), 1);
-        assert_eq!(without_continuation(&db, B).unwrap(), 0);
+        assert_eq!(without_continuation(&db, B).unwrap(), 1);
         assert_eq!(status(&db).unwrap()["notices"].as_array().unwrap().len(), 0);
         assert!(resolve(&mut db, &id).unwrap());
         assert_eq!(without_continuation(&db, A).unwrap(), 0);
@@ -541,6 +563,30 @@ mod tests {
         let result = status(&db).unwrap();
         assert_eq!(result["waits"].as_array().unwrap().len(), 2);
         assert_eq!(result["notices"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn continuation_update_keeps_wait_and_cycle_notices() {
+        let mut db = db();
+        let id = register(&mut db, A, B, "first", "unknown", None).unwrap();
+        register(&mut db, B, A, "second", "none", None).unwrap();
+        assert_eq!(without_continuation(&db, A).unwrap(), 1);
+        assert!(update_continuation(&db, &id, "registered", Some("subscription:123")).unwrap());
+        assert_eq!(without_continuation(&db, A).unwrap(), 0);
+        let value = status(&db).unwrap();
+        assert_eq!(value["waits"].as_array().unwrap().len(), 2);
+        assert_eq!(value["notices"].as_array().unwrap().len(), 2);
+        assert!(
+            value["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] == "ready")
+        );
+        assert!(update_continuation(&db, &id, "registered", None).is_err());
+        assert_eq!(without_continuation(&db, A).unwrap(), 0);
+        assert!(resolve(&mut db, &id).unwrap());
+        assert!(!update_continuation(&db, &id, "unknown", None).unwrap());
     }
 
     #[test]
