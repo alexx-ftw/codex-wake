@@ -1,0 +1,36 @@
+{
+  "historical_source": "0a1ba30162265efda9ffacf4f304602409873d11",
+  "candidate": "520109dbbf69332fafaa6cdccdee9e85b26c30d1",
+  "results": [
+    {
+      "missing_source_warning_in_message": false,
+      "receiver": "rebuilt-0a1ba30",
+      "required_source_missing": true,
+      "final_state": "queued",
+      "reason": null,
+      "synthetic_cli_queue_calls": 1,
+      "synthetic_native_queue_calls": 0,
+      "queue_from_receiver": true,
+      "receiver_pid_stable": true,
+      "unrelated_waiting": true,
+      "subscription_count": 2,
+      "systemd_used": false,
+      "controller_simulated": true
+    },
+    {
+      "missing_source_warning_in_message": true,
+      "receiver": "built-520109db",
+      "required_source_missing": true,
+      "final_state": "queued",
+      "reason": null,
+      "synthetic_cli_queue_calls": 1,
+      "synthetic_native_queue_calls": 0,
+      "queue_from_receiver": true,
+      "receiver_pid_stable": true,
+      "unrelated_waiting": true,
+      "subscription_count": 2,
+      "systemd_used": false,
+      "controller_simulated": true
+    }
+  ]
+}

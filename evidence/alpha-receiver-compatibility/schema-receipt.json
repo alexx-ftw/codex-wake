@@ -1,0 +1,36 @@
+{
+  "old": "0a1ba30162265efda9ffacf4f304602409873d11",
+  "new": "520109dbbf69332fafaa6cdccdee9e85b26c30d1",
+  "results": [
+    {
+      "schema_added_required_source": true,
+      "queue_from_receiver": true,
+      "triggered_final": "queued",
+      "queue_outcome": "synthetic_acceptance",
+      "receiver_pid_stable": true,
+      "first_hook_block": true,
+      "second_hook_block": true,
+      "subscription_state": "queued",
+      "unrelated_subscription_waiting": true,
+      "subscription_count": 2,
+      "synthetic_queue_calls": 1,
+      "receiver_systemd": false,
+      "control_server_simulated": true
+    },
+    {
+      "schema_added_required_source": true,
+      "queue_from_receiver": true,
+      "triggered_final": "needs_attention",
+      "queue_outcome": "synthetic_error",
+      "receiver_pid_stable": true,
+      "first_hook_block": true,
+      "second_hook_block": true,
+      "subscription_state": "needs_attention",
+      "unrelated_subscription_waiting": true,
+      "subscription_count": 2,
+      "synthetic_queue_calls": 1,
+      "receiver_systemd": false,
+      "control_server_simulated": true
+    }
+  ]
+}
