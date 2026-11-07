@@ -375,6 +375,12 @@ pub fn get(codex: &Path, thread: &str) -> Result<Value> {
     get_with(thread, &mut |method, params| rpc(codex, method, params))
 }
 
+pub(crate) fn get_with_timeout(codex: &Path, thread: &str, timeout: Duration) -> Result<Value> {
+    get_with(thread, &mut |method, params| {
+        rpc_with_timeout(codex, method, params, timeout)
+    })
+}
+
 /// Create a goal only when the thread does not already have one.
 pub fn create(
     codex: &Path,

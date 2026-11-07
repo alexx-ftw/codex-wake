@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -134,6 +134,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
             goal_sender_start INTEGER,
             goal_sender_boot TEXT,
             goal_sender_namespace TEXT,
+            goal_sender_next_check INTEGER,
             UNIQUE(kind,repo,resource,event,thread)
         );
         CREATE INDEX IF NOT EXISTS subscriptions_ready ON subscriptions(state,updated);",
@@ -181,6 +182,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
             ("goal_sender_start", "INTEGER"),
             ("goal_sender_boot", "TEXT"),
             ("goal_sender_namespace", "TEXT"),
+            ("goal_sender_next_check", "INTEGER"),
         ] {
             if !columns.iter().any(|existing| existing == column) {
                 db.execute_batch(&format!(
@@ -188,6 +190,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
                 ))?;
             }
         }
+        db.execute_batch("CREATE INDEX IF NOT EXISTS subscriptions_goal_reconcile ON subscriptions(state,goal_stage,COALESCE(goal_sender_next_check,0),id)")?;
         db.execute("UPDATE subscriptions SET dependency_notice_uncertain_generation=COALESCE(dependency_notice_generation,dependency_period_generation),dependency_notice_uncertain_reason=dependency_notice_reason WHERE dependency_notice_state='needs_attention' AND substr(dependency_notice_reason,1,21)='send_outcome_unknown:' AND dependency_notice_uncertain_generation IS NULL", [])?;
         db.execute("INSERT OR IGNORE INTO dependency_notice_uncertainties(subscription_id,generation,reason,recorded_at_ms) SELECT id,dependency_notice_uncertain_generation,dependency_notice_uncertain_reason,COALESCE(dependency_notice_started_at_ms,dependency_progress_at_ms,0) FROM subscriptions WHERE dependency_notice_uncertain_generation IS NOT NULL AND dependency_notice_uncertain_reason IS NOT NULL", [])?;
         db.execute("UPDATE subscriptions SET dependency_notice_state=NULL,dependency_notice_reason=NULL,dependency_notice_after_ms=NULL,dependency_notice_generation=NULL WHERE dependency_notice_state='needs_attention' AND dependency_notice_uncertain_generation IS NOT NULL AND dependency_notice_uncertain_generation<dependency_period_generation", [])?;
@@ -1185,9 +1188,10 @@ fn activate_queued_goal_with(
     activate: impl FnOnce(&str) -> Result<Value>,
 ) -> Result<bool> {
     let sender = goal_sender_identity();
+    let next_check = epoch_ms()?.saturating_add(15_000);
     let claim = db.query_row(
-        "UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP,goal_sender_pid=?2,goal_sender_start=?3,goal_sender_boot=?4,goal_sender_namespace=?5 WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='input_queued' RETURNING thread,reason",
-        params![id, sender.as_ref().map(|s| s.0), sender.as_ref().map(|s| s.1), sender.as_ref().map(|s| &s.2), sender.as_ref().map(|s| &s.3)],
+        "UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP,goal_sender_pid=?2,goal_sender_start=?3,goal_sender_boot=?4,goal_sender_namespace=?5,goal_sender_next_check=?6 WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='input_queued' RETURNING thread,reason",
+        params![id, sender.as_ref().map(|s| s.0), sender.as_ref().map(|s| s.1), sender.as_ref().map(|s| &s.2), sender.as_ref().map(|s| &s.3), next_check],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     ).optional()?;
     let Some((thread, queue_reason)) = claim else {
@@ -1282,16 +1286,23 @@ fn reconcile_interrupted_goal_with(
     };
     let active = goal["status"] == "active";
     let changed = db.execute(
-        "UPDATE subscriptions SET state=?1,reason=?2,goal_stage=?3,updated=CURRENT_TIMESTAMP WHERE id=?4 AND state='sending' AND goal_stage='activating' AND goal_sender_pid=?5 AND goal_sender_start=?6 AND goal_sender_boot=?7 AND goal_sender_namespace=?8",
+        "UPDATE subscriptions SET state=?1,reason=?2,goal_stage=?3,updated=CURRENT_TIMESTAMP WHERE id=?4 AND resume_goal=1 AND state='sending' AND goal_stage='activating' AND goal_sender_pid=?5 AND goal_sender_start=?6 AND goal_sender_boot=?7 AND goal_sender_namespace=?8",
         params![if active { "queued" } else { "needs_attention" }, if active { "goal_active_after_interrupted_activation" } else { "goal_activation_interrupted_input_queued" }, if active { "active" } else { "activation_unconfirmed" }, id, pid, start, boot, namespace],
     )?;
     Ok(changed == 1)
 }
 
-fn reconcile_interrupted_goals(db: &Connection, codex: &Path) -> Result<()> {
-    let mut statement = db.prepare("SELECT id,goal_sender_pid,goal_sender_start,goal_sender_boot,goal_sender_namespace FROM subscriptions WHERE resume_goal=1 AND state='sending' AND goal_stage='activating' AND goal_sender_pid IS NOT NULL AND updated<=datetime('now','-15 seconds') ORDER BY updated,id")?;
+fn reconcile_interrupted_goals_with(
+    db: &Connection,
+    timeout: Duration,
+    mut read_goal: impl FnMut(&str, Duration) -> Result<Value>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout.min(Duration::from_secs(5));
+    let now = epoch_ms()?;
+    let mut attempted = 0;
+    let mut statement = db.prepare("SELECT id,goal_sender_pid,goal_sender_start,goal_sender_boot,goal_sender_namespace FROM subscriptions WHERE state='sending' AND goal_stage='activating' AND resume_goal=1 AND goal_sender_pid IS NOT NULL AND COALESCE(goal_sender_next_check,0)<=?1 ORDER BY COALESCE(goal_sender_next_check,0),id LIMIT 128")?;
     let candidates = statement
-        .query_map([], |row| {
+        .query_map([now], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<i64>>(1)?,
@@ -1302,19 +1313,27 @@ fn reconcile_interrupted_goals(db: &Connection, codex: &Path) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
-    let mut attempted = 0;
-    for candidate in candidates {
-        let (id, Some(pid), Some(start), Some(boot), Some(namespace)) = candidate else {
+    for (id, pid, start, boot, namespace) in candidates {
+        if attempted == 16 || deadline.saturating_duration_since(Instant::now()).is_zero() {
+            break;
+        }
+        let claimed = db.execute("UPDATE subscriptions SET goal_sender_next_check=?2 WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='activating' AND COALESCE(goal_sender_next_check,0)<=?3 AND goal_sender_pid IS ?4 AND goal_sender_start IS ?5 AND goal_sender_boot IS ?6 AND goal_sender_namespace IS ?7", params![id, now.saturating_add(15_000), now, pid, start, boot, namespace])?;
+        if claimed == 0 {
+            continue;
+        }
+        let (Some(pid), Some(start), Some(boot), Some(namespace)) = (pid, start, boot, namespace)
+        else {
             continue;
         };
         if !goal_sender_confirmed_gone(pid, start, &boot, &namespace) {
             continue;
         }
-        if attempted == 16 {
-            break;
-        }
         attempted += 1;
-        reconcile_interrupted_goal_with(db, &id, |thread| crate::goals::get(codex, thread))?;
+        reconcile_interrupted_goal_with(db, &id, |thread| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            ensure!(!remaining.is_zero(), "Goal reconciliation deadline reached");
+            read_goal(thread, remaining)
+        })?;
     }
     Ok(())
 }
@@ -1322,7 +1341,9 @@ fn reconcile_interrupted_goals(db: &Connection, codex: &Path) -> Result<()> {
 /// Claim and send ready events once. A non-successful/ambiguous send is never retried automatically.
 pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<usize> {
     initialize(db)?;
-    reconcile_interrupted_goals(db, codex)?;
+    reconcile_interrupted_goals_with(db, timeout, |thread, remaining| {
+        crate::goals::get_with_timeout(codex, thread, remaining)
+    })?;
     let mut attempted = 0;
     loop {
         let queued_goal = db.query_row(
@@ -1907,6 +1928,69 @@ mod tests {
         assert!(
             !reconcile_interrupted_goal_with(&db, &id, |_| panic!("activation retried")).unwrap()
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reconciliation_limits_each_batch_and_continues_next_time() {
+        let db = db();
+        let (pid, start, boot, namespace) = goal_sender_identity().unwrap();
+        for number in 0..130 {
+            let id = subscribe(
+                &db,
+                "artifact",
+                "ci",
+                &format!("live-{number}"),
+                "available",
+                THREAD,
+            )
+            .unwrap();
+            db.execute("UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='activating',goal_sender_next_check=1,goal_sender_pid=?2,goal_sender_start=?3,goal_sender_boot=?4,goal_sender_namespace=?5 WHERE id=?1", params![id, pid, start, boot, namespace]).unwrap();
+        }
+        for number in 0..20 {
+            let id = subscribe(
+                &db,
+                "artifact",
+                "ci",
+                &format!("pkg-{number}"),
+                "available",
+                THREAD,
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='activating',goal_sender_next_check=2,goal_sender_pid=2147483647,goal_sender_start=1,goal_sender_boot=?2,goal_sender_namespace=?3 WHERE id=?1",
+                params![id, boot, namespace],
+            ).unwrap();
+        }
+        let calls = std::cell::Cell::new(0);
+        let read = |_: &str, remaining: Duration| {
+            assert!(!remaining.is_zero());
+            assert!(remaining <= Duration::from_secs(5));
+            calls.set(calls.get() + 1);
+            Ok(json!({"status":"active"}))
+        };
+        reconcile_interrupted_goals_with(&db, Duration::from_secs(10), &read).unwrap();
+        assert_eq!(calls.get(), 0);
+        reconcile_interrupted_goals_with(&db, Duration::from_secs(10), &read).unwrap();
+        assert_eq!(calls.get(), 16);
+        let waiting: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM subscriptions WHERE state='sending' AND resource GLOB 'pkg-*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(waiting, 4);
+        reconcile_interrupted_goals_with(&db, Duration::from_secs(10), &read).unwrap();
+        assert_eq!(calls.get(), 20);
+        let waiting: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM subscriptions WHERE state='sending' AND resource GLOB 'pkg-*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(waiting, 0);
     }
 
     #[test]
@@ -3850,6 +3934,7 @@ mod tests {
             "goal_sender_start",
             "goal_sender_boot",
             "goal_sender_namespace",
+            "goal_sender_next_check",
         ] {
             assert!(columns.iter().any(|existing| existing == column));
         }
