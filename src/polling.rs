@@ -793,7 +793,14 @@ impl PollCommitGuard {
             .lock()
             .map_err(|_| anyhow::anyhow!("poll commit lock poisoned"))?;
         let file = if let Some(path) = db.path().filter(|p| !p.is_empty()) {
-            let lock_path = format!("{path}.poll.lock");
+            let canonical = std::fs::canonicalize(path)?;
+            let database = std::fs::metadata(&canonical)?;
+            anyhow::ensure!(
+                database.is_file() && database.nlink() == 1,
+                "polling database must have one link"
+            );
+            let mut lock_path = canonical.into_os_string();
+            lock_path.push(".poll.lock");
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1321,6 +1328,15 @@ mod tests {
     use super::*;
     type Fetch<'a> =
         dyn FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure> + 'a;
+
+    #[test]
+    fn polling_rejects_hard_linked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let db = Connection::open(&path).unwrap();
+        std::fs::hard_link(&path, dir.path().join("alias.sqlite")).unwrap();
+        assert!(PollCommitGuard::acquire(&db).is_err());
+    }
 
     #[test]
     fn stale_response_from_another_process_does_not_regress_cursor() {
