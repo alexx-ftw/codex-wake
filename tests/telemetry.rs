@@ -273,7 +273,36 @@ fn existing_app_server_socket_routes_queue_and_telemetry_stays_private() {
     fs::create_dir(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     let socket = state.join("app-server.sock");
-    let _server = UnixListener::bind(&socket).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let init: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            ws.send(tungstenite::Message::Text(
+                json!({"id":init["id"],"result":{}}).to_string().into(),
+            ))
+            .unwrap();
+            let _: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            let request: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            let method = request["method"].as_str().unwrap().to_owned();
+            let result = if method == "thread/read" {
+                json!({"thread":{"status":{"type":"active"}}})
+            } else {
+                json!({})
+            };
+            methods.push(request);
+            ws.send(tungstenite::Message::Text(
+                json!({"id":"codex-wake-request","result":result})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        }
+        methods
+    });
     let repo = "owner/SECRET_MESSAGE_SENTINEL";
     let run = "91827364";
     let attempt = "2";
@@ -332,21 +361,18 @@ fn existing_app_server_socket_routes_queue_and_telemetry_stays_private() {
         String::from_utf8_lossy(&handled.stderr)
     );
     assert!(handled.stderr.is_empty());
-    let argv = fs::read_to_string(root.path().join("fake-codex-argv")).unwrap();
-    assert_eq!(argv.lines().next(), Some("queue"), "{argv}");
-    assert!(argv.lines().any(|arg| arg == "--resume"), "{argv}");
-    assert!(argv.lines().any(|arg| arg == "--remote"), "{argv}");
-    assert!(
-        argv.lines()
-            .any(|arg| arg == format!("unix://{}", socket.display())),
-        "{argv}"
-    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0]["method"], "thread/queue/add");
+    assert_eq!(requests[0]["params"]["threadId"], thread);
+    assert!(requests[0]["params"]["clientUserMessageId"].is_string());
+    assert_eq!(requests[1]["method"], "thread/read");
+    assert!(!root.path().join("fake-codex-argv").exists());
 
     let status = invoke_with_codex(root.path(), &codex, &["status"], None);
     assert!(status.status.success());
     let waits: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(waits[0]["state"], "queued");
-    assert_eq!(waits[0]["reason"], Value::Null);
+    assert_eq!(waits[0]["reason"], "native_queue_accepted");
 
     let diagnostics = invoke(root.path(), &["diagnostics", "--days", "42"], None);
     assert!(
@@ -356,11 +382,11 @@ fn existing_app_server_socket_routes_queue_and_telemetry_stays_private() {
     );
     let report: Value = serde_json::from_slice(&diagnostics.stdout).unwrap();
     let groups = report["daily_groups"].as_array().unwrap();
-    assert!(groups.iter().any(|event| {
-        event["operation"] == "delivery.cli_exit"
-            && event["outcome"] == "ok"
-            && event["reason"] == "exit_code_0"
-    }));
+    assert!(
+        groups
+            .iter()
+            .any(|event| { event["operation"] == "rpc.queue_add" && event["outcome"] == "ok" })
+    );
     assert!(
         groups
             .iter()
