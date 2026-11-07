@@ -2869,6 +2869,42 @@ mod hook_output_tests {
     }
 
     #[test]
+    fn interrupt_after_stop_for_same_turn_is_not_sent_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let db = database(&config).unwrap();
+        let source = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        obligations::register_coordinator(&db, source, coordinator).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture',?1,'artifact','repo','release','available','Pending')", [source]).unwrap();
+        let stop = json!({"hook_event_name":"Stop","session_id":source,"turn_id":"turn-1"});
+        assert_eq!(
+            notify_coordinator(&config, &db, source, &stop, false).unwrap(),
+            Some((coordinator.into(), "needs_attention".into()))
+        );
+        db.execute(
+            "UPDATE obligations SET description='Changed' WHERE id='fixture'",
+            [],
+        )
+        .unwrap();
+        let interrupt =
+            json!({"hook_event_name":"Interrupt","session_id":source,"turn_id":"turn-1"});
+        assert!(
+            notify_coordinator(&config, &db, source, &interrupt, true)
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM coordinator_alerts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn coordinator_stop_without_turn_is_recorded_without_sending() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = manager::Config::from_env().unwrap();
