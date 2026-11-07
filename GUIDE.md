@@ -436,17 +436,25 @@ can inspect it with `list_obligation_transfers` and take ownership only by
 calling `accept_obligation_transfer` from that chat.
 
 `register_coordinator` explicitly associates a responsible chat with its
-coordinator. On a root `Stop` hook with pending obligations, Wake queues one
-alert to that coordinator with the pending descriptions and the hook's
-`last_assistant_message` when available. The alert says that a turn stopped;
-`Stop` does not establish completion or abandonment. `SubagentStop`, repeated
+coordinator. On an eligible root `Stop` or `Interrupt` hook with pending
+obligations, Wake queues one alert to that coordinator with pending descriptions.
+A `Stop` may include `last_assistant_message`; the Codex 0.166 Interrupt
+payload does not include that field, so the alert reports it as unavailable.
+These hooks report a stopped or interrupted turn, not task completion or
+abandonment. Interrupt handling does not publish a completion event, resolve an
+obligation, or force a continuation. A hard process failure or a host/version that
+does not run a trusted Interrupt hook is not covered. `SubagentStop`, repeated
 Stop-loop hooks, and chats without an explicit coordinator do not trigger this
-alert. Wake persists the alert before sending and never retries the same
-fingerprinted event automatically. An uncertain send remains recorded for
+alert. Stop and Interrupt with the same usable turn ID share one persistent
+claim even if the pending set changes; an uncertain send is never replayed. An uncertain send remains recorded for
 inspection; queue acceptance still does not prove that the coordinator read it.
-If the hook has no turn ID, Wake sends at most one alert for the same pending
-obligation set and last assistant message; a changed message can identify a
-later Stop, while an identical reentrant hook remains deduplicated. In `get_status`,
+If Stop has no usable turn ID, Wake keeps the earlier fingerprint based on the
+pending set and last message; an identical reentrant hook is deduplicated. That
+fingerprint cannot be safely correlated with an Interrupt that has a turn ID,
+so the two could create separate alerts. Interrupt requires a usable turn ID. Prior releases used a different fingerprint; a matching legacy claim with
+the same pending set is honored. Legacy claims do not retain a reversible turn
+ID, so follow the maintenance upgrade barrier and finish controller-owned turns
+before upgrading; changed pending sets cannot be correlated across versions. In `get_status`,
 a `sending` alert whose sender process is no longer verifiably alive appears as
 `uncertain`: delivery may have been abandoned, receipt is unknown, and Wake will
 not resend it. A live sender remains `sending`; this read-only diagnosis does
@@ -475,9 +483,9 @@ When a reminder is due, the hook leaves lifecycle deliveries ready for the
 receiver's background dispatcher instead of waiting for unrelated sends. If the
 receiver is unavailable, they remain ready until it restarts or recovery runs.
 
-Bundled `SessionStart` checks the shared receiver. `Stop` and `SubagentStop` command hooks publish local lifecycle signals
+Bundled `SessionStart` checks the shared receiver. `Interrupt` alerts a registered coordinator without publishing a completion. `Stop` and `SubagentStop` command hooks publish local lifecycle signals
 without asking a model to interpret instructions. Codex requires users to review
-and trust plugin hooks before running them; installation alone doesn't trust
+and trust plugin hooks before running them; the new Interrupt hook also requires review. Installation alone doesn't trust
 them. No trust bypass is installed.
 
 `Stop` describes a turn stopping, not successful completion of its task. Another

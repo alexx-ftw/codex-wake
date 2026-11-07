@@ -293,14 +293,27 @@ pub fn register_coordinator(db: &Connection, responsible: &str, coordinator: &st
 }
 
 /// Persist before sending. Existing event IDs are never sent again, including after an uncertain result.
+#[cfg(test)]
 pub fn claim_coordinator_alert(
     db: &Connection,
     responsible: &str,
     fingerprint: &str,
     message: &str,
 ) -> Result<Option<(String, String)>> {
+    claim_coordinator_alert_compatible(db, responsible, fingerprint, message, None)
+}
+
+/// Atomically honor a legacy fingerprint before claiming a turn-scoped event.
+pub fn claim_coordinator_alert_compatible(
+    db: &Connection,
+    responsible: &str,
+    fingerprint: &str,
+    message: &str,
+    legacy: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let responsible = Uuid::parse_str(responsible)?.to_string();
-    let Some(coordinator) = db
+    let Some(coordinator) = tx
         .query_row(
             "SELECT coordinator FROM coordinators WHERE responsible=?1",
             [&responsible],
@@ -314,10 +327,25 @@ pub fn claim_coordinator_alert(
         "{:x}",
         Sha256::digest(format!("{responsible}:{coordinator}:{fingerprint}").as_bytes())
     );
+    if let Some(legacy) = legacy {
+        let legacy_id = format!(
+            "{:x}",
+            Sha256::digest(format!("{responsible}:{coordinator}:{legacy}").as_bytes())
+        );
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM coordinator_alerts WHERE id=?1)",
+            [&legacy_id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            tx.commit()?;
+            return Ok(None);
+        }
+    }
     let sender_pid = i64::from(std::process::id());
     let sender_start =
         process_start_time(std::process::id()).and_then(|started| i64::try_from(started).ok());
-    let inserted = db.execute(
+    let inserted = tx.execute(
         "INSERT OR IGNORE INTO coordinator_alerts
             (id,responsible,coordinator,message,state,sender_pid,sender_start)
          VALUES (?1,?2,?3,?4,'sending',?5,?6)",
@@ -330,6 +358,7 @@ pub fn claim_coordinator_alert(
             sender_start
         ],
     )?;
+    tx.commit()?;
     Ok((inserted == 1).then_some((id, coordinator)))
 }
 
@@ -1576,6 +1605,37 @@ mod tests {
         assert!(pending(&db, THREAD).unwrap().is_empty());
         assert_eq!(pending(&db, OTHER).unwrap()[0].id, obligation_id);
         assert_eq!(pending_transfers(&db, OTHER).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn legacy_alert_prevents_new_turn_claim_without_replaying_uncertain_delivery() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register_coordinator(&db, THREAD, OTHER).unwrap();
+        let (id, _) = claim_coordinator_alert(&db, THREAD, "legacy-fingerprint", "old message")
+            .unwrap()
+            .unwrap();
+        finish_coordinator_alert(
+            &db,
+            &id,
+            "needs_attention",
+            Some("timeout_delivery_unknown"),
+        )
+        .unwrap();
+        assert!(
+            claim_coordinator_alert_compatible(
+                &db,
+                THREAD,
+                "turn-fingerprint",
+                "new message",
+                Some("legacy-fingerprint")
+            )
+            .unwrap()
+            .is_none()
+        );
+        let alerts = coordinator_alerts_status(&db).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].state, "needs_attention");
     }
 
     #[test]
