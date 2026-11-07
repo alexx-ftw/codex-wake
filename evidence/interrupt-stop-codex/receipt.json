@@ -1,0 +1,35 @@
+{
+  "code": 1,
+  "signal": null,
+  "thread": "01a1b42b-46dd-7950-b521-a79bb8507509",
+  "requests": 2,
+  "signalled": true,
+  "receipts": [
+    {
+      "event": "Stop",
+      "session_id": "01a1b42b-46dd-7950-b521-a79bb8507509",
+      "turn_id": "01a1b42b-46fc-7c73-9f2d-48fa4f0ff471",
+      "stop_hook_active": false,
+      "decision": "block",
+      "exit": 0
+    },
+    {
+      "event": "Interrupt",
+      "session_id": "01a1b42b-46dd-7950-b521-a79bb8507509",
+      "turn_id": "01a1b42b-46fc-7c73-9f2d-48fa4f0ff471",
+      "exit": 0
+    }
+  ],
+  "one_turn": true,
+  "queue_calls": 1,
+  "alerts": [
+    {
+      "state": "queued",
+      "reason": null
+    }
+  ],
+  "pending": 1,
+  "synthetic_provider": true,
+  "synthetic_queue": true,
+  "stderr_tail": "Reading additional input from stdin...\n"
+}
