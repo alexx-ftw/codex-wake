@@ -145,6 +145,7 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `subscribe` | Register another exact source/resource/event and destination |
 | `publish_result` | Publish a verified provider result and dispatch matching waits |
 | `register_obligation` | Record a chat's pending result publication |
+| `register_resource_wait` | Record a wait on a non-chat resource and its declared continuation |
 | `register_coordinator` | Explicitly set the coordinator for a responsible chat |
 | `list_obligations` | List a chat's pending publications |
 | `resolve_obligation` | Resolve a pending obligation explicitly |
@@ -373,6 +374,13 @@ API has no atomic goal-plus-input operation: an automatic continuation may start
 before that input is queued, so it can be consumed by a subsequent turn.
 
 ## Thread and subagent signals
+
+`register_resource_wait` records an explicit wait for a non-chat resource using
+the same continuation declaration. Its resource is shown as `resource:<name>` in
+`get_status.circular_waits`; it cannot form a chat-to-chat cycle. Resolve it with
+`resolve_circular_wait` and register a new wait if the declaration changes. A
+`none` declaration triggers the same eligible Stop reminder; Wake does not infer
+whether mechanisms exist outside the explicit record.
 
 `register_circular_wait` records an explicit wait from `thread` to `waits_for`,
 with evidence supplied by the caller. Ordinary subscriptions do not create waits.

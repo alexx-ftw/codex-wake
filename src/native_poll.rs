@@ -702,6 +702,97 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_native_completion_claim_once_in_either_order() {
+        for hook_first in [true, false] {
+            let db = db();
+            let id = sub(&db);
+            db.execute(
+                "UPDATE subscriptions SET message_template=NULL WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+            arm_with(&db, &id, &mut page(SOURCE, vec![turn("t1", "inProgress")])).unwrap();
+            db.execute(
+                "UPDATE native_observers SET next_poll_ms=0 WHERE subscription_id=?1",
+                [&id],
+            )
+            .unwrap();
+            let hook = || {
+                crate::subscriptions::publish_with_source(
+                    &db,
+                    "thread",
+                    "",
+                    SOURCE,
+                    "turn_completed",
+                    &json!({"session_id":SOURCE,"turn_id":"t1"}),
+                )
+                .unwrap()
+            };
+            let poll = || {
+                tick_with(&db,&mut page(SOURCE,vec![turn("t1","completed")])).unwrap()["published"].as_u64().unwrap() as usize
+            };
+            let (first, second) = if hook_first {
+                (hook(), poll())
+            } else {
+                (poll(), hook())
+            };
+            assert_eq!((first, second), (1, 0));
+            let rows = crate::subscriptions::status(&db).unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            assert_eq!(rows[0]["state"], "ready");
+        }
+    }
+
+    #[test]
+    fn stop_and_native_completion_race_claim_one_subscription() {
+        use std::sync::{Arc, Barrier};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite3");
+        let db = crate::bridge::connect(&path).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        let id = sub(&db);
+        db.execute(
+            "UPDATE subscriptions SET message_template=NULL WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        arm_with(&db, &id, &mut page(SOURCE, vec![turn("t1", "inProgress")])).unwrap();
+        db.execute(
+            "UPDATE native_observers SET next_poll_ms=0 WHERE subscription_id=?1",
+            [&id],
+        )
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let hook_path = path.clone();
+        let hook_barrier = barrier.clone();
+        let hook = std::thread::spawn(move || {
+            let db = crate::bridge::connect(&hook_path).unwrap();
+            hook_barrier.wait();
+            crate::subscriptions::publish_with_source(
+                &db,
+                "thread",
+                "",
+                SOURCE,
+                "turn_completed",
+                &json!({"session_id":SOURCE,"turn_id":"t1"}),
+            )
+            .unwrap()
+        });
+        let poll_path = path.clone();
+        let poll = std::thread::spawn(move || {
+            let db = crate::bridge::connect(&poll_path).unwrap();
+            barrier.wait();
+            tick_with(&db, &mut page(SOURCE, vec![turn("t1", "completed")])).unwrap()["published"]
+                .as_u64()
+                .unwrap() as usize
+        });
+        assert_eq!(hook.join().unwrap() + poll.join().unwrap(), 1);
+        let row = crate::subscriptions::status(&db).unwrap();
+        assert_eq!(row.as_array().unwrap().len(), 1);
+        assert_eq!(row[0]["state"], "ready");
+    }
+
+    #[test]
     fn unloaded_interrupted_baseline_can_later_complete() {
         let db = db();
         let id = sub(&db);

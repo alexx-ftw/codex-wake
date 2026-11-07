@@ -94,6 +94,57 @@ pub fn register(
     Ok(id)
 }
 
+/// Record an explicit wait on a non-chat resource without creating a cycle edge.
+pub fn register_resource(
+    db: &Connection,
+    thread: &str,
+    resource: &str,
+    evidence: &str,
+    continuation: &str,
+    continuation_ref: Option<&str>,
+) -> Result<String> {
+    let thread = Uuid::parse_str(thread)?.to_string();
+    ensure!(!resource.trim().is_empty(), "Resource is empty");
+    ensure!(
+        resource.len() <= 255 && !resource.chars().any(char::is_control),
+        "Invalid resource"
+    );
+    ensure!(
+        !evidence.trim().is_empty() && serde_json::to_vec(evidence)?.len() <= 2048,
+        "Invalid wait evidence"
+    );
+    match (continuation, continuation_ref) {
+        ("registered", Some(value)) => ensure!(
+            !value.trim().is_empty() && serde_json::to_vec(value)?.len() <= 2048,
+            "A registered continuation requires a bounded identifier"
+        ),
+        ("none" | "unknown", None) => {}
+        _ => anyhow::bail!("Invalid continuation status or identifier"),
+    }
+    // The prefix separates resource identities from canonical chat UUIDs.
+    let target = format!("resource:{resource}");
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let existing: Option<(String, String, String, Option<String>)> = tx.query_row(
+        "SELECT id,evidence,continuation,continuation_ref FROM circular_waits WHERE thread=?1 AND waits_for=?2 AND active=1",
+        params![thread,target], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    let id = if let Some((id, prior_evidence, prior_continuation, prior_ref)) = existing {
+        ensure!(
+            prior_evidence == evidence
+                && prior_continuation == continuation
+                && prior_ref.as_deref() == continuation_ref,
+            "Active wait already exists with different evidence or continuation status"
+        );
+        id
+    } else {
+        let id = Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO circular_waits(id,thread,waits_for,evidence,continuation,continuation_ref) VALUES(?1,?2,?3,?4,?5,?6)",params![id,thread,target,evidence,continuation,continuation_ref])?;
+        id
+    };
+    tx.commit()?;
+    Ok(id)
+}
+
 pub fn resolve(db: &mut Connection, id: &str) -> Result<bool> {
     let id = Uuid::parse_str(id)?.to_string();
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -192,6 +243,30 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         initialize(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn resource_wait_is_idempotent_scoped_and_does_not_create_a_cycle() {
+        let mut db = db();
+        let resource = format!("build:{}", B);
+        let id = register_resource(&db, A, &resource, "Waiting for CI", "none", None).unwrap();
+        assert_eq!(
+            id,
+            register_resource(&db, A, &resource, "Waiting for CI", "none", None).unwrap()
+        );
+        assert!(register_resource(&db, A, &resource, "Different evidence", "none", None).is_err());
+        assert!(register_resource(&db, A, "", "Waiting", "none", None).is_err());
+        assert!(register_resource(&db, A, "other", "Waiting", "registered", None).is_err());
+        register(&mut db, B, A, "Waiting for A", "unknown", None).unwrap();
+        assert_eq!(without_continuation(&db, A).unwrap(), 1);
+        assert_eq!(without_continuation(&db, B).unwrap(), 0);
+        assert_eq!(status(&db).unwrap()["notices"].as_array().unwrap().len(), 0);
+        assert!(resolve(&mut db, &id).unwrap());
+        assert_eq!(without_continuation(&db, A).unwrap(), 0);
+        assert_ne!(
+            id,
+            register_resource(&db, A, &resource, "Waiting for CI", "none", None).unwrap()
+        );
     }
 
     #[test]

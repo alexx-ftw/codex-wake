@@ -163,6 +163,21 @@ struct CircularWaitInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ResourceWaitInput {
+    /// Chat explicitly waiting for an external resource.
+    thread: String,
+    /// Resource or dependency being awaited; not a chat identity.
+    resource: String,
+    /// Explicit evidence describing the wait.
+    evidence: String,
+    /// Declared continuation: none, registered, or unknown (default).
+    continuation: Option<String>,
+    /// Identifier of the declared continuation; required for registered.
+    continuation_ref: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CircularWaitId {
     wait_id: String,
 }
@@ -780,7 +795,32 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Mark an explicitly registered chat-to-chat wait as no longer active.",
+        description = "Register an explicit wait on a non-chat resource, including whether a continuation is identified. This declaration is not a health check.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    fn register_resource_wait(
+        &self,
+        Parameters(input): Parameters<ResourceWaitInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let id = circular_waits::register_resource(
+                &database(&self.config)?,
+                &input.thread,
+                &input.resource,
+                &input.evidence,
+                input.continuation.as_deref().unwrap_or("unknown"),
+                input.continuation_ref.as_deref(),
+            )?;
+            Ok(json!({"wait_id":id}))
+        })())
+    }
+
+    #[tool(
+        description = "Mark an explicitly registered chat or resource wait as no longer active.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1373,6 +1413,7 @@ impl rmcp::ServerHandler for WakeTools {
             "publish_result" => "mcp.publish_result",
             "register_obligation" => "mcp.register_obligation",
             "register_circular_wait" => "mcp.register_circular_wait",
+            "register_resource_wait" => "mcp.register_resource_wait",
             "resolve_circular_wait" => "mcp.resolve_circular_wait",
             "list_obligations" => "mcp.list_obligations",
             "resolve_obligation" => "mcp.resolve_obligation",
@@ -1925,6 +1966,43 @@ mod hook_output_tests {
     }
 
     #[test]
+    fn publication_tool_warns_only_for_a_prior_nonwaiting_recipient() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        let dest = "11111111-1111-4111-8111-111111111111";
+        subscriptions::subscribe(&db, "artifact", "ci", "old", "available", dest).unwrap();
+        subscriptions::publish_agent(&db, "artifact", "ci", "old", "available", &json!({}))
+            .unwrap();
+        subscriptions::subscribe(&db, "artifact", "ci", "waiting", "available", dest).unwrap();
+        drop(db);
+        let publish = |resource: &str| {
+            let input = serde_json::from_value::<PublicationInput>(
+                json!({"kind":"artifact","repo":"ci","resource":resource,"outcome":"available"}),
+            )
+            .unwrap();
+            let result = tools.publish_result(Parameters(input));
+            assert_ne!(result.is_error, Some(true));
+            result.structured_content.unwrap()
+        };
+        let previous = publish("old");
+        assert_eq!(previous["matched"], 0);
+        assert!(previous["no_waiting_subscriber"].is_string());
+        assert!(!previous["delivery_warnings"].as_array().unwrap().is_empty());
+        let unseen = publish("never-awaited");
+        assert_eq!(unseen["matched"], 0);
+        assert!(unseen.get("no_waiting_subscriber").is_none());
+        let waiting = publish("waiting");
+        assert_eq!(waiting["matched"], 1);
+        assert!(waiting.get("no_waiting_subscriber").is_none());
+    }
+
+    #[test]
     fn publication_warns_when_only_an_earlier_subscription_exists() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         subscriptions::initialize(&db).unwrap();
@@ -1946,6 +2024,73 @@ mod hook_output_tests {
         add_delivery_evidence(&mut result, &db, "artifact", "ci", "pkg", "available");
         assert!(result["no_waiting_subscriber"].is_string());
         assert_eq!(result["delivery_warnings"][0]["state"], "ready");
+    }
+
+    #[test]
+    fn resource_wait_reminder_preserves_subscriptions_and_respects_stop_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let tools = WakeTools { config };
+        let owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let other = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let db = database(&tools.config).unwrap();
+        let sub =
+            subscriptions::subscribe(&db, "artifact", "ci", "pkg", "available", owner).unwrap();
+        drop(db);
+        let response = tools.register_resource_wait(Parameters(ResourceWaitInput {
+            thread: owner.into(),
+            resource: "provider/build".into(),
+            evidence: "waiting for build".into(),
+            continuation: Some("none".into()),
+            continuation_ref: None,
+        }));
+        assert_ne!(response.is_error, Some(true));
+        let id = response.structured_content.unwrap()["wait_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let other_stop = json!({"hook_event_name":"Stop","session_id":other});
+        assert!(
+            run_hook(&tools.config, &other_stop)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        let owner_stop = json!({"hook_event_name":"Stop","session_id":owner});
+        let reminder = run_hook(&tools.config, &owner_stop).unwrap();
+        assert_eq!(reminder["decision"], "block");
+        assert!(
+            reminder["reason"]
+                .as_str()
+                .unwrap()
+                .contains("continuation")
+        );
+        let reentrant =
+            json!({"hook_event_name":"Stop","session_id":owner,"stop_hook_active":true});
+        assert!(
+            run_hook(&tools.config, &reentrant)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
+        let mut db = database(&tools.config).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM subscriptions WHERE id=?1", [sub], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "waiting");
+        assert!(circular_waits::resolve(&mut db, &id).unwrap());
+        assert!(
+            run_hook(&tools.config, &owner_stop)
+                .unwrap()
+                .get("decision")
+                .is_none()
+        );
     }
 
     #[test]
