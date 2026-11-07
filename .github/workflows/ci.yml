@@ -80,3 +80,28 @@ jobs:
           name: linux-x86_64-release-candidate
           path: .test-results/release-one/
           if-no-files-found: error
+
+  package-lifecycle:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download package from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-x86_64-release-candidate
+          path: ${{ runner.temp }}/release-candidate
+      - name: Install unauthenticated Codex CLI for app-server lifecycle
+        run: npm install --prefix "$RUNNER_TEMP/codex-cli" --no-save --no-audit --no-fund @openai/codex@0.166.0
+      - name: Download the previous alpha for upgrade qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.2.0-alpha.2 --repo alexx-ftw/codex-wake \
+            --pattern 'codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' --dir "$RUNNER_TEMP/previous"
+          echo '98c3fd2c436ee5dd7a53d0839c0e53d2148e2923859875aefa69bf7a8932a1a7  codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' | (cd "$RUNNER_TEMP/previous" && sha256sum --check)
+      - name: Qualify package user-service lifecycle
+        env:
+          CODEX_CLI: ${{ runner.temp }}/codex-cli/node_modules/.bin/codex
+        run: bash scripts/qualify-package-lifecycle.sh "$RUNNER_TEMP/release-candidate" "$RUNNER_TEMP/previous/codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz"

@@ -1,5 +1,8 @@
 mod bridge;
 mod circular_waits;
+mod condition_alerts;
+mod conditions;
+mod coordination_view;
 mod delivery_evidence;
 mod execution;
 mod goals;
@@ -82,6 +85,10 @@ struct SubscriptionInput {
     required_source: Option<Vec<String>>,
     /// Dependency inactivity timeout in seconds; defaults to 3600 for dependency/recovered.
     progress_timeout_secs: Option<u64>,
+    /// Optional subscription lifetime in seconds; the destination is notified on expiry.
+    expires_in_secs: Option<u64>,
+    /// Optional absolute expiry as Unix milliseconds; choose this or expires_in_secs.
+    expires_at_ms: Option<i64>,
     /// Activate the destination's existing goal after the event input is queued.
     #[serde(default)]
     resume_goal: bool,
@@ -99,7 +106,7 @@ struct PublicationInput {
     resource: String,
     /// Verified outcome: progress/recovered for dependency; otherwise the documented completion outcome.
     outcome: String,
-    /// Optional original values for matching subscribers' source.* placeholders.
+    /// Original values for source.* placeholders; use event_id for deduplication, or group_id and turn_id to complete a condition-chain step.
     source: Option<Value>,
     /// Exact execution ID, supplied together with attempt to detect conflicting job reports.
     execution_id: Option<String>,
@@ -281,6 +288,89 @@ struct CatalogInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CoordinationViewInput {
+    /// Zero-based chat offset from a previous response.
+    offset: Option<u32>,
+    /// Maximum chats in this page (1–100, default 20).
+    limit: Option<u32>,
+    /// Maximum entries per chat and category (1–100, default 20).
+    per_chat_limit: Option<u32>,
+    /// Zero-based offset within each chat's condition groups, from that page's next_offset.
+    condition_groups_offset: Option<u32>,
+    /// Zero-based offset within each returned condition group's selectors, from next_offset.
+    condition_selectors_offset: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConditionMemberInput {
+    kind: String,
+    #[serde(default)]
+    repo: String,
+    resource: String,
+    event: String,
+    outcome: Option<String>,
+    /// Exact GitHub Actions run identity for automatic polling.
+    ci: Option<ConditionCiInput>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConditionCiInput {
+    run_id: i64,
+    attempt: i64,
+    sha: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolveCiInput {
+    repo: String,
+    run_id: i64,
+    attempt: i64,
+    sha: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConditionDependencyInput {
+    group_id: String,
+    /// success_only or any_terminal.
+    mode: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolveConditionOrderInput {
+    group_id: String,
+    resource: String,
+    /// native, ci, or pull_request.
+    source: String,
+    /// Required for pull_request; closed or merged.
+    event: Option<String>,
+    /// Exact CI repository, run ID, attempt, and SHA when multiple members share this resource.
+    ci: Option<ResolveCiInput>,
+    /// Exact member event when CI identity alone still leaves multiple candidates.
+    member_event: Option<String>,
+    /// Exact member outcome when CI identity alone still leaves multiple candidates.
+    member_outcome: Option<String>,
+    /// True only when evidence shows the buffered event occurred after registration; false excludes it as historical.
+    accept: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConditionGroupInput {
+    /// and or or.
+    mode: String,
+    members: Vec<ConditionMemberInput>,
+    target_thread: String,
+    message_template: Option<String>,
+    dependency: Option<ConditionDependencyInput>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateGoalInput {
     thread: String,
     objective: String,
@@ -368,6 +458,8 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     let db = bridge::connect(&config.db)?;
     delivery_evidence::initialize(&db)?;
     subscriptions::initialize(&db)?;
+    conditions::initialize(&db)?;
+    condition_alerts::initialize(&db)?;
     rules::initialize(&db)?;
     polling::initialize(&db)?;
     observers::initialize(&db)?;
@@ -384,6 +476,7 @@ fn recover(config: &manager::Config) -> Result<usize> {
     Ok(
         bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+            + dispatch_conditions(&db, &config.codex)?
             + obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + obligations::dispatch_coordinator_alerts(
                 &mut db,
@@ -393,6 +486,122 @@ fn recover(config: &manager::Config) -> Result<usize> {
             + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
     )
+}
+
+pub(crate) fn dispatch_conditions(
+    db: &rusqlite::Connection,
+    codex: &std::path::Path,
+) -> Result<usize> {
+    conditions::initialize(db)?;
+    native_poll::initialize(db)?;
+    condition_alerts::initialize(db)?;
+    condition_alerts::reconcile(db)?;
+    let conditions = dispatch_conditions_with(db, |thread, message, id| {
+        send_condition_delivery_with(
+            thread,
+            message,
+            id,
+            |thread, message, id| {
+                execution::queue_with_identity(
+                    codex,
+                    thread,
+                    message,
+                    id,
+                    true,
+                    Duration::from_secs(120),
+                )
+            },
+            |thread, message| {
+                bridge::send_local_mode(codex, Duration::from_secs(120), thread, message, true)
+            },
+        )
+    })?;
+    Ok(conditions + condition_alerts::dispatch_with_timeout(db, codex, Duration::from_secs(120))?)
+}
+
+fn send_condition_delivery_with(
+    thread: &str,
+    message: &str,
+    id: &str,
+    native: impl FnOnce(&str, &str, &str) -> Result<(String, Option<String>)>,
+    cli: impl FnOnce(&str, &str) -> Result<(String, Option<String>)>,
+) -> Result<(String, Option<String>)> {
+    match native(thread, message, id) {
+        Err(error)
+            if error
+                .downcast_ref::<execution::TargetUnavailableBeforeSend>()
+                .is_some() =>
+        {
+            cli(thread, message)
+        }
+        result => result,
+    }
+}
+
+fn dispatch_conditions_with(
+    db: &rusqlite::Connection,
+    mut send: impl FnMut(&str, &str, &str) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
+    conditions::reconcile_interrupted_claims(db)?;
+    let mut attempted = 0;
+    while let Some(delivery) = conditions::claim_ready(db)? {
+        let sources: Vec<Value> = delivery
+            .sources
+            .iter()
+            .map(|item| {
+                json!({
+                    "kind":item.selector.kind, "repo":item.selector.repo,
+                    "resource":item.selector.resource, "event":item.selector.event,
+                    "outcome":item.selector.outcome, "source":item.source
+                })
+            })
+            .collect();
+        let context = json!({"source":sources,"event":{"group_id":delivery.group_id},"target":{"thread":delivery.target_thread}});
+        let message = if let Some(template) = &delivery.message_template {
+            templates::render(template, &context)
+        } else {
+            Ok(format!(
+                "Wake condition group {}: the configured conditions are satisfied.",
+                delivery.group_id
+            ))
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(_) => {
+                conditions::record_delivery_pre_send_failed(
+                    db,
+                    &delivery.group_id,
+                    "template_error",
+                )?;
+                attempted += 1;
+                continue;
+            }
+        };
+        match send(&delivery.target_thread, &message, &delivery.group_id) {
+            Ok((state, _)) if state == "queued" => {
+                conditions::record_delivery_accepted(db, &delivery.group_id)?;
+            }
+            Ok((state, Some(reason))) if state == "ready" && reason == "executable_not_found" => {
+                conditions::record_delivery_pre_send_failed(
+                    db,
+                    &delivery.group_id,
+                    "target_unavailable_before_send",
+                )?;
+            }
+            Err(error) if execution::before_send_retry_reason(&error).is_some() => {
+                conditions::record_delivery_pre_send_failed(
+                    db,
+                    &delivery.group_id,
+                    execution::before_send_retry_reason(&error).unwrap(),
+                )?;
+            }
+            _ => {
+                conditions::record_delivery_uncertain(db, &delivery.group_id)?;
+            }
+        }
+        attempted += 1;
+    }
+    Ok(attempted)
 }
 
 fn publication_result(config: &manager::Config, matched: usize, resolved: usize) -> Value {
@@ -414,6 +623,144 @@ fn publication_result(config: &manager::Config, matched: usize, resolved: usize)
     }
 }
 
+fn condition_identity_warning(
+    db: &rusqlite::Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+    has_execution_identity: bool,
+) -> Result<Option<&'static str>> {
+    let identity =
+        subscriptions::source_event_identity(kind, repo, resource, outcome, outcome, source)?;
+    if matches!(kind, "thread" | "subagent")
+        && source
+            .get("event_id")
+            .or_else(|| source.get("eventId"))
+            .is_some()
+        && valid_condition_turn_id(source).is_none()
+        && identity.is_some()
+    {
+        let waiting: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM condition_members m
+               JOIN condition_groups g ON g.id=m.group_id
+               WHERE m.kind=?1 AND m.repo=?2 AND m.resource=?3 AND m.event=?4
+                 AND (m.outcome='' OR m.outcome=?4) AND m.matched=0 AND g.state='pending')",
+            rusqlite::params![kind, repo, resource, outcome],
+            |row| row.get(0),
+        )?;
+        if waiting {
+            return Ok(Some(
+                "ambiguous_turn_order: source.event_id identified this thread/subagent event, but its turn_id is missing or invalid. The pending condition member remains unmatched; investigate the source turn evidence before treating it as satisfied.",
+            ));
+        }
+    }
+    if has_execution_identity || identity.is_some() {
+        return Ok(None);
+    }
+    let waiting: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM condition_members m
+           JOIN condition_groups g ON g.id=m.group_id
+           WHERE m.kind=?1 AND m.repo=?2 AND m.resource=?3
+             AND (m.event=?4 OR (?1='job' AND m.event='completed'
+                  AND ?4 IN ('success','failure','cancelled')))
+             AND (m.outcome='' OR m.outcome=?4) AND m.matched=0 AND g.state='pending')",
+        rusqlite::params![kind, repo, resource, outcome],
+        |row| row.get(0),
+    )?;
+    Ok(waiting.then_some(
+        "missing_stable_event_id: supply source.event_id to match condition groups safely",
+    ))
+}
+
+fn valid_condition_turn_id(source: &Value) -> Option<&str> {
+    source
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .or_else(|| source.get("turnId").and_then(Value::as_str))
+        .filter(|turn| {
+            !turn.is_empty()
+                && turn.len() <= 255
+                && turn.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+}
+
+fn condition_groups_for_publication(
+    db: &rusqlite::Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+    execution: Option<(&str, u64)>,
+) -> Result<(i64, i64)> {
+    let identity_source =
+        execution.map(|(id, attempt)| json!({"workflow_run":{"id":id,"run_attempt":attempt}}));
+    let source = identity_source.as_ref().unwrap_or(source);
+    let key = subscriptions::source_event_identity(kind, repo, resource, outcome, outcome, source)?;
+    let completed_key = if kind == "job" && matches!(outcome, "success" | "failure" | "cancelled") {
+        subscriptions::source_event_identity(kind, repo, resource, "completed", outcome, source)?
+    } else {
+        None
+    };
+    let count = db.query_row(
+        "SELECT count(DISTINCT group_id) FROM condition_members WHERE matched_event_key=?1 OR matched_event_key=?2",
+        rusqlite::params![key,completed_key], |row| row.get(0),
+    )?;
+    let mut collisions = 0;
+    for key in [key.as_deref(), completed_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        collisions += conditions::publication_collision_count(db, key)?;
+    }
+    Ok((count, collisions))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_condition_publication_summary(
+    result: &mut Value,
+    db: &rusqlite::Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+    execution: Option<(&str, u64)>,
+) {
+    let summary = (|| -> Result<_> {
+        Ok((
+            condition_groups_for_publication(db, kind, repo, resource, outcome, source, execution)?,
+            condition_identity_warning(
+                db,
+                kind,
+                repo,
+                resource,
+                outcome,
+                source,
+                execution.is_some(),
+            )?,
+        ))
+    })();
+    match summary {
+        Ok(((count, collisions), warning)) => {
+            result["condition_groups_recorded"] = json!(count);
+            if collisions > 0 {
+                result["condition_identity_collision"] = json!(
+                    "The same event identity was observed with different data; inspect before relying on this result."
+                );
+            }
+            if let Some(warning) = warning {
+                result["condition_warning"] = json!(warning);
+            }
+        }
+        Err(error) => {
+            result["condition_lookup_error"] = json!({"reason":observability::error_class(&error),"message":"Publication was accepted, but condition status could not be read."})
+        }
+    }
+}
+
 fn add_delivery_evidence(
     result: &mut Value,
     db: &rusqlite::Connection,
@@ -424,7 +771,11 @@ fn add_delivery_evidence(
 ) {
     match subscriptions::delivery_warnings(db, kind, repo, resource, event) {
         Ok(warnings) => {
-            if result["matched"] == 0 && warnings.as_array().is_some_and(|rows| !rows.is_empty()) {
+            if result["matched"] == 0
+                && result.get("condition_lookup_error").is_none()
+                && result["condition_members_matched"].as_u64().unwrap_or(0) == 0
+                && warnings.as_array().is_some_and(|rows| !rows.is_empty())
+            {
                 result["no_waiting_subscriber"] = json!(
                     "An earlier subscription matches this result, but none is waiting for this publication. Inspect the delivery evidence before deciding how to notify the destination."
                 );
@@ -761,6 +1112,32 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
     let resource = uuid::Uuid::parse_str(resource.context("Hook source ID missing")?)?.to_string();
     let db = database(config)?;
     let matched = subscriptions::publish_with_source(&db, kind, "", &resource, event, payload)?;
+    let condition_warning =
+        condition_identity_warning(&db, kind, "", &resource, event, payload, false)?;
+    if let Some(turn) = valid_condition_turn_id(payload) {
+        let mut source = payload.clone();
+        source["turnId"] = json!(turn);
+        if let Some(key) =
+            subscriptions::source_event_identity(kind, "", &resource, event, event, &source)?
+        {
+            conditions::record_published_event(
+                &db,
+                &conditions::PublishedEvent {
+                    selector: conditions::Selector {
+                        kind: kind.into(),
+                        repo: String::new(),
+                        resource: resource.clone(),
+                        event: event.into(),
+                        outcome: Some(event.into()),
+                    },
+                    source_event_key: key,
+                    cursor: Some(turn.into()),
+                    ci: None,
+                    source,
+                },
+            )?;
+        }
+    }
     observability::emit(
         "hook.matches",
         if matched > 0 {
@@ -832,6 +1209,15 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         matched,
         &states,
     );
+    if let Some(warning) = condition_warning {
+        output["condition_warning"] = json!(warning);
+        let previous = output["systemMessage"].as_str().unwrap_or_default();
+        output["systemMessage"] = json!(if previous.is_empty() {
+            warning.to_owned()
+        } else {
+            format!("{previous} {warning}")
+        });
+    }
     if matched > 0 {
         let mut evidence = json!({});
         add_delivery_evidence(&mut evidence, &db, kind, "", &resource, event);
@@ -1092,6 +1478,155 @@ impl WakeTools {
     }
 
     #[tool(
+        description = "Simulate a PR-comment rule with an example webhook; show its match and rendered action without sending or creating anything.",
+        annotations(read_only_hint = true)
+    )]
+    fn simulate_rule(
+        &self,
+        Parameters(input): Parameters<rules::SimulateRuleInput>,
+    ) -> CallToolResult {
+        tool_result(rules::simulate(input))
+    }
+
+    #[tool(
+        description = "Subscribe a chat to an AND/OR group of events, optionally gated by a predecessor's verified result.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn register_condition_group(
+        &self,
+        Parameters(input): Parameters<ConditionGroupInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let mode = match input.mode.as_str() {
+                "and" => conditions::Mode::And,
+                "or" => conditions::Mode::Or,
+                _ => bail!("Condition mode must be and or or"),
+            };
+            let dependency = input
+                .dependency
+                .map(|value| {
+                    let mode = match value.mode.as_str() {
+                        "success_only" => conditions::ModeDependency::SuccessOnly,
+                        "any_terminal" => conditions::ModeDependency::AnyTerminal,
+                        _ => bail!("Dependency mode must be success_only or any_terminal"),
+                    };
+                    Ok::<_, anyhow::Error>(conditions::Dependency {
+                        group_id: value.group_id,
+                        mode,
+                    })
+                })
+                .transpose()?;
+            let members: Vec<_> = input
+                .members
+                .into_iter()
+                .map(|value| {
+                    let (_, resource) = subscriptions::validate_source(
+                        &value.kind,
+                        &value.repo,
+                        &value.resource,
+                        &value.event,
+                        &input.target_thread,
+                    )?;
+                    let selector = conditions::Selector {
+                        kind: value.kind,
+                        repo: value.repo,
+                        resource,
+                        event: value.event,
+                        outcome: value.outcome,
+                    };
+                    let ci = value.ci.map(|ci| conditions::CiRunIdentity {
+                        repo: selector.repo.clone(),
+                        run_id: ci.run_id,
+                        attempt: ci.attempt,
+                        sha: ci.sha.to_ascii_lowercase(),
+                    });
+                    let automatic = ci.is_some()
+                        || matches!(
+                            selector.kind.as_str(),
+                            "pull_request"
+                                | "review"
+                                | "deployment"
+                                | "git_ref"
+                                | "thread"
+                                | "subagent"
+                        );
+                    Ok::<_, anyhow::Error>(if automatic {
+                        conditions::MemberRegistration::polling(selector, ci)
+                    } else {
+                        conditions::MemberRegistration::explicit(selector)
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let observers_pending = members
+                .iter()
+                .any(|member| member.observation == conditions::ObservationMode::Polling);
+            let id = conditions::register_group_with_members(
+                &database(&self.config)?,
+                mode,
+                &members,
+                &input.target_thread,
+                input.message_template.as_deref(),
+                dependency.as_ref(),
+            )?;
+            Ok(json!({"group_id":id,"observers_pending":observers_pending}))
+        })())
+    }
+
+    #[tool(
+        description = "Resolve an ambiguous native, CI, or pull request event order using verified evidence; for pull_request provide event=closed or merged. For multiple CI members sharing a resource, provide ci and, if needed, member_event/member_outcome.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn resolve_condition_order(
+        &self,
+        Parameters(input): Parameters<ResolveConditionOrderInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let db = database(&self.config)?;
+            let armed = match input.source.as_str() {
+                "native" => native_poll::resolve_condition_order(
+                    &db,
+                    &input.group_id,
+                    &input.resource,
+                    input.accept,
+                )?,
+                "ci" => polling::resolve_ci_condition_order(
+                    &db,
+                    &input.group_id,
+                    &input.resource,
+                    input.ci.as_ref().map(|ci| {
+                        (
+                            ci.repo.clone(),
+                            ci.run_id,
+                            ci.attempt,
+                            ci.sha.to_ascii_lowercase(),
+                        )
+                    }),
+                    input.member_event.as_deref(),
+                    input.member_outcome.as_deref(),
+                    input.accept,
+                )?,
+                "pull_request" => polling::resolve_pr_condition_order(
+                    &db,
+                    &input.group_id,
+                    &input.resource,
+                    input
+                        .event
+                        .as_deref()
+                        .context("event is required for pull_request resolution")?,
+                    input.accept,
+                )?,
+                _ => bail!("source must be native, ci, or pull_request"),
+            };
+            let mut result = json!({"armed":armed});
+            match recover(&self.config) {
+                Ok(count) => result["attempted"] = json!(count),
+                Err(error) => result["delivery_error"] = json!(observability::error_class(&error)),
+            }
+            Ok(result)
+        })())
+    }
+
+    #[tool(
         description = "Render and queue input for a thread. resume wakes it. steer delivers via its next tool/stop hook without waking or changing its model; incompatible with resume/execution.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -1209,7 +1744,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Subscribe to one source/resource/event. Optionally activate the destination's existing goal after queuing the event input. Dependency/recovered subscriptions send one investigation request after progress_timeout_secs (default 3600) without an explicit progress signal; the deadline does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. Registration errors do not invalidate subscription_id.",
+        description = "Subscribe to one source/resource/event. Set expires_in_secs or expires_at_ms to notify the chat on expiry. Optionally activate its existing goal after queuing input. Dependency/recovered subscriptions request investigation after progress_timeout_secs (default 3600) without progress; silence does not mean failure. GitHub and native turns are polled locally; optional observation checks files, health endpoints, locks or systemd jobs. Registration errors do not invalidate subscription_id.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1234,6 +1769,8 @@ impl WakeTools {
                     execution: input.execution.as_ref(),
                     required_source: input.required_source.as_deref(),
                     progress_timeout_secs: input.progress_timeout_secs,
+                    expires_in_secs: input.expires_in_secs,
+                    expires_at_ms: input.expires_at_ms,
                     resume_goal: input.resume_goal,
                 },
             )?;
@@ -1298,16 +1835,38 @@ impl WakeTools {
             } else {
                 Vec::new()
             };
-            let (matched, resolved, conflicts) = subscriptions::publish_report(
+            let (matched, resolved, conflicts, condition_record) =
+                subscriptions::publish_report_with_conditions(
+                    &db,
+                    &input.kind,
+                    &input.repo,
+                    &input.resource,
+                    &input.outcome,
+                    &source,
+                    identity,
+                )?;
+            let mut result = publication_result(&self.config, matched, resolved);
+            result["condition_members_matched"] = json!(condition_record.new_members);
+            if condition_record.buffer_overflow {
+                result["condition_buffer_warning"] = json!(
+                    "An unarmed condition could not retain this event; inspect coordination status."
+                );
+            }
+            if condition_record.payload_collision {
+                result["condition_identity_collision"] = json!(
+                    "The same event identity was observed with different data; inspect before relying on this result."
+                );
+            }
+            add_condition_publication_summary(
+                &mut result,
                 &db,
                 &input.kind,
                 &input.repo,
-                &input.resource,
+                &resource,
                 &input.outcome,
                 &source,
                 identity,
-            )?;
-            let mut result = publication_result(&self.config, matched, resolved);
+            );
             add_delivery_evidence(
                 &mut result,
                 &db,
@@ -1583,6 +2142,27 @@ impl WakeTools {
     }
 
     #[tool(
+        description = "Show a paginated coordination overview grouped by chat. Use condition_groups_offset and condition_selectors_offset to continue truncated condition pages. Queued does not prove execution.",
+        annotations(read_only_hint = true)
+    )]
+    fn get_coordination(
+        &self,
+        Parameters(input): Parameters<CoordinationViewInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let db = database(&self.config)?;
+            coordination_view::by_chat(
+                &db,
+                input.offset.unwrap_or(0),
+                input.limit.unwrap_or(20),
+                input.per_chat_limit.unwrap_or(20),
+                input.condition_groups_offset.unwrap_or(0),
+                input.condition_selectors_offset.unwrap_or(0),
+            )
+        })())
+    }
+
+    #[tool(
         description = "Read local receiver health, supported events and delivery states. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
         annotations(read_only_hint = true)
     )]
@@ -1639,6 +2219,9 @@ impl rmcp::ServerHandler for WakeTools {
             "list_models" => "mcp.list_models",
             "list_projects" => "mcp.list_projects",
             "configure_rule" => "mcp.configure_rule",
+            "simulate_rule" => "mcp.simulate_rule",
+            "register_condition_group" => "mcp.register_condition_group",
+            "resolve_condition_order" => "mcp.resolve_condition_order",
             "queue_thread" => "mcp.queue_thread",
             "get_goal" => "mcp.get_goal",
             "create_goal" => "mcp.create_goal",
@@ -1662,6 +2245,7 @@ impl rmcp::ServerHandler for WakeTools {
             "get_result_conflicts" => "mcp.get_result_conflicts",
             "register_wait" => "mcp.register_wait",
             "get_status" => "mcp.get_status",
+            "get_coordination" => "mcp.get_coordination",
             "recover_ready" => "mcp.recover_ready",
             _ => "mcp.unknown_tool",
         };
@@ -1876,7 +2460,7 @@ async fn run_command(
             let db = database(&config)?;
             println!(
                 "{}",
-                json!({"github":polling::tick(&db,&config.gh)?,"observers":observers::tick(&db,&config.codex)?,"native":native_poll::tick(&db,&config.codex)?,"dependency_notices":subscriptions::dependency_tick(&db,&config.codex,Duration::from_secs(120))?})
+                json!({"github":polling::tick(&db,&config.gh)?,"observers":observers::tick(&db,&config.codex)?,"native":native_poll::tick(&db,&config.codex)?,"expiration_notices":subscriptions::expiration_tick(&db,&config.codex,Duration::from_secs(120))?,"dependency_notices":subscriptions::dependency_tick(&db,&config.codex,Duration::from_secs(120))?})
             );
         }
         "remove-service" => {
@@ -1919,6 +2503,12 @@ async fn run_command(
             let progress_timeout_secs = option(&mut args, "--progress-timeout-seconds")?
                 .map(|value| value.parse::<u64>())
                 .transpose()?;
+            let expires_in_secs = option(&mut args, "--expires-in-seconds")?
+                .map(|value| value.parse::<u64>())
+                .transpose()?;
+            let expires_at_ms = option(&mut args, "--expires-at-ms")?
+                .map(|value| value.parse::<i64>())
+                .transpose()?;
             let resume_goal = option(&mut args, "--resume-goal")?
                 .map(|value| value.parse::<bool>())
                 .transpose()?
@@ -1946,6 +2536,8 @@ async fn run_command(
                     execution: execution.as_ref(),
                     required_source: required_source.as_deref(),
                     progress_timeout_secs,
+                    expires_in_secs,
+                    expires_at_ms,
                     resume_goal,
                 },
             )?;
@@ -1969,6 +2561,13 @@ async fn run_command(
             let repo = option(&mut args, "--repo")?.unwrap_or_default();
             let resource = required(&mut args, "--resource")?;
             let outcome = required(&mut args, "--outcome")?;
+            let event_id = option(&mut args, "--event-id")?;
+            let group_id = option(&mut args, "--group-id")?;
+            let turn_id = option(&mut args, "--turn-id")?;
+            anyhow::ensure!(
+                group_id.is_some() == turn_id.is_some(),
+                "--group-id and --turn-id must be supplied together"
+            );
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             anyhow::ensure!(
                 ["job", "chat", "dependency", "resource", "artifact"].contains(&kind.as_str()),
@@ -1979,11 +2578,43 @@ async fn run_command(
             } else {
                 resource.clone()
             };
-            let source = json!({"kind":kind,"repo":repo,"resource":canonical,"event":outcome,"outcome":outcome});
+            let mut source = json!({"kind":kind,"repo":repo,"resource":canonical,"event":outcome,"outcome":outcome});
+            if let Some(value) = event_id {
+                source["event_id"] = json!(value);
+            }
+            if let Some(value) = group_id {
+                source["group_id"] = json!(value);
+            }
+            if let Some(value) = turn_id {
+                source["turn_id"] = json!(value);
+            }
             let db = database(&config)?;
-            let (matched, resolved) =
-                subscriptions::publish_agent(&db, &kind, &repo, &resource, &outcome, &source)?;
+            let (matched, resolved, _, condition_record) =
+                subscriptions::publish_report_with_conditions(
+                    &db, &kind, &repo, &resource, &outcome, &source, None,
+                )?;
             let mut result = publication_result(&config, matched, resolved);
+            result["condition_members_matched"] = json!(condition_record.new_members);
+            if condition_record.buffer_overflow {
+                result["condition_buffer_warning"] = json!(
+                    "An unarmed condition could not retain this event; inspect coordination status."
+                );
+            }
+            if condition_record.payload_collision {
+                result["condition_identity_collision"] = json!(
+                    "The same event identity was observed with different data; inspect before relying on this result."
+                );
+            }
+            add_condition_publication_summary(
+                &mut result,
+                &db,
+                &kind,
+                &repo,
+                &canonical,
+                &outcome,
+                &source,
+                None,
+            );
             add_delivery_evidence(&mut result, &db, &kind, &repo, &resource, &outcome);
             println!("{}", result);
         }
@@ -2190,6 +2821,547 @@ mod hook_output_tests {
                 "reentrant payload update"
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn coordination_tool_reads_the_actual_database_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('test','11111111-1111-4111-8111-111111111111','artifact','repo','package','available','private')", []).unwrap();
+        drop(db);
+        let response = tools.get_coordination(Parameters(CoordinationViewInput {
+            offset: None,
+            limit: None,
+            per_chat_limit: None,
+            condition_groups_offset: None,
+            condition_selectors_offset: None,
+        }));
+        assert_ne!(response.is_error, Some(true));
+        let output = response.structured_content.unwrap();
+        assert_eq!(output["chats"][0]["obligations"]["total"], 1);
+        assert!(!output.to_string().contains("private"));
+    }
+
+    #[test]
+    fn simulate_rule_tool_does_not_open_the_service_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("unused-state");
+        config.db = config.state.join("state.sqlite3");
+        let tools = WakeTools { config };
+        let input = json!({"rule":{"repo":"owner/repo","pr":42,"author":"alice","prompt":"Check {{source.comment.body}}","target_thread":"11111111-1111-4111-8111-111111111111"},"event_header":"issue_comment","payload":{"action":"created","repository":{"full_name":"owner/repo"},"issue":{"number":42,"pull_request":{}},"comment":{"id":7,"user":{"login":"alice","type":"User"},"body":"example"}}});
+        let response = tools.simulate_rule(Parameters(serde_json::from_value(input).unwrap()));
+        assert_ne!(response.is_error, Some(true));
+        let output = response.structured_content.unwrap();
+        assert_eq!(output["matched"], true);
+        assert_eq!(output["dispatched"], false);
+        assert_eq!(output["prompt"], "Check example");
+        assert!(!tools.config.db.exists());
+    }
+
+    #[test]
+    fn condition_group_tool_validates_sources_and_dependency_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let tools = WakeTools { config };
+        let input = json!({"mode":"and","members":[{"kind":"artifact","repo":"ci","resource":"package","event":"available"}],"target_thread":"11111111-1111-4111-8111-111111111111"});
+        let result = tools
+            .register_condition_group(Parameters(serde_json::from_value(input.clone()).unwrap()));
+        assert_ne!(result.is_error, Some(true));
+        let group_id = result.structured_content.unwrap()["group_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let db = database(&tools.config).unwrap();
+        assert!(
+            condition_identity_warning(
+                &db,
+                "artifact",
+                "ci",
+                "package",
+                "available",
+                &json!({}),
+                false
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            condition_identity_warning(
+                &db,
+                "artifact",
+                "ci",
+                "package",
+                "available",
+                &json!({"event_id":"evt-1"}),
+                false
+            )
+            .unwrap()
+            .is_none()
+        );
+        let mut bad = input;
+        bad["dependency"] = json!({"group_id":group_id,"mode":"anything"});
+        assert_eq!(
+            tools
+                .register_condition_group(Parameters(serde_json::from_value(bad).unwrap()))
+                .is_error,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn thread_event_id_without_valid_turn_returns_condition_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let source = "11111111-1111-4111-8111-111111111111";
+        let destination = "22222222-2222-4222-8222-222222222222";
+        let db = database(&config).unwrap();
+        conditions::register_group_with_members(
+            &db,
+            conditions::Mode::And,
+            &[conditions::MemberRegistration::polling(
+                conditions::Selector {
+                    kind: "thread".into(),
+                    repo: String::new(),
+                    resource: source.into(),
+                    event: "turn_completed".into(),
+                    outcome: Some("turn_completed".into()),
+                },
+                None,
+            )],
+            destination,
+            None,
+            None,
+        )
+        .unwrap();
+        drop(db);
+
+        let output = run_hook_inner(
+            &config,
+            &json!({
+                "hook_event_name":"Stop",
+                "session_id":source,
+                "event_id":"stop-event-1",
+                "turn_id":"invalid turn id",
+                "stop_hook_active":true
+            }),
+        )
+        .unwrap();
+        let warning = output["condition_warning"].as_str().unwrap();
+        assert!(warning.contains("event_id identified this thread/subagent event"));
+        assert!(warning.contains("turn_id is missing or invalid"));
+        assert!(warning.contains("remains unmatched"));
+        assert_eq!(output["systemMessage"], warning);
+        let db = database(&config).unwrap();
+        let matched: i64 = db
+            .query_row("SELECT matched FROM condition_members", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(matched, 0);
+    }
+
+    #[test]
+    fn condition_delivery_queues_once_and_does_not_claim_work_completed() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let target = "11111111-1111-4111-8111-111111111111";
+        let selector = conditions::Selector {
+            kind: "artifact".into(),
+            repo: "ci".into(),
+            resource: "pkg".into(),
+            event: "available".into(),
+            outcome: None,
+        };
+        let group = conditions::register_group(
+            &db,
+            conditions::Mode::And,
+            std::slice::from_ref(&selector),
+            target,
+            Some("Artifact {{source.0.source.value}}"),
+            None,
+        )
+        .unwrap();
+        conditions::record_published_event(
+            &db,
+            &conditions::PublishedEvent {
+                selector,
+                source_event_key: "event-1".into(),
+                cursor: None,
+                ci: None,
+                source: json!({"value":"ready"}),
+            },
+        )
+        .unwrap();
+        let mut native_sends = 0;
+        let mut cli_sends = 0;
+        assert_eq!(
+            dispatch_conditions_with(&db, |thread, message, id| {
+                send_condition_delivery_with(
+                    thread,
+                    message,
+                    id,
+                    |thread, message, id| {
+                        native_sends += 1;
+                        assert_eq!(
+                            (thread, message, id),
+                            (target, "Artifact ready", group.as_str())
+                        );
+                        Err(execution::TargetUnavailableBeforeSend.into())
+                    },
+                    |thread, message| {
+                        cli_sends += 1;
+                        assert_eq!((thread, message), (target, "Artifact ready"));
+                        Ok(("queued".into(), None))
+                    },
+                )
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!((native_sends, cli_sends), (1, 1));
+        assert_eq!(
+            conditions::delivery_status(&db, &group).unwrap().state,
+            "accepted"
+        );
+        assert_eq!(
+            dispatch_conditions_with(&db, |_, _, _| panic!("must not replay")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn cli_without_confirmation_leaves_condition_delivery_uncertain_without_replay() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let target = "11111111-1111-4111-8111-111111111111";
+        let selector = conditions::Selector {
+            kind: "artifact".into(),
+            repo: "ci".into(),
+            resource: "pkg".into(),
+            event: "available".into(),
+            outcome: None,
+        };
+        let group = conditions::register_group(
+            &db,
+            conditions::Mode::And,
+            std::slice::from_ref(&selector),
+            target,
+            None,
+            None,
+        )
+        .unwrap();
+        conditions::record_published_event(
+            &db,
+            &conditions::PublishedEvent {
+                selector,
+                source_event_key: "event-1".into(),
+                cursor: None,
+                ci: None,
+                source: json!({"value":"ready"}),
+            },
+        )
+        .unwrap();
+        let mut native_sends = 0;
+        let mut cli_sends = 0;
+        assert_eq!(
+            dispatch_conditions_with(&db, |thread, message, id| {
+                send_condition_delivery_with(
+                    thread,
+                    message,
+                    id,
+                    |_, _, _| {
+                        native_sends += 1;
+                        Err(execution::TargetUnavailableBeforeSend.into())
+                    },
+                    |_, _| {
+                        cli_sends += 1;
+                        Ok((
+                            "needs_attention".into(),
+                            Some("cli_warning_or_nonzero_exit".into()),
+                        ))
+                    },
+                )
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!((native_sends, cli_sends), (1, 1));
+        assert_eq!(
+            conditions::delivery_status(&db, &group).unwrap().state,
+            "uncertain"
+        );
+        assert_eq!(
+            dispatch_conditions_with(&db, |_, _, _| panic!("must not replay")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_cli_executable_is_retryable_as_a_pre_send_failure() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let target = "11111111-1111-4111-8111-111111111111";
+        let selector = conditions::Selector {
+            kind: "artifact".into(),
+            repo: "ci".into(),
+            resource: "pkg".into(),
+            event: "available".into(),
+            outcome: None,
+        };
+        let group = conditions::register_group(
+            &db,
+            conditions::Mode::And,
+            std::slice::from_ref(&selector),
+            target,
+            None,
+            None,
+        )
+        .unwrap();
+        conditions::record_published_event(
+            &db,
+            &conditions::PublishedEvent {
+                selector,
+                source_event_key: "event-1".into(),
+                cursor: None,
+                ci: None,
+                source: json!({"value":"ready"}),
+            },
+        )
+        .unwrap();
+
+        let mut sends = 0;
+        assert_eq!(
+            dispatch_conditions_with(&db, |_, _, _| {
+                sends += 1;
+                Ok(("ready".into(), Some("executable_not_found".into())))
+            })
+            .unwrap(),
+            1
+        );
+        let status = conditions::delivery_status(&db, &group).unwrap();
+        assert_eq!(status.state, "send_failed");
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("target_unavailable_before_send")
+        );
+        assert_eq!(sends, 1);
+
+        db.execute(
+            "UPDATE condition_groups SET retry_at=datetime('now','-1 second') WHERE id=?1",
+            [&group],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_conditions_with(&db, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(sends, 2);
+        assert_eq!(
+            conditions::delivery_status(&db, &group).unwrap().state,
+            "accepted"
+        );
+    }
+
+    #[test]
+    fn ambiguous_native_condition_send_does_not_fall_back_to_cli() {
+        let mut cli_sends = 0;
+        let result = send_condition_delivery_with(
+            "11111111-1111-4111-8111-111111111111",
+            "message",
+            "22222222-2222-4222-8222-222222222222",
+            |_, _, _| Err(anyhow::anyhow!("queue response lost")),
+            |_, _| {
+                cli_sends += 1;
+                Ok(("queued".into(), None))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(cli_sends, 0);
+    }
+
+    #[test]
+    fn published_result_advances_chain_only_after_explicit_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let target = "11111111-1111-4111-8111-111111111111";
+        let selector = |resource: &str| conditions::Selector {
+            kind: "artifact".into(),
+            repo: "ci".into(),
+            resource: resource.into(),
+            event: "available".into(),
+            outcome: None,
+        };
+        let first = conditions::register_group(
+            &db,
+            conditions::Mode::And,
+            &[selector("a")],
+            target,
+            None,
+            None,
+        )
+        .unwrap();
+        let second = conditions::register_group(
+            &db,
+            conditions::Mode::And,
+            &[selector("b")],
+            target,
+            None,
+            Some(&conditions::Dependency {
+                group_id: first.clone(),
+                mode: conditions::ModeDependency::SuccessOnly,
+            }),
+        )
+        .unwrap();
+        for resource in ["a", "b"] {
+            let (_, _, _, record) = subscriptions::publish_report_with_conditions(
+                &db,
+                "artifact",
+                "ci",
+                resource,
+                "available",
+                &json!({"event_id":resource}),
+                None,
+            )
+            .unwrap();
+            assert_eq!(record.new_members, 1);
+        }
+        let (_, _, _, replay) = subscriptions::publish_report_with_conditions(
+            &db,
+            "artifact",
+            "ci",
+            "a",
+            "available",
+            &json!({"event_id":"a"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(replay.new_members, 0);
+        assert_eq!(
+            condition_groups_for_publication(
+                &db,
+                "artifact",
+                "ci",
+                "a",
+                "available",
+                &json!({"event_id":"a"}),
+                None
+            )
+            .unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            condition_groups_for_publication(
+                &db,
+                "artifact",
+                "ci",
+                "a",
+                "available",
+                &json!({"event_id":"another"}),
+                None
+            )
+            .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            dispatch_conditions_with(&db, |_, _, _| Ok(("queued".into(), None))).unwrap(),
+            1
+        );
+        assert_eq!(
+            conditions::delivery_status(&db, &second).unwrap().state,
+            "pending"
+        );
+        let observer = conditions::Selector {
+            kind: "chat".into(),
+            repo: String::new(),
+            resource: target.into(),
+            event: "completed".into(),
+            outcome: None,
+        };
+        let observer_group = conditions::register_group(
+            &db,
+            conditions::Mode::Or,
+            &[observer],
+            "22222222-2222-4222-8222-222222222222",
+            None,
+            None,
+        )
+        .unwrap();
+        let previous = subscriptions::subscribe(
+            &db,
+            "chat",
+            "",
+            target,
+            "completed",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE subscriptions SET state='queued' WHERE id=?1",
+            [&previous],
+        )
+        .unwrap();
+        let completion = json!({"group_id":first,"turn_id":"turn-1"});
+        let (_, _, _, record) = subscriptions::publish_report_with_conditions(
+            &db,
+            "chat",
+            "",
+            target,
+            "completed",
+            &completion,
+            None,
+        )
+        .unwrap();
+        assert_eq!(record.new_members, 1);
+        let mut first_report = json!({"matched":0,"condition_members_matched":record.new_members});
+        add_delivery_evidence(&mut first_report, &db, "chat", "", target, "completed");
+        assert!(first_report.get("no_waiting_subscriber").is_none());
+        let (_, _, _, replay) = subscriptions::publish_report_with_conditions(
+            &db,
+            "chat",
+            "",
+            target,
+            "completed",
+            &completion,
+            None,
+        )
+        .unwrap();
+        assert_eq!(replay.new_members, 0);
+        let mut replay_report = json!({"matched":0,"condition_members_matched":replay.new_members});
+        add_delivery_evidence(&mut replay_report, &db, "chat", "", target, "completed");
+        assert!(replay_report.get("no_waiting_subscriber").is_some());
+        assert_eq!(
+            dispatch_conditions_with(&db, |_, _, _| Ok(("queued".into(), None))).unwrap(),
+            2
+        );
+        assert_eq!(
+            conditions::delivery_status(&db, &observer_group)
+                .unwrap()
+                .state,
+            "accepted"
+        );
+        assert_eq!(
+            conditions::delivery_status(&db, &second).unwrap().state,
+            "accepted"
         );
     }
 

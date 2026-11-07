@@ -196,7 +196,8 @@ pub fn subscription_event_identity(
             }
         }
         ("chat" | "thread" | "subagent", _) => {
-            let turn_id = identity_component(source.get("turnId"));
+            let turn_id = identity_component(source.get("turn_id"))
+                .or_else(|| identity_component(source.get("turnId")));
             if turn_id.is_some() {
                 ("native-turn", vec![turn_id])
             } else if explicit_id.is_some() {
@@ -943,6 +944,18 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(
+            Some(event.clone()),
+            subscription_event_identity(
+                "thread",
+                "",
+                "11111111-1111-4111-8111-111111111111",
+                "turn_completed",
+                "turn_completed",
+                &serde_json::json!({"turn_id":"turn-123"}),
+            )
+            .unwrap()
+        );
         assert_ne!(
             client_user_message_id(&event, "22222222-2222-4222-8222-222222222222").unwrap(),
             client_user_message_id(&event, "33333333-3333-4333-8333-333333333333").unwrap()
@@ -959,6 +972,31 @@ mod tests {
             )
             .unwrap()
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn native_poll_identity_falls_back_when_snake_case_turn_id_is_invalid() {
+        let identity = |source: &Value| {
+            subscription_event_identity(
+                "thread",
+                "",
+                "11111111-1111-4111-8111-111111111111",
+                "turn_completed",
+                "turn_completed",
+                source,
+            )
+            .unwrap()
+        };
+
+        let camel_case = identity(&serde_json::json!({"turnId":"turn-123"}));
+        assert_eq!(
+            identity(&serde_json::json!({"turn_id":null,"turnId":"turn-123"})),
+            camel_case
+        );
+        assert_eq!(
+            identity(&serde_json::json!({"turn_id":{},"turnId":"turn-123"})),
+            camel_case
         );
     }
 

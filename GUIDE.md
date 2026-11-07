@@ -155,8 +155,12 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `accept_obligation_transfer` | Accept a proposal and become responsible |
 | `get_result_conflicts` | Read paginated evidence for an exact job execution and attempt |
 | `get_status` | Inspect local receiver health, CI waits, subscriptions and recent coordinator alert states |
+| `get_coordination` | View waits, obligations, transfers and delivery states grouped by chat |
 | `recover_ready` | Dispatch stored ready events; never retry ambiguous deliveries |
 | `configure_rule` | Match a PR comment and create or message a thread |
+| `simulate_rule` | Preview a PR-comment rule and example webhook without dispatching |
+| `register_condition_group` | Combine events and optionally chain them after another group |
+| `resolve_condition_order` | Resolve an ambiguous event order after checking evidence |
 | `queue_thread` | Render and queue an input, optionally resuming the thread |
 | `list_projects` | Read available Codex projects |
 | `list_models` | Read available models and supported reasoning efforts |
@@ -191,6 +195,35 @@ RPC. They retry after 15 seconds, preserving the preset. An uncertain
 Every subscription is independent and one-shot. Completing one doesn't cancel
 the others. Re-registering the same subscription is idempotent; it does not rearm
 a consumed subscription. Source events received before registration aren't replayed.
+Set `expires_in_secs` for a lifetime or `expires_at_ms` for an absolute Unix
+timestamp in milliseconds. Wake notifies the
+destination when a waiting subscription expires; expiry does not mean that the
+source failed. An uncertain notification is retained for review, not resent.
+
+`register_condition_group` combines event members using `and` or `or`. GitHub
+and native members report `armed: false` until their polling baseline is stored;
+inspect them with `get_coordination`. For a GitHub Actions attempt, use a `job`
+member and specify its exact `ci.run_id`, `ci.attempt` and `ci.sha`. Explicit
+publications need a stable `source.event_id` to match groups and deduplicate.
+If the first observation already finds an Actions attempt completed, Wake cannot
+establish whether it finished before registration and reports an ambiguous order.
+If the order of an event and registration cannot be established, the member
+stays unarmed and Wake prepares an investigation notice. Its delivery can be
+uncertain. `get_coordination` reports
+the uncertainty; use `resolve_condition_order` only after checking whether the
+event is new or historical. For pull requests specify `source: "pull_request"`
+and `event: "closed"` or `"merged"`.
+For CI members that share a resource, also provide `ci` with the exact
+`repo`, `run_id`, `attempt`, and `sha`; add `member_event` and `member_outcome` if that
+identity still matches more than one member. A unique pending member keeps the
+existing resource-only call.
+
+Each group may depend on an earlier group, choosing `success_only` or
+`any_terminal` for that link. Queue acceptance alone does not finish the work.
+The responsible chat publishes its actual terminal result with `source.group_id`
+and `source.turn_id`; only then can a dependent group proceed. Templates can use
+indexed original values such as `{{source.0.source.name}}`.
+
 Set `resume_goal` to true to queue the event input and then activate the target's
 existing goal. If queuing is uncertain, Wake does not activate the goal. If
 activation is unconfirmed after queue acceptance, it reports `needs_attention`
@@ -291,7 +324,7 @@ The optional `observation` field on `subscribe` selects a deterministic probe:
 | `{"type":"file","path":"/absolute/package.tar"}` | `artifact/available` | A regular file exists; symlinks are excluded |
 | `{"type":"http","url":"https://service.example/health"}` | `dependency/recovered` | The specified endpoint returns HTTP 2xx, without following redirects |
 | `{"type":"file_lock","path":"/absolute/worker.lock"}` | `resource/released` | An existing owned regular file permits a nonblocking exclusive `flock` |
-| `{"type":"systemd","unit":"build.service","invocation_id":"0123456789abcdef0123456789abcdef"}` | `job/success`, `job/failure` or `job/completed` | That exact user-unit invocation has a matching terminal result |
+| `{"type":"systemd","unit":"build.service","invocation_id":"0123456789abcdef0123456789abcdef","scope":"user"}` | `job/success`, `job/failure` or `job/completed` | That exact invocation in the selected user or system manager has a matching terminal result; omitted `scope` defaults to `user` |
 
 The CLI accepts the same JSON through `--observe`. Configuration is immutable
 for a registered subscription. Polling stops once that subscription is consumed.
@@ -301,7 +334,9 @@ states, not successful outcomes. HTTP probes are bounded and do not accept URL
 credentials. File presence does not prove a complete, correct artifact: publish
 atomically or use an explicit verified producer when that distinction matters.
 `file_lock` describes cooperative `flock` availability, not other locking protocols.
-Systemd cannot establish user cancellation, so `job/cancelled` remains producer-only.
+Systemd cannot establish user cancellation, so `job/cancelled` remains producer-only. Probes run every 60 seconds: a short lived unit may disappear before the next query. `LoadState=not-found` is reported as `unit_not_found`, separately from `generation_mismatch`; neither condition is a result, and `inactive` alone never proves completion.
+
+For transient units, polling cannot guarantee recovery after systemd has collected the invocation. A configured `OnSuccess=`/`OnFailure=` template handler can receive `$MONITOR_UNIT`, `$MONITOR_INVOCATION_ID` and the result/exit fields proactively (the monitor identity variables require systemd 251+). Forwarding that exact identity into a durable, validated publication needs producer and publication-contract changes outside this observer. The existing generic `publish_result` accepts producer reports but does not verify them against the saved systemd observation.
 
 Thread polling reads turn metadata without starting model work. Native subagents
 are polled only when the API verifies their child-thread identity and parent.
@@ -328,6 +363,11 @@ webhook when using rules. A rule targets an existing chat, or creates a new one
 inside the selected Codex project or outside a project, with an optional goal.
 Distinct matching comments trigger independently; duplicate deliveries don't
 create duplicate chats. Ambiguous creation results require inspection before retry.
+
+`simulate_rule` accepts a rule, GitHub event header and example payload. It uses
+the normal matcher and renders the proposed input without creating a chat or
+sending a message. A new chat's ID appears as `<new-thread-id>`; the preview
+does not verify project access or execution settings.
 
 Messages and goal objectives support literal dotted placeholders, for example
 `{{source.comment.user.login}}`, `{{source.comment.body}}`, `{{event.repo}}`
