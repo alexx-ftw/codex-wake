@@ -2816,3 +2816,53 @@ mod collision_tool_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod mixed_version_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn old_snapshot_before_pending_change_escapes_new_snapshot_guard() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        obligations::initialize(&db).unwrap();
+        let owner = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        obligations::register_coordinator(&db, owner, coordinator).unwrap();
+        for n in 0..9 {
+            db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES(?1,?2,'artifact','repo','release','available','pending')", rusqlite::params![format!("item-{n}"),owner]).unwrap();
+        }
+        let payload = json!({"hook_event_name":"Stop","session_id":owner,"turn_id":"same-turn"});
+        let (old_page, _) = obligations::pending_page(&db, owner, None).unwrap();
+        let old_fingerprint =
+            coordinator_alert_fingerprint(owner, &payload, &old_page, "fixture").unwrap();
+        db.execute("UPDATE obligations SET resolved=1 WHERE id='item-0'", [])
+            .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let (new_page, _) = obligations::pending_page(&tx, owner, None).unwrap();
+        let new_legacy =
+            coordinator_alert_fingerprint(owner, &payload, &new_page, "fixture").unwrap();
+        assert_ne!(old_fingerprint, new_legacy);
+        let (_, digest) = obligations::pending_digest(&tx, owner).unwrap();
+        let new_fingerprint =
+            coordinator_alert_full_fingerprint(owner, &payload, &digest, "fixture").unwrap();
+        let (_, _, collision) = obligations::claim_coordinator_alert_with_legacy(
+            &tx,
+            owner,
+            &new_fingerprint,
+            "new snapshot",
+            Some(&new_legacy),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!collision);
+        tx.commit().unwrap();
+        // This is the old algorithm's claim, using the page it read before the change.
+        assert!(
+            obligations::claim_coordinator_alert(&db, owner, &old_fingerprint, "old snapshot")
+                .unwrap()
+                .is_some()
+        );
+    }
+}
