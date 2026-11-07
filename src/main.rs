@@ -1936,6 +1936,48 @@ mod hook_output_tests {
     use super::*;
 
     #[test]
+    fn synthetic_turn_completion_and_stop_share_claim_only_with_a_common_turn_id() {
+        let source = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        let turn = "33333333-3333-4333-8333-333333333333";
+        let digest = "a".repeat(64);
+        let stop = json!({"hook_event_name":"Stop","session_id":source,"turn_id":turn});
+        // Adapter used only by this test; Wake does not currently consume this notification.
+        let notification = json!({"threadId":source,"turn":{"id":turn,"status":"interrupted"}});
+        let adapted =
+            json!({"session_id":notification["threadId"],"turn_id":notification["turn"]["id"]});
+        let a = coordinator_alert_full_fingerprint(source, &stop, &digest, "stop text").unwrap();
+        let b =
+            coordinator_alert_full_fingerprint(source, &adapted, &digest, "no transcript").unwrap();
+        assert_eq!(a, b);
+        for (first, second) in [(&a, &b), (&b, &a)] {
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            obligations::initialize(&db).unwrap();
+            obligations::register_coordinator(&db, source, coordinator).unwrap();
+            let (id, _) = obligations::claim_coordinator_alert(&db, source, first, "synthetic")
+                .unwrap()
+                .unwrap();
+            obligations::finish_coordinator_alert(
+                &db,
+                &id,
+                "needs_attention",
+                Some("outcome_unknown"),
+            )
+            .unwrap();
+            assert!(
+                obligations::claim_coordinator_alert(&db, source, second, "synthetic")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let without_id = json!({"hook_event_name":"Stop","session_id":source});
+        assert_ne!(
+            a,
+            coordinator_alert_full_fingerprint(source, &without_id, &digest, "stop text").unwrap()
+        );
+    }
+
+    #[test]
     fn no_turn_id_alert_fingerprint_distinguishes_messages_and_deduplicates_reentry() {
         let source = "11111111-1111-4111-8111-111111111111";
         let pending = vec![obligations::Obligation {
