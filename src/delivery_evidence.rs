@@ -277,6 +277,8 @@ pub fn initialize(db: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS user_message_observations_identity
             ON user_message_observations(client_user_message_id,item_id);
+        CREATE INDEX IF NOT EXISTS delivery_evidence_pending
+            ON delivery_evidence(identity_verified,coverage_state,target_thread);
         -- Fewer than two positive observations always means coverage is unknown.",
     )?;
     Ok(())
@@ -657,9 +659,9 @@ pub fn status(db: &Connection) -> Result<Value> {
         "evidence_source":"native_userMessage_notifications_and_history",
         "coverage_limits":{
             "turn_start":"Matching live notifications and persisted history are observed; absence is unknown.",
-            "queue_add":"The client ID mapping was qualified in one isolated case; ordinary CLI deliveries do not register a native identity and remain unknown.",
+            "queue_add":"Native deliveries with stable source identities are observed; the client ID mapping was qualified in one isolated case. CLI fallback remains unknown.",
             "cli":"Unknown. CLI queue output does not expose native userMessage item identities.",
-            "subscriptions":"Configured native turn/start sends are observed only when the source supplies a stable event ID. Default CLI sends and events without such IDs remain unknown.",
+            "subscriptions":"Native sends are observed only when the source supplies a stable event ID. CLI fallback and events without such IDs remain unknown.",
             "polling":"History pages are scanned incrementally and restarted after errors or service restart; only distinct matching native userMessage item IDs confirm a duplicate."
         }
     }))

@@ -1151,7 +1151,25 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                 }
             }
             (Ok(message), Ok(options)) => {
-                crate::execution::deliver(codex, timeout, &thread, &message, true, options.as_ref())
+                if let (Some(event_key), true) = (
+                    source_event_key.as_deref(),
+                    crate::execution::native_queue_available(),
+                ) {
+                    let (client_id, _) =
+                        crate::delivery_evidence::begin(db, event_key, &thread, true)?;
+                    crate::execution::queue_with_identity(
+                        codex, &thread, &message, &client_id, true,
+                    )
+                } else {
+                    crate::execution::deliver(
+                        codex,
+                        timeout,
+                        &thread,
+                        &message,
+                        true,
+                        options.as_ref(),
+                    )
+                }
             }
         };
         let (state, reason) = match result {

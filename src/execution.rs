@@ -270,6 +270,67 @@ pub fn queue_prepared(
     })
 }
 
+/// Submit a known event identity without changing the chat's execution settings.
+pub fn queue_with_identity(
+    codex: &Path,
+    thread: &str,
+    message: &str,
+    client_id: &str,
+    resume: bool,
+) -> Result<(String, Option<String>)> {
+    queue_with_identity_using(thread, message, client_id, resume, &mut |method, params| {
+        crate::goals::rpc(codex, method, params)
+    })
+}
+
+fn queue_with_identity_using(
+    thread: &str,
+    message: &str,
+    client_id: &str,
+    resume: bool,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<(String, Option<String>)> {
+    let thread = Uuid::parse_str(thread)
+        .context("Invalid thread UUID")?
+        .to_string();
+    Uuid::parse_str(client_id).context("Invalid client message UUID")?;
+    if call("thread/queue/add", json!({"threadId":thread,"clientUserMessageId":client_id,"input":[{"type":"text","text":message,"text_elements":[]}]})).is_err() {
+        return Ok(("needs_attention".into(), Some("native_queue_outcome_unknown".into())));
+    }
+    if resume {
+        let result = (|| -> Result<()> {
+            let read = call(
+                "thread/read",
+                json!({"threadId":thread,"includeTurns":false}),
+            )?;
+            let status = read
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+                .context("Missing thread status")?;
+            if status == "notLoaded" {
+                call(
+                    "thread/resume",
+                    json!({"threadId":thread,"excludeTurns":true}),
+                )?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            return Ok(("queued".into(), Some("native_queue_resume_warning".into())));
+        }
+    }
+    Ok(("queued".into(), Some("native_queue_accepted".into())))
+}
+
+pub fn native_queue_available() -> bool {
+    crate::goals::rpc_socket(
+        std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
+    .is_some_and(|socket| Path::new(&socket).exists())
+}
+
 fn deliver_with_id(
     thread: &str,
     message: &str,
@@ -366,6 +427,68 @@ mod tests {
     use super::*;
 
     const THREAD: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn identified_queue_preserves_resume_order_and_never_retries_unknown_send() {
+        let client_id = "22222222-2222-4222-8222-222222222222";
+        for (resume, status, methods) in [
+            (false, "idle", vec!["thread/queue/add"]),
+            (true, "active", vec!["thread/queue/add", "thread/read"]),
+            (true, "idle", vec!["thread/queue/add", "thread/read"]),
+            (
+                true,
+                "notLoaded",
+                vec!["thread/queue/add", "thread/read", "thread/resume"],
+            ),
+        ] {
+            let mut calls = Vec::new();
+            let result = queue_with_identity_using(
+                THREAD,
+                "message",
+                client_id,
+                resume,
+                &mut |method, params| {
+                    calls.push(method.to_owned());
+                    assert!(params.get("model").is_none());
+                    assert!(params.get("effort").is_none());
+                    if method == "thread/queue/add" {
+                        assert_eq!(params["clientUserMessageId"], client_id);
+                    }
+                    Ok(if method == "thread/read" {
+                        json!({"thread":{"status":{"type":status}}})
+                    } else {
+                        json!({})
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, methods);
+            assert_eq!(result.0, "queued");
+        }
+        let mut calls = 0;
+        let result = queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+            calls += 1;
+            anyhow::bail!("response lost")
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.0, "needs_attention");
+        let mut calls = 0;
+        let result = queue_with_identity_using(THREAD, "message", client_id, true, &mut |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Ok(json!({}))
+            } else {
+                anyhow::bail!("read failed")
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            ("queued".into(), Some("native_queue_resume_warning".into()))
+        );
+        assert_eq!(calls, 2);
+    }
 
     fn catalog_page(model: &str, id: &str, effort: &str, cursor: Option<&str>) -> Value {
         json!({

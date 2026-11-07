@@ -333,7 +333,7 @@ Correlation uses live notifications and incremental scans of persisted native
 chat history. Rules, waits, and subscription dispatch can be observed when
 their source has a stable event ID. Polling can supply source event IDs to those
 dispatch paths; a poll result alone is not recipient evidence. Sources without
-a stable event ID and CLI sends remain `unknown`. An isolated `queue/add` case
+a stable event ID and CLI fallback sends remain `unknown`. An isolated `queue/add` case
 confirmed the `clientUserMessageId`-to-`clientId` mapping; it does not prove
 coverage for every Codex version. Scans restart from the newest page after an
 error or service restart, refresh the newest page during long scans, and stop a

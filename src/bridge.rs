@@ -484,7 +484,10 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
             "github.workflow_run.completed",
             &[&repo, &source_run, &source_attempt],
         )?;
-        let identity = if options.as_ref().is_ok_and(Option::is_some) {
+        let identity = if options
+            .as_ref()
+            .is_ok_and(|options| options.is_some() || crate::execution::native_queue_available())
+        {
             Some(crate::delivery_evidence::begin(db, &event_key, &thread, true)?.0)
         } else {
             None
@@ -523,7 +526,15 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                 }
             }
             (Ok(message), Ok(None)) => {
-                match crate::execution::deliver(codex, timeout, &thread, &message, true, None) {
+                let delivery = match identity.as_deref() {
+                    Some(client_id) => crate::execution::queue_with_identity(
+                        codex, &thread, &message, client_id, true,
+                    ),
+                    None => {
+                        crate::execution::deliver(codex, timeout, &thread, &message, true, None)
+                    }
+                };
+                match delivery {
                     Ok((state, reason))
                         if matches!(state.as_str(), "queued" | "ready" | "needs_attention") =>
                     {

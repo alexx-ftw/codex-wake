@@ -452,12 +452,17 @@ fn dispatch_with_identity(
             context["target"]["thread"] = json!(thread);
             let identity = if event_identity_verified
                 && input.goal_objective.is_none()
-                && execution_options(&input).is_some()
+                && (execution_options(&input).is_some()
+                    || crate::execution::native_queue_available())
             {
                 stored_event_key
                     .map(|event_key| {
-                        crate::delivery_evidence::begin(db, &event_key, &thread, true)
-                            .map(|(client_id, _)| (event_key, client_id))
+                        let delivery_key = crate::delivery_evidence::source_fields_identity(
+                            "codex-wake/rule-delivery/v1",
+                            &[&rule_id, &event_key],
+                        )?;
+                        crate::delivery_evidence::begin(db, &delivery_key, &thread, true)
+                            .map(|(client_id, _)| (delivery_key, client_id))
                     })
                     .transpose()?
             } else {
@@ -539,6 +544,8 @@ pub fn dispatch(db: &mut Connection, codex: &Path, workspace_base: &Path) -> Res
                     notifications,
                 ));
                 Ok((state, reason))
+            } else if let Some(client_id) = client_id {
+                crate::execution::queue_with_identity(codex, thread, message, client_id, true)
             } else {
                 crate::execution::deliver(
                     codex,
@@ -609,6 +616,35 @@ mod tests {
         let options = execution_options(&new_chat).unwrap();
         assert_eq!(options.model, "gpt-6.1-terra");
         assert_eq!(options.reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn separate_rules_for_same_event_and_chat_have_distinct_delivery_ids() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for prompt in ["first", "second"] {
+            let mut rule = input();
+            rule.target_thread = Some(THREAD.into());
+            rule.model = Some("test-model".into());
+            rule.reasoning_effort = Some("medium".into());
+            rule.prompt = prompt.into();
+            configure(&db, rule).unwrap();
+        }
+        assert_eq!(accept(&db, "issue_comment", &payload()).unwrap(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        dispatch_with_identity(
+            &mut db,
+            dir.path(),
+            &mut |_, _| unreachable!(),
+            &mut |_, _, _, _, client| {
+                ids.push(client.unwrap().to_owned());
+                Ok(("queued".into(), None))
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
     }
     #[test]
     fn legacy_ready_deliveries_remain_without_verified_event_identity() {
