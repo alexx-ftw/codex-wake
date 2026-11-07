@@ -182,6 +182,18 @@ pub(crate) fn rpc_socket(
     })
 }
 
+pub(crate) fn runtime_rpc_socket() -> Option<std::ffi::OsString> {
+    let explicit = std::env::var_os("CODEX_WAKE_RPC_SOCKET");
+    // Unit tests must opt in to a socket rather than discovering a live receiver.
+    #[cfg(test)]
+    explicit.as_ref()?;
+    rpc_socket(
+        explicit,
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
 /// Connect to CODEX_WAKE_RPC_SOCKET or the receiver's XDG state socket (HOME/.local/state by default).
 /// The receiver owns the persistent server; this client never starts or stops a process.
 /// The executable argument is retained for API compatibility and is unused.
@@ -216,12 +228,8 @@ pub(crate) fn rpc_with_timeout(
 }
 
 fn rpc_inner(method: &str, params: Value, timeout: Duration) -> Result<Value> {
-    let socket = rpc_socket(
-        std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )
-    .ok_or_else(|| BeforeConnect("Codex Wake app-server socket missing".into()))?;
+    let socket = runtime_rpc_socket()
+        .ok_or_else(|| BeforeConnect("Codex Wake app-server socket missing".into()))?;
     if !Path::new(&socket)
         .try_exists()
         .map_err(|error| BeforeConnect(error.to_string()))?
@@ -243,12 +251,8 @@ pub fn rpc_with_notifications(
     method: &str,
     params: Value,
 ) -> Result<(Value, Vec<Value>)> {
-    let socket = rpc_socket(
-        std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )
-    .ok_or_else(|| BeforeConnect("Codex Wake app-server socket missing".into()))?;
+    let socket = runtime_rpc_socket()
+        .ok_or_else(|| BeforeConnect("Codex Wake app-server socket missing".into()))?;
     if !Path::new(&socket)
         .try_exists()
         .map_err(|error| BeforeConnect(error.to_string()))?
@@ -429,6 +433,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit_tests_do_not_discover_a_live_receiver_socket() {
+        use std::os::unix::net::UnixListener;
+        if std::env::var_os("WAKE_TEST_NO_IMPLICIT_SOCKET").is_some() {
+            assert!(runtime_rpc_socket().is_none());
+            assert!(!crate::execution::native_queue_available());
+            return;
+        }
+        let fixture = SocketDir::new();
+        let socket = fixture.0.join("codex-wake/app-server.sock");
+        fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "goals::tests::unit_tests_do_not_discover_a_live_receiver_socket",
+            ])
+            .env("WAKE_TEST_NO_IMPLICIT_SOCKET", "1")
+            .env("XDG_STATE_HOME", &fixture.0)
+            .env_remove("CODEX_WAKE_RPC_SOCKET")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[cfg(unix)]

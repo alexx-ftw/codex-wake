@@ -368,12 +368,7 @@ fn queue_with_identity_using(
 }
 
 pub fn native_queue_available() -> bool {
-    crate::goals::rpc_socket(
-        std::env::var_os("CODEX_WAKE_RPC_SOCKET"),
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )
-    .is_some_and(|socket| Path::new(&socket).exists())
+    crate::goals::runtime_rpc_socket().is_some_and(|socket| Path::new(&socket).exists())
 }
 
 fn deliver_with_id(

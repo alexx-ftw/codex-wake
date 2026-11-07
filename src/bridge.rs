@@ -3,7 +3,6 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
-    env,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::Path,
@@ -661,11 +660,7 @@ fn invoke_codex(
     if resume {
         command.arg("--resume");
     }
-    if let Some(socket) = crate::goals::rpc_socket(
-        env::var_os("CODEX_WAKE_RPC_SOCKET"),
-        env::var_os("XDG_STATE_HOME"),
-        env::var_os("HOME"),
-    ) {
+    if let Some(socket) = crate::goals::runtime_rpc_socket() {
         command
             .arg("--remote")
             .arg(format!("unix://{}", Path::new(&socket).display()));
