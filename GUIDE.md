@@ -441,13 +441,30 @@ coordinator received or acted on the message.
 
 `get_status.responsible_observations` also shows the last metadata-only turn
 snapshot for each explicitly coordinated chat with pending obligations. The
-receiver polls these chats separately from delivery processing. An `interrupted`
+receiver polls these chats separately from delivery processing, with at most eight
+claims per cycle, a 30-second active-turn interval, a five-minute terminal or
+empty interval, and exponential error backoff from 30 seconds to 15 minutes.
+The status includes the last attempt, next due time, consecutive failures and a
+coarse error class without remote error text. A `poll_claimed` observation
+may be in flight or abandoned; the lease expires at `next_poll_ms`. Polling
+is best effort, can miss short turns, and latency also depends on the number
+of sources and RPC timeouts. An `interrupted`
 status is uncertain: a different controller can reconstruct a still-live turn
 that way. `unavailable` retains the previous observation and its timestamp.
 This snapshot can miss short turns and does not publish, send a notification,
 or prove completion. In particular, an interruption without a Stop hook still
 requires the coordinator to inspect status; automatic notification for that case
 is not implemented.
+
+A native `interrupted` observation is not a reliable proof of interruption,
+and polling can miss a complete turn between reads. When a Stop payload lacks a
+turn ID, two distinct stops with the same pending obligations and assistant text
+are indistinguishable from a repeated hook. Conversely, an observation cannot
+be safely matched to that hook from timing alone. Wake therefore cannot promise
+both one alert per stop and no duplicate alert for these cases using these
+signals. A notification implementation needs a shared stable event identity or
+must explicitly report that correlation is unknown; it must not replay an
+uncertain send.
 
 An agent can explicitly register a committed, pending check with
 `register_validation`. Wake does not infer checks from conversation. The same
