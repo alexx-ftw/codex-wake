@@ -184,6 +184,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("subscriptions.rs").as_slice(),
         include_bytes!("producers.rs").as_slice(),
         include_bytes!("result_conflicts.rs").as_slice(),
+        include_bytes!("responsible_status.rs").as_slice(),
         include_bytes!("probe.rs").as_slice(),
         include_bytes!("goals.rs").as_slice(),
         include_bytes!("templates.rs").as_slice(),
@@ -939,7 +940,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
-    for source in ["github", "external", "native", "delivery"] {
+    for source in ["github", "external", "native", "delivery", "responsible"] {
         let poll_config = config.clone();
         thread::spawn(move || {
             let mut history_scans = std::collections::HashMap::new();
@@ -954,6 +955,10 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         }
                         "external" => {
                             crate::observers::tick(&db, &poll_config.codex)?;
+                        }
+                        "responsible" => {
+                            crate::obligations::initialize(&db)?;
+                            crate::responsible_status::tick(&db, &poll_config.codex)?;
                         }
                         "delivery" => {
                             crate::delivery_evidence::poll_history(
@@ -978,11 +983,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         1,
                     );
                 }
-                thread::sleep(Duration::from_secs(if source == "delivery" {
-                    5
-                } else {
-                    1
-                }));
+                thread::sleep(Duration::from_secs(
+                    if source == "delivery" || source == "responsible" {
+                        5
+                    } else {
+                        1
+                    },
+                ));
             }
         });
     }

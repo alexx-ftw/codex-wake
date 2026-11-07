@@ -12,6 +12,7 @@ mod observers;
 mod polling;
 mod probe;
 mod producers;
+mod responsible_status;
 mod result_conflicts;
 mod rules;
 mod status_view;
@@ -332,6 +333,7 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     polling::initialize(&db)?;
     observers::initialize(&db)?;
     native_poll::initialize(&db)?;
+    responsible_status::initialize(&db)?;
     steer::initialize(&db)?;
     obligations::initialize(&db)?;
     validation_obligations::initialize(&db)?;
@@ -1334,6 +1336,7 @@ impl WakeTools {
                 "steers":steer::status(&db)?,
                 "circular_waits":circular,
                 "coordinator_alerts":obligations::coordinator_alerts_status(&db)?,
+                "responsible_observations":responsible_status::status(&db)?,
                 "polling":{"github":polling::status(&db)?,"observers":observers::status(&db)?,"native":native_poll::status(&db)?},
                 "supported_events":subscriptions::ALLOWED_EVENTS,
                 "diagnostics":diagnostics(&self.config,42)?

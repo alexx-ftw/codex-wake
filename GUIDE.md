@@ -439,6 +439,16 @@ recorded sender PID and process start time no longer match a live process; older
 rows without that identity are also uncertain. It does not prove whether the
 coordinator received or acted on the message.
 
+`get_status.responsible_observations` also shows the last metadata-only turn
+snapshot for each explicitly coordinated chat with pending obligations. The
+receiver polls these chats separately from delivery processing. An `interrupted`
+status is uncertain: a different controller can reconstruct a still-live turn
+that way. `unavailable` retains the previous observation and its timestamp.
+This snapshot can miss short turns and does not publish, send a notification,
+or prove completion. In particular, an interruption without a Stop hook still
+requires the coordinator to inspect status; automatic notification for that case
+is not implemented.
+
 An agent can explicitly register a committed, pending check with
 `register_validation`. Wake does not infer checks from conversation. The same
 eligible `Stop` reminds the responsible chat; `list_obligations` includes these

@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','dependency_notice_uncertainties','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','responsible_observations','dependency_notice_uncertainties','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -194,6 +194,7 @@ mod tests {
         crate::rules::initialize(&db).unwrap();
         crate::polling::initialize(&db).unwrap();
         crate::native_poll::initialize(&db).unwrap();
+        crate::responsible_status::initialize(&db).unwrap();
         crate::observers::initialize(&db).unwrap();
         crate::steer::initialize(&db).unwrap();
         crate::obligations::initialize(&db).unwrap();
@@ -214,6 +215,7 @@ mod tests {
         for table in [
             "coordinators",
             "coordinator_alerts",
+            "responsible_observations",
             "dependency_notice_uncertainties",
         ] {
             let exists: bool = db
@@ -350,6 +352,7 @@ mod tests {
         for table in [
             "coordinators",
             "coordinator_alerts",
+            "responsible_observations",
             "dependency_notice_uncertainties",
         ] {
             let temp = tempfile::tempdir().unwrap();
