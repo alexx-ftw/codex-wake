@@ -164,7 +164,7 @@ fn arm_with(db: &Connection, id: &str, call: &mut Rpc) -> Result<()> {
     }
     match source_parent(call, &kind, &resource).and_then(|_| first_turn(call, &resource)) {
         Ok(turn) => {
-            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=NULL,updated_ms=?3 WHERE subscription_id=?4 AND state='unknown' AND reason='baseline_unavailable'", params![turn.as_ref().map(|t|t.id.as_str()),turn.as_ref().map(|t|t.status.as_str()),now+INTERVAL_MS,id])?;
+            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=?5,updated_ms=?3 WHERE subscription_id=?4 AND state='unknown' AND reason='baseline_unavailable'", params![turn.as_ref().map(|t|t.id.as_str()),turn.as_ref().map(|t|t.status.as_str()),now+INTERVAL_MS,id, if turn.as_ref().is_some_and(|t|t.status=="interrupted") {Some("interrupted_status_unverified")} else {None}])?;
             crate::observability::emit(
                 "native_poll.arm",
                 "ok",
@@ -261,7 +261,7 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
         let latest = latest_page.first().cloned();
         if state.as_deref() == Some("unknown") || (state.is_none() && base_id.is_none()) {
             let observed = latest.as_ref();
-            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=NULL,updated_ms=?3 WHERE subscription_id=?4",params![observed.map(|t|t.id.as_str()),observed.map(|t|t.status.as_str()),stamp+INTERVAL_MS,id])?;
+            db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='baseline',reason=?5,updated_ms=?3 WHERE subscription_id=?4",params![observed.map(|t|t.id.as_str()),observed.map(|t|t.status.as_str()),stamp+INTERVAL_MS,id,if observed.is_some_and(|t|t.status=="interrupted") {Some("interrupted_status_unverified")} else {None}])?;
             report["baselined"] = json!(report["baselined"].as_u64().unwrap_or(0) + 1);
             crate::observability::emit(
                 "native_poll.tick",
@@ -384,7 +384,7 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
         } else {
             latest.as_ref().map(|t| t.status.as_str())
         };
-        db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='observed',reason=NULL,updated_ms=?3 WHERE subscription_id=?4",params![latest.as_ref().map(|t|t.id.as_str()),last_status,stamp+INTERVAL_MS,id])?;
+        db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='observed',reason=?5,updated_ms=?3 WHERE subscription_id=?4",params![latest.as_ref().map(|t|t.id.as_str()),last_status,stamp+INTERVAL_MS,id,if latest.as_ref().is_some_and(|t|t.status=="interrupted") {Some("interrupted_status_unverified")} else {None}])?;
     }
     Ok(report)
 }
@@ -799,6 +799,10 @@ mod tests {
         let db = db();
         let id = sub(&db);
         arm_with(&db, &id, &mut page(SOURCE, vec![turn("t1", "interrupted")])).unwrap();
+        assert_eq!(
+            status(&db).unwrap()[0]["reason"],
+            "interrupted_status_unverified"
+        );
         db.execute("UPDATE native_observers SET next_poll_ms=0", [])
             .unwrap();
         assert_eq!(
@@ -808,6 +812,10 @@ mod tests {
         assert_eq!(
             crate::subscriptions::status(&db).unwrap()[0]["state"],
             "waiting"
+        );
+        assert_eq!(
+            status(&db).unwrap()[0]["reason"],
+            "interrupted_status_unverified"
         );
         db.execute("UPDATE native_observers SET next_poll_ms=0", [])
             .unwrap();
@@ -819,6 +827,7 @@ mod tests {
             crate::subscriptions::status(&db).unwrap()[0]["state"],
             "ready"
         );
+        assert!(status(&db).unwrap()[0]["reason"].is_null());
     }
 
     #[test]

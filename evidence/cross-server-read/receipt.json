@@ -1,0 +1,98 @@
+{
+  "codex_version": "0.166.0",
+  "transport": "isolated local app-server websocket",
+  "started_thread": "01a1b7aa-ad65-7363-884d-23791076c20f",
+  "started_turn": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+  "signals": [
+    {
+      "method": "turn/completed",
+      "thread_id": "01a1b7aa-ad65-7363-884d-23791076c20f",
+      "turn_id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+      "status": "interrupted"
+    },
+    {
+      "method": "turn/completed",
+      "thread_id": "01a1b7aa-ad65-7363-884d-23791076c20f",
+      "turn_id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+      "status": "interrupted"
+    }
+  ],
+  "reconnected_owner": {
+    "history": [
+      {
+        "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+        "status": "interrupted"
+      }
+    ],
+    "completion_notifications": []
+  },
+  "owner_before": {
+    "thread_status": {
+      "type": "active",
+      "activeFlags": []
+    },
+    "read_turns": [
+      {
+        "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+        "status": "inProgress"
+      }
+    ],
+    "list": [
+      {
+        "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+        "status": "inProgress"
+      }
+    ]
+  },
+  "separate_server": {
+    "resume_status": null,
+    "resume_error": "active_writer",
+    "completion_notifications": [],
+    "before_read": {
+      "thread_id": "01a1b7aa-ad65-7363-884d-23791076c20f",
+      "status": {
+        "type": "notLoaded"
+      },
+      "turns": [
+        {
+          "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+          "status": "interrupted"
+        }
+      ]
+    },
+    "before_list": [
+      {
+        "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+        "status": "interrupted"
+      }
+    ],
+    "after_read": {
+      "thread_id": "01a1b7aa-ad65-7363-884d-23791076c20f",
+      "status": {
+        "type": "notLoaded"
+      },
+      "turns": [
+        {
+          "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+          "status": "interrupted"
+        }
+      ]
+    },
+    "after_list": [
+      {
+        "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+        "status": "interrupted"
+      }
+    ],
+    "reconnect_list": [
+      {
+        "id": "01a1b7aa-ad83-7ce3-bd8a-61581e40097d",
+        "status": "interrupted"
+      }
+    ]
+  },
+  "synthetic_provider": true,
+  "real_codex": true,
+  "stop_hook_tested": false,
+  "delivery_tested": false
+}
