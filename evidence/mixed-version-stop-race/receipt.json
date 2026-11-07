@@ -1,0 +1,14 @@
+{
+  "mode": "manually_injected_identical_stop_payloads",
+  "first_binary": "e56479e",
+  "second_binary": "bfe5b59",
+  "queue": "fake",
+  "calls": 2,
+  "alert_states": [
+    "queued",
+    "queued"
+  ],
+  "distinct_alert_ids": 2,
+  "first_decision": "block",
+  "second_decision": "block"
+}
