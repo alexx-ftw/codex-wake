@@ -1,6 +1,6 @@
 const fs=require('fs'),net=require('net'),http=require('http'),{spawn}=require('child_process');
-const WebSocket=require('/workspace/scratch/wake-interrupt-deps/node_modules/ws');
-const root='/workspace/scratch/wake-turn-notification-proof', cli='/workspace/scratch/wake-interrupt-deps/node_modules/.bin/codex';
+const WebSocket=require(process.env.WAKE_PROOF_WS||'/workspace/scratch/wake-interrupt-deps/node_modules/ws');
+const root=process.env.WAKE_PROOF_ROOT||'/workspace/scratch/wake-turn-notification-proof', cli=process.env.WAKE_PROOF_CODEX||'/workspace/scratch/wake-interrupt-deps/node_modules/.bin/codex';
 const env={...process.env,CODEX_HOME:root+'/codex',HOME:root};delete env.OPENAI_API_KEY;delete env.CODEX_ACCESS_TOKEN;
 let app,app2,server,connections=[];let serverError='';const events=[[],[],[]];const pending=new Map();let seq=1,providerStarted;const providerReady=new Promise(r=>providerStarted=r);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
