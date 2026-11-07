@@ -1,0 +1,5 @@
+# Ingress rerun against canonical polling-lock identity
+
+The harnesses and JSON receipts here repeat the scenarios described in ../poll-fence-ingress/README.md against code commit `808aba91d01557d71c7ef3d91df58aa5eeea2054`. The Cloud debug binary SHA-256 was `ec049577517cce7e1af1ebbd7085328bb67ffbf06a9d9f4d8d83c08167f5e172`. Both receipts are byte-identical to the previous run: race `27ea8d1f5765bd796f67b29dbc75218d5815e8c6bb32c1df5c0be40bc24b9db4`; gap `60594ff423ec4811feb3d30663abdc474d62af7d65a3043975fbbfba512e2d54`. The fake queue, synthetic events, reconstructed old executable, standalone webhook processes and all other scope limits in the previous receipt continue to apply. The harnesses use absolute Cloud fixture paths and are not part of hosted CI.
+
+The new polling code resolves the database path canonically and rejects multiple hard links so aliases cannot silently use distinct lock names. This does not protect mixed old/new processes; old pollers do not use the new fence. Removing or replacing a live lock file would also split the lock. No runtime was activated.

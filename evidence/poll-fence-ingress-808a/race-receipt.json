@@ -1,0 +1,40 @@
+{
+  "old": "0a1ba30162265efda9ffacf4f304602409873d11",
+  "new": "520109dbbf69332fafaa6cdccdee9e85b26c30d1",
+  "results": [
+    {
+      "ingress_processes": 2,
+      "different_ports": true,
+      "webhook_binary": "verified-2.8.3",
+      "requests": [
+        200,
+        200
+      ],
+      "duplicate_status": 200,
+      "triggered_state": "queued",
+      "unrelated_state": "waiting",
+      "subscription_count": 2,
+      "queue_attempts": 1,
+      "queue_simulated": true,
+      "systemd": false,
+      "stable_ingress_handoff_tested": false
+    },
+    {
+      "ingress_processes": 2,
+      "different_ports": true,
+      "webhook_binary": "verified-2.8.3",
+      "requests": [
+        200,
+        200
+      ],
+      "duplicate_status": 200,
+      "triggered_state": "needs_attention",
+      "unrelated_state": "waiting",
+      "subscription_count": 2,
+      "queue_attempts": 1,
+      "queue_simulated": true,
+      "systemd": false,
+      "stable_ingress_handoff_tested": false
+    }
+  ]
+}
