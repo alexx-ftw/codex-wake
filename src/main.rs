@@ -2386,7 +2386,7 @@ async fn main() -> Result<()> {
     }
     anyhow::ensure!(
         !args.is_empty(),
-        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|poll|register|subscribe|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
+        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|poll|register|subscribe|cancel-subscription|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
     );
     let command = args.remove(0);
     // Cleanup must never recreate state after removing the plugin.

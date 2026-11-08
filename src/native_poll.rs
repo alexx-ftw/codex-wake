@@ -337,7 +337,7 @@ fn record_unknown(
     thread: &str,
     now: i64,
 ) -> Result<bool> {
-    Ok(db.execute("INSERT INTO native_observers(subscription_id,resource,thread,next_poll_ms,state,reason,updated_ms) VALUES(?1,?2,?3,?4,'unknown','baseline_unavailable',?5) ON CONFLICT(subscription_id) DO NOTHING", params![id,resource,thread,now+CLAIM_MS,now])? > 0)
+    Ok(db.execute("INSERT INTO native_observers(subscription_id,resource,thread,next_poll_ms,state,reason,updated_ms) SELECT ?1,?2,?3,?4,'unknown','baseline_unavailable',?5 WHERE EXISTS(SELECT 1 FROM subscriptions WHERE id=?1 AND state='waiting') ON CONFLICT(subscription_id) DO NOTHING", params![id,resource,thread,now+CLAIM_MS,now])? > 0)
 }
 
 fn condition_members_due(db: &Connection, now: i64) -> Result<(Vec<ConditionMember>, bool)> {
@@ -823,7 +823,7 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
             && Uuid::parse_str(&thread).is_ok_and(|u| u.to_string() == thread);
         if !valid {
             let stamp = now_ms();
-            db.execute("INSERT INTO native_observers(subscription_id,resource,thread,next_poll_ms,state,reason,updated_ms) VALUES(?1,?2,?3,?4,'error','invalid_thread_uuid',?4) ON CONFLICT(subscription_id) DO UPDATE SET next_poll_ms=excluded.next_poll_ms,state='error',reason=excluded.reason,updated_ms=excluded.updated_ms",params![id,resource,thread,stamp+INTERVAL_MS])?;
+            db.execute("INSERT INTO native_observers(subscription_id,resource,thread,next_poll_ms,state,reason,updated_ms) SELECT ?1,?2,?3,?4,'error','invalid_thread_uuid',?4 WHERE EXISTS(SELECT 1 FROM subscriptions WHERE id=?1 AND state='waiting') ON CONFLICT(subscription_id) DO UPDATE SET next_poll_ms=excluded.next_poll_ms,state='error',reason=excluded.reason,updated_ms=excluded.updated_ms",params![id,resource,thread,stamp+INTERVAL_MS])?;
             report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
             crate::observability::emit(
                 "native_poll.tick",
@@ -1132,6 +1132,24 @@ mod tests {
     use super::*;
     const SOURCE: &str = "11111111-1111-4111-8111-111111111111";
     const TARGET: &str = "22222222-2222-4222-8222-222222222222";
+    #[test]
+    fn cancelled_subscription_cannot_recreate_native_observer() {
+        let db = Connection::open_in_memory().unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::observers::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let id =
+            crate::subscriptions::subscribe(&db, "thread", "", SOURCE, "turn_completed", TARGET)
+                .unwrap();
+        crate::subscriptions::cancel(&db, &id).unwrap();
+        assert!(!record_unknown(&db, &id, SOURCE, TARGET, now_ms()).unwrap());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM native_observers", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
     #[test]
     #[ignore = "requires an isolated real-Codex interruption proof in WAKE_PROOF_ROOT"]
     fn recorded_interruption_reads_real_codex_fixture() {

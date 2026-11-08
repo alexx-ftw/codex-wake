@@ -620,11 +620,12 @@ cargo run --locked -- publish --kind dependency --repo payments \
   --resource database --outcome progress
 cargo run --locked -- status
 cargo run --locked -- subscriptions
-cargo run --locked -- cancel-subscription --subscription-id 11111111-1111-4111-8111-111111111111
+cargo run --locked -- cancel-subscription --subscription-id "$SUBSCRIPTION_ID"
 cargo run --locked -- recover
 cargo run --locked -- diagnostics --days 42
 ```
 
+Set `SUBSCRIPTION_ID` to the `subscription_id` returned by `subscribe`.
 Cancellation removes only a waiting subscription with no notice activity. It
 does not publish an event or undo a delivery; inspect status if cancellation is
 refused because delivery or a notice has already begun.
