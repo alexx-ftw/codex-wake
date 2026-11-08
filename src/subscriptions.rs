@@ -258,6 +258,7 @@ pub fn cancel(db: &Connection, id: &str) -> Result<()> {
         let changed = db.execute(
             "DELETE FROM subscriptions WHERE id=?1 AND state='waiting' \
              AND dependency_notice_state IS NULL AND expiration_notice_state IS NULL \
+             AND dependency_notice_started_at_ms IS NULL AND expiration_notice_started_at_ms IS NULL \
              AND NOT EXISTS (SELECT 1 FROM dependency_notice_uncertainties WHERE subscription_id=?1)",
             [&id],
         )?;
@@ -2277,6 +2278,12 @@ mod tests {
         assert_eq!(
             status_for_id(&db, &other).unwrap()["inactivity_notice_state"],
             "sending"
+        );
+        db.execute("UPDATE subscriptions SET dependency_notice_state=NULL,dependency_notice_started_at_ms=42 WHERE id=?1", [&other]).unwrap();
+        assert!(cancel(&db, &other).is_err());
+        assert_eq!(
+            status_for_id(&db, &other).unwrap()["inactivity_notice_started_at_ms"],
+            42
         );
     }
 
