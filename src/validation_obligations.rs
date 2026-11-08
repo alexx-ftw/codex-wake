@@ -8,6 +8,16 @@ use uuid::Uuid;
 
 const MAX_SCOPE_BYTES: usize = 2048;
 
+pub(crate) fn canonical_publication_resource(kind: &str, resource: &str) -> Result<String> {
+    if kind == "chat" {
+        Ok(Uuid::parse_str(resource)
+            .context("Invalid chat resource UUID")?
+            .to_string())
+    } else {
+        Ok(resource.to_owned())
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationLink {
@@ -65,6 +75,9 @@ pub fn register(
         crate::obligations::validate_publication_identity(&link.kind, &link.repo, &link.resource)?;
         validate_scope(scope.unwrap())?;
     }
+    let linked_resource = link
+        .map(|link| canonical_publication_resource(&link.kind, &link.resource))
+        .transpose()?;
     let id = Uuid::new_v4().to_string();
     let tx = db.unchecked_transaction()?;
     tx.execute(
@@ -72,7 +85,7 @@ pub fn register(
          VALUES (?1, ?2, 'validation', '', ?1, '', ?3)",
         params![id, thread, description],
     )?;
-    if let (Some(link), Some(scope)) = (link, scope) {
+    if let (Some(link), Some(scope), Some(resource)) = (link, scope, linked_resource.as_deref()) {
         tx.execute(
             "INSERT INTO validation_scope_links(obligation_id, kind, repo, resource, scope)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -80,7 +93,7 @@ pub fn register(
                 id,
                 link.kind,
                 link.repo,
-                link.resource,
+                resource,
                 serde_json::to_string(scope)?
             ],
         )?;
@@ -112,10 +125,12 @@ pub fn scope_mismatches(
     published_scope: &BTreeMap<String, String>,
 ) -> Result<Vec<ScopeMismatch>> {
     validate_scope(published_scope)?;
+    let resource = canonical_publication_resource(kind, resource)?;
     let mut statement = db.prepare(
         "SELECT o.id, o.thread, s.scope
          FROM obligations o JOIN validation_scope_links s ON s.obligation_id=o.id
-         WHERE o.kind='validation' AND o.resolved=0 AND s.kind=?1 AND s.repo=?2 AND s.resource=?3",
+         WHERE o.kind='validation' AND o.resolved=0 AND s.kind=?1 AND s.repo=?2
+           AND (s.resource=?3 OR (?1='chat' AND s.resource COLLATE NOCASE=?3))",
     )?;
     let mut rows = statement.query(params![kind, repo, resource])?;
     let mut mismatches = Vec::new();

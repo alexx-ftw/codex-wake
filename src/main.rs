@@ -1813,11 +1813,10 @@ impl WakeTools {
                 "Unsupported publication kind"
             );
             let db = database(&self.config)?;
-            let resource = if input.kind == "chat" {
-                uuid::Uuid::parse_str(&input.resource)?.to_string()
-            } else {
-                input.resource.clone()
-            };
+            let resource = validation_obligations::canonical_publication_resource(
+                &input.kind,
+                &input.resource,
+            )?;
             let identity = match (input.execution_id.as_deref(), input.attempt) {
                 (None, None) => None,
                 (Some(execution), Some(attempt)) => Some((execution, attempt)),
@@ -1829,7 +1828,7 @@ impl WakeTools {
                     &db,
                     &input.kind,
                     &input.repo,
-                    &input.resource,
+                    &resource,
                     scope,
                 )?
             } else {
@@ -1840,7 +1839,7 @@ impl WakeTools {
                     &db,
                     &input.kind,
                     &input.repo,
-                    &input.resource,
+                    &resource,
                     &input.outcome,
                     &source,
                     identity,
@@ -1872,7 +1871,7 @@ impl WakeTools {
                 &db,
                 &input.kind,
                 &input.repo,
-                &input.resource,
+                &resource,
                 &input.outcome,
             );
             result["conflict"] = json!(!conflicts.is_empty());
@@ -4003,6 +4002,94 @@ mod hook_output_tests {
                 .unwrap()
                 .iter()
                 .any(|item| item.id == id)
+        );
+    }
+
+    #[test]
+    fn chat_scope_mismatch_matches_new_and_legacy_uuid_casing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("must-not-execute");
+        let tools = WakeTools { config };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let chat = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+        let register = |resource: &str| {
+            let response = tools.register_validation(Parameters(
+                serde_json::from_value(json!({
+                    "thread":thread,
+                    "description":"Check the chat result",
+                    "link":{"kind":"chat","resource":resource},
+                    "scope":{"environment":"production"}
+                }))
+                .unwrap(),
+            ));
+            assert_ne!(response.is_error, Some(true));
+            response.structured_content.unwrap()["obligation_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let new_id = register(&chat.to_uppercase());
+        let db = database(&tools.config).unwrap();
+        let stored_new: String = db
+            .query_row(
+                "SELECT resource FROM validation_scope_links WHERE obligation_id=?1",
+                [&new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_new, chat);
+        drop(db);
+
+        let legacy_id = register(chat);
+        let db = database(&tools.config).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE validation_scope_links SET resource=?1 WHERE obligation_id=?2",
+                rusqlite::params![chat.to_uppercase(), legacy_id],
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
+
+        let publish = || {
+            let input = serde_json::from_value::<PublicationInput>(json!({
+                "kind":"chat",
+                "resource":chat,
+                "outcome":"completed",
+                "scope":{"environment":"local"}
+            }))
+            .unwrap();
+            let response = tools.publish_result(Parameters(input));
+            assert_ne!(response.is_error, Some(true));
+            response.structured_content.unwrap()
+        };
+        let result = publish();
+        assert_eq!(result["validation_scope_mismatch"], true);
+        assert_eq!(
+            result["validation_scope_warnings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            result["validation_scope_warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["obligation_id"] == new_id)
+        );
+        assert!(
+            result["validation_scope_warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["obligation_id"] == legacy_id)
         );
     }
 
