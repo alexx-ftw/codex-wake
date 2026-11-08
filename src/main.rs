@@ -2880,6 +2880,34 @@ mod hook_output_tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancellation_cli_uses_exact_subscription_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let id = subscriptions::subscribe(
+            &db,
+            "artifact",
+            "ci",
+            "one",
+            "available",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        drop(db);
+        run_command(
+            config.clone(),
+            "cancel-subscription".into(),
+            vec!["--subscription-id".into(), id.clone()],
+        )
+        .await
+        .unwrap();
+        assert!(subscriptions::status_for_id(&database(&config).unwrap(), &id).is_err());
+    }
+
     #[test]
     fn coordination_tool_reads_the_actual_database_schema() {
         let temp = tempfile::tempdir().unwrap();
