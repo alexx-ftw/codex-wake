@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','steers','obligations','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -235,6 +235,8 @@ mod tests {
         fs::write(&artifact, b"keep").unwrap();
         let db = crate::bridge::connect(&path).unwrap();
         crate::subscriptions::initialize(&db).unwrap();
+        crate::conditions::initialize(&db).unwrap();
+        crate::condition_alerts::initialize(&db).unwrap();
         crate::rules::initialize(&db).unwrap();
         crate::polling::initialize(&db).unwrap();
         crate::native_poll::initialize(&db).unwrap();
@@ -259,6 +261,14 @@ mod tests {
             "coordinators",
             "coordinator_alerts",
             "dependency_notice_uncertainties",
+            "condition_groups",
+            "condition_members",
+            "condition_completions",
+            "condition_publications",
+            "condition_pending_events",
+            "condition_publication_collisions",
+            "condition_alerts",
+            "native_condition_observers",
         ] {
             let exists: bool = db
                 .query_row(
@@ -396,6 +406,7 @@ mod tests {
             "coordinator_alerts",
             "coordinator_hook_events",
             "dependency_notice_uncertainties",
+            "condition_alerts",
         ] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("state.sqlite3");

@@ -1,6 +1,6 @@
 //! Metadata-only polling for registered Codex thread turn-completion observers.
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
     ffi::CString,
@@ -22,6 +22,7 @@ const INTERVAL_MS: i64 = 5_000;
 const CLAIM_MS: i64 = 180_000;
 const PAGE_SIZE: i64 = 100;
 const MAX_PAGES: usize = 10;
+const CONDITION_BATCH_LIMIT: i64 = 128;
 type Rpc<'a> = dyn FnMut(&str, Value) -> Result<Value> + 'a;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +30,36 @@ type Rpc<'a> = dyn FnMut(&str, Value) -> Result<Value> + 'a;
 struct Turn {
     id: String,
     status: String,
+}
+
+#[derive(Clone, Debug)]
+struct ConditionMember {
+    group_id: String,
+    kind: String,
+    repo: String,
+    resource: String,
+    event: String,
+    outcome: String,
+    armed: bool,
+    buffer_overflow: bool,
+    buffer_overflow_count: i64,
+    baseline_cursor: Option<String>,
+    observer_exists: bool,
+    baseline_turn_id: Option<String>,
+    baseline_status: Option<String>,
+    baseline_order_uncertain: bool,
+}
+
+impl ConditionMember {
+    fn selector(&self) -> crate::conditions::Selector {
+        crate::conditions::Selector {
+            kind: self.kind.clone(),
+            repo: self.repo.clone(),
+            resource: self.resource.clone(),
+            event: self.event.clone(),
+            outcome: (!self.outcome.is_empty()).then(|| self.outcome.clone()),
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -51,7 +82,23 @@ pub fn initialize(db: &Connection) -> Result<()> {
         state TEXT NOT NULL CHECK(state IN ('unknown','baseline','observed','error')),
         reason TEXT,
         updated_ms INTEGER NOT NULL
-    ); CREATE INDEX IF NOT EXISTS native_observers_due ON native_observers(next_poll_ms);",
+    ); CREATE INDEX IF NOT EXISTS native_observers_due ON native_observers(next_poll_ms);
+    CREATE TABLE IF NOT EXISTS native_condition_observers (
+        group_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        event TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        baseline_turn_id TEXT,
+        baseline_status TEXT,
+        baseline_order_uncertain INTEGER NOT NULL DEFAULT 0
+            CHECK(baseline_order_uncertain IN (0,1)),
+        next_poll_ms INTEGER NOT NULL,
+        PRIMARY KEY(group_id,kind,repo,resource,event,outcome)
+    );
+    CREATE INDEX IF NOT EXISTS native_condition_observers_due
+        ON native_condition_observers(next_poll_ms);",
     )?;
     Ok(())
 }
@@ -291,6 +338,415 @@ fn record_unknown(
     now: i64,
 ) -> Result<bool> {
     Ok(db.execute("INSERT INTO native_observers(subscription_id,resource,thread,next_poll_ms,state,reason,updated_ms) VALUES(?1,?2,?3,?4,'unknown','baseline_unavailable',?5) ON CONFLICT(subscription_id) DO NOTHING", params![id,resource,thread,now+CLAIM_MS,now])? > 0)
+}
+
+fn condition_members_due(db: &Connection, now: i64) -> Result<(Vec<ConditionMember>, bool)> {
+    let mut statement = db.prepare(
+        "SELECT m.group_id,m.kind,m.repo,m.resource,m.event,m.outcome,m.armed,
+                m.buffer_overflow,m.buffer_overflow_count,m.baseline_cursor,
+                o.group_id IS NOT NULL,o.baseline_turn_id,o.baseline_status,
+                COALESCE(o.baseline_order_uncertain,0)
+         FROM condition_members m
+         JOIN condition_groups g ON g.id=m.group_id
+         LEFT JOIN native_condition_observers o
+           ON o.group_id=m.group_id AND o.kind=m.kind AND o.repo=m.repo
+          AND o.resource=m.resource AND o.event=m.event AND o.outcome=m.outcome
+         WHERE m.polling=1 AND m.matched=0
+           AND g.state='pending'
+           AND ((m.kind='thread' AND m.event='turn_completed')
+                OR (m.kind='subagent' AND m.event='completed'))
+           AND (o.group_id IS NULL OR o.next_poll_ms<=?1)
+         ORDER BY m.group_id,m.kind,m.repo,m.resource,m.event,m.outcome
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![now, CONDITION_BATCH_LIMIT + 1], |row| {
+        Ok(ConditionMember {
+            group_id: row.get(0)?,
+            kind: row.get(1)?,
+            repo: row.get(2)?,
+            resource: row.get(3)?,
+            event: row.get(4)?,
+            outcome: row.get(5)?,
+            armed: row.get::<_, i64>(6)? != 0,
+            buffer_overflow: row.get::<_, i64>(7)? != 0,
+            buffer_overflow_count: row.get(8)?,
+            baseline_cursor: row.get(9)?,
+            observer_exists: row.get::<_, bool>(10)?,
+            baseline_turn_id: row.get(11)?,
+            baseline_status: row.get(12)?,
+            baseline_order_uncertain: row.get::<_, i64>(13)? != 0,
+        })
+    })?;
+    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = rows.len() as i64 > CONDITION_BATCH_LIMIT;
+    if has_more {
+        rows.pop();
+    }
+    Ok((rows, has_more))
+}
+
+fn claim_condition_member(db: &Connection, member: &ConditionMember, now: i64) -> Result<bool> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let initial_turn = if member.armed && !member.observer_exists {
+        member.baseline_cursor.as_deref()
+    } else {
+        None
+    };
+    let initial_status = initial_turn.map(|_| "completed");
+    let changed = tx.execute(
+        "INSERT INTO native_condition_observers
+         (group_id,kind,repo,resource,event,outcome,baseline_turn_id,baseline_status,next_poll_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(group_id,kind,repo,resource,event,outcome) DO UPDATE
+            SET next_poll_ms=excluded.next_poll_ms
+          WHERE native_condition_observers.next_poll_ms<=?10",
+        params![
+            member.group_id,
+            member.kind,
+            member.repo,
+            member.resource,
+            member.event,
+            member.outcome,
+            initial_turn,
+            initial_status,
+            now + CLAIM_MS,
+            now
+        ],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+fn condition_member_retry(db: &Connection, member: &ConditionMember, now: i64) -> Result<()> {
+    db.execute(
+        "UPDATE native_condition_observers SET next_poll_ms=?1
+         WHERE group_id=?2 AND kind=?3 AND repo=?4 AND resource=?5 AND event=?6 AND outcome=?7",
+        params![
+            now + INTERVAL_MS,
+            member.group_id,
+            member.kind,
+            member.repo,
+            member.resource,
+            member.event,
+            member.outcome
+        ],
+    )?;
+    Ok(())
+}
+
+fn condition_member_observed(
+    db: &Connection,
+    member: &ConditionMember,
+    latest: Option<&Turn>,
+    now: i64,
+) -> Result<()> {
+    db.execute(
+        "UPDATE native_condition_observers
+         SET baseline_turn_id=?1,
+             baseline_status=CASE
+                 WHEN baseline_turn_id=?1 AND baseline_status='completed' THEN 'completed'
+                 ELSE ?2
+             END,
+             next_poll_ms=?3
+         WHERE group_id=?4 AND kind=?5 AND repo=?6 AND resource=?7 AND event=?8 AND outcome=?9",
+        params![
+            latest.map(|turn| turn.id.as_str()),
+            latest.map(|turn| turn.status.as_str()),
+            now + INTERVAL_MS,
+            member.group_id,
+            member.kind,
+            member.repo,
+            member.resource,
+            member.event,
+            member.outcome
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read a bounded native history slice, oldest-first, ending at the captured
+/// baseline when one exists. A missing baseline cursor is never silently
+/// treated as a complete history if the page cap is reached.
+fn turns_since_baseline(
+    call: &mut Rpc,
+    resource: &str,
+    baseline_turn_id: Option<&str>,
+) -> Result<(Option<Turn>, Vec<Turn>, bool)> {
+    let (mut page, mut cursor) = turns_page(call, resource, None)?;
+    let latest = page.first().cloned();
+    let mut descending = Vec::new();
+    let mut found = baseline_turn_id.is_none();
+    let mut exhausted = cursor.is_none();
+    for page_no in 0..MAX_PAGES {
+        if baseline_turn_id.is_some_and(|baseline| page.iter().any(|turn| turn.id == baseline)) {
+            found = true;
+        }
+        descending.append(&mut page);
+        if (baseline_turn_id.is_some() && found) || exhausted {
+            break;
+        }
+        let Some(next_cursor) = cursor.take() else {
+            exhausted = true;
+            break;
+        };
+        if page_no + 1 == MAX_PAGES {
+            break;
+        }
+        (page, cursor) = turns_page(call, resource, Some(&next_cursor))?;
+        exhausted = cursor.is_none();
+    }
+    if !found {
+        anyhow::bail!("Native condition baseline cursor was not found within the page limit");
+    }
+    let baseline_missing_beyond_cap = baseline_turn_id.is_none() && !exhausted;
+    if let Some(baseline) = baseline_turn_id {
+        let index = descending
+            .iter()
+            .position(|turn| turn.id == baseline)
+            .context("Native condition baseline cursor was not found")?;
+        descending.truncate(index + 1);
+    }
+    descending.reverse();
+    Ok((latest, descending, baseline_missing_beyond_cap))
+}
+
+fn native_condition_source(kind: &str, resource: &str, parent: Option<&str>, turn: &Turn) -> Value {
+    if kind == "subagent" {
+        json!({"session_id":parent,"agent_id":resource,"turnId":turn.id,"status":turn.status})
+    } else {
+        json!({"session_id":resource,"turnId":turn.id,"status":turn.status})
+    }
+}
+
+fn tick_condition_members(db: &Connection, call: &mut Rpc) -> Result<Value> {
+    crate::conditions::initialize(db)?;
+    initialize(db)?;
+    let now = now_ms();
+    let (due, has_more) = condition_members_due(db, now)?;
+    let mut report = json!({
+        "due": due.len(),
+        "armed": 0,
+        "armed_with_order_uncertainty": 0,
+        "baseline_order_uncertain_members": due.iter().filter(|member| member.baseline_order_uncertain).count(),
+        "observed": 0,
+        "ready_groups": 0,
+        "payload_collisions": 0,
+        "buffer_overflow_members": due.iter().filter(|member| member.buffer_overflow).count(),
+        "buffer_overflow_events": due.iter().map(|member| member.buffer_overflow_count).sum::<i64>(),
+        "errors": 0,
+        "has_more": has_more,
+        "batch_limit": CONDITION_BATCH_LIMIT
+    });
+
+    for member in due {
+        if !claim_condition_member(db, &member, now_ms())? {
+            continue;
+        }
+        let valid_resource =
+            Uuid::parse_str(&member.resource).is_ok_and(|uuid| uuid.to_string() == member.resource);
+        if !valid_resource {
+            condition_member_retry(db, &member, now_ms())?;
+            report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+            continue;
+        }
+
+        if !member.armed {
+            let baseline = source_parent(call, &member.kind, &member.resource)
+                .and_then(|_| first_turn(call, &member.resource));
+            let baseline = match baseline {
+                Ok(baseline) => baseline,
+                Err(_) => {
+                    condition_member_retry(db, &member, now_ms())?;
+                    report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+                    continue;
+                }
+            };
+            if let Some(turn) = baseline.as_ref().filter(|turn| turn.status == "completed") {
+                let ambiguous: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM condition_pending_events WHERE group_id=?1 AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5 AND outcome=?6 AND event_cursor=?7)",
+                    params![member.group_id,member.kind,member.repo,member.resource,member.event,member.outcome,turn.id], |row| row.get(0),
+                )?;
+                if ambiguous {
+                    db.execute("UPDATE native_condition_observers SET baseline_turn_id=?1,baseline_status='completed',baseline_order_uncertain=1,next_poll_ms=?2 WHERE group_id=?3 AND kind=?4 AND repo=?5 AND resource=?6 AND event=?7 AND outcome=?8", params![turn.id,now_ms()+INTERVAL_MS,member.group_id,member.kind,member.repo,member.resource,member.event,member.outcome])?;
+                    report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+                    continue;
+                }
+            }
+            // Anchor the first observation at the latest turn so older history
+            // cannot be replayed; an active baseline can still complete later.
+            let baseline_cursor = baseline.as_ref().map(|turn| turn.id.as_str());
+            let order_uncertain = baseline
+                .as_ref()
+                .is_some_and(|turn| turn.status == "completed");
+            let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+            let armed = crate::conditions::arm_native_member_in(
+                &tx,
+                &member.group_id,
+                &member.selector(),
+                baseline_cursor,
+            );
+            match armed {
+                Ok(true) => {
+                    tx.execute(
+                        "UPDATE native_condition_observers
+                         SET baseline_turn_id=?1,baseline_status=?2,
+                             baseline_order_uncertain=?3,next_poll_ms=?4
+                         WHERE group_id=?5 AND kind=?6 AND repo=?7 AND resource=?8 AND event=?9 AND outcome=?10",
+                        params![
+                            baseline.as_ref().map(|turn| turn.id.as_str()),
+                            baseline.as_ref().map(|turn| turn.status.as_str()),
+                            i64::from(order_uncertain),
+                            now_ms() + INTERVAL_MS,
+                            member.group_id,
+                            member.kind,
+                            member.repo,
+                            member.resource,
+                            member.event,
+                            member.outcome
+                        ],
+                    )?;
+                    tx.commit()?;
+                    let key = if order_uncertain {
+                        "armed_with_order_uncertainty"
+                    } else {
+                        "armed"
+                    };
+                    report[key] = json!(report[key].as_u64().unwrap_or(0) + 1);
+                }
+                Ok(false) => {
+                    tx.commit()?;
+                    condition_member_retry(db, &member, now_ms())?;
+                }
+                Err(error) => {
+                    drop(tx);
+                    condition_member_retry(db, &member, now_ms())?;
+                    return Err(error);
+                }
+            }
+            continue;
+        }
+
+        let baseline_turn_id = if member.observer_exists {
+            member.baseline_turn_id.clone()
+        } else {
+            member.baseline_cursor.clone()
+        };
+        let baseline_status = if member.observer_exists {
+            member.baseline_status.clone()
+        } else if baseline_turn_id.is_some() {
+            Some("completed".to_owned())
+        } else {
+            None
+        };
+        let observed = (|| -> Result<_> {
+            let parent = source_parent(call, &member.kind, &member.resource)?;
+            let (latest, chronological, incomplete) =
+                turns_since_baseline(call, &member.resource, baseline_turn_id.as_deref())?;
+            let mut previous_id = baseline_turn_id.clone();
+            let mut previous_status = baseline_status.clone();
+            let mut completed = Vec::new();
+            for turn in chronological {
+                let same = previous_id.as_deref() == Some(turn.id.as_str());
+                if turn.status == "completed"
+                    && (!same || previous_status.as_deref() != Some("completed"))
+                {
+                    completed.push(turn.clone());
+                }
+                previous_id = Some(turn.id);
+                previous_status = Some(turn.status);
+            }
+            Ok((parent, latest, completed, incomplete))
+        })();
+        let (parent, latest, completed, incomplete) = match observed {
+            Ok(observed) => observed,
+            Err(_) => {
+                condition_member_retry(db, &member, now_ms())?;
+                report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+                continue;
+            }
+        };
+
+        let mut collision_without_match = false;
+        for turn in &completed {
+            let source =
+                native_condition_source(&member.kind, &member.resource, parent.as_deref(), turn);
+            let outcome = if member.kind == "subagent" {
+                "completed"
+            } else {
+                "turn_completed"
+            };
+            let selector = crate::conditions::Selector {
+                kind: member.kind.clone(),
+                repo: member.repo.clone(),
+                resource: member.resource.clone(),
+                event: outcome.into(),
+                outcome: Some(outcome.into()),
+            };
+            let Some(source_event_key) = crate::subscriptions::source_event_identity(
+                &member.kind,
+                &member.repo,
+                &member.resource,
+                outcome,
+                outcome,
+                &source,
+            )?
+            else {
+                condition_member_retry(db, &member, now_ms())?;
+                report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+                continue;
+            };
+            let record = crate::conditions::record_native_poll_event(
+                db,
+                &member.group_id,
+                &crate::conditions::PublishedEvent {
+                    selector,
+                    source_event_key,
+                    cursor: Some(turn.id.clone()),
+                    ci: None,
+                    source,
+                },
+            )?;
+            report["observed"] = json!(report["observed"].as_u64().unwrap_or(0) + 1);
+            report["ready_groups"] =
+                json!(report["ready_groups"].as_u64().unwrap_or(0) + record.ready_groups as u64);
+            if record.payload_collision {
+                report["payload_collisions"] =
+                    json!(report["payload_collisions"].as_u64().unwrap_or(0) + 1);
+                collision_without_match |= record.new_members == 0;
+            }
+            if record.buffer_overflow {
+                report["buffer_overflow_members"] =
+                    json!(report["buffer_overflow_members"].as_u64().unwrap_or(0) + 1);
+                report["buffer_overflow_events"] =
+                    json!(report["buffer_overflow_events"].as_i64().unwrap_or(0) + 1);
+            }
+        }
+
+        if collision_without_match {
+            let matched: i64 = db.query_row(
+                "SELECT matched FROM condition_members
+                 WHERE group_id=?1 AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5 AND outcome=?6",
+                params![member.group_id,member.kind,member.repo,member.resource,member.event,member.outcome],
+                |row| row.get(0),
+            )?;
+            if matched == 0 {
+                // Keep the saved baseline so an identity collision cannot
+                // silently skip this turn; a later valid turn in this batch
+                // may still have matched the member.
+                condition_member_retry(db, &member, now_ms())?;
+                report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+                continue;
+            }
+        }
+
+        if incomplete && completed.is_empty() {
+            condition_member_retry(db, &member, now_ms())?;
+            report["errors"] = json!(report["errors"].as_u64().unwrap_or(0) + 1);
+        } else {
+            condition_member_observed(db, &member, latest.as_ref(), now_ms())?;
+        }
+    }
+    Ok(report)
 }
 
 /// Arm after inserting the subscription. RPC errors are retained as `unknown` state for retry.
@@ -539,14 +995,135 @@ fn tick_with(db: &Connection, call: &mut Rpc) -> Result<Value> {
         };
         db.execute("UPDATE native_observers SET baseline_turn_id=?1,baseline_status=?2,next_poll_ms=?3,state='observed',reason=?5,updated_ms=?3 WHERE subscription_id=?4",params![latest.as_ref().map(|t|t.id.as_str()),last_status,stamp+INTERVAL_MS,id,reason])?;
     }
+    report["conditions"] = tick_condition_members(db, call)?;
     Ok(report)
+}
+
+/// Resolve the ordering of a buffered native event after inspecting its evidence.
+pub fn resolve_condition_order(
+    db: &Connection,
+    group_id: &str,
+    resource: &str,
+    accept: bool,
+) -> Result<bool> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let mut statement = tx.prepare("SELECT kind,repo,event,outcome,baseline_turn_id,baseline_status FROM native_condition_observers WHERE group_id=?1 AND resource=?2 AND baseline_order_uncertain=1")?;
+    let rows = statement
+        .query_map(params![group_id, resource], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    anyhow::ensure!(
+        rows.len() == 1,
+        "Expected exactly one ambiguous native observer"
+    );
+    let (kind, repo, event, outcome, turn, baseline_status) = &rows[0];
+    let selector = crate::conditions::Selector {
+        kind: kind.clone(),
+        repo: repo.clone(),
+        resource: resource.to_owned(),
+        event: event.clone(),
+        outcome: (!outcome.is_empty()).then(|| outcome.clone()),
+    };
+    let accepted_event = if accept {
+        anyhow::ensure!(
+            baseline_status.as_deref() == Some("completed"),
+            "Accepting a native event requires an observed completed turn"
+        );
+        let pending: Option<(String, String)> = tx
+            .query_row(
+                "SELECT source_event_key,source_json FROM condition_pending_events
+             WHERE group_id=?1 AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5
+               AND outcome=?6 AND event_cursor=?7 LIMIT 1",
+                params![group_id, kind, repo, resource, event, outcome, turn],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (source_event_key, source): (String, Value) = match pending {
+            Some((key, source)) => (key, serde_json::from_str(&source)?),
+            None => {
+                anyhow::ensure!(
+                    kind == "thread" && baseline_status.as_deref() == Some("completed"),
+                    "Accepting a native baseline requires explicit completion evidence"
+                );
+                let turn = Turn {
+                    id: turn.clone(),
+                    status: "completed".into(),
+                };
+                let source = native_condition_source(kind, resource, None, &turn);
+                let observed_outcome = if kind == "subagent" {
+                    "completed"
+                } else {
+                    "turn_completed"
+                };
+                let key = crate::subscriptions::source_event_identity(
+                    kind,
+                    repo,
+                    resource,
+                    event,
+                    observed_outcome,
+                    &source,
+                )?
+                .context("Accepted native baseline has no stable event identity")?;
+                (key, source)
+            }
+        };
+        Some(crate::conditions::PublishedEvent {
+            selector: selector.clone(),
+            source_event_key,
+            cursor: Some(turn.clone()),
+            ci: None,
+            source,
+        })
+    } else {
+        None
+    };
+    let changed = crate::conditions::arm_native_member_in(&tx, group_id, &selector, Some(turn))?;
+    if let Some(event) = accepted_event {
+        let recorded = crate::conditions::record_native_accepted_event_in(&tx, group_id, &event)?;
+        anyhow::ensure!(
+            !recorded.payload_collision,
+            "Accepted native event has conflicting payload"
+        );
+    }
+    tx.execute("UPDATE native_condition_observers SET baseline_order_uncertain=0,next_poll_ms=?1 WHERE group_id=?2 AND resource=?3 AND kind=?4 AND repo=?5 AND event=?6 AND outcome=?7",params![now_ms()+INTERVAL_MS,group_id,resource,kind,repo,event,outcome])?;
+    tx.commit()?;
+    Ok(changed)
 }
 
 /// Read observer state only; never contacts the app-server or returns turn contents.
 pub fn status(db: &Connection) -> Result<Value> {
     initialize(db)?;
     let mut statement=db.prepare("SELECT subscription_id,resource,thread,baseline_turn_id,baseline_status,state,reason,next_poll_ms,updated_ms FROM native_observers ORDER BY subscription_id")?;
-    let rows=statement.query_map([],|r|Ok(json!({"subscription_id":r.get::<_,String>(0)?,"resource":r.get::<_,String>(1)?,"thread":r.get::<_,String>(2)?,"baseline_turn_id":r.get::<_,Option<String>>(3)?,"baseline_status":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"next_poll_ms":r.get::<_,i64>(7)?,"updated_ms":r.get::<_,i64>(8)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rows=statement.query_map([],|r|Ok(json!({"subscription_id":r.get::<_,String>(0)?,"resource":r.get::<_,String>(1)?,"thread":r.get::<_,String>(2)?,"baseline_turn_id":r.get::<_,Option<String>>(3)?,"baseline_status":r.get::<_,Option<String>>(4)?,"state":r.get::<_,String>(5)?,"reason":r.get::<_,Option<String>>(6)?,"next_poll_ms":r.get::<_,i64>(7)?,"updated_ms":r.get::<_,i64>(8)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut statement = db.prepare(
+        "SELECT group_id,kind,resource,event,baseline_status,baseline_order_uncertain,next_poll_ms
+         FROM native_condition_observers ORDER BY group_id,kind,resource,event",
+    )?;
+    rows.extend(
+        statement
+            .query_map([], |row| {
+                Ok(json!({
+                    "observer_kind":"condition_member",
+                    "group_id":row.get::<_,String>(0)?,
+                    "kind":row.get::<_,String>(1)?,
+                    "resource":row.get::<_,String>(2)?,
+                    "event":row.get::<_,String>(3)?,
+                    "baseline_status":row.get::<_,Option<String>>(4)?,
+                    "baseline_order_uncertain":row.get::<_,i64>(5)? != 0,
+                    "next_poll_ms":row.get::<_,i64>(6)?
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
     Ok(json!(rows))
 }
 
@@ -999,6 +1576,575 @@ mod tests {
         })
         .unwrap();
         assert_eq!(status(&db).unwrap()[0]["baseline_turn_id"], "active");
+    }
+
+    fn register_native_condition(db: &Connection) -> String {
+        crate::conditions::register_group(
+            db,
+            crate::conditions::Mode::Or,
+            &[crate::conditions::Selector {
+                kind: "thread".into(),
+                repo: String::new(),
+                resource: SOURCE.into(),
+                event: "turn_completed".into(),
+                outcome: Some("turn_completed".into()),
+            }],
+            TARGET,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn hook_event(turn_id: &str) -> crate::conditions::PublishedEvent {
+        let source = json!({
+            "hook_event_name":"Stop",
+            "session_id":SOURCE,
+            "turn_id":turn_id,
+            "turnId":turn_id,
+            "status":"completed"
+        });
+        let source_event_key = crate::subscriptions::source_event_identity(
+            "thread",
+            "",
+            SOURCE,
+            "turn_completed",
+            "turn_completed",
+            &source,
+        )
+        .unwrap()
+        .unwrap();
+        crate::conditions::PublishedEvent {
+            selector: crate::conditions::Selector {
+                kind: "thread".into(),
+                repo: String::new(),
+                resource: SOURCE.into(),
+                event: "turn_completed".into(),
+                outcome: Some("turn_completed".into()),
+            },
+            source_event_key,
+            cursor: Some(turn_id.into()),
+            ci: None,
+            source,
+        }
+    }
+
+    #[test]
+    fn ambiguous_hook_and_baseline_are_not_dispatched() {
+        let db = db();
+        let group = register_native_condition(&db);
+        let hook = hook_event("turn-new");
+        let hook_key = hook.source_event_key.clone();
+        let mut rpc = |method: &str, params: Value| -> Result<Value> {
+            assert_eq!(method, "thread/turns/list");
+            assert_eq!(params["threadId"], SOURCE);
+            crate::conditions::record_published_event(&db, &hook)?;
+            Ok(json!({
+                "data":[{"id":"turn-new","status":"completed"}],
+                "nextCursor":null
+            }))
+        };
+
+        let report = tick_with(&db, &mut rpc).unwrap();
+        assert_eq!(report["conditions"]["armed"], 0);
+        assert_eq!(report["conditions"]["errors"], 1);
+        assert_eq!(
+            crate::conditions::matched_group_count_for_event(&db, &hook_key).unwrap(),
+            0
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        assert_eq!(
+            db.query_row(
+                "SELECT baseline_order_uncertain FROM native_condition_observers WHERE group_id=?1",
+                [&group],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(resolve_condition_order(&db, &group, SOURCE, true).unwrap());
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            group
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT baseline_order_uncertain FROM native_condition_observers WHERE group_id=?1",
+                [&group],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn active_first_baseline_does_not_replay_older_completions() {
+        let db = db();
+        let group = register_native_condition(&db);
+        let turns = vec![turn("active", "inProgress"), turn("old", "completed")];
+        let first = tick_with(&db, &mut page(SOURCE, turns.clone())).unwrap();
+        assert_eq!(first["conditions"]["armed"], 1);
+        let baseline: (String, String) = db
+            .query_row(
+                "SELECT baseline_turn_id,baseline_status FROM native_condition_observers WHERE group_id=?1",
+                [&group],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(baseline, ("active".into(), "inProgress".into()));
+
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&group],
+        )
+        .unwrap();
+        let next = tick_with(&db, &mut page(SOURCE, turns)).unwrap();
+        assert_eq!(next["conditions"]["observed"], 0);
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_condition_baseline_stays_completed_after_interruption() {
+        let db = db();
+        let group = register_native_condition(&db);
+        tick_with(&db, &mut page(SOURCE, vec![turn("old", "completed")])).unwrap();
+        resolve_condition_order(&db, &group, SOURCE, false).unwrap();
+
+        for status in ["interrupted", "completed"] {
+            db.execute(
+                "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+                [&group],
+            )
+            .unwrap();
+            let report = tick_with(&db, &mut page(SOURCE, vec![turn("old", status)])).unwrap();
+            assert_eq!(report["conditions"]["observed"], 0);
+            let baseline_status: String = db
+                .query_row(
+                    "SELECT baseline_status FROM native_condition_observers WHERE group_id=?1",
+                    [&group],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(baseline_status, "completed");
+        }
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn accepting_completed_baseline_matches_only_that_explicit_turn() {
+        let db = db();
+        let group = register_native_condition(&db);
+        let turns = vec![turn("new", "completed"), turn("old", "completed")];
+        tick_with(&db, &mut page(SOURCE, turns.clone())).unwrap();
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+
+        resolve_condition_order(&db, &group, SOURCE, true).unwrap();
+        let matched_cursor: String = db
+            .query_row(
+                "SELECT last_cursor FROM condition_members WHERE group_id=?1",
+                [&group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched_cursor, "new");
+
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&group],
+        )
+        .unwrap();
+        let report = tick_with(&db, &mut page(SOURCE, turns)).unwrap();
+        assert_eq!(report["conditions"]["observed"], 0);
+        let old_receipts: i64 = db
+            .query_row(
+                "SELECT count(*) FROM condition_publications WHERE event_cursor='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_receipts, 0);
+        let ready = crate::conditions::claim_ready(&db).unwrap().unwrap();
+        assert_eq!(ready.group_id, group);
+    }
+
+    #[test]
+    fn real_stop_then_poller_same_turn_has_no_collision_and_uses_poll_payload() {
+        const BASELINE: &str = "baseline-turn";
+        const TURN: &str = "completed-turn";
+
+        let db = db();
+        let group = register_native_condition(&db);
+        tick_with(&db, &mut page(SOURCE, vec![turn(BASELINE, "inProgress")])).unwrap();
+
+        // Match the real Stop path: publish the raw hook payload first, then
+        // main adds turnId before recording the condition event.
+        let raw_stop = json!({
+            "hook_event_name":"Stop",
+            "session_id":SOURCE,
+            "turn_id":TURN,
+            "cwd":"/home/codex"
+        });
+        let raw_event_key = crate::subscriptions::source_event_identity(
+            "thread",
+            "",
+            SOURCE,
+            "turn_completed",
+            "turn_completed",
+            &raw_stop,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            crate::subscriptions::publish_with_source(
+                &db,
+                "thread",
+                "",
+                SOURCE,
+                "turn_completed",
+                &raw_stop,
+            )
+            .unwrap(),
+            0
+        );
+        let condition_receipts: i64 = db
+            .query_row(
+                "SELECT count(*) FROM condition_publications WHERE source_event_key=?1",
+                [&raw_event_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(condition_receipts, 0);
+
+        let mut hook_source = raw_stop;
+        hook_source["turnId"] = json!(TURN);
+        let source_event_key = crate::subscriptions::source_event_identity(
+            "thread",
+            "",
+            SOURCE,
+            "turn_completed",
+            "turn_completed",
+            &hook_source,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(source_event_key, raw_event_key);
+        let hook_publication = crate::conditions::PublishedEvent {
+            selector: crate::conditions::Selector {
+                kind: "thread".into(),
+                repo: String::new(),
+                resource: SOURCE.into(),
+                event: "turn_completed".into(),
+                outcome: Some("turn_completed".into()),
+            },
+            source_event_key: source_event_key.clone(),
+            cursor: Some(TURN.into()),
+            ci: None,
+            source: hook_source,
+        };
+        let hook_record =
+            crate::conditions::record_published_event(&db, &hook_publication).unwrap();
+        assert!(!hook_record.payload_collision);
+        assert_eq!(hook_record.ready_groups, 0);
+        assert_eq!(
+            crate::conditions::matched_group_count_for_event(&db, &source_event_key).unwrap(),
+            0
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&group],
+        )
+        .unwrap();
+        let report = tick_with(
+            &db,
+            &mut page(
+                SOURCE,
+                vec![turn(TURN, "completed"), turn(BASELINE, "inProgress")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(report["conditions"]["observed"], 1);
+        assert_eq!(report["conditions"]["payload_collisions"], 0);
+        assert_eq!(report["conditions"]["ready_groups"], 1);
+        assert_eq!(
+            crate::conditions::publication_collision_count(&db, &source_event_key).unwrap(),
+            0
+        );
+        let digests: (String, Option<String>) = db
+            .query_row(
+                "SELECT source_digest,native_poll_digest FROM condition_publications
+                 WHERE source_event_key=?1",
+                [&source_event_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(digests.1.is_some());
+        assert_ne!(digests.0, digests.1.unwrap());
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            group
+        );
+        let source_json: String = db
+            .query_row(
+                "SELECT source_json FROM condition_members WHERE group_id=?1",
+                [&group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&source_json).unwrap(),
+            native_condition_source("thread", SOURCE, None, &turn(TURN, "completed"))
+        );
+    }
+
+    #[test]
+    fn historical_ambiguous_hook_can_be_excluded_without_delivery() {
+        let db = db();
+        let group = register_native_condition(&db);
+        let hook = hook_event("old-turn");
+        let mut rpc = |_: &str, _: Value| -> Result<Value> {
+            crate::conditions::record_published_event(&db, &hook)?;
+            Ok(json!({"data":[{"id":"old-turn","status":"completed"}],"nextCursor":null}))
+        };
+        tick_with(&db, &mut rpc).unwrap();
+        assert!(resolve_condition_order(&db, &group, SOURCE, false).unwrap());
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn publication_before_group_registration_is_not_replayed_by_baseline_polling() {
+        let db = db();
+        let old = hook_event("turn-old");
+        let old_key = old.source_event_key.clone();
+        crate::conditions::record_published_event(&db, &old).unwrap();
+        let group = register_native_condition(&db);
+        // A delivery retry after registration reuses the receipt and is not
+        // buffered for the newly registered member.
+        crate::conditions::record_published_event(&db, &old).unwrap();
+
+        let baseline =
+            tick_with(&db, &mut page(SOURCE, vec![turn("turn-old", "completed")])).unwrap();
+        assert_eq!(baseline["conditions"]["armed_with_order_uncertainty"], 1);
+        db.execute("UPDATE native_condition_observers SET next_poll_ms=0", [])
+            .unwrap();
+        let next = tick_with(&db, &mut page(SOURCE, vec![turn("turn-old", "completed")])).unwrap();
+        assert_eq!(next["conditions"]["observed"], 0);
+        assert_eq!(
+            crate::conditions::matched_group_count_for_event(&db, &old_key).unwrap(),
+            0
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        let state: String = db
+            .query_row(
+                "SELECT state FROM condition_groups WHERE id=?1",
+                [&group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
+    #[test]
+    fn member_order_rejects_t1_and_t2_but_keeps_t3_after_peer_receipt() {
+        let db = db();
+        let earlier = register_native_condition(&db);
+        tick_with(&db, &mut page(SOURCE, vec![turn("T1", "inProgress")])).unwrap();
+
+        let later = register_native_condition(&db);
+        tick_with(
+            &db,
+            &mut page(
+                SOURCE,
+                vec![turn("T2", "completed"), turn("T1", "completed")],
+            ),
+        )
+        .unwrap();
+
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&earlier],
+        )
+        .unwrap();
+        let earlier_report = tick_with(
+            &db,
+            &mut page(
+                SOURCE,
+                vec![
+                    turn("T3", "completed"),
+                    turn("T2", "completed"),
+                    turn("T1", "completed"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(earlier_report["conditions"]["observed"], 3);
+        let baselines: (Option<String>, Option<String>) = db
+            .query_row(
+                "SELECT m.baseline_cursor,o.baseline_turn_id
+                 FROM condition_members m JOIN native_condition_observers o USING(group_id)
+                 WHERE m.group_id=?1",
+                [&later],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(baselines, (Some("T2".into()), Some("T2".into())));
+        assert_eq!(
+            crate::conditions::delivery_status(&db, &later)
+                .unwrap()
+                .state,
+            "pending"
+        );
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            earlier
+        );
+
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&later],
+        )
+        .unwrap();
+        let later_report = tick_with(
+            &db,
+            &mut page(
+                SOURCE,
+                vec![
+                    turn("T3", "completed"),
+                    turn("T2", "completed"),
+                    turn("T1", "completed"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(later_report["conditions"]["observed"], 1);
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            later
+        );
+    }
+
+    #[test]
+    fn delayed_stop_for_pre_baseline_turn_cannot_match_but_next_turn_survives_peer_receipt() {
+        // These UUIDs deliberately sort opposite to the source chronology:
+        // T1 > T2 > T3 lexically, while the poller reports T1, T2, then T3.
+        const T1: &str = "f0000000-0000-4000-8000-000000000001";
+        const T2: &str = "10000000-0000-4000-8000-000000000002";
+        const T3: &str = "08000000-0000-4000-8000-000000000003";
+
+        let db = db();
+        let later = register_native_condition(&db);
+        let peer = register_native_condition(&db);
+        tick_with(
+            &db,
+            &mut page(SOURCE, vec![turn(T2, "completed"), turn(T1, "completed")]),
+        )
+        .unwrap();
+        for group in [&later, &peer] {
+            let baseline: String = db
+                .query_row(
+                    "SELECT baseline_turn_id FROM native_condition_observers WHERE group_id=?1",
+                    [group],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(baseline, T2);
+        }
+
+        // The Stop hook is delayed until after T2 was captured. Its global
+        // publication receipt is not evidence that T1 follows this baseline.
+        let delayed_stop = hook_event(T1);
+        assert_eq!(
+            crate::subscriptions::publish_with_source(
+                &db,
+                "thread",
+                "",
+                SOURCE,
+                "turn_completed",
+                &delayed_stop.source,
+            )
+            .unwrap(),
+            0
+        );
+        crate::conditions::record_published_event(&db, &delayed_stop).unwrap();
+        assert_eq!(
+            crate::conditions::matched_group_count_for_event(&db, &delayed_stop.source_event_key)
+                .unwrap(),
+            0
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+
+        // A different observer records T3 first. The later group's own poller
+        // must accept it by list order even though its UUID sorts before T2.
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&peer],
+        )
+        .unwrap();
+        let peer_report = tick_with(
+            &db,
+            &mut page(
+                SOURCE,
+                vec![
+                    turn(T3, "completed"),
+                    turn(T2, "completed"),
+                    turn(T1, "completed"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(peer_report["conditions"]["observed"], 1);
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            peer
+        );
+
+        db.execute(
+            "UPDATE native_condition_observers SET next_poll_ms=0 WHERE group_id=?1",
+            [&later],
+        )
+        .unwrap();
+        let later_report = tick_with(
+            &db,
+            &mut page(
+                SOURCE,
+                vec![
+                    turn(T3, "completed"),
+                    turn(T2, "completed"),
+                    turn(T1, "completed"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(later_report["conditions"]["observed"], 1);
+        assert_eq!(
+            crate::conditions::matched_group_count_for_event(&db, &delayed_stop.source_event_key)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            later
+        );
     }
 
     #[test]

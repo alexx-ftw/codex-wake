@@ -60,6 +60,16 @@ pub struct RuleInput {
     pub reasoning_effort: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SimulateRuleInput {
+    pub rule: RuleInput,
+    /// GitHub event header: issue_comment or pull_request_review_comment.
+    pub event_header: String,
+    /// Example GitHub webhook payload; it is never dispatched.
+    pub payload: Value,
+}
+
 fn bounded(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max && !value.contains('\0')
 }
@@ -176,7 +186,11 @@ pub fn initialize(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn configure(db: &Connection, mut input: RuleInput) -> Result<String> {
+pub fn configure(db: &Connection, input: RuleInput) -> Result<String> {
+    configure_inner(db, input, true)
+}
+
+fn configure_inner(db: &Connection, mut input: RuleInput, log: bool) -> Result<String> {
     validate(&mut input)?;
     initialize(db)?;
     let id = Uuid::new_v4().to_string();
@@ -184,14 +198,16 @@ pub fn configure(db: &Connection, mut input: RuleInput) -> Result<String> {
         "INSERT INTO rules(id,input) VALUES(?1,?2)",
         params![id, serde_json::to_string(&input)?],
     )?;
-    crate::observability::emit(
-        "rule.configure",
-        "created",
-        "",
-        Some(&id),
-        Duration::ZERO,
-        1,
-    );
+    if log {
+        crate::observability::emit(
+            "rule.configure",
+            "created",
+            "",
+            Some(&id),
+            Duration::ZERO,
+            1,
+        );
+    }
     Ok(id)
 }
 
@@ -215,8 +231,80 @@ fn matches(input: &RuleInput, author: &str, author_type: &str, body: &str) -> bo
         }
 }
 
+fn render_context(
+    input: &RuleInput,
+    source: &Value,
+    header: &str,
+    comment_id: u64,
+    thread: &str,
+) -> Result<Value> {
+    Ok(
+        json!({"source":source,"event":{"repo":input.repo,"pr":input.pr,"comment_id":comment_id,"author":source.pointer("/comment/user/login").and_then(Value::as_str).context("Missing source author")?,"event_header":header},"target":{"thread":thread}}),
+    )
+}
+
+/// Exercise the real matcher against an isolated in-memory database without dispatching.
+pub fn simulate(mut example: SimulateRuleInput) -> Result<Value> {
+    validate(&mut example.rule)?;
+    let db = Connection::open_in_memory()?;
+    configure_inner(&db, example.rule.clone(), false)?;
+    if accept_inner(&db, &example.event_header, &example.payload, false)? == 0 {
+        return Ok(json!({"matched":false,"dispatched":false}));
+    }
+    let comment_id = example
+        .payload
+        .pointer("/comment/id")
+        .and_then(Value::as_u64)
+        .context("Invalid comment ID")?;
+    let thread = example
+        .rule
+        .target_thread
+        .as_deref()
+        .unwrap_or("<new-thread-id>");
+    let context = render_context(
+        &example.rule,
+        &example.payload,
+        &example.event_header,
+        comment_id,
+        thread,
+    )?;
+    let prompt = crate::templates::render(&example.rule.prompt, &context)?;
+    let objective = example
+        .rule
+        .goal_objective
+        .as_ref()
+        .map(|value| crate::templates::render(value, &context))
+        .transpose()?;
+    if let Some(template) = &example.rule.goal_objective {
+        let validation_thread = example
+            .rule
+            .target_thread
+            .as_deref()
+            .unwrap_or("00000000-0000-0000-0000-000000000000");
+        let validation_context = render_context(
+            &example.rule,
+            &example.payload,
+            &example.event_header,
+            comment_id,
+            validation_thread,
+        )?;
+        let validation_objective = crate::templates::render(template, &validation_context)?;
+        ensure!(
+            !validation_objective.trim().is_empty() && validation_objective.chars().count() <= 4000,
+            "Invalid rendered goal objective"
+        );
+    }
+    Ok(
+        json!({"matched":true,"dispatched":false,"action":if example.rule.target_thread.is_some() {"message_thread"} else {"create_thread"},"target_thread":example.rule.target_thread,"new_thread_placeholder":"<new-thread-id>","project_id":example.rule.project_id,"cwd":example.rule.cwd,"prompt":prompt,"goal_objective":objective,"token_budget":example.rule.token_budget,"model":example.rule.model,"reasoning_effort":example.rule.reasoning_effort,"project_and_execution_verified":false}),
+    )
+}
+
 /// Signature verification belongs to the upstream receiver. Source payload stays in the private database.
 pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<usize> {
+    accept_inner(db, event_header, payload, true)
+}
+
+fn accept_inner(db: &Connection, event_header: &str, payload: &Value, log: bool) -> Result<usize> {
     ensure!(
         serde_json::to_vec(payload)?.len() <= 1024 * 1024,
         "Payload exceeds 1 MiB"
@@ -226,7 +314,9 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
         "issue_comment" | "pull_request_review_comment"
     ) || !matches!(payload["action"].as_str(), Some("created" | "edited"))
     {
-        crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
+        if log {
+            crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
+        }
         return Ok(0);
     }
     if event_header == "issue_comment"
@@ -234,7 +324,9 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
             .pointer("/issue/pull_request")
             .is_some_and(Value::is_object)
     {
-        crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
+        if log {
+            crate::observability::emit("event.accept", "ignored", "", None, Duration::ZERO, 0);
+        }
         return Ok(0);
     }
     let pr = payload
@@ -283,14 +375,16 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
     }
     transaction.commit()?;
     let subject = format!("{event_header}/{id}");
-    crate::observability::emit(
-        "event.accept",
-        if count > 0 { "matched" } else { "no_new_match" },
-        "",
-        Some(&subject),
-        Duration::ZERO,
-        count as u64,
-    );
+    if log {
+        crate::observability::emit(
+            "event.accept",
+            if count > 0 { "matched" } else { "no_new_match" },
+            "",
+            Some(&subject),
+            Duration::ZERO,
+            count as u64,
+        );
+    }
     Ok(count)
 }
 
@@ -377,7 +471,16 @@ fn dispatch_with_identity(
             let mut input: RuleInput = serde_json::from_str(&raw)?;
             validate(&mut input)?;
             let source: Value = serde_json::from_str(&source)?;
-            let mut context = json!({"source":source,"event":{"repo":input.repo,"pr":input.pr,"comment_id":comment_id.parse::<u64>()?,"author":source.pointer("/comment/user/login").and_then(Value::as_str).context("Missing source author")?,"event_header":header},"target":{"thread":input.target_thread.as_deref().unwrap_or("00000000-0000-0000-0000-000000000000")}});
+            let mut context = render_context(
+                &input,
+                &source,
+                &header,
+                comment_id.parse::<u64>()?,
+                input
+                    .target_thread
+                    .as_deref()
+                    .unwrap_or("00000000-0000-0000-0000-000000000000"),
+            )?;
             stage = "goal_template_failed";
             if let Some(objective) = &input.goal_objective {
                 let rendered = crate::templates::render(objective, &context)?;
@@ -642,6 +745,104 @@ mod tests {
     fn payload() -> Value {
         json!({"action":"created","repository":{"full_name":"owner/repo"},"issue":{"number":42,"pull_request":{}},"comment":{"id":7,"user":{"login":"alice","type":"User"},"body":"ship it untrusted body"}})
     }
+    #[test]
+    fn simulation_uses_real_matching_and_renders_without_dispatch() {
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        rule.prompt = "Review {{source.comment.body}} for {{target.thread}}".into();
+        let report = simulate(SimulateRuleInput {
+            rule: rule.clone(),
+            event_header: "issue_comment".into(),
+            payload: payload(),
+        })
+        .unwrap();
+        assert_eq!(report["matched"], true);
+        assert_eq!(report["dispatched"], false);
+        assert_eq!(report["action"], "message_thread");
+        assert_eq!(
+            report["prompt"],
+            format!("Review ship it untrusted body for {THREAD}")
+        );
+        let mut other = payload();
+        other["comment"]["body"] = json!("not yet");
+        assert_eq!(
+            simulate(SimulateRuleInput {
+                rule,
+                event_header: "issue_comment".into(),
+                payload: other
+            })
+            .unwrap(),
+            json!({"matched":false,"dispatched":false})
+        );
+    }
+
+    #[test]
+    fn simulation_reports_unknown_new_thread_and_template_errors() {
+        let mut rule = input();
+        rule.prompt = "For {{target.thread}}: {{source.comment.body}}".into();
+        let report = simulate(SimulateRuleInput {
+            rule: rule.clone(),
+            event_header: "issue_comment".into(),
+            payload: payload(),
+        })
+        .unwrap();
+        assert_eq!(report["action"], "create_thread");
+        assert!(
+            report["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("<new-thread-id>")
+        );
+        assert_eq!(report["project_and_execution_verified"], false);
+        rule.prompt = "{{source.missing}}".into();
+        assert!(
+            simulate(SimulateRuleInput {
+                rule,
+                event_header: "issue_comment".into(),
+                payload: payload()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn simulation_keeps_multiple_thread_placeholders_and_checks_full_uuid_length() {
+        let mut rule = input();
+        rule.prompt = "{{target.thread}}/{{target.thread}}".into();
+        rule.goal_objective = Some(format!(
+            "{} {{{{target.thread}}}} and {{{{target.thread}}}}",
+            "x".repeat(3900)
+        ));
+        let report = simulate(SimulateRuleInput {
+            rule: rule.clone(),
+            event_header: "issue_comment".into(),
+            payload: payload(),
+        })
+        .unwrap();
+        assert_eq!(report["prompt"], "<new-thread-id>/<new-thread-id>");
+        assert_eq!(
+            report["goal_objective"]
+                .as_str()
+                .unwrap()
+                .matches("<new-thread-id>")
+                .count(),
+            2
+        );
+
+        rule.goal_objective = Some(format!(
+            "{} {{{{target.thread}}}} and {{{{target.thread}}}}",
+            "x".repeat(3940)
+        ));
+        assert!(
+            simulate(SimulateRuleInput {
+                rule,
+                event_header: "issue_comment".into(),
+                payload: payload(),
+            })
+            .is_err()
+        );
+    }
+
     #[test]
     fn existing_target_without_preset_keeps_its_execution_settings() {
         let mut rule = input();

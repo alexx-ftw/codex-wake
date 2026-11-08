@@ -489,3 +489,93 @@ fn recover_accepted_input_without_queuing_it_again() {
     exercise_recover_accepted_input(false);
     exercise_recover_accepted_input(true);
 }
+
+#[test]
+fn condition_group_publishes_once_after_both_events() {
+    let temp = private_tempdir();
+    let socket = temp.path().join("app.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let initialized = cli(temp.path(), &socket, &["poll"]);
+    assert!(initialized.status.success());
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    let group = "11111111-1111-4111-8111-111111111111";
+    let target = "22222222-2222-4222-8222-222222222222";
+    db.execute("INSERT INTO condition_groups(id,mode,target_thread,message_template) VALUES(?1,'and',?2,'Both artifacts are ready')", [group, target]).unwrap();
+    for resource in ["first", "second"] {
+        db.execute("INSERT INTO condition_members(group_id,kind,repo,resource,event) VALUES(?1,'artifact','ci',?2,'available')", [group, resource]).unwrap();
+    }
+    let server = thread::spawn(move || {
+        for expected in ["thread/queue/add", "thread/read"] {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let init: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({"id":init["id"],"result":{}}).to_string().into(),
+            ))
+            .unwrap();
+            let _ = ws.read().unwrap();
+            let request: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], expected);
+            assert_eq!(request["params"]["threadId"], target);
+            let result = if expected == "thread/queue/add" {
+                assert_eq!(request["params"]["clientUserMessageId"], group);
+                assert_eq!(
+                    request["params"]["input"][0]["text"],
+                    "Both artifacts are ready"
+                );
+                json!({"queuedSubmission":{"id":"queued-1"}})
+            } else {
+                json!({"thread":{"status":{"type":"idle"}}})
+            };
+            ws.send(Message::Text(
+                json!({"id":request["id"],"result":result})
+                    .to_string()
+                    .into(),
+            ))
+            .unwrap();
+        }
+    });
+    for (resource, expected) in [("first", 0), ("second", 1)] {
+        let output = cli(
+            temp.path(),
+            &socket,
+            &[
+                "publish",
+                "--kind",
+                "artifact",
+                "--repo",
+                "ci",
+                "--resource",
+                resource,
+                "--outcome",
+                "available",
+                "--event-id",
+                resource,
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["attempted"], expected);
+    }
+    server.join().unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM condition_groups WHERE id=?1",
+            [group],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "accepted");
+    let output = cli(temp.path(), &socket, &["recover"]);
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["attempted"], 0);
+}
