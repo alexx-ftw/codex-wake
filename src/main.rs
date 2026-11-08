@@ -98,6 +98,13 @@ struct SubscriptionInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct CancelSubscriptionInput {
+    /// Exact subscription UUID returned by subscribe.
+    subscription_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PublicationInput {
     /// job, chat, dependency, resource, or artifact.
     kind: String,
@@ -1798,6 +1805,20 @@ impl WakeTools {
     }
 
     #[tool(
+        description = "Cancel one waiting subscription by UUID. Refuses subscriptions with delivery or notice activity; does not publish an event or undo any delivery.",
+        annotations(read_only_hint = false, destructive_hint = true)
+    )]
+    fn cancel_subscription(
+        &self,
+        Parameters(input): Parameters<CancelSubscriptionInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            subscriptions::cancel(&database(&self.config)?, &input.subscription_id)?;
+            Ok(json!({"cancelled": true, "subscription_id": input.subscription_id}))
+        })())
+    }
+
+    #[tool(
         description = "Publish verified job/chat results, dependency progress or recovery, resource release, or artifact availability. For dependencies, progress resets the inactivity deadline. When comparing an explicitly linked validation commitment, provide its structured scope; Wake warns on mismatch but does not verify results or resolve validation.",
         annotations(
             read_only_hint = false,
@@ -2227,6 +2248,7 @@ impl rmcp::ServerHandler for WakeTools {
             "edit_goal" => "mcp.edit_goal",
             "resume_goal" => "mcp.resume_goal",
             "subscribe" => "mcp.subscribe",
+            "cancel_subscription" => "mcp.cancel_subscription",
             "publish_result" => "mcp.publish_result",
             "register_obligation" => "mcp.register_obligation",
             "register_circular_wait" => "mcp.register_circular_wait",
@@ -2379,6 +2401,7 @@ async fn main() -> Result<()> {
         "poll" => "cli.poll",
         "register" => "cli.register",
         "subscribe" => "cli.subscribe",
+        "cancel-subscription" => "cli.cancel_subscription",
         "publish" => "cli.publish",
         "handle" => "cli.handle",
         "hook" => "cli.hook",
@@ -2491,6 +2514,12 @@ async fn run_command(
                 execution.as_ref(),
             )?;
             println!("{}", json!({"registered":true}));
+        }
+        "cancel-subscription" => {
+            let id = required(&mut args, "--subscription-id")?;
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            subscriptions::cancel(&database(&config)?, &id)?;
+            println!("{}", json!({"cancelled":true,"subscription_id":id}));
         }
         "subscribe" => {
             let kind = required(&mut args, "--kind")?;
@@ -2820,6 +2849,34 @@ mod hook_output_tests {
                 "reentrant payload update"
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn cancellation_tool_removes_only_the_requested_subscription() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id =
+            subscriptions::subscribe(&db, "artifact", "ci", "one", "available", thread).unwrap();
+        let other =
+            subscriptions::subscribe(&db, "artifact", "ci", "two", "available", thread).unwrap();
+        drop(db);
+        let response = tools.cancel_subscription(Parameters(CancelSubscriptionInput {
+            subscription_id: id.clone(),
+        }));
+        assert_ne!(response.is_error, Some(true));
+        assert_eq!(response.structured_content.unwrap()["subscription_id"], id);
+        let db = database(&tools.config).unwrap();
+        assert!(subscriptions::status_for_id(&db, &id).is_err());
+        assert_eq!(
+            subscriptions::status_for_id(&db, &other).unwrap()["state"],
+            "waiting"
         );
     }
 

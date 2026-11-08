@@ -251,6 +251,29 @@ fn immediate<T>(db: &Connection, operation: impl FnOnce() -> Result<T>) -> Resul
     finish_transaction(db, operation())
 }
 
+/// Remove one unclaimed subscription without publishing or dispatching an event.
+pub fn cancel(db: &Connection, id: &str) -> Result<()> {
+    let id = uuid(id)?;
+    immediate(db, || {
+        let changed = db.execute(
+            "DELETE FROM subscriptions WHERE id=?1 AND state='waiting' \
+             AND dependency_notice_state IS NULL AND expiration_notice_state IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM dependency_notice_uncertainties WHERE subscription_id=?1)",
+            [&id],
+        )?;
+        ensure!(
+            changed == 1,
+            "Subscription not found or has delivery/notice activity; inspect its status"
+        );
+        db.execute("DELETE FROM observers WHERE subscription_id=?1", [&id])?;
+        db.execute(
+            "DELETE FROM native_observers WHERE subscription_id=?1",
+            [&id],
+        )?;
+        Ok(())
+    })
+}
+
 pub(crate) fn expire_due_in_transaction(db: &Connection, now: i64) -> Result<usize> {
     Ok(db.execute(
         "UPDATE subscriptions SET state='needs_attention',reason='subscription_expired',
@@ -2210,6 +2233,52 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static EXPIRY_WRITER_LOCK_BUSY: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn cancel_is_exact_and_rejects_delivery_or_notice_activity() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        crate::observers::initialize(&db).unwrap();
+        crate::native_poll::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let target = subscribe(&db, "artifact", "ci", "one", "available", thread).unwrap();
+        let other = subscribe(&db, "artifact", "ci", "two", "available", thread).unwrap();
+        db.execute(
+            "INSERT INTO observers(subscription_id,config) VALUES(?1,'{}')",
+            [&target],
+        )
+        .unwrap();
+        cancel(&db, &target).unwrap();
+        assert!(status_for_id(&db, &target).is_err());
+        assert_eq!(status_for_id(&db, &other).unwrap()["state"], "waiting");
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM observers", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            publish_observation(&db, &target, "available", &json!({})).unwrap(),
+            0
+        );
+        assert_eq!(status_for_id(&db, &other).unwrap()["state"], "waiting");
+        assert!(cancel(&db, &target).is_err());
+        assert!(cancel(&db, "invalid").is_err());
+        for state in ["ready", "sending", "queued", "needs_attention"] {
+            db.execute(
+                "UPDATE subscriptions SET state=?1 WHERE id=?2",
+                params![state, other],
+            )
+            .unwrap();
+            assert!(cancel(&db, &other).is_err());
+            assert_eq!(status_for_id(&db, &other).unwrap()["state"], state);
+        }
+        db.execute("UPDATE subscriptions SET state='waiting',dependency_notice_state='sending' WHERE id=?1", [&other]).unwrap();
+        assert!(cancel(&db, &other).is_err());
+        assert_eq!(
+            status_for_id(&db, &other).unwrap()["inactivity_notice_state"],
+            "sending"
+        );
+    }
 
     fn mark_expiry_writer_lock_busy(_: i32) -> bool {
         EXPIRY_WRITER_LOCK_BUSY.store(true, Ordering::SeqCst);

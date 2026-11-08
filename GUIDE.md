@@ -143,6 +143,7 @@ for the dated external delivery evidence in `VALIDATION.md`.
 |---|---|
 | `register_wait` | Register exact CI repo/run/attempt/SHA and destination chat |
 | `subscribe` | Register another exact source/resource/event and destination |
+| `cancel_subscription` | Remove one waiting subscription by its exact UUID |
 | `publish_result` | Publish a verified provider result and dispatch matching waits |
 | `register_obligation` | Record a chat's pending result publication |
 | `register_resource_wait` | Record a wait on a non-chat resource and its declared continuation |
@@ -619,9 +620,14 @@ cargo run --locked -- publish --kind dependency --repo payments \
   --resource database --outcome progress
 cargo run --locked -- status
 cargo run --locked -- subscriptions
+cargo run --locked -- cancel-subscription --subscription-id 11111111-1111-4111-8111-111111111111
 cargo run --locked -- recover
 cargo run --locked -- diagnostics --days 42
 ```
+
+Cancellation removes only a waiting subscription with no notice activity. It
+does not publish an event or undo a delivery; inspect status if cancellation is
+refused because delivery or a notice has already begun.
 
 The database is `$XDG_STATE_HOME/codex-wake/state.sqlite3` (default
 `~/.local/state/codex-wake/state.sqlite3`), overridable by `CODEX_WAKE_DB` or
