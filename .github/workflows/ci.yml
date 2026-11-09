@@ -27,7 +27,7 @@ jobs:
       - name: Obtain verified receiver for HTTP tests
         run: |
           mkdir -p .tools
-          curl --fail --location --max-time 60 --silent --show-error \
+          curl --fail --location --max-time 60 --retry 3 --retry-all-errors --retry-max-time 90 --silent --show-error \
             --output .tools/webhook.tar.gz \
             https://github.com/adnanh/webhook/releases/download/2.8.3/webhook-linux-amd64.tar.gz
           printf '%s  %s\n' \
