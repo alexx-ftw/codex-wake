@@ -25,11 +25,11 @@ freeze_receiver() {
     exec {pending_fd}<"$state/telemetry-pending.lock"
     flock -x -w 10 "$pending_fd"
   fi
-  # Exclude writers before stopping all receiver threads, then release the unchanged transaction.
+  # Exclude readers too: a stopped shared lock would prevent the gate-close commit.
   sqlite3 -batch "$db" <<SQL
 .bail on
 .timeout 10000
-BEGIN IMMEDIATE;
+BEGIN EXCLUSIVE;
 .shell /bin/kill -STOP $pid
 COMMIT;
 SQL

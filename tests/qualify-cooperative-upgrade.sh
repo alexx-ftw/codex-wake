@@ -49,6 +49,23 @@ for lock in "$state/telemetry.sqlite3" "$state/telemetry-pending.lock"; do
   child=
 done
 printf 'freezing waits for telemetry writers and leaves both locks available\n'
+coproc READER { exec sqlite3 -batch "$db"; }
+child=$READER_PID
+exec {reader_input}>&"${READER[1]}" {reader_output}<&"${READER[0]}"
+printf 'BEGIN; SELECT count(*) FROM wake_delivery_claim_gate;\n.print reader-ready\n' >&"$reader_input"
+IFS= read -r -t 5 count <&"$reader_output"
+IFS= read -r -t 5 marker <&"$reader_output"
+[[ $count == 1 && $marker == reader-ready ]]
+(sleep .3; printf 'COMMIT;\n' >&"$reader_input") & release=$!
+freeze_receiver "$child"
+sqlite3 -cmd '.timeout 100' "$db" 'BEGIN EXCLUSIVE; ROLLBACK;'
+kill -CONT "$child"
+kill "$child"
+wait "$child" 2>/dev/null || true
+child=
+wait "$release"
+exec {reader_input}>&- {reader_output}<&-
+printf 'freezing excludes existing SQLite readers before stopping the receiver\n'
 eval "$(sed -n '/^wait_cgroup_empty() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
 mkdir "$scratch/group"
 printf 'populated 1\n' > "$scratch/group/cgroup.events"
