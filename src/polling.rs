@@ -4443,7 +4443,7 @@ mod tests {
             .into_iter()
             .find(|notice| notice.event == "base_changed")
             .unwrap();
-        let source: Value = serde_json::from_str(&notice.source).unwrap();
+        let source = notice.source;
         assert_eq!(source["changes"]["base"]["ref"], "main");
         assert_eq!(source["pull_request"]["base"]["ref"], "release");
         let second = tick_with(&db, INTERVAL_MS + 1, |route, _| {
