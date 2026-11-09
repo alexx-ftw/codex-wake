@@ -1335,13 +1335,22 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
     if payload["hook_event_name"] == "PostToolUse" {
         let mut db = database(config)?;
         let transport = pr_observation::GhCliPullRequestGet::from_config(config);
-        pr_observation::handle_post_tool_use(
+        if let Err(error) = pr_observation::handle_post_tool_use(
             &mut db,
             payload,
             &transport,
             Duration::from_secs(20),
             3_600_000,
-        )?;
+        ) {
+            observability::emit(
+                "pr_observation.post_tool_use",
+                "error",
+                observability::error_class(&error),
+                None,
+                Duration::ZERO,
+                1,
+            );
+        }
         return steer::take(&mut db, payload);
     }
     if payload["hook_event_name"] == "SessionStart" {
@@ -5702,6 +5711,39 @@ printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s' "$body"
 mod pr_hook_registration_integration_tests {
     use super::*;
     use std::{os::unix::fs::PermissionsExt, thread, time::Duration};
+
+    #[test]
+    fn failed_pr_observation_does_not_block_pending_steer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        pr_observation::initialize(&db).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_candidate BEFORE INSERT ON pr_hook_candidates
+             BEGIN SELECT RAISE(FAIL, 'observation failed'); END;",
+        )
+        .unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        steer::enqueue(&db, thread, "Continue the existing task").unwrap();
+        drop(db);
+        let post = json!({
+            "hook_event_name":"PostToolUse", "session_id":thread, "turn_id":"turn-1",
+            "tool_use_id":"call-1", "tool_name":"Bash",
+            "tool_input":{"command":"gh pr create --repo owner/repo --title test"},
+            "tool_response":"https://github.com/owner/repo/pull/42"
+        });
+        let output = run_hook_inner(&config, &post).unwrap();
+        assert!(
+            output["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("Continue the existing task")
+        );
+        assert_eq!(run_hook_inner(&config, &post).unwrap(), json!({}));
+    }
 
     #[test]
     fn pre_post_candidate_retries_and_reconcile_registers_once() {
