@@ -4343,27 +4343,53 @@ mod tests {
             .unwrap(),
             0
         );
-        let report = tick_with(&db, INTERVAL_MS + 1, |route, _| {
-            assert_eq!(route, "/repos/owner/repo/pulls/7");
-            let mut latest = open.clone();
-            latest["updated_at"] = json!("2099-01-01T00:05:00Z");
-            Ok(response(latest, false))
-        })
-        .unwrap();
-        assert!(report["errors"].as_object().unwrap().is_empty());
-        let reopened: Vec<_> = pr_notifications::pending(&db)
-            .unwrap()
-            .into_iter()
-            .filter(|notice| notice.event == "reopened")
-            .collect();
-        assert_eq!(reopened.len(), 1);
-        assert_eq!(reopened[0].event_key, "reopened:4070908740");
-        let consumed: i64 = db
-            .query_row("SELECT count(*) FROM pr_ci_reopen_events", [], |row| {
-                row.get(0)
+        let mut reopened_id = None;
+        for now in [INTERVAL_MS + 1, 2 * INTERVAL_MS + 1] {
+            let mut requested = Vec::new();
+            let report = tick_with(&db, now, |route, _| {
+                requested.push(route.to_owned());
+                match route {
+                    "/repos/owner/repo/pulls/7" => {
+                        let mut latest = open.clone();
+                        latest["updated_at"] = json!("2099-01-01T00:05:00Z");
+                        Ok(response(latest, false))
+                    }
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                        json!([
+                            {"id":7001,"event":"closed","created_at":"2098-12-31T23:59:00Z"},
+                            {"id":7002,"event":"reopened","created_at":"2099-01-01T00:00:00Z"}
+                        ]),
+                        false,
+                    )),
+                    _ => panic!("unexpected route {route}"),
+                }
             })
             .unwrap();
-        assert_eq!(consumed, 1);
+            assert!(report["errors"].as_object().unwrap().is_empty(), "{report}");
+            assert_eq!(
+                requested,
+                vec![
+                    "/repos/owner/repo/pulls/7",
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1"
+                ]
+            );
+            let notices = pr_notifications::pending(&db).unwrap();
+            assert_eq!(notices.len(), 2);
+            let reopened: Vec<_> = notices
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .collect();
+            assert_eq!(reopened.len(), 1);
+            assert_eq!(reopened[0].event_key, "reopened:4070908740");
+            let expected_id = reopened_id.get_or_insert_with(|| reopened[0].id.clone());
+            assert_eq!(expected_id.as_str(), reopened[0].id.as_str());
+            let consumed: i64 = db
+                .query_row("SELECT count(*) FROM pr_ci_reopen_events", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(consumed, 1);
+        }
     }
 
     #[test]
