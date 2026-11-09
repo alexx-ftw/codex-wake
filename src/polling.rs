@@ -1311,10 +1311,10 @@ pub fn status(db: &Connection) -> Result<Value> {
         "automatic_pr_notifications",
         "SELECT count(*) FROM automatic_pr_notifications WHERE state='pending'",
     )?;
-    let automatic_notifications_attention = count(
-        "automatic_pr_notifications",
-        "SELECT count(*) FROM automatic_pr_notifications WHERE state IN ('sending','needs_attention')",
-    )?;
+    let (automatic_notifications_attention, automatic_attention_details) =
+        pr_notifications::attention_details(db)?;
+    let automatic_attention_truncated =
+        automatic_notifications_attention > automatic_attention_details.len() as i64;
     let automatic_change_identity_pending = count(
         "automatic_pr_event_journal",
         "SELECT count(*) FROM automatic_pr_event_journal WHERE event IN ('pending_synchronize','pending_base_changed')",
@@ -1349,7 +1349,7 @@ pub fn status(db: &Connection) -> Result<Value> {
     )?;
     Ok(
         json!({"active":{"waits":waits,"subscriptions":subscriptions,"rules":rules},
-        "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention,"identity_pending":automatic_change_identity_pending},
+        "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention,"identity_pending":automatic_change_identity_pending,"attention_details":automatic_attention_details,"attention_details_truncated":automatic_attention_truncated},
         "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors},
         "last_success_ms":last_success,"errors":errors,"next_poll_ms":next_poll,
         "calls":calls,"cached_pages":pages}),

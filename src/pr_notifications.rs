@@ -1385,6 +1385,42 @@ fn release_before_send_at(db: &Connection, id: &str, available_at_ms: i64) -> Re
 }
 
 /// Surface interrupted and uncertain sends for explicit reconciliation, never retry them.
+pub(crate) fn attention_details(db: &Connection) -> Result<(i64, Vec<Value>)> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='automatic_pr_notifications')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok((0, Vec::new()));
+    }
+    let mut statement = db.prepare(
+        "SELECT id,kind,repo,pr,thread,event,event_key,state,count(*) OVER ()
+         FROM automatic_pr_notifications
+         WHERE state IN ('sending','needs_attention') ORDER BY created_at,id LIMIT 50",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(8)?,
+            serde_json::json!({
+                "queue_identity": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "repo": row.get::<_, String>(2)?,
+                "pr": row.get::<_, String>(3)?,
+                "thread": row.get::<_, String>(4)?,
+                "event": row.get::<_, String>(5)?,
+                "event_key": row.get::<_, String>(6)?,
+                "state": row.get::<_, String>(7)?,
+            }),
+        ))
+    })?;
+    let rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("Could not read uncertain automatic PR notifications")?;
+    let count = rows.first().map_or(0, |row| row.0);
+    Ok((count, rows.into_iter().map(|row| row.1).collect()))
+}
+
 #[cfg(test)]
 pub(crate) fn needs_attention(db: &Connection) -> Result<Vec<Notification>> {
     initialize(db)?;
@@ -1820,6 +1856,14 @@ mod tests {
         let status = crate::polling::status(&db).unwrap();
         assert_eq!(status["automatic_pr_notifications"]["pending"], 3);
         assert_eq!(status["automatic_pr_notifications"]["needs_attention"], 1);
+        let detail = &status["automatic_pr_notifications"]["attention_details"][0];
+        assert_eq!(detail["queue_identity"], initial_pending[0].id);
+        assert_eq!(detail["thread"], initial_pending[0].thread);
+        assert_eq!(detail["repo"], "owner/repo");
+        assert_eq!(detail["pr"], "7");
+        assert_eq!(detail["event"], initial_pending[0].event);
+        assert_eq!(detail["state"], "needs_attention");
+        assert!(detail.get("source").is_none());
         assert!(!mark_queued(&db, &initial_pending[0].id).unwrap());
         let old_delivery: (String, Option<String>) = db
             .query_row(
@@ -1829,6 +1873,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(old_delivery, ("queued".into(), Some("old_delivery".into())));
+    }
+
+    #[test]
+    fn status_limits_uncertain_details_without_exposing_source_or_changing_delivery() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        crate::polling::initialize(&db).unwrap();
+        for index in 0..52 {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state,created_at)
+                VALUES(?1,'pull_request','owner/repo','7','thread','closed',?1,
+                '{\"private\":\"secret-payload\"}',?2,'2000-01-01 00:00:00')",
+                params![
+                    format!("id-{index:02}"),
+                    if index == 51 {
+                        "pending"
+                    } else if index == 49 {
+                        "sending"
+                    } else {
+                        "needs_attention"
+                    }
+                ],
+            )
+            .unwrap();
+        }
+        let before = db.total_changes();
+        let status = crate::polling::status(&db).unwrap();
+        assert_eq!(db.total_changes(), before);
+        let notifications = &status["automatic_pr_notifications"];
+        assert_eq!(notifications["needs_attention"], 51);
+        assert_eq!(
+            notifications["attention_details"].as_array().unwrap().len(),
+            50
+        );
+        assert_eq!(notifications["attention_details_truncated"], true);
+        assert_eq!(
+            notifications["attention_details"][0]["queue_identity"],
+            "id-00"
+        );
+        assert_eq!(notifications["attention_details"][49]["state"], "sending");
+        assert!(!status.to_string().contains("secret-payload"));
     }
 
     #[test]
