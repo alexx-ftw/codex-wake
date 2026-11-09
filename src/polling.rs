@@ -283,6 +283,7 @@ where
     for resource in &targets.pull_requests {
         let number: i64 = resource.resource.parse().unwrap_or(0);
         let route = format!("/repos/{}/pulls/{}", resource.repo, resource.resource);
+        let automatic_generation = poll_generation(db, &automatic_pr_generation_key(resource))?;
         let validated = &mut validated_prs;
         let cached = state(db, &route, 0)?;
         let cached_cursor: Value = cached
@@ -627,30 +628,6 @@ where
                             &resource.resource,
                             changed_at,
                         )? as u64;
-                        if pr["state"] == "open"
-                            && let Some(event_at) = changed_at
-                        {
-                            let event_key = pr_change_event_key(
-                                &resource.repo,
-                                &resource.resource,
-                                "synchronize",
-                                old["head"].as_str(),
-                                head,
-                                prior_sequence.unwrap_or(now),
-                            );
-                            let source = full("synchronize", Value::Null);
-                            pr_notifications::record_event(
-                                db,
-                                "pull_request",
-                                &resource.repo,
-                                &resource.resource,
-                                "synchronize",
-                                event_at,
-                                &event_key,
-                                &source,
-                            )
-                            .map_err(|_| Failure::new("database"))?;
-                        }
                     }
                     if base_changed {
                         if let Some(cursor) = event_cursor.as_ref() {
@@ -680,32 +657,9 @@ where
                             &resource.resource,
                             changed_at,
                         )? as u64;
-                        if pr["state"] == "open"
-                            && let Some(event_at) = changed_at
-                        {
-                            let event_key = pr_change_event_key(
-                                &resource.repo,
-                                &resource.resource,
-                                "base_changed",
-                                old["base"].as_str(),
-                                base,
-                                prior_sequence.unwrap_or(now),
-                            );
-                            let source = full("edited", json!({"base":{"ref":old["base"]}}));
-                            pr_notifications::record_event(
-                                db,
-                                "pull_request",
-                                &resource.repo,
-                                &resource.resource,
-                                "base_changed",
-                                event_at,
-                                &event_key,
-                                &source,
-                            )
-                            .map_err(|_| Failure::new("database"))?;
-                        }
                     }
                 }
+                record_automatic_pr_changes(db, resource, pr, &old, automatic_generation)?;
                 accepted += observe_conditions(
                     db,
                     "pull_request",
@@ -2029,34 +1983,107 @@ pub(super) fn stable_source_key(
     format!("github-poll-v1:{:x}", hash.finalize())
 }
 
-fn pr_change_event_key(
-    repo: &str,
-    pr: &str,
-    event: &str,
-    previous: Option<&str>,
-    current: &str,
-    previous_poll_sequence: i64,
-) -> String {
-    let sequence = previous_poll_sequence.to_string();
-    if matches!(event, "synchronize" | "base_changed") {
-        stable_source_key(
-            "pull_request",
-            &repo.to_ascii_lowercase(),
-            pr,
-            event,
-            "",
-            &[previous.unwrap_or_default(), current, &sequence],
-        )
-    } else {
-        stable_source_key(
-            "pull_request",
-            &repo.to_ascii_lowercase(),
-            pr,
-            event,
-            "",
-            &[current],
-        )
+fn record_automatic_pr_changes(
+    db: &Connection,
+    resource: &Resource,
+    pr: &Value,
+    route_cursor: &Value,
+    expected_generation: i64,
+) -> std::result::Result<(), Failure> {
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| Failure::new("database"))?;
+    let generation_key = automatic_pr_generation_key(resource);
+    if poll_generation(&tx, &generation_key).map_err(|_| Failure::new("database"))?
+        != expected_generation
+    {
+        return tx.commit().map_err(|_| Failure::new("database"));
     }
+    let repo = resource.repo.to_ascii_lowercase();
+    // Page -1 stores the shared automatic baseline; page 0 remains the original
+    // case-sensitive poll cursor used by subscriptions and conditions.
+    let endpoint = format!("/repos/{repo}/pulls/{}", resource.resource);
+    let saved: Option<String> = tx
+        .query_row(
+            "SELECT cursor FROM github_poll_state WHERE endpoint=?1 AND page=-1",
+            [&endpoint],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| Failure::new("database"))?;
+    let previous_cursor = saved
+        .as_deref()
+        .and_then(|cursor| serde_json::from_str::<Value>(cursor).ok())
+        .unwrap_or_else(|| route_cursor.clone());
+    let mut sequence = previous_cursor["automatic_sequence"].as_i64().unwrap_or(0);
+    for (event, field, action) in [
+        ("synchronize", "head", "synchronize"),
+        ("base_changed", "base", "edited"),
+    ] {
+        let current = match event {
+            "synchronize" => pr.pointer("/head/sha"),
+            _ => pr.pointer("/base/ref"),
+        }
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::new("invalid_response"))?;
+        if pr["state"] == "open"
+            && let Some(event_at) = pr["updated_at"].as_str()
+            && let Some(previous) = previous_cursor[field].as_str()
+            && previous != current
+        {
+            let event_key = stable_source_key(
+                "pull_request",
+                &repo,
+                &resource.resource,
+                event,
+                "",
+                &["automatic-v2", previous, current, &sequence.to_string()],
+            );
+            let changes = if event == "base_changed" {
+                json!({"base":{"ref":previous}})
+            } else {
+                Value::Null
+            };
+            let source = json!({"action":action,"number":pr["number"],"pull_request":pr,
+                "repository":{"full_name":resource.repo},"changes":changes});
+            pr_notifications::record_event_in(
+                &tx,
+                "pull_request",
+                &repo,
+                &resource.resource,
+                event,
+                event_at,
+                &event_key,
+                &source,
+            )
+            .map_err(|_| Failure::new("database"))?;
+            sequence = sequence.saturating_add(1);
+        }
+    }
+    let cursor = json!({"head":pr["head"]["sha"],"base":pr["base"]["ref"],
+        "automatic_sequence":sequence})
+    .to_string();
+    tx.execute(
+        "INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls)
+         VALUES(?1,-1,?2,?3,60000,0)
+         ON CONFLICT(endpoint,page) DO UPDATE SET cursor=excluded.cursor",
+        params![endpoint, cursor, i64::MAX],
+    )
+    .map_err(|_| Failure::new("database"))?;
+    tx.execute(
+        "INSERT INTO github_poll_generation(endpoint,generation) VALUES(?1,1)
+         ON CONFLICT(endpoint) DO UPDATE SET generation=generation+1",
+        [generation_key],
+    )
+    .map_err(|_| Failure::new("database"))?;
+    tx.commit().map_err(|_| Failure::new("database"))
+}
+
+fn automatic_pr_generation_key(resource: &Resource) -> String {
+    format!(
+        "__automatic_pr_changes__/{}/{}",
+        resource.repo.to_ascii_lowercase(),
+        resource.resource
+    )
 }
 
 fn cursor_number(value: i64) -> String {
@@ -5834,15 +5861,230 @@ mod tests {
     }
 
     #[test]
-    fn head_change_identity_is_stable_for_retry_and_distinct_for_later_transition() {
-        let retry = pr_change_event_key("Owner/Repo", "7", "synchronize", Some("a"), "b", 100);
+    fn case_variant_pollers_share_automatic_transitions_and_keep_subscriptions() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let subscription = subscribe(&db, "pull_request", "7", "synchronize");
+        crate::rules::configure(
+            &db,
+            serde_json::from_value(json!({
+                "repo":"Owner/Repo","pr":7,"author":"alice","contains":"wake",
+                "prompt":"Continue","target_thread":thread
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let baseline = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        for (repo, sequence) in [("Owner/Repo", 100), ("owner/repo", 200)] {
+            let cursor = json!({"head":"a".repeat(40),"base":"main","state":"open",
+                "updated_at":"2099-01-01T00:00:00Z","poll_seq":sequence});
+            db.execute(
+                "INSERT INTO github_poll_state(endpoint,page,body,cursor,next_poll_ms,backoff_ms,calls)
+                 VALUES(?1,0,?2,?3,0,60000,1)",
+                params![format!("/repos/{repo}/pulls/7"), baseline.to_string(), cursor.to_string()],
+            )
+            .unwrap();
+        }
+        let now = now_ms();
+        for (index, (head, base)) in [('b', "release"), ('a', "main"), ('b', "release")]
+            .into_iter()
+            .enumerate()
+        {
+            let snapshot = json!({
+                "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+                "updated_at":format!("2099-01-0{}T00:00:00Z", index + 2),
+                "head":{"sha":head.to_string().repeat(40)},"base":{"ref":base}
+            });
+            let report = tick_with(&db, now + (index as i64) * INTERVAL_MS, |route, _| {
+                if route.ends_with("/pulls/7") {
+                    Ok(response(snapshot.clone(), false))
+                } else if route.contains("/timeline?") || route.contains("/comments?") {
+                    Ok(response(json!([]), false))
+                } else {
+                    panic!("unexpected route {route}")
+                }
+            })
+            .unwrap();
+            assert_eq!(report["errors"], json!({}), "{report}");
+            if index == 0 {
+                assert_eq!(registration_state(&db, &subscription), "ready");
+                let notices = pr_notifications::pending(&db).unwrap();
+                assert_eq!(
+                    notices
+                        .iter()
+                        .filter(|notice| notice.event == "synchronize")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    notices
+                        .iter()
+                        .filter(|notice| notice.event == "base_changed")
+                        .count(),
+                    1
+                );
+            }
+        }
+        for event in ["synchronize", "base_changed"] {
+            let (count, unique): (i64, i64) = db
+                .query_row(
+                    "SELECT count(*),count(DISTINCT event_key) FROM automatic_pr_notifications
+                     WHERE event=?1",
+                    [event],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((count, unique), (3, 3), "{event}");
+        }
+    }
+
+    #[test]
+    fn first_case_variant_establishes_automatic_baseline_for_stale_other_cursor() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let upper = Resource {
+            repo: "Owner/Repo".into(),
+            resource: "7".into(),
+        };
+        let lower = Resource {
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+        };
+        let snapshot = json!({"number":7,"state":"open","updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let current = json!({"head":"a".repeat(40),"base":"main"});
+        let stale = json!({"head":"b".repeat(40),"base":"release"});
+        record_automatic_pr_changes(&db, &upper, &snapshot, &current, 0).unwrap();
+        let generation = poll_generation(&db, &automatic_pr_generation_key(&lower)).unwrap();
+        record_automatic_pr_changes(&db, &lower, &snapshot, &stale, generation).unwrap();
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn older_case_variant_response_cannot_reverse_automatic_baseline() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let upper = Resource {
+            repo: "Owner/Repo".into(),
+            resource: "7".into(),
+        };
+        let lower = Resource {
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+        };
+        let old_cursor = json!({"head":"a".repeat(40),"base":"main"});
+        let snapshot = |head: char| {
+            json!({"number":7,"state":"open",
+            "updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":head.to_string().repeat(40)},"base":{"ref":"main"}})
+        };
+        record_automatic_pr_changes(&db, &upper, &snapshot('a'), &old_cursor, 0).unwrap();
+        let captured = poll_generation(&db, &automatic_pr_generation_key(&upper)).unwrap();
+        let mut slow_fetch = |_: &str, _: Option<&str>| {
+            let mut fast_fetch = |_: &str, _: Option<&str>| Ok(response(snapshot('b'), false));
+            let fast = poll_endpoint(
+                &db,
+                "/repos/owner/repo/pulls/7",
+                0,
+                1,
+                &mut fast_fetch,
+                |db, _, items, _| {
+                    record_automatic_pr_changes(db, &lower, &items[0], &old_cursor, captured)?;
+                    Ok((None, 0))
+                },
+            )
+            .unwrap();
+            assert!(fast.error.is_none());
+            Ok(response(snapshot('a'), false))
+        };
+        let slow = poll_endpoint(
+            &db,
+            "/repos/Owner/Repo/pulls/7",
+            0,
+            1,
+            &mut slow_fetch,
+            |db, _, items, _| {
+                record_automatic_pr_changes(db, &upper, &items[0], &old_cursor, captured)?;
+                Ok((None, 0))
+            },
+        )
+        .unwrap();
+        assert!(slow.error.is_none());
+        let generation = poll_generation(&db, &automatic_pr_generation_key(&lower)).unwrap();
+        record_automatic_pr_changes(&db, &lower, &snapshot('b'), &old_cursor, generation).unwrap();
+        let notices = pr_notifications::pending(&db).unwrap();
         assert_eq!(
-            retry,
-            pr_change_event_key("owner/repo", "7", "synchronize", Some("a"), "b", 100)
+            notices
+                .iter()
+                .filter(|notice| notice.event == "synchronize")
+                .count(),
+            1
         );
-        assert_ne!(
-            retry,
-            pr_change_event_key("owner/repo", "7", "synchronize", Some("a"), "b", 200)
+        let cursor: String = db.query_row(
+            "SELECT cursor FROM github_poll_state WHERE endpoint='/repos/owner/repo/pulls/7' AND page=-1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&cursor).unwrap()["head"],
+            json!("b".repeat(40))
+        );
+    }
+
+    #[test]
+    fn automatic_baseline_and_notification_roll_back_together() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let resource = Resource {
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+        };
+        let cursor = json!({"head":"a".repeat(40),"base":"main"});
+        let snapshot = json!({"number":7,"state":"open","updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"b".repeat(40)},"base":{"ref":"main"}});
+        db.execute_batch(
+            "CREATE TRIGGER fail_automatic_baseline BEFORE INSERT ON github_poll_state
+             WHEN NEW.page=-1 BEGIN SELECT RAISE(ABORT,'injected'); END",
+        )
+        .unwrap();
+        assert!(record_automatic_pr_changes(&db, &resource, &snapshot, &cursor, 0).is_err());
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+        assert_eq!(
+            poll_generation(&db, &automatic_pr_generation_key(&resource)).unwrap(),
+            0
+        );
+        db.execute_batch("DROP TRIGGER fail_automatic_baseline")
+            .unwrap();
+        record_automatic_pr_changes(&db, &resource, &snapshot, &cursor, 0).unwrap();
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 1);
+        assert_eq!(
+            poll_generation(&db, &automatic_pr_generation_key(&resource)).unwrap(),
+            1
         );
     }
 

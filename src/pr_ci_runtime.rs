@@ -334,20 +334,38 @@ fn gh_api_with_timeout(
     let stderr_exceeded = Arc::clone(&exceeded);
     let stdout_cancelled = Arc::clone(&cancelled);
     let stderr_cancelled = Arc::clone(&cancelled);
-    let stdout_reader = thread::spawn(move || {
+    let mut stdout_reader = Some(thread::spawn(move || {
         read_pipe(stdout, GH_OUTPUT_LIMIT, stdout_exceeded, stdout_cancelled)
-    });
-    let stderr_reader = thread::spawn(move || {
+    }));
+    let mut stderr_reader = Some(thread::spawn(move || {
         read_pipe(stderr, GH_STDERR_LIMIT, stderr_exceeded, stderr_cancelled)
-    });
+    }));
+    let mut output = None;
+    let mut diagnostics = None;
     let deadline = Instant::now() + timeout;
     let mut status = None;
     let mut timed_out = false;
     loop {
+        if stdout_reader
+            .as_ref()
+            .is_some_and(|reader| reader.is_finished())
+        {
+            output = Some(stdout_reader.take().unwrap().join());
+        }
+        if stderr_reader
+            .as_ref()
+            .is_some_and(|reader| reader.is_finished())
+        {
+            diagnostics = Some(stderr_reader.take().unwrap().join());
+        }
         if exceeded.load(Ordering::Relaxed) {
             break;
         }
-        if let Some(exit) = child.try_wait().context("Check gh process")? {
+        // Join both readers before reaping, so their output-limit decisions are final.
+        if output.is_some()
+            && diagnostics.is_some()
+            && let Some(exit) = child.try_wait().context("Check gh process")?
+        {
             status = Some(exit);
             break;
         }
@@ -357,25 +375,15 @@ fn gh_api_with_timeout(
         }
         thread::sleep(Duration::from_millis(10));
     }
-    while !timed_out
-        && !exceeded.load(Ordering::Relaxed)
-        && (!stdout_reader.is_finished() || !stderr_reader.is_finished())
-    {
-        if Instant::now() >= deadline {
-            timed_out = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
     if timed_out || exceeded.load(Ordering::Relaxed) {
         cancelled.store(true, Ordering::Relaxed);
         terminate_process_group(&mut child);
     }
-    let output = stdout_reader
-        .join()
+    let output = output
+        .unwrap_or_else(|| stdout_reader.unwrap().join())
         .map_err(|_| anyhow::anyhow!("gh stdout reader panicked"))??;
-    let diagnostics = stderr_reader
-        .join()
+    let diagnostics = diagnostics
+        .unwrap_or_else(|| stderr_reader.unwrap().join())
         .map_err(|_| anyhow::anyhow!("gh stderr reader panicked"))??;
     if timed_out {
         bail!("GitHub CLI request timed out")
@@ -1210,6 +1218,75 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh_output_limit_stops_process_group() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("gh-wrapper");
+        fs::write(&wrapper, "#!/bin/sh\nhead -c 1048577 /dev/zero\nsleep 10\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let error = gh_api_with_timeout(
+            &wrapper,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output exceeded"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh_keeps_exited_group_leader_until_pipe_cleanup() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("gh-wrapper");
+        let leader_file = directory.path().join("leader.pid");
+        let escaped_file = directory.path().join("escaped.pid");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nsetsid sh -c 'echo $$ > {}; exec sleep 10' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nexit 0\n",
+                leader_file.display(), escaped_file.display(), escaped_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let worker = thread::spawn(move || {
+            gh_api_with_timeout(
+                &wrapper,
+                "/repos/owner/project/pulls/7",
+                Duration::from_secs(2),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut reserved = false;
+        while Instant::now() < deadline {
+            if let Ok(pid) = fs::read_to_string(&leader_file)
+                && let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                && stat
+                    .split_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("Z "))
+            {
+                reserved = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let result = worker.join().unwrap();
+        if let Ok(pid) = fs::read_to_string(escaped_file) {
+            let _ = Command::new("kill").arg("-KILL").arg(pid.trim()).status();
+        }
+        assert!(reserved, "exited leader must remain unreaped until cleanup");
+        assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 
     #[cfg(target_os = "linux")]
