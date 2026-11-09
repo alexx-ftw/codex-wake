@@ -150,7 +150,7 @@ cleanup() {
   fi
   if [[ ${handoff_mode:-0} == 1 && -f $output ]]; then
     if [[ ${handoff_done:-0} == 1 && $result == 0 ]]; then
-      jq --arg sha "$handoff_sha" '. + {"cooperative_handoff_qualification_passed":true,"handoff_script_sha256":$sha}' "$output" > "$output.tmp" && mv "$output.tmp" "$output" || clean=0
+      jq --arg sha "$handoff_sha" --arg legacy "$legacy_sha" '. + {"cooperative_handoff_qualification_passed":true,"handoff_script_sha256":$sha,"previous_wake_sha256":$legacy}' "$output" > "$output.tmp" && mv "$output.tmp" "$output" || clean=0
     else
       result=1
       jq '. + {"status":"failed","cooperative_handoff_qualification_passed":false}' "$output" > "$output.tmp" && mv "$output.tmp" "$output" || clean=0
@@ -207,6 +207,9 @@ if [[ $handoff_mode == 1 ]]; then
   [[ -f $handoff_script && ! -L $handoff_script ]] || fail 'handoff qualification script missing'
   command -v sqlite3 >/dev/null || fail 'sqlite3 is required for handoff qualification'
   handoff_sha=$(sha256sum "$handoff_script" | cut -d' ' -f1)
+  legacy=$(realpath -- "${WAKE_QUALIFY_LEGACY:?missing previous cooperative binary}")
+  [[ -x $legacy && -f $legacy && ! -L $legacy ]] || fail 'previous cooperative binary is missing'
+  legacy_sha=$(sha256sum "$legacy" | cut -d' ' -f1)
 fi
 [[ ! -e $output && ! -L $output && ! -e $output.tmp && ! -L $output.tmp ]] || fail 'receipt destination already exists'
 [[ -x $native && -x $wake && -x $probe ]] || fail 'qualification binary is missing'
@@ -256,7 +259,9 @@ sudo install -m 700 -o "$qual_user" -g "$qual_user" "$wake" "$qual_root/wake"
 sudo install -m 700 -o "$qual_user" -g "$qual_user" "$probe" "$qual_root/probe"
 if [[ $handoff_mode == 1 ]]; then
   sudo install -m 700 -o "$qual_user" -g "$qual_user" "$handoff_script" "$qual_root/handoff"
+  sudo install -m 700 -o "$qual_user" -g "$qual_user" "$legacy" "$qual_root/legacy"
   [[ $handoff_sha == "$(sudo sha256sum "$qual_root/handoff" | cut -d' ' -f1)" ]] || fail 'handoff script checksum mismatch'
+  [[ $legacy_sha == "$(sudo sha256sum "$qual_root/legacy" | cut -d' ' -f1)" ]] || fail 'previous binary checksum mismatch'
 fi
 [[ $native_sha == "$(sudo sha256sum "$qual_root/codex" | cut -d' ' -f1)" && \
    $wake_sha == "$(sudo sha256sum "$qual_root/wake" | cut -d' ' -f1)" && \
@@ -286,8 +291,11 @@ if [[ $handoff_mode == 1 ]]; then
   stage=cooperative_handoff
   controller_identity=$(as_qual_user /usr/bin/systemctl --user show wake-qualification-controller.service -p MainPID -p InvocationID) \
     || fail 'cannot identify isolated controller'
-  as_qual_user /usr/bin/timeout 180 "$qual_root/handoff" "$qual_root/wake" "$qual_root/codex" "$qual_root/socket" >/dev/null 2>&1 \
-    || fail 'cooperative handoff qualification failed'
+  if ! as_qual_user /usr/bin/timeout 180 "$qual_root/handoff" "$qual_root/wake" "$qual_root/codex" "$qual_root/socket" "$qual_root/legacy" >/dev/null 2>&1; then
+    failure=$(sudo cat "$qual_root/handoff-failure" 2>/dev/null || true)
+    [[ $failure =~ ^handoff_failure_line=[0-9]+$ ]] && printf '%s\n' "$failure" >&2
+    fail 'cooperative handoff qualification failed'
+  fi
   controller_after=$(as_qual_user /usr/bin/systemctl --user show wake-qualification-controller.service -p MainPID -p InvocationID) \
     || fail 'cannot reidentify isolated controller'
   [[ $controller_identity == "$controller_after" ]] || fail 'isolated controller changed during handoff'

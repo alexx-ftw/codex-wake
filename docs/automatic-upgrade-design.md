@@ -1,6 +1,6 @@
 # Automatic shared-service upgrade: design and qualification
 
-This is a design under review, not an implemented upgrade protocol.
+This broader design remains under review. A narrower managed cooperative path is implemented in [the receiver lifecycle](cooperative-receiver-lifecycle.md#managed-cooperative-updates); it does not migrate legacy installations.
 
 ## Existing installations
 
@@ -54,8 +54,8 @@ supports the same protocol; merely checking the receiver version is not enough.
    retain the state and expose the failure without replaying uncertain sends.
    A process crash or external termination can still make delivery uncertain.
 
-The concrete handover and cross-process admission mechanisms remain to be
-designed and reviewed. In particular, an in-process re-exec is not sufficient
+Full legacy migration and cross-process admission mechanisms remain to be
+designed and reviewed beyond the narrower managed path. In particular, an in-process re-exec is not sufficient
 until child ownership, descriptors, worker drainage, failure recovery and
 mixed-version clients are demonstrated. Do not treat this list as an
 implemented safety guarantee.

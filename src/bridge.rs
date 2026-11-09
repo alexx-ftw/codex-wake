@@ -334,10 +334,14 @@ pub(crate) fn bind_receiver_gate(db: &mut Connection, owner: &str, generation: i
         receiver_binding_columns(&tx)? == 5,
         "Receiver binding is not armed"
     );
+    crate::upgrade::verify_successor(&tx, owner, generation)?;
     ensure!(tx.execute(
         "UPDATE wake_delivery_claim_gate SET is_open=1,receiver_pid=?1,receiver_start=?2,receiver_boot=?3,receiver_namespace=?4,receiver_token=?5 WHERE id=1 AND is_open=0 AND owner=?6 AND generation=?7 AND receiver_pid IS NULL AND receiver_start IS NULL AND receiver_boot IS NULL AND receiver_namespace IS NULL AND receiver_token IS NULL",
         params![identity.pid, identity.start, identity.boot, identity.namespace, receiver_token().to_string(), owner, generation],
     )? == 1, "Receiver gate closed state or ownership changed");
+    if crate::upgrade::managed(&tx)? {
+        ensure!(tx.execute("UPDATE wake_cooperative_handoff SET phase='active' WHERE id=1 AND phase='binding' AND successor_pid=?1", [identity.pid])? == 1, "Managed binding state changed");
+    }
     tx.commit()?;
     Ok(())
 }
@@ -431,6 +435,10 @@ pub(crate) fn control_claim_gate(
             }
             "transfer" => {
                 ensure!(!open, "Close the gate before transferring ownership");
+                ensure!(
+                    !crate::upgrade::managed(&tx)?,
+                    "Managed cooperative gate can only be transferred by the updater"
+                );
                 let next = uuid::Uuid::parse_str(next_owner.context("Missing next owner")?)
                     .context("Invalid next owner UUID")?;
                 ensure!(!next.is_nil(), "Invalid next owner UUID");

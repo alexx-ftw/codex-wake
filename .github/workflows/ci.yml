@@ -118,6 +118,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Check receipt and UID preflight regressions
@@ -129,6 +130,12 @@ jobs:
         run: |
           cargo test --locked --jobs "$(nproc)" --example controller-systemd-qualification
           cargo build --locked --jobs "$(nproc)" --bin codex-wake --example controller-systemd-qualification
+      - name: Build previous cooperative receiver for bypass checks
+        if: ${{ inputs.probe == 'cooperative-handoff-qualification' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/previous-wake"
+          git archive af65d16699e3e82a2585887539ddc11ad8b32e03 | tar -x -C "$RUNNER_TEMP/previous-wake"
+          cargo build --locked --jobs "$(nproc)" --manifest-path "$RUNNER_TEMP/previous-wake/Cargo.toml" --target-dir "$RUNNER_TEMP/previous-target" --bin codex-wake
       - name: Install SQLite CLI for handoff qualification
         if: ${{ inputs.probe == 'cooperative-handoff-qualification' }}
         run: |
@@ -198,6 +205,7 @@ jobs:
       - name: Qualify independent units under a temporary user
         env:
           WAKE_QUALIFY_HANDOFF: ${{ inputs.probe == 'cooperative-handoff-qualification' && '1' || '0' }}
+          WAKE_QUALIFY_LEGACY: ${{ runner.temp }}/previous-target/debug/codex-wake
         run: |
           native=$(node --input-type=module -e '
             import { createRequire } from "node:module";

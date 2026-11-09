@@ -23,6 +23,7 @@ mod subscriptions;
 mod telemetry;
 mod templates;
 mod uninstall;
+mod upgrade;
 mod validation_obligations;
 
 use anyhow::{Context, Result, bail};
@@ -3184,6 +3185,11 @@ async fn run_command(
     mut args: Vec<String>,
 ) -> Result<()> {
     match command.as_str() {
+        "cooperative-upgrade" => {
+            let unit = required(&mut args, "--unit")?;
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            println!("{}", upgrade::run(&config, &unit)?);
+        }
         "cooperative-gate" => {
             anyhow::ensure!(!args.is_empty(), "Missing cooperative gate action");
             let action = args.remove(0);
@@ -3285,6 +3291,7 @@ async fn run_command(
         }
         "mcp" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            upgrade::automatic(&config)?;
             match bound_mode_state(&config)? {
                 None => {
                     anyhow::ensure!(
@@ -3304,7 +3311,13 @@ async fn run_command(
         }
         "ensure" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
-            println!("{}", manager::ensure_receiver(&config)?);
+            println!(
+                "{}",
+                match upgrade::automatic(&config)? {
+                    Some(result) => result,
+                    None => manager::ensure_receiver(&config)?,
+                }
+            );
         }
         "receiver" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");

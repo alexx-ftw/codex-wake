@@ -29,7 +29,7 @@ run_case() {
   [[ ! -f $qual_root/receipt.json ]] || { printf 'fixture directory is traversable\n' >&2; exit 1; }
   (
     manager_owned=0 linger_attempted=0 bus_active=0 created=0 uid_safe=0 qual_uid=65534
-    handoff_mode=${CASE_HANDOFF_MODE:-0} handoff_done=${CASE_HANDOFF_DONE:-0} handoff_sha=test
+    handoff_mode=${CASE_HANDOFF_MODE:-0} handoff_done=${CASE_HANDOFF_DONE:-0} handoff_sha=test legacy_sha=previous
     qual_user=unused stage=receiver_restart native_sha=test wake_sha=test probe_sha=test
     GITHUB_SHA=0123456789012345678901234567890123456789 output="$scratch/$name.json"
     cleanup

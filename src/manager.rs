@@ -194,6 +194,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("execution.rs").as_slice(),
         include_bytes!("rules.rs").as_slice(),
         include_bytes!("uninstall.rs").as_slice(),
+        include_bytes!("upgrade.rs").as_slice(),
         include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("observability.rs").as_slice(),
         include_bytes!("obligations.rs").as_slice(),
@@ -404,7 +405,7 @@ fn systemctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-fn lock(config: &Config) -> Result<File> {
+pub(crate) fn lock(config: &Config) -> Result<File> {
     private_dir(&config.state)?;
     let file = OpenOptions::new()
         .read(true)
@@ -939,13 +940,21 @@ fn receiver_standby(config: &Config) -> Result<()> {
         "Standby requires the closed gate and matching owner and generation"
     );
     tx.commit()?;
-    std::io::stdout().write_all(b"receiver-standby-ready-v1\n")?;
-    std::io::stdout().flush()?;
-    let mut signal = [0];
-    std::io::stdin()
-        .read_exact(&mut signal)
-        .context("Standby control pipe closed")?;
-    ensure!(signal[0] == b'G', "Invalid standby activation");
+    if env::var_os("CODEX_WAKE_RECEIVER_AUTO").is_some() {
+        ensure!(
+            env::var("CODEX_WAKE_RECEIVER_AUTO").as_deref() == Ok("1")
+                && crate::upgrade::managed(&db)?,
+            "Automatic standby requires a managed handoff"
+        );
+    } else {
+        std::io::stdout().write_all(b"receiver-standby-ready-v1\n")?;
+        std::io::stdout().flush()?;
+        let mut signal = [0];
+        std::io::stdin()
+            .read_exact(&mut signal)
+            .context("Standby control pipe closed")?;
+        ensure!(signal[0] == b'G', "Invalid standby activation");
+    }
     let mut db = crate::bridge::connect(&config.db)?;
     crate::bridge::bind_receiver_gate(&mut db, &owner, generation)?;
     Ok(())

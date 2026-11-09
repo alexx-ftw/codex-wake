@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # Run only under the private user manager provisioned by qualify-systemd-controller.sh.
-set -euo pipefail
-[[ ${WAKE_PRIVATE_QUALIFICATION:-} == 1 && $HOME =~ ^/tmp/wq\.[[:alnum:]]{8}/h$ && $(id -u) != 0 && $# == 3 ]] || exit 1
+set -Eeuo pipefail
+[[ ${WAKE_PRIVATE_QUALIFICATION:-} == 1 && $HOME =~ ^/tmp/wq\.[[:alnum:]]{8}/h$ && $(id -u) != 0 && $# == 4 ]] || exit 1
 root=${HOME%/h}
+trap 'printf "handoff_failure_line=%d\n" "$LINENO" > "$root/handoff-failure"' ERR
 wake=$1
 codex=$2
 socket=$3
-[[ $wake == "$root/wake" && $codex == "$root/codex" && $socket == "$root/socket" ]] || exit 1
+legacy=$4
+[[ $wake == "$root/wake" && $codex == "$root/codex" && $socket == "$root/socket" && $legacy == "$root/legacy" ]] || exit 1
 export TMPDIR="$root/t" XDG_STATE_HOME="$HOME/s" XDG_DATA_HOME="$HOME/d" XDG_CONFIG_HOME="$HOME/f" XDG_CACHE_HOME="$HOME/a"
 export CODEX_WAKE_CODEX="$codex" CODEX_WAKE_GH=/usr/bin/false CODEX_WAKE_ENABLE_WEBHOOKS=0 CODEX_WAKE_RPC_SOCKET="$socket"
 owner_a=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
-owner_b=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
 export CODEX_WAKE_COOPERATIVE_RECEIVER=1 CODEX_WAKE_GATE_OWNER=$owner_a CODEX_WAKE_GATE_GENERATION=1
-child=
-opened=0
+successor_unit=
+first_successor=
 cleanup_handoff() {
   local rc=$?
   trap - EXIT
-  if [[ $opened == 1 ]]; then gate close --owner "$owner_b" --generation 2 >/dev/null || rc=1; fi
-  if [[ -n $child ]]; then kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi
-  for unit in wake-handoff-failed.service wake-handoff-old.service; do
+  for unit in "$successor_unit" "$first_successor" codex-wake-coop-failed.service codex-wake-coop-old.service; do
+    [[ -n $unit ]] || continue
     /usr/bin/systemctl --user stop "$unit" >/dev/null 2>&1 || rc=1
   done
   exit "$rc"
@@ -29,14 +29,19 @@ ctl() { /usr/bin/systemctl --user "$@" 2>/dev/null; }
 gate() { "$wake" cooperative-gate "$@" 2>/dev/null; }
 start_old() {
   local unit=$1
+  local -a stdin=() standby=()
+  if [[ ${2:-} == standby ]]; then
+    stdin=("--property=StandardInput=file:$root/standby.fifo")
+    standby=(CODEX_WAKE_RECEIVER_STANDBY=1)
+  fi
   /usr/bin/systemd-run --user --unit="$unit" --property=Type=exec --property=Restart=no \
     --property=RemainAfterExit=yes --property=KillMode=control-group --property=NoNewPrivileges=yes \
-    --property=StandardOutput=null --property=StandardError=null --property="WorkingDirectory=$HOME" \
+    --property=StandardOutput=null --property=StandardError=null --property="WorkingDirectory=$HOME" "${stdin[@]}" \
     /usr/bin/env -i "HOME=$HOME" "CODEX_HOME=$CODEX_HOME" "TMPDIR=$TMPDIR" PATH=/usr/bin:/bin \
     "XDG_STATE_HOME=$XDG_STATE_HOME" "XDG_DATA_HOME=$XDG_DATA_HOME" "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" \
     "XDG_CACHE_HOME=$XDG_CACHE_HOME" "CODEX_WAKE_CODEX=$CODEX_WAKE_CODEX" CODEX_WAKE_GH=/usr/bin/false \
     CODEX_WAKE_ENABLE_WEBHOOKS=0 "CODEX_WAKE_RPC_SOCKET=$CODEX_WAKE_RPC_SOCKET" \
-    CODEX_WAKE_COOPERATIVE_RECEIVER=1 "CODEX_WAKE_GATE_OWNER=$owner_a" CODEX_WAKE_GATE_GENERATION=1 \
+    CODEX_WAKE_COOPERATIVE_RECEIVER=1 "CODEX_WAKE_GATE_OWNER=$owner_a" CODEX_WAKE_GATE_GENERATION=1 "${standby[@]}" \
     "$wake" receiver >/dev/null 2>&1
 }
 field() { sed -n "s/^$1=//p" <<< "$2"; }
@@ -102,71 +107,70 @@ close_gate() {
 
 gate init --owner "$owner_a" >/dev/null
 gate open --owner "$owner_a" --generation 1 >/dev/null
-start_old wake-handoff-failed
-wait_started wake-handoff-failed.service
+start_old codex-wake-coop-failed
+wait_started codex-wake-coop-failed.service
 failed_invocation=$OLD_INVOCATION
 failed_cgroup=$OLD_CGROUP
-ctl kill --kill-whom=main --signal=SIGKILL wake-handoff-failed.service
-wait_terminal wake-handoff-failed.service "$failed_invocation"
+ctl kill --kill-whom=main --signal=SIGKILL codex-wake-coop-failed.service
+wait_terminal codex-wake-coop-failed.service "$failed_invocation"
 if successful_terminal "$TERMINAL"; then exit 1; fi
 drain_group "$failed_cgroup"
 close_gate "$owner_a" 1
-# No transfer follows the failed invocation.
-gate open --owner "$owner_a" --generation 1 >/dev/null
-start_old wake-handoff-old
-wait_started wake-handoff-old.service
+gate arm --owner "$owner_a" --generation 1 >/dev/null
+producer=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+gate producer --owner "$owner_a" --generation 1 --producer-id "$producer" >/dev/null
+mkfifo -m 600 "$root/standby.fifo"
+exec {standby_fd}<>"$root/standby.fifo"
+start_old codex-wake-coop-old standby
+printf G >&"$standby_fd"
+wait_started codex-wake-coop-old.service
 old_invocation=$OLD_INVOCATION
 old_cgroup=$OLD_CGROUP
-close_gate "$owner_a" 1
-wait_terminal wake-handoff-old.service "$old_invocation"
+db="$XDG_STATE_HOME/codex-wake/state.sqlite3"
+sqlite3 "$db" "INSERT INTO waits(repo,run_id,attempt,thread,sha,state) VALUES('private/test',987654,1,'11111111-1111-4111-8111-111111111111','0123456789012345678901234567890123456789','waiting');"
+sqlite3 "$db" "INSERT INTO waits(repo,run_id,attempt,thread,sha,state) VALUES('private/test',987655,1,'11111111-1111-4111-8111-111111111111','0123456789012345678901234567890123456789','sending');"
+result=$("$wake" cooperative-upgrade --unit codex-wake-coop-old.service)
+successor_unit=$(jq -er '.unit' <<< "$result")
+owner_b=$(jq -er '.owner' <<< "$result")
+[[ $(jq -er '.generation' <<< "$result") == 2 ]]
+wait_terminal codex-wake-coop-old.service "$old_invocation"
 successful_terminal "$TERMINAL"
 drain_group "$old_cgroup"
-gate arm --owner "$owner_a" --generation 1 >/dev/null
-gate transfer --owner "$owner_a" --generation 1 --next-owner "$owner_b" >/dev/null
 export CODEX_WAKE_GATE_OWNER=$owner_b CODEX_WAKE_GATE_GENERATION=2
-spawn_candidate() {
-  coproc CANDIDATE { exec env CODEX_WAKE_RECEIVER_STANDBY=1 "$wake" receiver 2>/dev/null; }
-  child=$CANDIDATE_PID
-  exec {read_fd}<&"${CANDIDATE[0]}" {write_fd}>&"${CANDIDATE[1]}"
-  local line
-  IFS= read -r -t 30 line <&"$read_fd"
-  [[ $line == receiver-standby-ready-v1 ]]
-}
-candidate_alive() {
-  local stat_line state
-  kill -0 "$child" 2>/dev/null || return 1
-  stat_line=$(cat "/proc/$child/stat") || return 1
-  stat_line=${stat_line##*) }
-  state=${stat_line%% *}
-  [[ $state != Z && $state != X && $(stat -Lc '%d:%i' "/proc/$child/exe") == "$(stat -Lc '%d:%i' "$wake")" ]]
-}
-spawn_candidate
-candidate_alive
-kill "$child"
-wait "$child" 2>/dev/null || true
-child=
-exec {read_fd}<&- {write_fd}>&-
-assert_closed "$owner_b" 2
-spawn_candidate
-candidate_alive
-opened=1
-printf G >&"$write_fd"
-# A marker is not a durable health guarantee; confirm the same child emitted its heartbeat.
+successor_pid=$(field MainPID "$(snapshot "$successor_unit")")
 for ((i=0; i<300; i++)); do
-  candidate_alive
-  ready=$(sqlite3 -readonly "$XDG_STATE_HOME/codex-wake/telemetry.sqlite3" "SELECT EXISTS(SELECT 1 FROM events WHERE pid=$child AND operation='receiver.heartbeat' AND outcome='ok');" 2>/dev/null || true)
+  ready=$(sqlite3 -readonly "$XDG_STATE_HOME/codex-wake/telemetry.sqlite3" "SELECT EXISTS(SELECT 1 FROM events WHERE pid=$successor_pid AND operation='receiver.heartbeat' AND outcome='ok');" 2>/dev/null || true)
   [[ $ready == 1 ]] && break
   sleep 0.1
 done
 [[ $ready == 1 ]]
-close_gate "$owner_b" 2
-opened=0
-for ((i=0; i<300; i++)); do
-  candidate_alive || break
-  sleep 0.1
-done
-if candidate_alive; then exit 1; fi
-wait "$child"
-child=
-exec {read_fd}<&- {write_fd}>&-
+[[ $(sqlite3 -readonly "$db" "SELECT producer_id FROM wake_delivery_claim_gate WHERE id=1") == "$producer" ]]
+[[ $(sqlite3 -readonly "$db" "SELECT state FROM waits WHERE run_id=987654") == waiting ]]
+[[ $(sqlite3 -readonly "$db" "SELECT state FROM waits WHERE run_id=987655") == sending ]]
+current=$(CODEX_WAKE_COOPERATIVE_AUTO=1 CODEX_WAKE_PRODUCER_ID=$producer "$wake" ensure)
+[[ $(jq -er '.state' <<< "$current") == current && $(jq -er '.unit' <<< "$current") == "$successor_unit" ]]
+first_successor=$successor_unit
+install -m 700 "$wake" "$root/wake-next"
+printf '\nprivate-upgrade-qualification\n' >> "$root/wake-next"
+result=$(CODEX_WAKE_COOPERATIVE_AUTO=1 CODEX_WAKE_PRODUCER_ID=$producer "$root/wake-next" ensure)
+successor_unit=$(jq -er '.unit' <<< "$result")
+owner_c=$(jq -er '.owner' <<< "$result")
+[[ $(jq -er '.generation' <<< "$result") == 3 && $successor_unit != "$first_successor" ]]
+[[ $(sqlite3 -readonly "$db" "SELECT producer_id FROM wake_delivery_claim_gate WHERE id=1") == "$producer" ]]
+[[ $(sqlite3 -readonly "$db" "SELECT state FROM waits WHERE run_id=987654") == waiting ]]
+[[ $(sqlite3 -readonly "$db" "SELECT state FROM waits WHERE run_id=987655") == sending ]]
+successor_invocation=$(field InvocationID "$(snapshot "$successor_unit")")
+ctl kill --kill-whom=main --signal=SIGKILL "$successor_unit"
+wait_terminal "$successor_unit" "$successor_invocation"
+if CODEX_WAKE_COOPERATIVE_AUTO=1 CODEX_WAKE_PRODUCER_ID="$producer" "$root/wake-next" ensure >/dev/null 2>&1; then exit 1; fi
+assert_closed "$owner_c" 3
+request=eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
+queued=$(printf '{"thread":"11111111-1111-4111-8111-111111111111","message_template":"private fixture","request_id":"%s"}' "$request" | CODEX_WAKE_PRODUCER_ID="$producer" "$root/wake-next" queue-direct)
+[[ $(jq -er '.state' <<< "$queued") == pending ]]
+[[ $(sqlite3 -readonly "$db" "SELECT count(*) FROM cooperative_direct_pending WHERE request_id='$request'") == 1 ]]
+if gate transfer --owner "$owner_c" --generation 3 --next-owner "$owner_a"; then exit 1; fi
+if printf G | env CODEX_WAKE_RECEIVER_STANDBY=1 CODEX_WAKE_GATE_OWNER="$owner_c" CODEX_WAKE_GATE_GENERATION=3 "$root/wake-next" receiver >/dev/null 2>&1; then exit 1; fi
+if "$legacy" cooperative-gate transfer --owner "$owner_c" --generation 3 --next-owner "$owner_a" >/dev/null 2>&1; then exit 1; fi
+if printf G | env CODEX_WAKE_RECEIVER_STANDBY=1 CODEX_WAKE_GATE_OWNER="$owner_c" CODEX_WAKE_GATE_GENERATION=3 "$legacy" receiver >/dev/null 2>&1; then exit 1; fi
+assert_closed "$owner_c" 3
 printf 'cooperative handoff qualification passed\n'
