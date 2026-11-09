@@ -77,6 +77,17 @@ fn request(
     event: Option<&str>,
     signature: Option<&str>,
 ) -> u16 {
+    request_with_delivery(addr, method, body, event, signature, None)
+}
+
+fn request_with_delivery(
+    addr: std::net::SocketAddr,
+    method: &str,
+    body: &[u8],
+    event: Option<&str>,
+    signature: Option<&str>,
+    delivery_id: Option<&str>,
+) -> u16 {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -101,6 +112,9 @@ fn request(
         }
         if let Some(signature) = signature {
             write!(stream, "X-Hub-Signature-256: {signature}\r\n").unwrap();
+        }
+        if let Some(delivery_id) = delivery_id {
+            write!(stream, "X-GitHub-Delivery: {delivery_id}\r\n").unwrap();
         }
     }
     stream.write_all(b"\r\n").unwrap();
@@ -152,6 +166,22 @@ fn start_receiver(
     codex: &Path,
     defer: bool,
 ) -> (Receiver, std::net::SocketAddr) {
+    start_receiver_with_executable(
+        temp,
+        db,
+        codex,
+        defer,
+        Path::new(env!("CARGO_BIN_EXE_codex-wake")),
+    )
+}
+
+fn start_receiver_with_executable(
+    temp: &TempDir,
+    db: &Path,
+    codex: &Path,
+    defer: bool,
+    executable: &Path,
+) -> (Receiver, std::net::SocketAddr) {
     let webhook = receiver_path().expect(
         "set CODEX_WAKE_WEBHOOK to a verified webhook executable or install the verified local binary",
     );
@@ -171,7 +201,7 @@ fn start_receiver(
             "-hooks",
             "hooks.json.tmpl",
         ])
-        .env("CODEX_WAKE_EXECUTABLE", env!("CARGO_BIN_EXE_codex-wake"))
+        .env("CODEX_WAKE_EXECUTABLE", executable)
         .env("CODEX_WAKE_DB", db)
         .env("CODEX_WAKE_CODEX", codex)
         .env("CAPTURE", temp.path().join("codex-calls"))
@@ -209,6 +239,48 @@ fn start_receiver(
         thread::sleep(Duration::from_millis(40));
     }
     (receiver, addr)
+}
+
+#[test]
+#[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
+fn real_webhook_passes_delivery_id_and_exact_request_bytes_to_command() {
+    let temp = TempDir::new().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let db = temp.path().join("state.sqlite3");
+    let codex = temp.path().join("unused-codex");
+    let capture = temp.path().join("received-body");
+    let recorder = temp.path().join("record-webhook-input");
+    fs::write(
+        &recorder,
+        "#!/bin/sh\ncat \"$CODEX_WAKE_PAYLOAD\" > \"$CAPTURE\"\nprintf '%s' \"$CODEX_WAKE_DELIVERY\" > \"$CAPTURE.delivery\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let (_receiver, addr) = start_receiver_with_executable(&temp, &db, &codex, true, &recorder);
+    let body = br#"{
+  "workflow_run": { "conclusion": "success", "status": "completed", "id": 123 },
+  "repository": { "full_name": "owner/repo" },
+  "action": "completed"
+}"#;
+    let delivery_id = "11111111-2222-4333-8444-555555555555";
+    assert_eq!(
+        request_with_delivery(
+            addr,
+            "POST",
+            body,
+            Some("workflow_run"),
+            Some(&signed(body, SECRET.as_bytes())),
+            Some(delivery_id),
+        ),
+        200
+    );
+    assert_eq!(fs::read(capture).unwrap(), body);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("received-body.delivery")).unwrap(),
+        delivery_id
+    );
 }
 
 #[test]

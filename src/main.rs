@@ -538,13 +538,23 @@ fn verified_webhook_payload(
 fn capture_authenticated_pr_notification(
     db: &rusqlite::Connection,
     event: &str,
+    delivery_id: Option<&str>,
     payload: &Value,
 ) -> Result<usize> {
     let is_supported = (event == "pull_request"
         && matches!(payload["action"].as_str(), Some("closed" | "reopened")))
         || (event == "pull_request_review" && payload["action"] == "submitted");
     if is_supported {
-        polling::pr_notifications::accept_authenticated_webhook(db, event, payload)
+        if let Some(delivery_id) = delivery_id.filter(|id| !id.is_empty()) {
+            polling::pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                db,
+                event,
+                delivery_id,
+                payload,
+            )
+        } else {
+            polling::pr_notifications::accept_authenticated_webhook(db, event, payload)
+        }
     } else {
         Ok(0)
     }
@@ -2874,8 +2884,20 @@ async fn run_command(
             };
             let db = database(&config)?;
             let matched_rules = rules::accept(&db, &event, &payload)?;
+            let delivery_id = if authenticated_webhook {
+                env::var("CODEX_WAKE_DELIVERY")
+                    .ok()
+                    .filter(|id| !id.is_empty())
+            } else {
+                None
+            };
             let automatic_pr_notifications = if authenticated_webhook {
-                capture_authenticated_pr_notification(&db, &event, &payload)?
+                capture_authenticated_pr_notification(
+                    &db,
+                    &event,
+                    delivery_id.as_deref(),
+                    &payload,
+                )?
             } else {
                 0
             };
@@ -3013,14 +3035,15 @@ mod hook_output_tests {
             let signature = format!("sha256={:x}", mac.finalize().into_bytes());
             let parsed = verified_webhook_payload(&config, &raw, &signature).unwrap();
             assert_eq!(
-                capture_authenticated_pr_notification(&db, "pull_request", &parsed).unwrap(),
+                capture_authenticated_pr_notification(&db, "pull_request", None, &parsed).unwrap(),
                 1,
                 "signed {action} webhook should enqueue once"
             );
             if *action == "reopened" {
                 let replay = verified_webhook_payload(&config, &raw, &signature).unwrap();
                 assert_eq!(
-                    capture_authenticated_pr_notification(&db, "pull_request", &replay).unwrap(),
+                    capture_authenticated_pr_notification(&db, "pull_request", None, &replay,)
+                        .unwrap(),
                     0
                 );
             }

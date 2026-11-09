@@ -14,7 +14,8 @@
     ],
     "pass-environment-to-command": [
       {"source": "header", "name": "X-GitHub-Event", "envname": "CODEX_WAKE_EVENT"},
-      {"source": "header", "name": "X-Hub-Signature-256", "envname": "CODEX_WAKE_SIGNATURE"}
+      {"source": "header", "name": "X-Hub-Signature-256", "envname": "CODEX_WAKE_SIGNATURE"},
+      {"source": "header", "name": "X-GitHub-Delivery", "envname": "CODEX_WAKE_DELIVERY"}
     ],
     "pass-file-to-command": [
       {"source": "raw-request-body", "envname": "CODEX_WAKE_PAYLOAD"}
