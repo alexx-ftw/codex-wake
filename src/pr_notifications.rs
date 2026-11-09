@@ -145,15 +145,15 @@ fn insert_listener(
             params![kind, repo, pr, thread],
         )?,
     };
-    if inserted == 0 {
-        if let Some(registered_at_sec) = registered_at_sec {
-            db.execute(
-                "UPDATE automatic_pr_notification_listeners
-                 SET registered_at_sec=MIN(registered_at_sec,?5)
-                 WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4",
-                params![kind, repo, pr, thread, registered_at_sec],
-            )?;
-        }
+    if inserted == 0
+        && let Some(registered_at_sec) = registered_at_sec
+    {
+        db.execute(
+            "UPDATE automatic_pr_notification_listeners
+             SET registered_at_sec=MIN(registered_at_sec,?5)
+             WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4",
+            params![kind, repo, pr, thread, registered_at_sec],
+        )?;
     }
     Ok(inserted != 0)
 }
@@ -171,11 +171,41 @@ pub(crate) fn record_event(
     event_key: &str,
     source: &Value,
 ) -> Result<Vec<Notification>> {
+    initialize(db)?;
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let notifications =
+            record_event_in(&tx, kind, repo, pr, event, event_at, event_key, source)?;
+        tx.commit()?;
+        Ok(notifications)
+    } else {
+        record_event_in(db, kind, repo, pr, event, event_at, event_key, source)
+    }
+}
+
+/// Record a provider event in a caller-owned transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_event_in(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    pr: &str,
+    event: &str,
+    event_at: &str,
+    event_key: &str,
+    source: &Value,
+) -> Result<Vec<Notification>> {
+    // `reopened` is an internal durable notification, not a subscription rule event.
+    let validation_event = if kind == "pull_request" && event == "reopened" {
+        "closed"
+    } else {
+        event
+    };
     let (_, pr) = crate::subscriptions::validate_source(
         kind,
         repo,
         pr,
-        event,
+        validation_event,
         "11111111-1111-4111-8111-111111111111",
     )?;
     ensure!(
@@ -199,9 +229,8 @@ pub(crate) fn record_event(
         |row| row.get(0),
     )?;
     let event_at_sec = event_at_sec.context("Invalid event timestamp")?;
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let listeners = {
-        let mut statement = tx.prepare(
+        let mut statement = db.prepare(
             "SELECT thread FROM automatic_pr_notification_listeners
              WHERE kind=?1 AND repo=?2 AND pr=?3 AND registered_at_sec<=?4 ORDER BY thread",
         )?;
@@ -215,7 +244,7 @@ pub(crate) fn record_event(
     let mut notifications = Vec::new();
     for thread in listeners {
         let id = Uuid::new_v4().to_string();
-        let inserted = tx.execute(
+        let inserted = db.execute(
             "INSERT OR IGNORE INTO automatic_pr_notifications
              (id,kind,repo,pr,thread,event,event_key,source)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -234,7 +263,7 @@ pub(crate) fn record_event(
                 state: "pending".into(),
             });
         } else {
-            let existing_event: String = tx.query_row(
+            let existing_event: String = db.query_row(
                 "SELECT event FROM automatic_pr_notifications
                  WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4 AND event_key=?5",
                 params![kind, repo, pr, thread, event_key],
@@ -246,7 +275,6 @@ pub(crate) fn record_event(
             );
         }
     }
-    tx.commit()?;
     Ok(notifications)
 }
 

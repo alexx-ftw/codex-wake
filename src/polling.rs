@@ -169,6 +169,17 @@ where
             if !valid_pr(pr, number) {
                 return Err(Failure::new("invalid_response"));
             }
+            let observed_state = pr["state"]
+                .as_str()
+                .ok_or_else(|| Failure::new("invalid_response"))?;
+            codex_wake::pr_ci::observe_pull_request_state_in(
+                db,
+                &resource.repo,
+                &resource.resource,
+                observed_state,
+                now,
+            )
+            .map_err(|_| Failure::new("database"))?;
             validated.insert(resource.clone());
             let head = pr
                 .pointer("/head/sha")
@@ -181,6 +192,17 @@ where
             let old: Value = cursor
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .unwrap_or(Value::Null);
+            // Older PR cursors omit state; recover it from the cached response.
+            let prior_state = match old["state"].as_str() {
+                Some(state @ ("open" | "closed")) => Some(state.to_owned()),
+                _ if old.is_null() => None,
+                _ => state(db, &route, 0)
+                    .map_err(|_| Failure::new("database"))?
+                    .and_then(|cached| cached.body)
+                    .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                    .filter(|cached| valid_pr(cached, number))
+                    .and_then(|cached| cached["state"].as_str().map(str::to_owned)),
+            };
             let full = |action: &str, changes: Value| {
                 json!({"action":action,"number":number,
                 "pull_request":pr,"repository":{"full_name":resource.repo},"changes":changes})
@@ -200,17 +222,6 @@ where
                     pr["closed_at"].as_str()
                 };
                 let event_time = event_time.ok_or_else(|| Failure::new("invalid_response"))?;
-                // Older PR cursors omit state; recover it from the previous cached response.
-                let prior_state = match old["state"].as_str() {
-                    Some(state @ ("open" | "closed")) => Some(state.to_owned()),
-                    _ if old.is_null() => None,
-                    _ => state(db, &route, 0)
-                        .map_err(|_| Failure::new("database"))?
-                        .and_then(|cached| cached.body)
-                        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-                        .filter(|cached| valid_pr(cached, number))
-                        .and_then(|cached| cached["state"].as_str().map(str::to_owned)),
-                };
                 let mut closed_pr = pr.clone();
                 closed_pr["updated_at"] = json!(event_time);
                 let event = json!({"action":"closed","number":number,"pull_request":closed_pr,
@@ -278,6 +289,43 @@ where
                 .map_err(|_| Failure::new("database"))?;
             } else if !old.is_null() {
                 let changed_at = pr["updated_at"].as_str();
+                if prior_state.as_deref() == Some("closed") {
+                    let event_at = changed_at.ok_or_else(|| Failure::new("invalid_response"))?;
+                    let event = full("reopened", Value::Null);
+                    let event_key = stable_source_key(
+                        "pull_request",
+                        &resource.repo,
+                        &resource.resource,
+                        "reopened",
+                        "",
+                        &[event_at],
+                    );
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        db,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )
+                    .map_err(|_| Failure::new("database"))?;
+                    let notifications = pr_notifications::record_event_in(
+                        &tx,
+                        "pull_request",
+                        &resource.repo,
+                        &resource.resource,
+                        "reopened",
+                        event_at,
+                        &event_key,
+                        &event,
+                    )
+                    .map_err(|_| Failure::new("database"))?;
+                    for notification in notifications {
+                        codex_wake::pr_ci::consume_reopened_notification_in(
+                            &tx,
+                            &notification.id,
+                            now,
+                        )
+                        .map_err(|_| Failure::new("database"))?;
+                    }
+                    tx.commit().map_err(|_| Failure::new("database"))?;
+                }
                 if old["head"].as_str().is_some_and(|v| v != head) {
                     let event_key = stable_source_key(
                         "pull_request",
@@ -3233,6 +3281,75 @@ mod tests {
                 assert!(ready.is_none());
             }
         }
+    }
+
+    #[test]
+    fn reopened_pr_is_recorded_once_as_a_durable_notification() {
+        let mut db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let unregistered_thread = "22222222-2222-4222-8222-222222222222";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", unregistered_thread).unwrap();
+        codex_wake::pr_ci::unregister(&db, "owner/repo", "7", unregistered_thread).unwrap();
+        codex_wake::pr_ci::observe_pull_request_state_in(&db, "owner/repo", "7", "closed", 1)
+            .unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2098-12-31T23:59:00Z","updated_at":"2098-12-31T23:59:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        crate::polling::pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread)
+            .unwrap();
+        let reopened = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,
+            "closed_at":null,"updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let route = "/repos/owner/repo/pulls/7";
+        let report = tick_with(&db, INTERVAL_MS + 1, |requested, _| {
+            assert_eq!(requested, route);
+            Ok(response(reopened.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+
+        // Simulate a closed-state write that commits before the poll cursor does.
+        // The next response is open→open from that cursor, but reconciliation must resume CI.
+        codex_wake::pr_ci::observe_pull_request_state_in(
+            &db,
+            "owner/repo",
+            "7",
+            "closed",
+            INTERVAL_MS + 2,
+        )
+        .unwrap();
+        let report = tick_with(&db, INTERVAL_MS * 2 + 1, |requested, _| {
+            assert_eq!(requested, route);
+            Ok(response(reopened.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+
+        let notices = crate::polling::pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].kind, "pull_request");
+        assert_eq!(notices[0].event, "reopened");
+        assert_eq!(notices[0].source["action"], "reopened");
+        let tracker_states: Vec<(String, bool)> = {
+            let mut statement = db
+                .prepare("SELECT thread,active FROM pr_ci_trackers ORDER BY thread")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            tracker_states,
+            vec![(thread.into(), true), (unregistered_thread.into(), false)]
+        );
     }
 
     #[test]

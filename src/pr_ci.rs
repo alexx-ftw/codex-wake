@@ -5,7 +5,7 @@
 //! is independent of the exact-run `waits` table.
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -33,6 +33,19 @@ const DELIVERIES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_deliveries (
         CHECK(state IN ('pending','claimed','delivered','needs_attention')),
     lease_until_ms INTEGER,
     UNIQUE(repo,pull_number,sha,run_id,attempt,thread)
+);";
+const CLOSED_TRACKERS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_auto_closed_trackers (
+    repo TEXT NOT NULL, pull_number INTEGER NOT NULL, thread TEXT NOT NULL,
+    PRIMARY KEY(repo,pull_number,thread)
+);";
+const REOPEN_EVENTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_reopen_events (
+    notification_id TEXT PRIMARY KEY, consumed_at_ms INTEGER NOT NULL
+);";
+const PR_OBSERVATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_pr_observations (
+    repo TEXT NOT NULL, pull_number INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open','closed')),
+    observed_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(repo,pull_number)
 );";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -98,6 +111,9 @@ pub fn initialize(db: &Connection) -> Result<()> {
         );",
     )?;
     db.execute_batch(DELIVERIES_SCHEMA)?;
+    db.execute_batch(CLOSED_TRACKERS_SCHEMA)?;
+    db.execute_batch(REOPEN_EVENTS_SCHEMA)?;
+    db.execute_batch(PR_OBSERVATIONS_SCHEMA)?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS pr_ci_due ON pr_ci_trackers(active,next_poll_ms);
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_queue ON pr_ci_deliveries(state,id);
@@ -138,6 +154,11 @@ pub fn register_in(db: &Connection, repo: &str, number: &str, thread: &str) -> R
         "UPDATE pr_ci_trackers SET active=1 WHERE repo=?1 AND pull_number=?2 AND thread=?3",
         params![repo, number, thread],
     )?;
+    db.execute(
+        "DELETE FROM pr_ci_auto_closed_trackers
+         WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+        params![repo, number, thread],
+    )?;
     Ok(inserted)
 }
 
@@ -147,11 +168,159 @@ pub fn unregister(db: &Connection, repo: &str, number: &str, thread: &str) -> Re
     let number = parse_number(number)?;
     ensure!(valid_repo(repo), "Invalid repository");
     let repo = repo.to_ascii_lowercase();
-    let changed = db.execute(
+    let thread = Uuid::parse_str(thread)?.to_string();
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
         "UPDATE pr_ci_trackers SET active=0 WHERE repo=?1 AND pull_number=?2 AND thread=?3",
-        params![repo, number, Uuid::parse_str(thread)?.to_string()],
+        params![repo, number, thread],
     )?;
-    Ok(changed != 0)
+    let cleared_auto_close = tx.execute(
+        "DELETE FROM pr_ci_auto_closed_trackers
+         WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+        params![repo, number, thread],
+    )?;
+    tx.commit()?;
+    Ok(changed != 0 || cleared_auto_close != 0)
+}
+
+/// Apply the latest validated PR state from the ordinary PR poller.
+/// `observed_at_ms` orders concurrent responses so a late stale `closed`
+/// snapshot cannot overwrite a newer `open` observation. Closed PRs stay
+/// active while any observed Actions run is nonterminal. A completed closed PR
+/// is paused with a marker that an explicit `unregister` removes.
+pub fn observe_pull_request_state_in(
+    db: &Connection,
+    repo: &str,
+    number: &str,
+    state: &str,
+    observed_at_ms: i64,
+) -> Result<bool> {
+    initialize(db)?;
+    ensure!(
+        matches!(state, "open" | "closed"),
+        "Invalid pull request state"
+    );
+    let number = parse_number(number)?;
+    ensure!(valid_repo(repo), "Invalid repository");
+    let repo = repo.to_ascii_lowercase();
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let changed = observe_pull_request_state_tx(&tx, &repo, number, state, observed_at_ms)?;
+        tx.commit()?;
+        Ok(changed)
+    } else {
+        observe_pull_request_state_tx(db, &repo, number, state, observed_at_ms)
+    }
+}
+
+fn observe_pull_request_state_tx(
+    db: &Connection,
+    repo: &str,
+    number: i64,
+    state: &str,
+    observed_at_ms: i64,
+) -> Result<bool> {
+    let observed = db.execute(
+        "INSERT INTO pr_ci_pr_observations(repo,pull_number,state,observed_at_ms)
+         VALUES(?1,?2,?3,?4)
+         ON CONFLICT(repo,pull_number) DO UPDATE SET
+             state=excluded.state,observed_at_ms=excluded.observed_at_ms
+         WHERE excluded.observed_at_ms>pr_ci_pr_observations.observed_at_ms
+            OR (excluded.observed_at_ms=pr_ci_pr_observations.observed_at_ms
+                AND excluded.state='open' AND pr_ci_pr_observations.state='closed')",
+        params![repo, number, state, observed_at_ms],
+    )?;
+    if observed == 0 {
+        return Ok(false);
+    }
+    if state == "open" {
+        db.execute(
+            "UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,
+                 error=NULL,updated_at_ms=?1
+             WHERE repo=?2 AND pull_number=?3 AND EXISTS(
+                 SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+                 WHERE closed.repo=pr_ci_trackers.repo
+                   AND closed.pull_number=pr_ci_trackers.pull_number
+                   AND closed.thread=pr_ci_trackers.thread)",
+            params![observed_at_ms, repo, number],
+        )?;
+        db.execute(
+            "DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2",
+            params![repo, number],
+        )?;
+    } else {
+        let pending_runs: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_ci_runs
+             WHERE repo=?1 AND pull_number=?2 AND status!='completed')",
+            params![repo, number],
+            |row| row.get(0),
+        )?;
+        if !pending_runs {
+            db.execute(
+                "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
+                 SELECT repo,pull_number,thread FROM pr_ci_trackers
+                 WHERE repo=?1 AND pull_number=?2 AND active=1",
+                params![repo, number],
+            )?;
+            db.execute(
+                "UPDATE pr_ci_trackers SET active=0,error=NULL,updated_at_ms=?1
+                 WHERE repo=?2 AND pull_number=?3 AND active=1",
+                params![observed_at_ms, repo, number],
+            )?;
+        }
+    }
+    Ok(true)
+}
+
+/// Consume a durable `reopened` notification by its ID after inserting it into
+/// `automatic_pr_notifications`. Call this from the same transaction as the
+/// notification insert when possible. Explicitly unregistered trackers remain
+/// inactive because `observe_pull_request_state_in` only resumes auto-closed
+/// trackers.
+pub fn consume_reopened_notification_in(
+    db: &Connection,
+    notification_id: &str,
+    observed_at_ms: i64,
+) -> Result<bool> {
+    initialize(db)?;
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let consumed = consume_reopened_notification_tx(&tx, notification_id, observed_at_ms)?;
+        tx.commit()?;
+        Ok(consumed)
+    } else {
+        consume_reopened_notification_tx(db, notification_id, observed_at_ms)
+    }
+}
+
+fn consume_reopened_notification_tx(
+    db: &Connection,
+    notification_id: &str,
+    observed_at_ms: i64,
+) -> Result<bool> {
+    let Some((repo, number)) = db
+        .query_row(
+            "SELECT repo,pr FROM automatic_pr_notifications
+             WHERE id=?1 AND kind='pull_request' AND event='reopened'",
+            [notification_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    let repo = repo.to_ascii_lowercase();
+    let number = parse_number(&number)?;
+    if db.execute(
+        "INSERT OR IGNORE INTO pr_ci_reopen_events(notification_id,consumed_at_ms)
+         VALUES(?1,?2)",
+        params![notification_id, observed_at_ms],
+    )? == 0
+    {
+        return Ok(false);
+    }
+    observe_pull_request_state_tx(db, &repo, number, "open", observed_at_ms)?;
+    Ok(true)
 }
 
 /// Poll due PRs. The transport receives GitHub REST paths (including query
@@ -172,7 +341,7 @@ where
            AND pull_number=(SELECT pull_number FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
            AND thread=(SELECT thread FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
            AND active=1 AND next_poll_ms<=?2
-         RETURNING repo,pull_number,thread,head_sha,backoff_ms",
+         RETURNING repo,pull_number,thread,head_sha,backoff_ms,updated_at_ms",
     )?;
     let trackers = stmt
         .query_map(params![now_ms.saturating_add(POLL_MS), now_ms], |row| {
@@ -182,11 +351,12 @@ where
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut report = PollReport::default();
-    for (repo, number, thread, old_sha, backoff) in trackers {
+    for (repo, number, thread, old_sha, backoff, expected_updated_at) in trackers {
         report.checked += 1;
         let poll_result = poll_one(
             db,
@@ -195,10 +365,11 @@ where
             number,
             &thread,
             old_sha.as_deref(),
+            expected_updated_at,
             &mut fetch,
         );
-        let finished_ms = now_ms
-            .saturating_add(i64::try_from(poll_started.elapsed().as_millis()).unwrap_or(i64::MAX));
+        let elapsed_ms = i64::try_from(poll_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let finished_ms = now_ms.saturating_add(elapsed_ms);
         match poll_result {
             Ok((discovered, queued, unlinked)) => {
                 report.discovered += discovered;
@@ -208,7 +379,7 @@ where
                     "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,error=NULL,
                      updated_at_ms=?2 WHERE repo=?3 AND pull_number=?4 AND thread=?5 AND active=1",
                     params![
-                        finished_ms.saturating_add(POLL_MS),
+                        schedule_after_completion_ms(now_ms, elapsed_ms, POLL_MS),
                         finished_ms,
                         repo,
                         number,
@@ -223,7 +394,7 @@ where
                     "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=?2,error=?3,
                      updated_at_ms=?4 WHERE repo=?5 AND pull_number=?6 AND thread=?7 AND active=1",
                     params![
-                        finished_ms.saturating_add(delay),
+                        schedule_after_completion_ms(now_ms, elapsed_ms, delay),
                         next,
                         "poll_failed",
                         finished_ms,
@@ -241,6 +412,12 @@ where
     Ok(report)
 }
 
+fn schedule_after_completion_ms(started_ms: i64, elapsed_ms: i64, delay_ms: i64) -> i64 {
+    started_ms
+        .saturating_add(elapsed_ms.max(0))
+        .saturating_add(delay_ms)
+}
+
 fn poll_one<F>(
     db: &Connection,
     now: i64,
@@ -248,6 +425,7 @@ fn poll_one<F>(
     number: i64,
     thread: &str,
     old_sha: Option<&str>,
+    expected_updated_at: i64,
     fetch: &mut F,
 ) -> Result<(usize, usize, usize)>
 where
@@ -881,8 +1059,8 @@ mod tests {
     }
 
     #[test]
-    fn poll_selects_oldest_due_tracker_and_reschedules_from_completion() {
-        use std::{cell::Cell, thread, time::Duration};
+    fn poll_selects_oldest_due_tracker_first() {
+        use std::cell::Cell;
 
         let mut db = db();
         for number in [7, 8, 9] {
@@ -895,12 +1073,8 @@ mod tests {
         )
         .unwrap();
 
-        let started = Instant::now();
         let first_pr = Cell::new(None);
-        let last_fetch_ms = Cell::new(0_i64);
         let mut response = |route: &str| -> Result<ApiResponse> {
-            thread::sleep(Duration::from_millis(5));
-            last_fetch_ms.set(i64::try_from(started.elapsed().as_millis()).unwrap());
             let number = route
                 .split("/pulls/")
                 .nth(1)
@@ -923,14 +1097,14 @@ mod tests {
         let report = poll(&db, 1_000, &mut response).unwrap();
         assert_eq!(report.checked, 1);
         assert_eq!(first_pr.get(), Some(8));
-        let scheduled: i64 = db
-            .query_row(
-                "SELECT next_poll_ms FROM pr_ci_trackers WHERE pull_number=8",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(scheduled >= 1_000 + last_fetch_ms.get() + POLL_MS);
+    }
+
+    #[test]
+    fn next_poll_delay_is_added_after_elapsed_poll_time() {
+        assert_eq!(
+            schedule_after_completion_ms(1_000, 95_000, POLL_MS),
+            156_000
+        );
     }
 
     #[test]
@@ -1176,48 +1350,53 @@ mod tests {
 
     #[test]
     fn closed_pr_remains_tracked_and_picks_up_ci_after_reopen() {
-        use std::cell::Cell;
-
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        let is_complete = Cell::new(false);
-        let is_reopened = Cell::new(false);
         let mut response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 return Ok(ApiResponse {
                     status: 200,
-                    body: pull(7, if is_reopened.get() { "open" } else { "closed" }, SHA),
+                    body: pull(7, "closed", SHA),
                 });
-            }
-            let mut workflow_run = run(7, SHA, 52, 1, "success");
-            if !is_complete.get() {
-                workflow_run["status"] = json!("in_progress");
-                workflow_run["conclusion"] = Value::Null;
-            }
-            let mut workflow_runs = vec![workflow_run];
-            if is_reopened.get() {
-                workflow_runs.push(run(7, SHA, 53, 1, "success"));
             }
             Ok(ApiResponse {
                 status: 200,
-                body: json!({"total_count":workflow_runs.len(),"workflow_runs":workflow_runs}),
+                body: json!({"total_count":1,"workflow_runs":[run(7,SHA,52,1,"success")]}),
             })
         };
+        let mut pending_run = run(7, SHA, 52, 1, "success");
+        pending_run["status"] = json!("in_progress");
+        pending_run["conclusion"] = Value::Null;
+        let pending_response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":1,"workflow_runs":[pending_run.clone()]}),
+                })
+            }
+        };
 
-        assert_eq!(poll(&db, 1, &mut response).unwrap().queued, 0);
-        let active_after_pending: i64 = db
+        assert_eq!(poll(&db, 1, pending_response).unwrap().queued, 0);
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        let active_with_pending: i64 = db
             .query_row(
                 "SELECT count(*) FROM pr_ci_trackers WHERE active=1 AND repo='owner/project' AND pull_number=7",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(active_after_pending, 1);
-        is_complete.set(true);
+        assert_eq!(active_with_pending, 1);
+
         db.execute("UPDATE pr_ci_trackers SET next_poll_ms=0", [])
             .unwrap();
         assert_eq!(poll(&db, 2, &mut response).unwrap().queued, 1);
-        let (active, deliveries): (i64, i64) = db
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 20).unwrap());
+        let (active_after_close, deliveries): (i64, i64) = db
             .query_row(
                 "SELECT (SELECT count(*) FROM pr_ci_trackers WHERE active=1),
                         (SELECT count(*) FROM pr_ci_deliveries WHERE run_id=52)",
@@ -1225,12 +1404,36 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((active, deliveries), (1, 1));
+        assert_eq!((active_after_close, deliveries), (0, 1));
 
-        is_reopened.set(true);
-        db.execute("UPDATE pr_ci_trackers SET next_poll_ms=0", [])
-            .unwrap();
-        assert_eq!(poll(&db, 3, &mut response).unwrap().queued, 1);
+        db.execute_batch(
+            "CREATE TABLE automatic_pr_notifications(
+                id TEXT PRIMARY KEY, kind TEXT, repo TEXT, pr TEXT, thread TEXT, event TEXT
+             );
+             INSERT INTO automatic_pr_notifications
+                VALUES('reopened-7','pull_request','owner/project','7',
+                       '11111111-1111-4111-8111-111111111111','reopened');",
+        )
+        .unwrap();
+        assert!(consume_reopened_notification_in(&db, "reopened-7", 30).unwrap());
+        assert!(!consume_reopened_notification_in(&db, "reopened-7", 31).unwrap());
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 31).unwrap());
+        let open_response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "open", SHA),
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":2,"workflow_runs":[
+                        run(7,SHA,52,1,"success"),run(7,SHA,53,1,"success")
+                    ]}),
+                })
+            }
+        };
+        assert_eq!(poll(&db, 3, open_response).unwrap().queued, 1);
         let (active, reopened_deliveries): (i64, i64) = db
             .query_row(
                 "SELECT (SELECT count(*) FROM pr_ci_trackers WHERE active=1),
@@ -1240,6 +1443,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!((active, reopened_deliveries), (1, 1));
+    }
+
+    #[test]
+    fn reopen_observation_does_not_restore_explicit_unregister() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(unregister(&db, "owner/project", "7", THREAD).unwrap());
+        db.execute_batch(
+            "CREATE TABLE automatic_pr_notifications(
+                id TEXT PRIMARY KEY, kind TEXT, repo TEXT, pr TEXT, thread TEXT, event TEXT
+             );
+             INSERT INTO automatic_pr_notifications
+                VALUES('reopened-unregistered','pull_request','owner/project','7',
+                       '11111111-1111-4111-8111-111111111111','reopened');",
+        )
+        .unwrap();
+        assert!(consume_reopened_notification_in(&db, "reopened-unregistered", 10).unwrap());
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn stale_closed_observation_cannot_pause_a_newer_open_pr() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 100).unwrap());
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 200).unwrap());
+        assert!(!observe_pull_request_state_in(&db, "owner/project", "7", "closed", 150).unwrap());
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
     }
 
     #[test]
@@ -1339,12 +1584,15 @@ mod tests {
     fn poll_persists_backoff_on_api_error() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let started = Instant::now();
         let report = poll(&db, 100, |_| anyhow::bail!("offline")).unwrap();
         assert_eq!(report.errors.len(), 1);
         let (next, backoff): (i64, i64) = db.query_row(
             "SELECT next_poll_ms,backoff_ms FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
             [], |r| Ok((r.get(0)?,r.get(1)?)),
         ).unwrap();
-        assert_eq!((next, backoff), (60_100, 120_000));
+        let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap();
+        assert!((60_100..=60_100 + elapsed).contains(&next));
+        assert_eq!(backoff, 120_000);
     }
 }
