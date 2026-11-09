@@ -36,6 +36,14 @@ struct PendingReopen {
     event_at: String,
 }
 
+struct PendingReopenSourceRow {
+    id: i64,
+    repo: String,
+    pr: String,
+    event_at: String,
+    source: String,
+}
+
 pub(crate) fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS automatic_pr_notification_listeners (
@@ -74,6 +82,8 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             pr TEXT NOT NULL,
             closed_at_sec INTEGER NOT NULL,
             PRIMARY KEY(repo,pr,closed_at_sec));
+        CREATE TABLE IF NOT EXISTS automatic_pr_schema_migrations (
+            name TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS automatic_pr_pending_reopens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             repo TEXT NOT NULL,
@@ -91,6 +101,7 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
         [],
     )?;
     migrate_pending_reopens(db)?;
+    sanitize_pending_reopen_sources(db)?;
     let lifecycle_columns = {
         let mut statement = db.prepare("PRAGMA table_info(automatic_pr_lifecycle)")?;
         statement
@@ -223,6 +234,65 @@ fn migrate_pending_reopens(db: &Connection) -> Result<()> {
         return Err(error.into());
     }
     db.execute_batch("RELEASE pending_reopens_migration")?;
+    Ok(())
+}
+
+fn sanitize_pending_reopen_sources(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS automatic_pr_schema_migrations(name TEXT PRIMARY KEY);",
+    )?;
+    let done: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automatic_pr_schema_migrations
+         WHERE name='pending_reopen_payload_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    db.execute_batch("SAVEPOINT pending_reopen_payload_migration")?;
+    let migration = (|| -> Result<()> {
+        let rows: Vec<PendingReopenSourceRow> = {
+            let mut statement = db.prepare(
+                "SELECT id,repo,pr,event_at,source FROM automatic_pr_pending_reopens ORDER BY id",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(PendingReopenSourceRow {
+                        id: row.get(0)?,
+                        repo: row.get(1)?,
+                        pr: row.get(2)?,
+                        event_at: row.get(3)?,
+                        source: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for row in rows {
+            let source =
+                serde_json::to_string(&minimal_reopen_source(&row.repo, &row.pr, &row.event_at))?;
+            if source != row.source {
+                db.execute(
+                    "UPDATE automatic_pr_pending_reopens SET source=?2 WHERE id=?1",
+                    params![row.id, source],
+                )?;
+            }
+        }
+        db.execute(
+            "INSERT OR IGNORE INTO automatic_pr_schema_migrations(name)
+             VALUES('pending_reopen_payload_v1')",
+            [],
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = migration {
+        let _ = db.execute_batch(
+            "ROLLBACK TO pending_reopen_payload_migration;
+             RELEASE pending_reopen_payload_migration;",
+        );
+        return Err(error);
+    }
+    db.execute_batch("RELEASE pending_reopen_payload_migration")?;
     Ok(())
 }
 
@@ -621,16 +691,7 @@ pub(crate) fn record_reopened_event_in(
         .optional()?;
 
     let Some(current) = current else {
-        store_pending_reopen_in(
-            db,
-            repo,
-            pr,
-            source_kind,
-            source_id,
-            event_at_sec,
-            event_at,
-            source,
-        )?;
+        store_pending_reopen_in(db, repo, pr, source_kind, source_id, event_at_sec, event_at)?;
         reconcile_pending_reopens_in(db, repo, pr)?;
         return Ok(None);
     };
@@ -645,16 +706,7 @@ pub(crate) fn record_reopened_event_in(
         seen_id == Some(source_id)
     };
     if !same_cycle {
-        store_pending_reopen_in(
-            db,
-            repo,
-            pr,
-            source_kind,
-            source_id,
-            event_at_sec,
-            event_at,
-            source,
-        )?;
+        store_pending_reopen_in(db, repo, pr, source_kind, source_id, event_at_sec, event_at)?;
         reconcile_pending_reopens_in(db, repo, pr)?;
         return Ok(None);
     }
@@ -733,7 +785,6 @@ fn store_pending_reopen_in(
     source_id: &str,
     event_at_sec: i64,
     event_at: &str,
-    _source: &Value,
 ) -> Result<()> {
     db.execute(
         "INSERT OR IGNORE INTO automatic_pr_pending_reopens
@@ -1791,6 +1842,46 @@ mod tests {
         );
         assert!(migrated.get("huge").is_none());
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn pending_reopen_payloads_are_sanitized_when_source_id_already_exists() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE automatic_pr_pending_reopens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo TEXT NOT NULL, pr TEXT NOT NULL,
+                source_kind TEXT NOT NULL CHECK(source_kind IN ('webhook','poll')),
+                source_id TEXT NOT NULL,
+                event_at_sec INTEGER NOT NULL, event_at TEXT NOT NULL, source TEXT NOT NULL,
+                UNIQUE(repo,pr,source_kind,source_id));",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO automatic_pr_pending_reopens
+             (repo,pr,source_kind,source_id,event_at_sec,event_at,source)
+             VALUES('owner/repo','7','webhook','delivery-1',1,?1,?2)",
+            params![
+                "2099-01-01T00:00:01Z",
+                r#"{"action":"reopened","secret":"remove-me"}"#
+            ],
+        )
+        .unwrap();
+
+        sanitize_pending_reopen_sources(&db).unwrap();
+        let (source_id, event_at, source): (String, String, String) = db
+            .query_row(
+                "SELECT source_id,event_at,source FROM automatic_pr_pending_reopens",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(source_id, "delivery-1");
+        assert_eq!(event_at, "2099-01-01T00:00:01Z");
+        let source: Value = serde_json::from_str(&source).unwrap();
+        assert_eq!(source["repository"]["full_name"], "owner/repo");
+        assert_eq!(source["pull_request"]["updated_at"], event_at);
+        assert!(source.get("secret").is_none());
     }
 
     #[test]

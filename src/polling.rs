@@ -200,9 +200,8 @@ where
         }
         let timeline_floor = if cached_prior_state.as_deref() == Some("closed") {
             Some(
-                pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)
-                    .map_err(|_| Failure::new("database"))?
-                    .ok_or_else(|| Failure::new("invalid_response"))?,
+                pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)?
+                    .ok_or_else(|| anyhow::anyhow!("Missing retained PR close timestamp"))?,
             )
         } else {
             None
@@ -2286,19 +2285,35 @@ where
             .ok_or_else(|| Failure::new("invalid_response"))?;
         let mut reached_floor = false;
         for event in page_events {
-            let event_at = event["created_at"]
-                .as_str()
-                .ok_or_else(|| Failure::new("invalid_response"))?;
-            let event_at_sec = pr_notifications::timestamp_second(db, event_at)
-                .map_err(|_| Failure::new("invalid_response"))?;
-            reached_floor |= event_at_sec <= floor_sec;
-            if event["event"] == "reopened" && event_at_sec >= floor_sec {
+            let event_kind = event["event"].as_str();
+            let reopened_event = event_kind == Some("reopened");
+            let event_at = if reopened_event {
+                let event_id = event["id"]
+                    .as_i64()
+                    .ok_or_else(|| Failure::new("invalid_response"))?;
+                Some((
+                    event["created_at"]
+                        .as_str()
+                        .ok_or_else(|| Failure::new("invalid_response"))?,
+                    Some(event_id),
+                ))
+            } else {
+                timeline_event_timestamp(&event).map(|timestamp| (timestamp, None))
+            };
+            let Some((event_at, event_id)) = event_at else {
+                continue;
+            };
+            let event_at_sec = match pr_notifications::timestamp_second(db, event_at) {
+                Ok(event_at_sec) => event_at_sec,
+                Err(_) if reopened_event => return Err(Failure::new("invalid_response")),
+                Err(_) => continue,
+            };
+            reached_floor |= event_at_sec < floor_sec;
+            if reopened_event && event_at_sec >= floor_sec {
+                let event_id = event_id.ok_or_else(|| Failure::new("invalid_response"))?;
                 reopened.push(ReopenedTimelineEvent {
                     event_at: event_at.to_owned(),
-                    event_id: event["id"]
-                        .as_i64()
-                        .ok_or_else(|| Failure::new("invalid_response"))?
-                        .to_string(),
+                    event_id: event_id.to_string(),
                 });
             }
         }
@@ -2325,6 +2340,46 @@ where
         if page.status != 200 {
             return Err(page.failure());
         }
+    }
+}
+
+fn timeline_event_timestamp(event: &Value) -> Option<&str> {
+    match event["event"].as_str()? {
+        "reviewed" => event["submitted_at"].as_str(),
+        "assigned"
+        | "unassigned"
+        | "labeled"
+        | "unlabeled"
+        | "milestoned"
+        | "demilestoned"
+        | "closed"
+        | "reopened"
+        | "referenced"
+        | "cross-referenced"
+        | "mentioned"
+        | "subscribed"
+        | "unsubscribed"
+        | "review_requested"
+        | "review_request_removed"
+        | "ready_for_review"
+        | "converted_to_draft"
+        | "locked"
+        | "unlocked"
+        | "pinned"
+        | "unpinned"
+        | "renamed"
+        | "head_ref_force_pushed"
+        | "head_ref_deleted"
+        | "base_ref_changed"
+        | "merged"
+        | "connected"
+        | "disconnected"
+        | "added_to_project"
+        | "removed_from_project"
+        | "moved_columns_in_project"
+        | "commit"
+        | "committed" => event["created_at"].as_str(),
+        _ => None,
     }
 }
 
@@ -3681,7 +3736,10 @@ mod tests {
                         format!("<https://api.github.com{last_page}>; rel=\"last\""),
                     ),
                     route if route == last_page => (
-                        json!([{"id":7002,"event":"reopened","created_at":"2099-01-02T00:00:00Z"}]),
+                        json!([
+                            {"id":7002,"event":"reopened","created_at":"2099-01-01T00:00:00Z"},
+                            {"event":"future_event","created_at":"2098-12-31T23:59:00Z"}
+                        ]),
                         format!("<https://api.github.com{first_page}>; rel=\"prev\""),
                     ),
                     route if route == first_page => (
@@ -3704,8 +3762,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_id, "7001");
-        assert_eq!(events[1].event_id, "7002");
+        let mut event_ids: Vec<_> = events.iter().map(|event| event.event_id.as_str()).collect();
+        event_ids.sort_unstable();
+        assert_eq!(event_ids, ["7001", "7002"]);
         assert_eq!(
             requested,
             vec![
@@ -3736,6 +3795,7 @@ mod tests {
                     route if route == last_page => (
                         json!([
                             {"id":7001,"event":"reopened","created_at":"2099-01-01T00:00:00Z"},
+                            {"event":"reviewed","submitted_at":"2099-01-01T00:00:00Z"},
                             {"id":6999,"event":"closed","created_at":"2098-12-31T23:59:00Z"}
                         ]),
                         format!("<https://api.github.com{first_page}>; rel=\"prev\""),
