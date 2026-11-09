@@ -1070,7 +1070,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                 crate::observability::emit(
                                     "native_wake.recovery",
                                     "ok",
-                                    "queue_started",
+                                    "recovery_rows_cleared",
                                     None,
                                     Duration::ZERO,
                                     recovered as u64,
