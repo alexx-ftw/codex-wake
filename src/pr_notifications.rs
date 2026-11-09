@@ -29,7 +29,7 @@ struct PrLifecycleState {
     poll_reopen_source_id: Option<String>,
 }
 
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct PendingReopen {
     source_kind: String,
     source_id: String,
