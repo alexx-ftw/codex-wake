@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -84,6 +84,7 @@ pub fn connect(path: &Path) -> Result<Connection> {
             PRIMARY KEY(repo, run_id, attempt)
         );",
         )?;
+        initialize_claim_gate(&db)?;
         let columns = {
             let mut statement = db.prepare("PRAGMA table_info(waits)")?;
             statement
@@ -103,6 +104,420 @@ pub fn connect(path: &Path) -> Result<Connection> {
     })();
     finish_transaction(&db, migration)?;
     Ok(db)
+}
+
+// This gate currently covers only dispatchers that explicitly check it inside
+// their claim transaction. It is not an upgrade or global admission interface.
+pub(crate) fn initialize_claim_gate(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS wake_delivery_claim_gate (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        is_open INTEGER NOT NULL CHECK(is_open IN (0,1))
+    ); INSERT OR IGNORE INTO wake_delivery_claim_gate(id,is_open) VALUES(1,1);",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn claims_open(db: &Connection) -> Result<bool> {
+    let owner = std::env::var_os("CODEX_WAKE_GATE_OWNER");
+    let generation = std::env::var_os("CODEX_WAKE_GATE_GENERATION");
+    if owner.as_ref().is_some_and(|value| value.to_str().is_none())
+        || generation
+            .as_ref()
+            .is_some_and(|value| value.to_str().is_none())
+    {
+        return Ok(false);
+    }
+    claims_open_for(
+        db,
+        owner.as_deref().and_then(|value| value.to_str()),
+        generation.as_deref().and_then(|value| value.to_str()),
+    )
+}
+
+fn claims_open_for(db: &Connection, owner: Option<&str>, generation: Option<&str>) -> Result<bool> {
+    let open: bool = db.query_row(
+        "SELECT is_open FROM wake_delivery_claim_gate WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if !open {
+        return Ok(false);
+    }
+    let columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('wake_delivery_claim_gate') WHERE name IN ('owner','generation')", [], |r| r.get(0))?;
+    if columns == 0 {
+        return Ok(owner.is_none() && generation.is_none());
+    }
+    ensure!(columns == 2, "Incomplete gate ownership metadata");
+    let (actual_owner, actual_generation): (String, i64) = db.query_row(
+        "SELECT owner,generation FROM wake_delivery_claim_gate WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    ensure!(
+        actual_generation > 0
+            && uuid::Uuid::parse_str(&actual_owner)
+                .is_ok_and(|id| !id.is_nil() && id.to_string() == actual_owner),
+        "Invalid gate ownership metadata"
+    );
+    let expected_owner = owner
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(|id| id.to_string());
+    let expected_generation = generation.and_then(|value| value.parse::<i64>().ok());
+    if expected_owner.as_deref() != Some(actual_owner.as_str())
+        || expected_generation != Some(actual_generation)
+    {
+        return Ok(false);
+    }
+    let bound = receiver_binding_columns(db)?;
+    if bound == 0 {
+        return Ok(true);
+    }
+    ensure!(bound == 5, "Incomplete receiver binding metadata");
+    let current = match crate::conditions::current_sender_identity() {
+        Ok(identity) => identity,
+        Err(_) => return Ok(false),
+    };
+    let token = receiver_token().to_string();
+    let matches = db.query_row(
+        "SELECT receiver_pid,receiver_start,receiver_boot,receiver_namespace,receiver_token FROM wake_delivery_claim_gate WHERE id=1", [],
+        |row| Ok(row.get::<_, Option<i64>>(0)? == Some(current.pid)
+            && row.get::<_, Option<i64>>(1)? == Some(current.start)
+            && row.get::<_, Option<String>>(2)?.as_deref() == Some(current.boot.as_str())
+            && row.get::<_, Option<String>>(3)?.as_deref() == Some(current.namespace.as_str())
+            && row.get::<_, Option<String>>(4)?.as_deref() == Some(token.as_str())),
+    )?;
+    Ok(matches)
+}
+
+fn receiver_binding_columns(db: &Connection) -> Result<i64> {
+    Ok(db.query_row("SELECT count(*) FROM pragma_table_info('wake_delivery_claim_gate') WHERE name IN ('receiver_pid','receiver_start','receiver_boot','receiver_namespace','receiver_token')", [], |row| row.get(0))?)
+}
+
+// No creation or migration before validating ownership on this connection.
+pub(crate) fn open_existing_owned(path: &Path) -> Result<Connection> {
+    check_private_directory(path.parent().context("Database path has no parent")?)?;
+    check_private_file(path)?;
+    let db = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    db.busy_timeout(Duration::from_secs(15))?;
+    crate::uninstall::validate_owned_database(&db)?;
+    Ok(db)
+}
+
+// A stable producer can retain inputs but cannot claim work.
+pub(crate) fn producer_enqueue_allowed(db: &Connection) -> Result<Option<bool>> {
+    let Some(raw) = std::env::var_os("CODEX_WAKE_PRODUCER_ID") else {
+        return bound_enqueue_allowed(db);
+    };
+    let bound = bound_enqueue_allowed(db)?;
+    if bound.is_none() {
+        return Ok(Some(false));
+    }
+    let id = raw
+        .to_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .filter(|id| !id.is_nil())
+        .map(|id| id.to_string());
+    let has_column: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('wake_delivery_claim_gate') WHERE name='producer_id')", [], |r| r.get(0))?;
+    if !has_column {
+        return Ok(Some(false));
+    }
+    let saved: Option<String> = db.query_row(
+        "SELECT producer_id FROM wake_delivery_claim_gate WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(Some(id.is_some() && id == saved))
+}
+
+pub(crate) fn configure_producer(
+    db: &mut Connection,
+    owner: &str,
+    generation: i64,
+    producer: &str,
+) -> Result<Value> {
+    let owner = uuid::Uuid::parse_str(owner)?;
+    let producer = uuid::Uuid::parse_str(producer)?;
+    ensure!(
+        !owner.is_nil() && !producer.is_nil() && generation > 0,
+        "Invalid owner, producer or generation"
+    );
+    let owner = owner.to_string();
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    crate::uninstall::validate_owned_database(&tx)?;
+    ensure!(
+        receiver_binding_columns(&tx)? == 5,
+        "Producer identity requires an armed cooperative gate"
+    );
+    let (open, actual_owner, actual_generation): (bool, String, i64) = tx.query_row(
+        "SELECT is_open,owner,generation FROM wake_delivery_claim_gate WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    ensure!(
+        !open && actual_owner == owner && actual_generation == generation,
+        "Gate must be closed with matching owner and generation"
+    );
+    let has_column: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('wake_delivery_claim_gate') WHERE name='producer_id')", [], |r| r.get(0))?;
+    if has_column {
+        let existing: Option<String> = tx.query_row(
+            "SELECT producer_id FROM wake_delivery_claim_gate WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            existing.as_deref() == Some(producer.to_string().as_str()),
+            "Producer identity already configured differently"
+        );
+        tx.commit()?;
+        return Ok(
+            json!({"producer_id":producer.to_string(),"state":"configured","replayed":true}),
+        );
+    }
+    tx.execute_batch("ALTER TABLE wake_delivery_claim_gate ADD COLUMN producer_id TEXT")?;
+    ensure!(
+        tx.execute(
+            "UPDATE wake_delivery_claim_gate SET producer_id=?1 WHERE id=1",
+            [producer.to_string()]
+        )? == 1,
+        "Gate record missing"
+    );
+    tx.commit()?;
+    Ok(json!({"producer_id":producer.to_string(),"state":"configured","replayed":false}))
+}
+
+// A bound cohort may persist requests even while its gate is closed. This
+// authorizes storage only; actual dispatch still requires the bound process.
+pub(crate) fn bound_enqueue_allowed(db: &Connection) -> Result<Option<bool>> {
+    let columns = receiver_binding_columns(db)?;
+    if columns == 0 {
+        return Ok(None);
+    }
+    ensure!(columns == 5, "Incomplete receiver binding metadata");
+    let owner = std::env::var("CODEX_WAKE_GATE_OWNER")
+        .ok()
+        .and_then(|value| uuid::Uuid::parse_str(&value).ok().map(|id| id.to_string()));
+    let generation = std::env::var("CODEX_WAKE_GATE_GENERATION")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0);
+    let (actual_owner, actual_generation): (String, i64) = db.query_row(
+        "SELECT owner,generation FROM wake_delivery_claim_gate WHERE id=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        actual_generation > 0
+            && uuid::Uuid::parse_str(&actual_owner)
+                .is_ok_and(|id| !id.is_nil() && id.to_string() == actual_owner),
+        "Invalid gate ownership metadata"
+    );
+    Ok(Some(
+        owner.as_deref() == Some(actual_owner.as_str()) && generation == Some(actual_generation),
+    ))
+}
+
+fn receiver_token() -> &'static uuid::Uuid {
+    static TOKEN: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(uuid::Uuid::new_v4)
+}
+
+// Called only by the waiting receiver itself. A different process cannot use
+// the resulting gate even if it knows the cohort UUID and generation.
+pub(crate) fn bind_receiver_gate(db: &mut Connection, owner: &str, generation: i64) -> Result<()> {
+    let identity =
+        crate::conditions::current_sender_identity().context("Read receiver process identity")?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let lifecycle = crate::upgrade::verify_binding(&tx, owner, generation)
+        .context("Verify receiver lifecycle identity")?;
+    bind_receiver_gate_in(&tx, owner, generation, &identity, lifecycle)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn bind_receiver_gate_in(
+    db: &Connection,
+    owner: &str,
+    generation: i64,
+    identity: &crate::conditions::SenderIdentity,
+    lifecycle: bool,
+) -> Result<()> {
+    ensure!(
+        receiver_binding_columns(db)? == 5,
+        "Receiver binding is not armed"
+    );
+    ensure!(db.execute(
+        "UPDATE wake_delivery_claim_gate SET is_open=?8,receiver_pid=?1,receiver_start=?2,receiver_boot=?3,receiver_namespace=?4,receiver_token=?5 WHERE id=1 AND is_open=0 AND owner=?6 AND generation=?7 AND receiver_pid IS NULL AND receiver_start IS NULL AND receiver_boot IS NULL AND receiver_namespace IS NULL AND receiver_token IS NULL",
+        params![identity.pid, identity.start, identity.boot, identity.namespace, receiver_token().to_string(), owner, generation, !lifecycle],
+    )? == 1, "Receiver gate closed state or ownership changed");
+    Ok(())
+}
+
+// Cooperative fencing only: the owner UUID is a cohort identity, not process
+// authentication. Legacy clients that do not check this gate are not fenced.
+pub(crate) fn control_claim_gate(
+    db: &mut Connection,
+    action: &str,
+    owner: &str,
+    generation: Option<i64>,
+    next_owner: Option<&str>,
+) -> Result<Value> {
+    control_claim_gate_inner(db, action, owner, generation, next_owner, None)
+}
+
+pub(crate) fn transfer_receiver_gate(
+    db: &mut Connection,
+    owner: &str,
+    generation: i64,
+    next_owner: &str,
+    next: &crate::upgrade::Spec,
+    drained: &crate::upgrade::Drained,
+) -> Result<Value> {
+    control_claim_gate_inner(
+        db,
+        "transfer",
+        owner,
+        Some(generation),
+        Some(next_owner),
+        Some((next, drained)),
+    )
+}
+
+fn control_claim_gate_inner(
+    db: &mut Connection,
+    action: &str,
+    owner: &str,
+    generation: Option<i64>,
+    next_owner: Option<&str>,
+    proof: Option<(&crate::upgrade::Spec, &crate::upgrade::Drained)>,
+) -> Result<Value> {
+    let owner = uuid::Uuid::parse_str(owner).context("Invalid gate owner UUID")?;
+    ensure!(!owner.is_nil(), "Invalid gate owner UUID");
+    let owner = owner.to_string();
+    initialize_claim_gate(db)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let columns: i64 = tx.query_row("SELECT count(*) FROM pragma_table_info('wake_delivery_claim_gate') WHERE name IN ('owner','generation')", [], |r| r.get(0))?;
+    let (new_owner, new_generation, open) = if action == "init" {
+        ensure!(
+            columns == 0 && generation.is_none() && next_owner.is_none(),
+            "Gate ownership already initialized or invalid arguments"
+        );
+        tx.execute_batch("ALTER TABLE wake_delivery_claim_gate ADD COLUMN owner TEXT; ALTER TABLE wake_delivery_claim_gate ADD COLUMN generation INTEGER;")?;
+        ensure!(
+            tx.execute(
+                "UPDATE wake_delivery_claim_gate SET is_open=0,owner=?1,generation=1 WHERE id=1",
+                [&owner]
+            )? == 1,
+            "Gate record is missing"
+        );
+        (owner, 1, false)
+    } else {
+        ensure!(
+            columns == 2,
+            "Gate ownership is not initialized or incomplete"
+        );
+        let (current, current_generation): (String, i64) = tx.query_row(
+            "SELECT owner,generation FROM wake_delivery_claim_gate WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(
+            current_generation > 0
+                && uuid::Uuid::parse_str(&current)
+                    .is_ok_and(|id| !id.is_nil() && id.to_string() == current),
+            "Invalid gate ownership metadata"
+        );
+        ensure!(
+            owner == current && generation == Some(current_generation),
+            "Stale gate owner or generation"
+        );
+        let open: bool = tx.query_row(
+            "SELECT is_open FROM wake_delivery_claim_gate WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        match action {
+            "close" => {
+                ensure!(next_owner.is_none(), "Unexpected next owner");
+                tx.execute(
+                    "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+                    [],
+                )?;
+                (owner, current_generation, false)
+            }
+            "arm" => {
+                ensure!(
+                    !open && next_owner.is_none(),
+                    "Close the gate before arming"
+                );
+                ensure!(
+                    receiver_binding_columns(&tx)? == 0,
+                    "Receiver binding already armed or incomplete"
+                );
+                tx.execute_batch("ALTER TABLE wake_delivery_claim_gate ADD COLUMN receiver_pid INTEGER; ALTER TABLE wake_delivery_claim_gate ADD COLUMN receiver_start INTEGER; ALTER TABLE wake_delivery_claim_gate ADD COLUMN receiver_boot TEXT; ALTER TABLE wake_delivery_claim_gate ADD COLUMN receiver_namespace TEXT; ALTER TABLE wake_delivery_claim_gate ADD COLUMN receiver_token TEXT;")?;
+                (owner, current_generation, false)
+            }
+            "open" => {
+                ensure!(
+                    receiver_binding_columns(&tx)? == 0,
+                    "Armed receiver gate must be opened by its receiver"
+                );
+                ensure!(next_owner.is_none(), "Unexpected next owner");
+                tx.execute(
+                    "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+                    [],
+                )?;
+                (owner, current_generation, true)
+            }
+            "transfer" => {
+                ensure!(!open, "Close the gate before transferring ownership");
+                let next = uuid::Uuid::parse_str(next_owner.context("Missing next owner")?)
+                    .context("Invalid next owner UUID")?;
+                ensure!(!next.is_nil(), "Invalid next owner UUID");
+                let next = next.to_string();
+                let next_generation = current_generation
+                    .checked_add(1)
+                    .context("Gate generation exhausted")?;
+                let bound = receiver_binding_columns(&tx)?;
+                ensure!(
+                    bound == 0 || bound == 5,
+                    "Incomplete receiver binding metadata"
+                );
+                if bound == 5 {
+                    let bound_pid: Option<i64> = tx.query_row(
+                        "SELECT receiver_pid FROM wake_delivery_claim_gate WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if bound_pid.is_some() {
+                        let (_, drained) = proof.context(
+                            "Bound receiver requires verified invocation exit and cgroup drain",
+                        )?;
+                        drained.verify_gate(&tx)?;
+                    }
+                    if let Some((next, _)) = proof {
+                        tx.execute(
+                            "UPDATE wake_delivery_claim_gate SET receiver_lifecycle=?1 WHERE id=1",
+                            [serde_json::to_string(next)?],
+                        )?;
+                    }
+                }
+                let update = if bound == 5 {
+                    "UPDATE wake_delivery_claim_gate SET owner=?1,generation=?2,receiver_pid=NULL,receiver_start=NULL,receiver_boot=NULL,receiver_namespace=NULL,receiver_token=NULL WHERE id=1"
+                } else {
+                    "UPDATE wake_delivery_claim_gate SET owner=?1,generation=?2 WHERE id=1"
+                };
+                tx.execute(update, params![next, next_generation])?;
+                (next, next_generation, false)
+            }
+            _ => bail!("Unknown cooperative gate action"),
+        }
+    };
+    tx.commit()?;
+    Ok(json!({"owner":new_owner,"generation":new_generation,"open":open}))
 }
 
 #[cfg(unix)]
@@ -389,6 +804,11 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
     loop {
         db.execute_batch("BEGIN IMMEDIATE")?;
         let claim = (|| -> Result<Option<ClaimedWait>> {
+            // The gate and claim use the same writer transaction as a close.
+            // This gates only bridge claims, not other Wake sources or dispatchers.
+            if !claims_open(db)? {
+                return Ok(None);
+            }
             let row = db
                 .query_row(
                     "SELECT repo,run_id,attempt,thread,sha,conclusion,message_template,source_json,execution_json FROM waits \
@@ -837,6 +1257,27 @@ mod tests {
         (dir, db)
     }
 
+    #[test]
+    fn producer_configuration_rolls_back_if_update_fails() {
+        let (_dir, mut db) = setup();
+        let owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let producer = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        control_claim_gate(&mut db, "init", owner, None, None).unwrap();
+        control_claim_gate(&mut db, "arm", owner, Some(1), None).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_producer BEFORE UPDATE ON wake_delivery_claim_gate BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(configure_producer(&mut db, owner, 1, producer).is_err());
+        let columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('wake_delivery_claim_gate') WHERE name='producer_id'", [], |r| r.get(0)).unwrap();
+        assert_eq!(columns, 0);
+        db.execute_batch("DROP TRIGGER fail_producer").unwrap();
+        assert_eq!(
+            configure_producer(&mut db, owner, 1, producer).unwrap()["state"],
+            "configured"
+        );
+        bind_receiver_gate(&mut db, owner, 1).unwrap();
+        assert!(!claims_open_for(&db, None, None).unwrap());
+        assert!(claims_open_for(&db, Some(owner), Some("1")).unwrap());
+    }
+
     fn payload() -> Value {
         payload_for("owner/repo", 123, 1, SHA)
     }
@@ -870,6 +1311,326 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    #[test]
+    fn prepared_lifecycle_binding_does_not_authorize_admission_or_transfer() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        control_claim_gate(&mut db, "init", owner, None, None).unwrap();
+        control_claim_gate(&mut db, "arm", owner, Some(1), None).unwrap();
+        let identity = crate::conditions::current_sender_identity().unwrap();
+        let tx = db.transaction().unwrap();
+        bind_receiver_gate_in(&tx, owner, 1, &identity, true).unwrap();
+        tx.commit().unwrap();
+        assert!(!claims_open_for(&db, Some(owner), Some("1")).unwrap());
+        assert!(control_claim_gate(&mut db, "open", owner, Some(1), None).is_err());
+        assert!(
+            control_claim_gate(
+                &mut db,
+                "transfer",
+                owner,
+                Some(1),
+                Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            )
+            .is_err()
+        );
+        assert!(
+            !db.query_row("SELECT is_open FROM wake_delivery_claim_gate", [], |r| r
+                .get::<_, bool>(
+                0
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn receiver_bound_gate_fences_identity_and_rejects_manual_open() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        control_claim_gate(&mut db, "init", a, None, None).unwrap();
+        control_claim_gate(&mut db, "arm", a, Some(1), None).unwrap();
+        assert!(control_claim_gate(&mut db, "open", a, Some(1), None).is_err());
+        bind_receiver_gate(&mut db, a, 1).unwrap();
+        assert!(claims_open_for(&db, Some(a), Some("1")).unwrap());
+        assert!(!claims_open_for(&db, Some(b), Some("1")).unwrap());
+        for column in [
+            "receiver_pid",
+            "receiver_start",
+            "receiver_boot",
+            "receiver_namespace",
+            "receiver_token",
+        ] {
+            db.execute_batch("SAVEPOINT altered").unwrap();
+            db.execute_batch(&format!(
+                "UPDATE wake_delivery_claim_gate SET {column}=NULL"
+            ))
+            .unwrap();
+            assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+            db.execute_batch("ROLLBACK TO altered; RELEASE altered")
+                .unwrap();
+        }
+        for change in [
+            "receiver_pid=receiver_pid+1",
+            "receiver_start=receiver_start+1",
+            "receiver_boot='00000000-0000-0000-0000-000000000000'",
+            "receiver_namespace='pid:[0]'",
+            "receiver_token='00000000-0000-0000-0000-000000000000'",
+        ] {
+            db.execute_batch("SAVEPOINT altered").unwrap();
+            db.execute_batch(&format!("UPDATE wake_delivery_claim_gate SET {change}"))
+                .unwrap();
+            assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+            db.execute_batch("ROLLBACK TO altered; RELEASE altered")
+                .unwrap();
+        }
+        control_claim_gate(&mut db, "close", a, Some(1), None).unwrap();
+        assert!(control_claim_gate(&mut db, "transfer", a, Some(1), Some(b)).is_err());
+        assert!(bind_receiver_gate(&mut db, a, 1).is_err());
+        assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+    }
+
+    #[test]
+    fn cooperative_gate_owner_transfer_rejects_stale_generation() {
+        let (dir, mut db) = setup();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        assert!(claims_open_for(&db, None, None).unwrap());
+        assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+        assert!(!claims_open_for(&db, Some(a), None).unwrap());
+        assert_eq!(
+            control_claim_gate(&mut db, "init", a, None, None).unwrap()["generation"],
+            1
+        );
+        assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+        control_claim_gate(&mut db, "open", a, Some(1), None).unwrap();
+        assert!(claims_open_for(&db, Some(a), Some("1")).unwrap());
+        assert!(!claims_open_for(&db, None, None).unwrap());
+        assert!(!claims_open_for(&db, Some(b), Some("1")).unwrap());
+        assert!(!claims_open_for(&db, Some(a), Some("2")).unwrap());
+        assert!(control_claim_gate(&mut db, "transfer", a, Some(1), Some(b)).is_err());
+        control_claim_gate(&mut db, "close", a, Some(1), None).unwrap();
+        assert_eq!(
+            control_claim_gate(&mut db, "transfer", a, Some(1), Some(b)).unwrap()["generation"],
+            2
+        );
+        assert!(control_claim_gate(&mut db, "open", a, Some(1), None).is_err());
+        assert!(control_claim_gate(&mut db, "close", a, Some(1), None).is_err());
+        assert!(control_claim_gate(&mut db, "transfer", a, Some(1), Some(a)).is_err());
+        control_claim_gate(&mut db, "open", b, Some(2), None).unwrap();
+        assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+        assert!(claims_open_for(&db, Some(b), Some("2")).unwrap());
+        assert!(control_claim_gate(&mut db, "init", a, None, None).is_err());
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0,generation=?1 WHERE id=1",
+            [i64::MAX],
+        )
+        .unwrap();
+        assert!(control_claim_gate(&mut db, "transfer", b, Some(i64::MAX), Some(a)).is_err());
+        let exhausted: (String, i64, bool) = db
+            .query_row(
+                "SELECT owner,generation,is_open FROM wake_delivery_claim_gate WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(exhausted, (b.to_owned(), i64::MAX, false));
+        crate::uninstall::validate_external_database(&dir.path().join("state/state.sqlite3"))
+            .unwrap();
+    }
+
+    #[test]
+    fn cooperative_gate_incomplete_or_invalid_owner_metadata_fails_closed() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize_claim_gate(&db).unwrap();
+        db.execute_batch("ALTER TABLE wake_delivery_claim_gate ADD COLUMN owner TEXT")
+            .unwrap();
+        assert!(claims_open_for(&db, None, None).is_err());
+        assert!(
+            control_claim_gate(
+                &mut db,
+                "init",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                None,
+                None
+            )
+            .is_err()
+        );
+        db.execute_batch("ALTER TABLE wake_delivery_claim_gate ADD COLUMN generation INTEGER")
+            .unwrap();
+        assert!(claims_open_for(&db, None, None).is_err());
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET owner=?1,generation=-1",
+            ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+        )
+        .unwrap();
+        assert!(
+            claims_open_for(
+                &db,
+                Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                Some("-1")
+            )
+            .is_err()
+        );
+        assert!(
+            control_claim_gate(
+                &mut db,
+                "open",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                Some(-1),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cooperative_gate_non_utf8_owner_never_falls_back_to_legacy() {
+        use std::{
+            os::unix::ffi::OsStringExt,
+            process::{Command, Stdio},
+        };
+        const CHILD: &str = "WAKE_GATE_NON_UTF8_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let db = Connection::open_in_memory().unwrap();
+            initialize_claim_gate(&db).unwrap();
+            assert!(!claims_open(&db).unwrap());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bridge::tests::cooperative_gate_non_utf8_owner_never_falls_back_to_legacy",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", dir.path())
+            .env(
+                "CODEX_WAKE_GATE_OWNER",
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )
+            .env(
+                "CODEX_WAKE_GATE_GENERATION",
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated invalid environment test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn cooperative_gate_concurrent_claim_rejects_previous_owner() {
+        use std::process::{Command, Stdio};
+        use wait_timeout::ChildExt;
+        const CHILD: &str = "WAKE_GATE_OWNER_TEST_DB";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let marker = std::env::var_os("WAKE_GATE_BUSY_MARKER").unwrap();
+            let mut db = Connection::open(path).unwrap();
+            db.busy_handler(Some(|_| {
+                if let Some(marker) = std::env::var_os("WAKE_GATE_BUSY_MARKER") {
+                    let _ = std::fs::write(marker, b"blocked");
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                true
+            }))
+            .unwrap();
+            assert!(Path::new(&marker).parent().unwrap().is_dir());
+            assert_eq!(
+                dispatch(
+                    &mut db,
+                    Path::new("/nonexistent-wake-codex"),
+                    Duration::from_secs(1)
+                )
+                .unwrap(),
+                std::env::var("WAKE_GATE_EXPECT_CLAIMS")
+                    .unwrap_or_else(|_| "0".into())
+                    .parse::<usize>()
+                    .unwrap()
+            );
+            return;
+        }
+        let (dir, db) = setup();
+        accept(&db, &payload()).unwrap();
+        let path = dir.path().join("state/state.sqlite3");
+        let mut control = connect(&path).unwrap();
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        control_claim_gate(&mut control, "init", a, None, None).unwrap();
+        control_claim_gate(&mut control, "open", a, Some(1), None).unwrap();
+        control.execute_batch("BEGIN IMMEDIATE; UPDATE wake_delivery_claim_gate SET is_open=0; UPDATE wake_delivery_claim_gate SET owner='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',generation=2; UPDATE wake_delivery_claim_gate SET is_open=1;").unwrap();
+        let marker = dir.path().join("blocked");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bridge::tests::cooperative_gate_concurrent_claim_rejects_previous_owner",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", dir.path())
+            .env("CODEX_WAKE_GATE_OWNER", a)
+            .env("CODEX_WAKE_GATE_GENERATION", "1")
+            .env(CHILD, &path)
+            .env("WAKE_GATE_BUSY_MARKER", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !marker.exists() {
+            control.execute_batch("ROLLBACK").unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("claim did not contend with the transfer transaction");
+        }
+        control.execute_batch("COMMIT").unwrap();
+        let status = child.wait_timeout(Duration::from_secs(10)).unwrap();
+        if status.is_none() {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.is_some() && output.status.success(),
+            "isolated claim failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(row_state(&db), "ready");
+        assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
+        assert!(claims_open_for(&db, Some(b), Some("2")).unwrap());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bridge::tests::cooperative_gate_concurrent_claim_rejects_previous_owner",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", dir.path())
+            .env("CODEX_WAKE_GATE_OWNER", b)
+            .env("CODEX_WAKE_GATE_GENERATION", "2")
+            .env(CHILD, &path)
+            .env("WAKE_GATE_BUSY_MARKER", &marker)
+            .env("WAKE_GATE_EXPECT_CLAIMS", "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "current owner could not claim: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1175,6 +1936,117 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(capture).unwrap().lines().count(), 1);
         }
+    }
+
+    #[test]
+    fn closed_claim_gate_retains_real_events_until_reopened() {
+        let (dir, db) = setup();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(accept(&db, &payload()).unwrap(), "recorded");
+        drop(db);
+        let mut db = connect(&dir.path().join("state/state.sqlite3")).unwrap();
+        let capture = dir.path().join("calls");
+        let codex = fake_codex(dir.path(), &format!("echo call >> '{}'", capture.display()));
+        assert_eq!(
+            dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert_eq!(row_state(&db), "ready");
+        assert!(!capture.exists());
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let mut db = connect(&dir.path().join("state/state.sqlite3")).unwrap();
+        assert_eq!(
+            dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            1
+        );
+        assert_eq!(
+            dispatch(&mut db, &codex, Duration::from_secs(2)).unwrap(),
+            0
+        );
+        assert_eq!(row_state(&db), "queued");
+        assert_eq!(fs::read_to_string(capture).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn claim_gate_close_serializes_with_real_dispatcher() {
+        let (dir, db) = setup();
+        accept(&db, &payload()).unwrap();
+        let path = dir.path().join("state/state.sqlite3");
+        let capture = dir.path().join("calls");
+        let codex = fake_codex(dir.path(), &format!("echo call >> '{}'", capture.display()));
+        let mut other = connect(&path).unwrap();
+        // Hold SQLite's writer lock with the gate closed, while a real dispatch starts.
+        db.execute_batch(
+            "BEGIN IMMEDIATE; UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1;",
+        )
+        .unwrap();
+        static BUSY_OBSERVED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        BUSY_OBSERVED.store(false, Ordering::SeqCst);
+        other
+            .busy_handler(Some(|_| {
+                BUSY_OBSERVED.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(1));
+                true
+            }))
+            .unwrap();
+        let worker =
+            thread::spawn(move || dispatch(&mut other, &codex, Duration::from_secs(2)).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !BUSY_OBSERVED.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            BUSY_OBSERVED.load(Ordering::SeqCst),
+            "dispatcher never contended for the writer lock"
+        );
+        db.execute_batch("COMMIT").unwrap();
+        assert_eq!(worker.join().unwrap(), 0);
+        assert_eq!(row_state(&db), "ready");
+        assert!(!capture.exists());
+    }
+
+    #[test]
+    fn closing_claim_gate_does_not_abort_a_claimed_delivery() {
+        let (dir, db) = setup();
+        accept(&db, &payload()).unwrap();
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let codex = fake_codex(
+            dir.path(),
+            &format!(
+                "touch '{}'; while [ ! -e '{}' ]; do sleep 0.01; done",
+                started.display(),
+                release.display()
+            ),
+        );
+        let mut dispatcher = connect(&dir.path().join("state/state.sqlite3")).unwrap();
+        let worker = thread::spawn(move || {
+            dispatch(&mut dispatcher, &codex, Duration::from_secs(10)).unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.exists(), "delivery did not start");
+        assert_eq!(row_state(&db), "sending");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        fs::write(release, b"release").unwrap();
+        assert_eq!(worker.join().unwrap(), 1);
+        assert_eq!(row_state(&db), "queued");
     }
 
     #[test]

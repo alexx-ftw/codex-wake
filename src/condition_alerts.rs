@@ -200,8 +200,13 @@ pub(crate) fn reconcile(db: &Connection) -> Result<usize> {
 }
 
 fn claim_ready(db: &Connection) -> Result<Option<(String, Alert)>> {
+    crate::bridge::initialize_claim_gate(db)?;
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     record_uncertainty(&tx)?;
+    if !crate::bridge::claims_open(&tx)? {
+        tx.commit()?;
+        return Ok(None);
+    }
     let row: Option<(String, Alert)> = tx
         .query_row(
             "SELECT id,ambiguity,group_id,target_thread,kind,repo,resource,event,outcome,
@@ -407,6 +412,35 @@ mod tests {
         )
         .unwrap();
         group
+    }
+
+    #[test]
+    fn claim_gate_persists_ambiguity_notice_until_reopened() {
+        let db = db();
+        ci_member(&db);
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&db, |_, _, _| panic!("closed gate sent alert")).unwrap(),
+            0
+        );
+        let state: String = db
+            .query_row("SELECT state FROM condition_alerts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "ready");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&db, |_, _, _| Ok(("queued".into(), None))).unwrap(),
+            1
+        );
     }
 
     #[test]

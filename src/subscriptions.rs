@@ -1377,6 +1377,7 @@ fn expiration_tick_with_clock(
     mut send: impl FnMut(&str, &str, bool) -> Result<(String, Option<String>)>,
 ) -> Result<usize> {
     initialize(db)?;
+    crate::bridge::initialize_claim_gate(db)?;
     let stale_senders = immediate(db, || {
         let now = clock()?;
         expire_due_in_transaction(db, now)?;
@@ -1430,6 +1431,9 @@ fn expiration_tick_with_clock(
     let mut attempted = 0;
     loop {
         let row = immediate(db, || {
+            if !crate::bridge::claims_open(db)? {
+                return Ok(None);
+            }
             // Refresh the timestamp after each lock acquisition so a long
             // batch does not make subsequent claims appear old on arrival.
             let now = clock()?;
@@ -1735,13 +1739,20 @@ fn activate_queued_goal_with(
     id: &str,
     activate: impl FnOnce(&str) -> Result<Value>,
 ) -> Result<bool> {
+    crate::bridge::initialize_claim_gate(db)?;
     let sender = goal_sender_identity();
     let next_check = epoch_ms()?.saturating_add(15_000);
-    let claim = db.query_row(
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !crate::bridge::claims_open(&tx)? {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let claim = tx.query_row(
         "UPDATE subscriptions SET goal_stage='activating',updated=CURRENT_TIMESTAMP,goal_sender_pid=?2,goal_sender_start=?3,goal_sender_boot=?4,goal_sender_namespace=?5,goal_sender_next_check=?6 WHERE id=?1 AND resume_goal=1 AND state='sending' AND goal_stage='input_queued' RETURNING thread,reason",
         params![id, sender.as_ref().map(|s| s.0), sender.as_ref().map(|s| s.1), sender.as_ref().map(|s| &s.2), sender.as_ref().map(|s| &s.3), next_check],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     ).optional()?;
+    tx.commit()?;
     let Some((thread, queue_reason)) = claim else {
         return Ok(false);
     };
@@ -1889,6 +1900,7 @@ fn reconcile_interrupted_goals_with(
 /// Claim and send ready events once. A non-successful/ambiguous send is never retried automatically.
 pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<usize> {
     initialize(db)?;
+    crate::bridge::initialize_claim_gate(db)?;
     reconcile_interrupted_goals_with(db, timeout, |thread, remaining| {
         crate::goals::get_with_timeout(codex, thread, remaining)
     })?;
@@ -1902,10 +1914,16 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
         if let Some(id) = queued_goal {
             if activate_queued_goal(db, &id, codex)? {
                 attempted += 1;
+                continue;
             }
-            continue;
+            // Another worker or a closed gate prevented this activation.
+            return Ok(attempted);
         }
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !crate::bridge::claims_open(&transaction)? {
+            transaction.commit()?;
+            return Ok(attempted);
+        }
         let row = transaction
             .query_row(
                 "SELECT id,source_event_key,kind,repo,resource,event,thread,outcome,message_template,source_json,execution_json,required_source,resume_goal FROM subscriptions \
@@ -2056,8 +2074,16 @@ pub fn dispatch(db: &mut Connection, codex: &Path, timeout: Duration) -> Result<
                         match queued {
                             Ok((state, reason)) if state == "queued" => {
                                 ensure!(db.execute("UPDATE subscriptions SET goal_stage='input_queued',reason=?2,updated=CURRENT_TIMESTAMP WHERE id=?1 AND state='sending' AND goal_stage='preparing'", params![id, reason])? == 1, "Subscription claim was lost after queue acceptance");
-                                activate_queued_goal(db, &id, codex)?;
-                                span.finish("observed", "goal_activation_dispatched", 1);
+                                let activated = activate_queued_goal(db, &id, codex)?;
+                                span.finish(
+                                    "observed",
+                                    if activated {
+                                        "goal_activation_dispatched"
+                                    } else {
+                                        "goal_activation_deferred"
+                                    },
+                                    1,
+                                );
                                 attempted += 1;
                                 continue;
                             }
@@ -2193,6 +2219,7 @@ fn dependency_tick_with_clock(
     ) -> Result<(String, Option<String>)>,
 ) -> Result<usize> {
     initialize(db)?;
+    crate::bridge::initialize_claim_gate(db)?;
     let now = clock()?;
     // A sender left in this state across a service restart has an unknown delivery outcome.
     db.execute("INSERT OR IGNORE INTO dependency_notice_uncertainties(subscription_id,generation,reason,recorded_at_ms) SELECT id,COALESCE(dependency_notice_generation,dependency_period_generation),'send_outcome_unknown: sender stopped while delivery was in progress',?2 FROM subscriptions WHERE dependency_notice_state='sending' AND dependency_notice_started_at_ms<=?1", params![now.saturating_sub(120_000), now])?;
@@ -2201,6 +2228,10 @@ fn dependency_tick_with_clock(
     loop {
         let row = immediate(db, || {
             let now = clock()?;
+            if !crate::bridge::claims_open(db)? {
+                expire_due_in_transaction(db, now)?;
+                return Ok(None);
+            }
             expire_due_in_transaction(db, now)?;
             let row = db.query_row(
                 "SELECT id,repo,resource,thread,dependency_timeout_secs,execution_json,dependency_period_generation,?1 FROM subscriptions \
@@ -2432,6 +2463,287 @@ mod tests {
                 Some("goal_resume_unconfirmed_input_queued".into())
             )
         );
+    }
+
+    #[test]
+    fn claim_gate_retains_ready_and_already_queued_subscription() {
+        let mut db = db();
+        let ready = subscribe(&db, "job", "ci", "ready", "failure", THREAD).unwrap();
+        publish_with_source(&db, "job", "ci", "ready", "failure", &json!({})).unwrap();
+        let queued = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        db.execute("UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='input_queued' WHERE id=?1", [&queued]).unwrap();
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&mut db, Path::new("/bin/false"), Duration::from_secs(1)).unwrap(),
+            0
+        );
+        assert!(
+            !activate_queued_goal_with(&db, &queued, |_| panic!("closed gate activated goal"))
+                .unwrap()
+        );
+        assert_eq!(status_for_id(&db, &ready).unwrap()["state"], "ready");
+        assert_eq!(
+            status_for_id(&db, &queued).unwrap()["goal_stage"],
+            "input_queued"
+        );
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            activate_queued_goal_with(&db, &queued, |_| Ok(json!({"status":"active"}))).unwrap()
+        );
+        assert_eq!(status_for_id(&db, &queued).unwrap()["state"], "queued");
+        assert_eq!(status_for_id(&db, &ready).unwrap()["state"], "ready");
+    }
+
+    #[test]
+    fn claim_gate_retains_subscription_ready_event_until_reopened() {
+        let mut db = db();
+        let id = subscribe(&db, "job", "ci", "ready", "failure", THREAD).unwrap();
+        publish_with_source(&db, "job", "ci", "ready", "failure", &json!({})).unwrap();
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let missing = Path::new("/nonexistent-codex-wake-test");
+        assert_eq!(
+            dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
+            0
+        );
+        assert_eq!(status_for_id(&db, &id).unwrap()["state"], "ready");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&mut db, missing, Duration::from_secs(1)).unwrap(),
+            1
+        );
+        assert_eq!(status_for_id(&db, &id).unwrap()["state"], "ready");
+    }
+
+    #[test]
+    fn claim_gate_closes_between_queue_acceptance_and_goal_activation() {
+        use std::{
+            os::unix::net::UnixListener,
+            process::{Command, Stdio},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            thread,
+        };
+        use wait_timeout::ChildExt;
+        const CHILD: &str = "WAKE_QUEUE_GATE_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let mut db = crate::bridge::connect(Path::new(&path)).unwrap();
+            initialize(&db).unwrap();
+            let id = subscribe_with_delivery(
+                &db,
+                "artifact",
+                "ci",
+                "pkg",
+                "available",
+                THREAD,
+                DeliveryConfig {
+                    resume_goal: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            publish_with_source(&db, "artifact", "ci", "pkg", "available", &json!({})).unwrap();
+            assert_eq!(
+                dispatch(&mut db, Path::new("/bin/false"), Duration::from_secs(5)).unwrap(),
+                1
+            );
+            let before = status_for_id(&db, &id).unwrap();
+            assert_eq!(before["state"], "sending");
+            assert_eq!(before["goal_stage"], "input_queued");
+            db.execute(
+                "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                dispatch(&mut db, Path::new("/bin/false"), Duration::from_secs(5)).unwrap(),
+                1
+            );
+            let after = status_for_id(&db, &id).unwrap();
+            assert_eq!(after["state"], "queued");
+            assert_eq!(after["goal_stage"], "active");
+            assert_eq!(
+                dispatch(&mut db, Path::new("/bin/false"), Duration::from_secs(5)).unwrap(),
+                0
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("state/state.sqlite3");
+        let socket = root.path().join("rpc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let queue_count = Arc::new(AtomicUsize::new(0));
+        let activation_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (q, a, done, path) = (
+            queue_count.clone(),
+            activation_count.clone(),
+            stop.clone(),
+            db_path.clone(),
+        );
+        let server = thread::spawn(move || {
+            let mut active = false;
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                ws.read().unwrap();
+                let request: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "thread/goal/get" => {
+                        json!({"goal":{"status":if active {"active"} else {"paused"},"updatedAt":42}})
+                    }
+                    "thread/queue/add" => {
+                        q.fetch_add(1, Ordering::SeqCst);
+                        // Acceptance is recorded before closing the gate; withhold the response
+                        // until the close commits, forcing the real handoff boundary.
+                        let db = Connection::open(&path).unwrap();
+                        db.busy_timeout(Duration::from_secs(5)).unwrap();
+                        assert_eq!(
+                            db.execute(
+                                "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+                                []
+                            )
+                            .unwrap(),
+                            1
+                        );
+                        json!({"queuedSubmission":{"id":"accepted-1"}})
+                    }
+                    "thread/goal/set" => {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        active = true;
+                        json!({})
+                    }
+                    method => panic!("unexpected method {method}"),
+                };
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+        });
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "subscriptions::tests::claim_gate_closes_between_queue_acceptance_and_goal_activation", "--nocapture"])
+            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", root.path())
+            .env("CODEX_HOME", root.path().join("codex")).env("CODEX_WAKE_RPC_SOCKET", &socket)
+            .env(CHILD, &db_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        let status = child.wait_timeout(Duration::from_secs(20)).unwrap();
+        if status.is_none() {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert!(
+            status.is_some() && output.status.success(),
+            "isolated receiver test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(queue_count.load(Ordering::SeqCst), 1, "input was requeued");
+        assert_eq!(
+            activation_count.load(Ordering::SeqCst),
+            1,
+            "goal activation count"
+        );
+    }
+
+    #[test]
+    fn cooperative_gate_rejects_stale_goal_activation() {
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "WAKE_GATE_ACTIVATION_TEST_DB";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let db = Connection::open(path).unwrap();
+            let id: String = db
+                .query_row("SELECT id FROM subscriptions", [], |r| r.get(0))
+                .unwrap();
+            let expected = std::env::var("WAKE_GATE_EXPECT_ACTIVATION").unwrap() == "1";
+            let claimed =
+                activate_queued_goal_with(&db, &id, |_| Ok(json!({"status":"active"}))).unwrap();
+            assert_eq!(claimed, expected);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        initialize(&db).unwrap();
+        let id = subscribe(&db, "artifact", "ci", "pkg", "available", THREAD).unwrap();
+        db.execute("UPDATE subscriptions SET resume_goal=1,state='sending',goal_stage='input_queued' WHERE id=?1", [&id]).unwrap();
+        let old = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let new = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        crate::bridge::control_claim_gate(&mut db, "init", old, None, None).unwrap();
+        crate::bridge::control_claim_gate(&mut db, "transfer", old, Some(1), Some(new)).unwrap();
+        crate::bridge::control_claim_gate(&mut db, "open", new, Some(2), None).unwrap();
+        for (owner, generation, expected) in [(old, "1", "0"), (new, "2", "1")] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "subscriptions::tests::cooperative_gate_rejects_stale_goal_activation",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", dir.path())
+                .env("CODEX_WAKE_GATE_OWNER", owner)
+                .env("CODEX_WAKE_GATE_GENERATION", generation)
+                .env(CHILD, &path)
+                .env("WAKE_GATE_EXPECT_ACTIVATION", expected)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated activation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let state = status_for_id(&db, &id).unwrap();
+            assert_eq!(
+                state["goal_stage"],
+                if expected == "1" {
+                    "active"
+                } else {
+                    "input_queued"
+                }
+            );
+        }
     }
 
     #[test]
@@ -2892,6 +3204,201 @@ mod tests {
             .query_row("SELECT count(*) FROM future_audit", [], |row| row.get(0))
             .unwrap();
         assert_eq!(trigger_rows, 1);
+    }
+
+    #[test]
+    fn review_close_during_expiry_send_stops_next_claim() {
+        let db = db();
+        for resource in ["first", "second"] {
+            let id = subscribe(&db, "artifact", "ci", resource, "available", THREAD).unwrap();
+            db.execute(
+                "UPDATE subscriptions SET expires_at_ms=10 WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        }
+        let mut sends = 0;
+        let count = expiration_tick_with(&db, 10, |_, _, _| {
+            sends += 1;
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM subscriptions WHERE expiration_notice_state='sending'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            db.execute(
+                "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+                [],
+            )
+            .unwrap();
+            Ok(("queued".into(), None))
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sends, 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM subscriptions WHERE expiration_notice_state='ready'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM subscriptions WHERE expiration_notice_state='queued'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            expiration_tick_with(&db, 10, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            expiration_tick_with(&db, 10, |_, _, _| panic!("expiry replay")).unwrap(),
+            0
+        );
+        assert_eq!(sends, 2);
+    }
+
+    #[test]
+    fn review_close_during_dependency_send_stops_next_claim() {
+        let db = db();
+        for resource in ["first", "second"] {
+            let id = subscribe(&db, "dependency", "ci", resource, "recovered", THREAD).unwrap();
+            db.execute(
+                "UPDATE subscriptions SET dependency_deadline_ms=10 WHERE id=?1",
+                [&id],
+            )
+            .unwrap();
+        }
+        let mut sends = 0;
+        let count = dependency_tick_with(&db, 10, |_, _, _| {
+            sends += 1;
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM subscriptions WHERE dependency_notice_state='sending'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            db.execute(
+                "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+                [],
+            )
+            .unwrap();
+            Ok(("queued".into(), None))
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sends, 1);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM subscriptions WHERE dependency_notice_state IS NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM subscriptions WHERE dependency_notice_state='queued'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dependency_tick_with(&db, 10, |_, _, _| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            dependency_tick_with(&db, 10, |_, _, _| panic!("dependency replay")).unwrap(),
+            0
+        );
+        assert_eq!(sends, 2);
+    }
+
+    #[test]
+    fn claim_gate_retains_expiry_and_dependency_notices() {
+        let db = db();
+        let expired = subscribe(&db, "artifact", "ci", "expires", "available", THREAD).unwrap();
+        let dependency =
+            subscribe(&db, "dependency", "ci", "waiting", "recovered", THREAD).unwrap();
+        db.execute(
+            "UPDATE subscriptions SET expires_at_ms=10 WHERE id=?1",
+            [&expired],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE subscriptions SET dependency_deadline_ms=10 WHERE id=?1",
+            [&dependency],
+        )
+        .unwrap();
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            expiration_tick_with(&db, 10, |_, _, _| panic!("closed gate sent expiry")).unwrap(),
+            0
+        );
+        assert_eq!(
+            dependency_tick_with(&db, 10, |_, _, _| panic!(
+                "closed gate sent dependency notice"
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            status_for_id(&db, &expired).unwrap()["expiration_notice_state"],
+            "ready"
+        );
+        assert_eq!(status_for_id(&db, &dependency).unwrap()["state"], "waiting");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            expiration_tick_with(&db, 10, |_, _, _| Ok(("queued".into(), None))).unwrap(),
+            1
+        );
+        assert_eq!(
+            dependency_tick_with(&db, 10, |_, _, _| Ok(("queued".into(), None))).unwrap(),
+            1
+        );
     }
 
     #[test]
