@@ -52,19 +52,28 @@ jq -Rsc '[
       ["later_error","Receiver reported an error after its health marker"],
       ["activation_journal","Receiver activation journal mismatch"],
       ["preparation","Controller preparation failed"],
+      ["missing_environment","environment variable not found"],
+      ["sqlite_type","Invalid column type"],
+      ["socket_refused","Connection refused"],
+      ["permission","Permission denied"],
       ["missing_rows","returned no rows"],
       ["missing_table","no such table"],
       ["locked","database is locked"]
     ] as $rules | . as $message | [$rules[] | . as $rule | select($message | contains($rule[1])) | $rule[0]]'
 }
 diagnose() {
-  local state_json gate_json health_json codes phase matches expected actual unit_pid
+  local state_json gate_json health_json codes phase matches expected actual unit_pid event_pid
   state_json=$(ctl show codex-wake.service -p LoadState -p ActiveState -p SubState -p MainPID -p Result -p ExecMainCode -p ExecMainStatus |
     jq -Rn '[inputs | split("=") | {(.[0]):.[1]}] | add') || state_json='{}'
   unit_pid=$(jq -r '.MainPID // "0"' <<< "$state_json")
   [[ $unit_pid =~ ^[0-9]+$ ]] || unit_pid=0
+  event_pid=$unit_pid
+  if [[ $event_pid == 0 ]]; then
+    event_pid=$(sqlite3 -readonly "$state/telemetry.sqlite3" "SELECT pid FROM events WHERE operation='cli.receiver' ORDER BY at_ms DESC,rowid DESC LIMIT 1;" 2>/dev/null) || event_pid=0
+    [[ $event_pid =~ ^[0-9]+$ ]] || event_pid=0
+  fi
   gate_json=$(sqlite3 -readonly "$db" "SELECT json_object('open',is_open,'generation',generation,'bound',receiver_pid IS NOT NULL,'pid_matches_unit',receiver_pid=$unit_pid,'start_present',receiver_start IS NOT NULL,'lifecycle_present',receiver_lifecycle IS NOT NULL,'owner_matches_lifecycle',owner=json_extract(receiver_lifecycle,'$.owner'),'generation_matches_lifecycle',generation=json_extract(receiver_lifecycle,'$.generation')) FROM wake_delivery_claim_gate WHERE id=1;" 2>/dev/null) || gate_json='{}'
-  health_json=$(sqlite3 -readonly "$state/telemetry.sqlite3" "SELECT json_group_array(json_object('operation',operation,'outcome',outcome,'count',n,'latest_ms',latest)) FROM (SELECT operation,outcome,count(*) n,max(at_ms) latest FROM events WHERE pid=$unit_pid AND operation IN ('receiver.prepared','receiver.heartbeat','receiver.start','receiver.dispatch','receiver.worker','cli.receiver') GROUP BY operation,outcome);" 2>/dev/null) || health_json='[]'
+  health_json=$(sqlite3 -readonly "$state/telemetry.sqlite3" "SELECT json_group_array(json_object('operation',operation,'outcome',outcome,'binding_state',binding_state,'count',n,'latest_ms',latest)) FROM (SELECT operation,outcome,CASE WHEN operation='receiver.binding' AND reason IN ('activating_start','active_running','other_state') THEN reason ELSE NULL END binding_state,count(*) n,max(at_ms) latest FROM events WHERE pid=$event_pid AND operation IN ('receiver.binding','receiver.prepared','receiver.heartbeat','receiver.start','receiver.dispatch','receiver.worker','cli.receiver') GROUP BY operation,outcome,binding_state);" 2>/dev/null) || health_json='[]'
   # Only fixed codes leave this private fixture; never export error strings or journal messages.
   codes=$({ cat "$root/upgrade-error" 2>/dev/null || true; receiver_journal 2>/dev/null || true; } |
     receiver_error_codes) || codes='[]'

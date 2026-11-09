@@ -110,3 +110,10 @@ Health queries use the same hashed invocation subject as `observability::emit`.
 A subprocess regression writes through that actual telemetry path and runs the
 real health query, including a later failed heartbeat. Generation units preserve
 the configured environment; only their executable and working directory change.
+
+Before binding, the receiver waits up to five seconds for the manager's strict
+running/identity check to succeed. This covers Type=exec startup ordering; it
+only repeats read-only verification and never repeats start/stop/transfer.
+Bootstrap diagnostics export fixed error codes, unit/gate state and operation
+counts. Raw messages are classified inside the disposable qualification user
+or by root restricted to that UID and unit; the original text is discarded.

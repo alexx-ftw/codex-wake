@@ -325,7 +325,32 @@ pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> R
         "Lifecycle generation mismatch"
     );
     let config = Config::from_env()?;
-    let s = running(&config, &spec)?;
+    let initial = snapshot()?;
+    let state = match (
+        field(&initial, "ActiveState")?,
+        field(&initial, "SubState")?,
+    ) {
+        ("activating", "start") => "activating_start",
+        ("active", "running") => "active_running",
+        _ => "other_state",
+    };
+    crate::observability::emit(
+        "receiver.binding",
+        "observed",
+        state,
+        None,
+        Duration::ZERO,
+        1,
+    );
+    // Type=exec can still be activating when its main process first queries the manager.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let s = loop {
+        match running(&config, &spec) {
+            Ok(s) => break s,
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    };
     ensure!(
         field(&s, "MainPID")? == std::process::id().to_string()
             && env::var("INVOCATION_ID")? == invocation(&s)?,

@@ -23,8 +23,8 @@ CREATE TABLE wake_delivery_claim_gate(id INTEGER PRIMARY KEY,is_open INTEGER,gen
 INSERT INTO wake_delivery_claim_gate VALUES(1,0,1,123,1,'{"owner":"owner","generation":1}','owner');
 SQL
 sqlite3 "$scratch/telemetry.sqlite3" <<'SQL'
-CREATE TABLE events(pid INTEGER,operation TEXT,outcome TEXT,at_ms INTEGER);
-INSERT INTO events VALUES(123,'receiver.prepared','ok',1);
+CREATE TABLE events(pid INTEGER,operation TEXT,outcome TEXT,at_ms INTEGER,reason TEXT);
+INSERT INTO events VALUES(123,'receiver.prepared','ok',1,'');
 SQL
 ctl() { printf 'LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainCode=0\nExecMainStatus=0\n'; }
 receiver_journal() { printf 'PRIVATE_TEST_TOKEN Receiver has not bound its lifecycle generation'; }

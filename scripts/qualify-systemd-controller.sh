@@ -305,6 +305,11 @@ if [[ $handoff_mode != 0 ]]; then
           printf 'upgrade qualification: %s\n' "$diagnostic" >&2
         fi
         if as_qual_user jq -ce '{stage,line,status,error_class,journal_phase,service,gate,health,error_codes,unit_matches_journal}' "$qual_root/upgrade-diagnostic.json" > "$output.upgrade-diagnostic.json" 2>/dev/null; then
+          # The disposable UID may lack journal read access. Root reads only this fixture's unit;
+          # the pure classifier emits fixed codes and discards every original message.
+          eval "$(sed -n '/^receiver_error_codes() {/,/^}/p' "$handoff_script")"
+          root_codes=$(sudo journalctl --no-pager -n 40 -o cat "_UID=$qual_uid" _SYSTEMD_USER_UNIT=codex-wake.service 2>/dev/null | receiver_error_codes) || root_codes='[]'
+          jq --argjson codes "$root_codes" '.error_codes = ((.error_codes + $codes) | unique)' "$output.upgrade-diagnostic.json" > "$output.upgrade-diagnostic.tmp" && mv "$output.upgrade-diagnostic.tmp" "$output.upgrade-diagnostic.json"
           cat "$output.upgrade-diagnostic.json" >&2
         fi
       fi
