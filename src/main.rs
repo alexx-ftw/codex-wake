@@ -610,17 +610,27 @@ fn recover_with_queue(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis(),
     )?;
-    attempted += codex_wake::pr_ci_runtime::dispatch(&mut db, now, |delivery, message| {
-        let run = delivery.run_id.to_string();
-        let attempt = delivery.attempt.to_string();
-        let key = delivery_evidence::source_fields_identity(
-            "github.workflow_run.completed",
-            &[&delivery.repo, &run, &attempt],
-        )?;
-        let id = prepare_ci_delivery_identity(&config.db, &key, &delivery.thread)?;
-        queue(&delivery.thread, message, &id, true)
-    })?
-    .claimed;
+    attempted +=
+        codex_wake::pr_ci_runtime::dispatch(&mut db, now, |dispatch_db, delivery, message| {
+            let run = delivery.run_id.to_string();
+            let attempt = delivery.attempt.to_string();
+            let key = delivery_evidence::source_fields_identity(
+                "github.workflow_run.completed",
+                &[&delivery.repo, &run, &attempt],
+            )?;
+            let id = prepare_ci_delivery_identity(&config.db, &key, &delivery.thread)?;
+            let (state, reason) = queue(&delivery.thread, message, &id, true)?;
+            if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
+                codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                    dispatch_db,
+                    &delivery.thread,
+                    "native_queue_resume_warning",
+                    &id,
+                )?;
+            }
+            Ok((state, reason))
+        })?
+        .claimed;
     Ok(attempted)
 }
 
@@ -5474,7 +5484,7 @@ mod pr_hook_registration_integration_tests {
         let mut delivered = Vec::new();
         let first_attempts = recover_with_queue(&config, |thread, message, id, resume| {
             delivered.push((thread.to_owned(), message.to_owned(), id.to_owned(), resume));
-            Ok(("queued".into(), None))
+            Ok(("queued".into(), Some("native_queue_resume_warning".into())))
         })
         .unwrap();
         let second_attempts = recover_with_queue(&config, |thread, message, id, resume| {
@@ -5496,6 +5506,17 @@ mod pr_hook_registration_integration_tests {
             .query_row("SELECT state FROM pr_ci_deliveries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(state, "delivered");
+        let recovery: (String, String) = db
+            .query_row(
+                "SELECT thread,client_ids_json FROM native_wake_recovery",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery.0, thread);
+        let ids: Value = serde_json::from_str(&recovery.1).unwrap();
+        assert_eq!(ids["client_ids"], json!([delivered[0].2.as_str()]));
+        assert_eq!(ids["unattributed"], false);
     }
 
     #[test]

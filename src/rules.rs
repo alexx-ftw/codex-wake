@@ -468,6 +468,7 @@ fn dispatch_with_identity(
         let mut stage = "invalid_configuration";
         let mut may_retry = false;
         let mut delivery_thread = None;
+        let mut delivery_client_id = None;
         let result = (|| -> Result<(String, Option<String>)> {
             let mut input: RuleInput = serde_json::from_str(&raw)?;
             validate(&mut input)?;
@@ -582,6 +583,7 @@ fn dispatch_with_identity(
             } else {
                 None
             };
+            delivery_client_id = identity.as_ref().map(|(_, client_id)| client_id.to_owned());
             let message = format!(
                 "{}\n\nMatched PR comment event data: repository={}, pr={}, comment_id={}, event={}.",
                 rendered_prompt, input.repo, input.pr, comment_id, header
@@ -629,11 +631,20 @@ fn dispatch_with_identity(
                 .as_deref()
                 .context("Accepted rule delivery has no target thread")?;
             let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            codex_wake::pr_ci_runtime::record_native_wake_recovery(
-                &tx,
-                thread,
-                "native_queue_resume_warning",
-            )?;
+            if let Some(client_id) = delivery_client_id.as_deref() {
+                codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                    &tx,
+                    thread,
+                    "native_queue_resume_warning",
+                    client_id,
+                )?;
+            } else {
+                codex_wake::pr_ci_runtime::record_unattributed_native_wake_recovery(
+                    &tx,
+                    thread,
+                    "native_queue_resume_warning",
+                )?;
+            }
             ensure!(
                 tx.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5 AND state='creating'",params![state,reason,rule_id,header,comment_id])? == 1,
                 "Rule delivery claim was lost before wake recovery was recorded"
@@ -990,15 +1001,61 @@ mod tests {
             .unwrap();
         assert_eq!(state, "queued");
         assert_eq!(reason.as_deref(), Some("native_queue_resume_warning"));
-        let (thread, recovery_reason): (String, String) = db
+        let (thread, recovery_reason, raw_ids): (String, String, String) = db
             .query_row(
-                "SELECT thread,reason FROM native_wake_recovery",
+                "SELECT thread,reason,client_ids_json FROM native_wake_recovery",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(thread, THREAD);
         assert_eq!(recovery_reason, "native_queue_resume_warning");
+        let stored_ids: Value = serde_json::from_str(&raw_ids).unwrap();
+        assert_eq!(stored_ids["client_ids"], json!([expected_client_id]));
+        assert_eq!(stored_ids["unattributed"], false);
+    }
+
+    #[test]
+    fn accepted_comment_resume_warning_without_identity_remains_unattributed() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        rule.model = Some("gpt-6.1-sol".into());
+        rule.reasoning_effort = Some("medium".into());
+        configure(&db, rule).unwrap();
+        let source = payload();
+        assert_eq!(accept(&db, "issue_comment", &source).unwrap(), 1);
+        db.execute(
+            "UPDATE rule_deliveries SET event_identity_verified=0,source_event_key=NULL",
+            [],
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+
+        dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut |_, _| unreachable!(),
+            &mut |thread, _, _, event_key, client_id| {
+                assert_eq!(thread, THREAD);
+                assert_eq!(event_key, None);
+                assert_eq!(client_id, None);
+                Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        let raw_ids: String = db
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_ids: Value = serde_json::from_str(&raw_ids).unwrap();
+        assert_eq!(stored_ids["client_ids"], json!([]));
+        assert_eq!(stored_ids["unattributed"], true);
     }
 
     #[test]

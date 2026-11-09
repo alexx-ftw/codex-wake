@@ -5,7 +5,7 @@
 
 use crate::pr_ci::{self, ApiResponse, Delivery, PollReport};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -58,42 +58,135 @@ pub struct DispatchReport {
     pub uncertain: usize,
 }
 
-/// Persist a wake retry after native queue acceptance. This records only the
-/// destination and warning; it never stores or resends the accepted input.
-pub fn record_native_wake_recovery(db: &Connection, thread: &str, reason: &str) -> Result<bool> {
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct NativeWakeIds {
+    client_ids: Vec<String>,
+    unattributed: bool,
+    generation: String,
+}
+
+fn native_wake_ids(raw: Option<&str>) -> Result<NativeWakeIds> {
+    let ids: NativeWakeIds = match raw {
+        Some(raw) => serde_json::from_str(raw)?,
+        None => NativeWakeIds {
+            unattributed: true,
+            ..NativeWakeIds::default()
+        },
+    };
+    if raw.is_some() {
+        uuid::Uuid::parse_str(&ids.generation)?;
+    }
+    for id in &ids.client_ids {
+        ensure!(
+            uuid::Uuid::parse_str(id)?.to_string() == *id,
+            "Invalid stored native recovery message identity"
+        );
+    }
+    Ok(ids)
+}
+
+/// Persist the exact accepted message identity, never its input. Multiple warnings
+/// accumulate obligations; an unattributed legacy warning cannot be cleared implicitly.
+pub fn record_native_wake_recovery(
+    db: &Connection,
+    thread: &str,
+    reason: &str,
+    client_id: &str,
+) -> Result<bool> {
+    record_native_wake_recovery_with_id(db, thread, reason, Some(client_id))
+}
+
+/// Retain a warning from a delivery path that cannot provide a verified message ID.
+/// Known IDs on the same row can still be started, but cannot resolve this warning.
+pub fn record_unattributed_native_wake_recovery(
+    db: &Connection,
+    thread: &str,
+    reason: &str,
+) -> Result<bool> {
+    record_native_wake_recovery_with_id(db, thread, reason, None)
+}
+
+fn record_native_wake_recovery_with_id(
+    db: &Connection,
+    thread: &str,
+    reason: &str,
+    client_id: Option<&str>,
+) -> Result<bool> {
     ensure!(
         reason == "native_queue_resume_warning",
         "Unsupported native wake recovery reason"
     );
     let thread = uuid::Uuid::parse_str(thread)?.to_string();
+    let client_id = client_id
+        .map(|id| uuid::Uuid::parse_str(id).map(|id| id.to_string()))
+        .transpose()?;
     initialize_native_wake_recovery(db)?;
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let recorded = record_native_wake_recovery_in(&tx, &thread, reason, client_id.as_deref())?;
+        tx.commit()?;
+        Ok(recorded)
+    } else {
+        record_native_wake_recovery_in(db, &thread, reason, client_id.as_deref())
+    }
+}
+
+fn record_native_wake_recovery_in(
+    db: &Connection,
+    thread: &str,
+    reason: &str,
+    client_id: Option<&str>,
+) -> Result<bool> {
+    let existing: Option<Option<String>> = db
+        .query_row(
+            "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+            [thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut ids = match existing {
+        Some(raw) => native_wake_ids(raw.as_deref())?,
+        None => NativeWakeIds::default(),
+    };
+    if let Some(client_id) = client_id {
+        ids.client_ids.push(client_id.to_owned());
+    } else {
+        ids.unattributed = true;
+    }
+    ids.client_ids.sort();
+    ids.client_ids.dedup();
+    ids.generation = uuid::Uuid::new_v4().to_string();
+    let raw = serde_json::to_string(&ids)?;
     Ok(db.execute(
-        "INSERT INTO native_wake_recovery(thread,reason,next_attempt_ms,backoff_ms,revision)
-         VALUES(?1,?2,0,1000,1)
+        "INSERT INTO native_wake_recovery
+         (thread,reason,next_attempt_ms,backoff_ms,revision,client_ids_json)
+         VALUES(?1,?2,0,1000,1,?3)
          ON CONFLICT(thread) DO UPDATE SET reason=excluded.reason,next_attempt_ms=0,
-             backoff_ms=1000,revision=native_wake_recovery.revision+1",
-        rusqlite::params![thread, reason],
+             backoff_ms=1000,revision=native_wake_recovery.revision+1,
+             client_ids_json=excluded.client_ids_json",
+        rusqlite::params![thread, reason, raw],
     )? != 0)
 }
 
 /// Retry only the native wake operation for accepted queue entries. Failed
-/// wakes remain durable and use bounded backoff; successful wakes clear them.
+/// wakes remain durable and use bounded backoff. The callback must confirm every
+/// supplied ID without resending input; unattributed legacy warnings stay durable.
 pub fn recover_native_wake_retries<F>(db: &Connection, now_ms: i64, mut wake: F) -> Result<usize>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(&str, &[String]) -> Result<()>,
 {
     initialize_native_wake_recovery(db)?;
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
     let due = {
         let mut statement = tx.prepare(
-            "SELECT thread,reason,revision,backoff_ms FROM native_wake_recovery
+            "SELECT thread,client_ids_json,revision,backoff_ms FROM native_wake_recovery
              WHERE next_attempt_ms<=?1 ORDER BY next_attempt_ms,thread LIMIT ?2",
         )?;
         statement
             .query_map([now_ms, WAKE_RETRY_BATCH], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                 ))
@@ -115,11 +208,14 @@ where
     tx.commit()?;
 
     let mut recovered = 0;
-    for (thread, _, revision, _) in due {
-        if wake(&thread).is_ok() {
+    for (thread, raw, revision, _) in due {
+        let ids = native_wake_ids(raw.as_deref())?;
+        if !ids.client_ids.is_empty() && wake(&thread, &ids.client_ids).is_ok() && !ids.unattributed
+        {
             recovered += db.execute(
-                "DELETE FROM native_wake_recovery WHERE thread=?1 AND revision=?2",
-                rusqlite::params![thread, revision],
+                "DELETE FROM native_wake_recovery
+                 WHERE thread=?1 AND revision=?2 AND client_ids_json=?3",
+                rusqlite::params![thread, revision, raw],
             )?;
         }
     }
@@ -127,14 +223,35 @@ where
 }
 
 fn initialize_native_wake_recovery(db: &Connection) -> Result<()> {
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        initialize_native_wake_recovery_in(&tx)?;
+        tx.commit()?;
+        Ok(())
+    } else {
+        initialize_native_wake_recovery_in(db)
+    }
+}
+
+fn initialize_native_wake_recovery_in(db: &Connection) -> Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS native_wake_recovery (
             thread TEXT PRIMARY KEY, reason TEXT NOT NULL,
             next_attempt_ms INTEGER NOT NULL DEFAULT 0,
             backoff_ms INTEGER NOT NULL DEFAULT 1000,
-            revision INTEGER NOT NULL DEFAULT 1
+            revision INTEGER NOT NULL DEFAULT 1,
+            client_ids_json TEXT
         );",
     )?;
+    let columns = {
+        let mut statement = db.prepare("PRAGMA table_info(native_wake_recovery)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !columns.iter().any(|column| column == "client_ids_json") {
+        db.execute_batch("ALTER TABLE native_wake_recovery ADD COLUMN client_ids_json TEXT")?;
+    }
     Ok(())
 }
 
@@ -381,9 +498,11 @@ where
 
 /// Dispatch already durable CI outbox rows without polling GitHub. Schedule it
 /// in the CI worker, independently of Wake's existing dispatcher.
+/// The delivery callback must persist an exact-ID wake recovery before returning
+/// `queued` with a wake warning; only the caller knows the identity it submitted.
 pub fn dispatch<D>(db: &mut Connection, now_ms: i64, deliver: D) -> Result<DispatchReport>
 where
-    D: FnMut(&Delivery, &str) -> Result<(String, Option<String>)>,
+    D: FnMut(&Connection, &Delivery, &str) -> Result<(String, Option<String>)>,
 {
     let started = Instant::now();
     dispatch_with_clock(db, now_ms, deliver, || {
@@ -398,7 +517,7 @@ fn dispatch_with_clock<D, C>(
     mut now: C,
 ) -> Result<DispatchReport>
 where
-    D: FnMut(&Delivery, &str) -> Result<(String, Option<String>)>,
+    D: FnMut(&Connection, &Delivery, &str) -> Result<(String, Option<String>)>,
     C: FnMut() -> i64,
 {
     let deliveries = pr_ci::claim_deliveries(db, now_ms, DISPATCH_BATCH, DELIVERY_LEASE)?;
@@ -408,11 +527,8 @@ where
     };
     for delivery in deliveries {
         let message = notification(&delivery);
-        match deliver(&delivery, &message) {
-            Ok((state, reason)) if state == "queued" => {
-                if let Some(reason @ "native_queue_resume_warning") = reason.as_deref() {
-                    record_native_wake_recovery(db, &delivery.thread, reason)?;
-                }
+        match deliver(db, &delivery, &message) {
+            Ok((state, _)) if state == "queued" => {
                 if pr_ci::ack_delivery(db, delivery.id)? {
                     report.accepted += 1;
                 } else {
@@ -462,7 +578,7 @@ pub fn spawn_dispatch<D>(
     deliver: D,
 ) -> tokio::task::JoinHandle<Result<DispatchReport>>
 where
-    D: FnMut(&Delivery, &str) -> Result<(String, Option<String>)> + Send + 'static,
+    D: FnMut(&Connection, &Delivery, &str) -> Result<(String, Option<String>)> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
         let mut db = open_database(database_path)?;
@@ -533,7 +649,7 @@ mod tests {
 
     fn dispatch_at<D>(db: &mut Connection, now_ms: i64, deliver: D) -> Result<DispatchReport>
     where
-        D: FnMut(&Delivery, &str) -> Result<(String, Option<String>)>,
+        D: FnMut(&Connection, &Delivery, &str) -> Result<(String, Option<String>)>,
     {
         dispatch_with_clock(db, now_ms, deliver, || now_ms)
     }
@@ -541,7 +657,7 @@ mod tests {
     #[test]
     fn accepted_queue_delivery_is_acknowledged() {
         let mut db = database();
-        let report = dispatch(&mut db, 1_000, |_, _| Ok(("queued".into(), None))).unwrap();
+        let report = dispatch(&mut db, 1_000, |_, _, _| Ok(("queued".into(), None))).unwrap();
         assert_eq!(report.accepted, 1);
         assert_eq!(pr_ci::uncertain_deliveries(&db).unwrap().len(), 0);
     }
@@ -549,7 +665,7 @@ mod tests {
     #[test]
     fn uncertain_send_is_not_requeued_automatically() {
         let mut db = database();
-        let report = dispatch(&mut db, 1_000, |_, _| Err(anyhow::anyhow!("ambiguous"))).unwrap();
+        let report = dispatch(&mut db, 1_000, |_, _, _| Err(anyhow::anyhow!("ambiguous"))).unwrap();
         assert_eq!(report.uncertain, 1);
         assert_eq!(pr_ci::uncertain_deliveries(&db).unwrap().len(), 1);
         assert_eq!(
@@ -563,7 +679,7 @@ mod tests {
     #[test]
     fn definitely_pre_send_result_returns_to_queue() {
         let mut db = database();
-        let report = dispatch_at(&mut db, 1_000, |_, _| Ok(("ready".into(), None))).unwrap();
+        let report = dispatch_at(&mut db, 1_000, |_, _, _| Ok(("ready".into(), None))).unwrap();
         assert_eq!(report.retried_before_send, 1);
         assert_eq!(
             pr_ci::claim_deliveries(&mut db, 6_000, 10, DELIVERY_LEASE)
@@ -598,7 +714,7 @@ mod tests {
 
         for marker in [BeforeSend::Unavailable, BeforeSend::Busy] {
             let mut db = database();
-            let report = dispatch_at(&mut db, 1_000, |_, _| {
+            let report = dispatch_at(&mut db, 1_000, |_, _, _| {
                 Err(anyhow::anyhow!("preparation failed").context(marker))
             })
             .unwrap();
@@ -612,7 +728,7 @@ mod tests {
         }
 
         let mut evidence_db = database();
-        let report = dispatch_at(&mut evidence_db, 2_000, |_, _| {
+        let report = dispatch_at(&mut evidence_db, 2_000, |_, _, _| {
             Err(before_send_failure(anyhow::anyhow!(
                 "could not open delivery evidence database"
             )))
@@ -622,7 +738,7 @@ mod tests {
         assert_eq!(pr_ci::uncertain_deliveries(&evidence_db).unwrap().len(), 0);
 
         let mut uncertain_db = database();
-        let report = dispatch(&mut uncertain_db, 3_000, |_, _| {
+        let report = dispatch(&mut uncertain_db, 3_000, |_, _, _| {
             Err(anyhow::anyhow!("unknown send state"))
         })
         .unwrap();
@@ -630,7 +746,7 @@ mod tests {
         assert_eq!(pr_ci::uncertain_deliveries(&uncertain_db).unwrap().len(), 1);
 
         let mut unknown_state_db = database();
-        let report = dispatch(&mut unknown_state_db, 4_000, |_, _| {
+        let report = dispatch(&mut unknown_state_db, 4_000, |_, _, _| {
             Ok(("unknown".into(), None))
         })
         .unwrap();
@@ -657,7 +773,7 @@ mod tests {
             .unwrap();
         }
         let calls = Cell::new(0);
-        let report = dispatch(&mut db, 1_000, |_, _| {
+        let report = dispatch(&mut db, 1_000, |_, _, _| {
             calls.set(calls.get() + 1);
             Err(anyhow::anyhow!("ambiguous send"))
         })
@@ -685,7 +801,7 @@ mod tests {
         )
         .unwrap();
 
-        let first = dispatch_at(&mut db, 1_000, |delivery, _| {
+        let first = dispatch_at(&mut db, 1_000, |_, delivery, _| {
             assert_eq!(delivery.run_id, 101);
             Err(anyhow::anyhow!(
                 "Target thread has an active writer; input was not sent"
@@ -694,14 +810,14 @@ mod tests {
         .unwrap();
         assert_eq!(first.retried_before_send, 1);
 
-        let second = dispatch_at(&mut db, 1_000, |delivery, _| {
+        let second = dispatch_at(&mut db, 1_000, |_, delivery, _| {
             assert_eq!(delivery.run_id, 102);
             Ok(("queued".into(), None))
         })
         .unwrap();
         assert_eq!(second.accepted, 1);
 
-        let retry = dispatch_at(&mut db, 6_000, |delivery, _| {
+        let retry = dispatch_at(&mut db, 6_000, |_, delivery, _| {
             assert_eq!(delivery.run_id, 101);
             Ok(("queued".into(), None))
         })
@@ -718,7 +834,7 @@ mod tests {
         let failed = dispatch_with_clock(
             &mut db,
             1_000,
-            |_, _| {
+            |_, _, _| {
                 clock.set(8_000);
                 Err(anyhow::anyhow!(
                     "Target thread has an active writer; input was not sent"
@@ -730,13 +846,13 @@ mod tests {
         assert_eq!(failed.retried_before_send, 1);
 
         assert_eq!(
-            dispatch(&mut db, 12_999, |_, _| panic!("retry ran early"))
+            dispatch(&mut db, 12_999, |_, _, _| panic!("retry ran early"))
                 .unwrap()
                 .claimed,
             0
         );
         assert_eq!(
-            dispatch(&mut db, 13_000, |_, _| Ok(("queued".into(), None)))
+            dispatch(&mut db, 13_000, |_, _, _| Ok(("queued".into(), None)))
                 .unwrap()
                 .accepted,
             1
@@ -756,7 +872,13 @@ mod tests {
                 params!["a".repeat(40)],
             )
             .unwrap();
-            let report = dispatch(&mut db, 1_000, |_, _| {
+            let report = dispatch(&mut db, 1_000, |writer, delivery, _| {
+                record_native_wake_recovery(
+                    writer,
+                    &delivery.thread,
+                    "native_queue_resume_warning",
+                    "10000000-0000-4000-8000-000000000001",
+                )?;
                 Ok(("queued".into(), Some("native_queue_resume_warning".into())))
             })
             .unwrap();
@@ -774,7 +896,8 @@ mod tests {
         let db = Connection::open(&database_path).unwrap();
         let mut woken = Vec::new();
         assert_eq!(
-            recover_native_wake_retries(&db, 1_001, |thread| {
+            recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                assert_eq!(ids, &["10000000-0000-4000-8000-000000000001"]);
                 woken.push(thread.to_owned());
                 Ok(())
             })
@@ -804,7 +927,13 @@ mod tests {
             params!["a".repeat(40)],
         )
         .unwrap();
-        let report = dispatch(&mut db, 1_000, |_, _| {
+        let report = dispatch(&mut db, 1_000, |writer, delivery, _| {
+            record_native_wake_recovery(
+                writer,
+                &delivery.thread,
+                "native_queue_resume_warning",
+                "10000000-0000-4000-8000-000000000001",
+            )?;
             Ok(("queued".into(), Some("native_queue_resume_warning".into())))
         })
         .unwrap();
@@ -812,12 +941,14 @@ mod tests {
 
         let writer_path = database_path.clone();
         assert_eq!(
-            recover_native_wake_retries(&db, 1_001, |thread| {
+            recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                assert_eq!(ids, &["10000000-0000-4000-8000-000000000001"]);
                 let writer = Connection::open(&writer_path).unwrap();
                 assert!(record_native_wake_recovery(
                     &writer,
                     thread,
-                    "native_queue_resume_warning"
+                    "native_queue_resume_warning",
+                    "10000000-0000-4000-8000-000000000002"
                 )?);
                 Ok(())
             })
@@ -831,6 +962,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 1);
+        let mut recovered_ids = Vec::new();
+        assert_eq!(
+            recover_native_wake_retries(&db, 2_002, |_, ids| {
+                recovered_ids = ids.to_vec();
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            recovered_ids,
+            vec![
+                "10000000-0000-4000-8000-000000000001",
+                "10000000-0000-4000-8000-000000000002"
+            ]
+        );
         let state: String = db
             .query_row(
                 "SELECT state FROM pr_ci_deliveries WHERE run_id=101",
@@ -840,11 +987,229 @@ mod tests {
             .unwrap();
         assert_eq!(state, "delivered");
         assert_eq!(
-            dispatch(&mut db, 2_000, |_, _| panic!("accepted input resent"))
+            dispatch(&mut db, 2_000, |_, _, _| panic!("accepted input resent"))
                 .unwrap()
                 .claimed,
             0
         );
+    }
+
+    #[test]
+    fn wake_recovery_accumulates_exact_ids_and_retains_them_after_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let first = "10000000-0000-4000-8000-000000000001";
+        let second = "10000000-0000-4000-8000-000000000002";
+        for id in [second, first, second] {
+            record_native_wake_recovery(&db, thread, "native_queue_resume_warning", id).unwrap();
+        }
+        let mut attempts = 0;
+        assert_eq!(
+            recover_native_wake_retries(&db, 1_000, |destination, ids| {
+                assert_eq!(destination, thread);
+                assert_eq!(ids, &[first, second]);
+                attempts += 1;
+                bail!("exact message is not yet observable")
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            recover_native_wake_retries(&db, 1_999, |_, _| panic!("retry before deadline"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            recover_native_wake_retries(&db, 2_000, |_, ids| {
+                assert_eq!(ids, &[first, second]);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn wake_recovery_migration_preserves_unattributed_legacy_and_new_obligations() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let id = "10000000-0000-4000-8000-000000000001";
+        db.execute_batch(
+            "CREATE TABLE native_wake_recovery (
+                 thread TEXT PRIMARY KEY,reason TEXT NOT NULL,
+                 next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+                 backoff_ms INTEGER NOT NULL DEFAULT 1000,
+                 revision INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO native_wake_recovery(thread,reason)
+             VALUES(?1,'native_queue_resume_warning')",
+            [thread],
+        )
+        .unwrap();
+        assert_eq!(
+            recover_native_wake_retries(&db, 1_000, |_, _| panic!("legacy identity was guessed"))
+                .unwrap(),
+            0
+        );
+        record_native_wake_recovery(&db, thread, "native_queue_resume_warning", id).unwrap();
+        let mut attempts = 0;
+        assert_eq!(
+            recover_native_wake_retries(&db, 1_001, |_, ids| {
+                assert_eq!(ids, &[id]);
+                attempts += 1;
+                Ok(())
+            })
+            .unwrap(),
+            0,
+            "executing a new message must not resolve the unattributed legacy warning"
+        );
+        assert_eq!(attempts, 1);
+        let raw: String = db
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ids = native_wake_ids(Some(&raw)).unwrap();
+        assert!(ids.unattributed);
+        assert_eq!(ids.client_ids, vec![id]);
+    }
+
+    #[test]
+    fn unattributed_warning_preserves_known_ids_without_becoming_resolvable() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let id = "10000000-0000-4000-8000-000000000001";
+        record_native_wake_recovery(&db, thread, "native_queue_resume_warning", id).unwrap();
+        record_unattributed_native_wake_recovery(&db, thread, "native_queue_resume_warning")
+            .unwrap();
+        let mut attempts = 0;
+        assert_eq!(
+            recover_native_wake_retries(&db, 1_000, |_, ids| {
+                assert_eq!(ids, &[id]);
+                attempts += 1;
+                Ok(())
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(attempts, 1);
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM native_wake_recovery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn wake_recovery_ignores_unrelated_uncertainty_after_crash_before_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wake-crash.sqlite");
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let id = "10000000-0000-4000-8000-000000000002";
+        {
+            let mut db = Connection::open(&path).unwrap();
+            pr_ci::initialize(&db).unwrap();
+            for (run, state) in [(100, "needs_attention"), (101, "pending")] {
+                db.execute(
+                    "INSERT INTO pr_ci_deliveries
+                     (repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json,state)
+                     VALUES('acme/widget',7,?1,?2,1,?3,'success','{}',?4)",
+                    params!["a".repeat(40), run, thread, state],
+                )
+                .unwrap();
+            }
+            let claimed =
+                pr_ci::claim_deliveries(&mut db, 1_000, 1, Duration::from_secs(1)).unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].run_id, 101);
+            record_native_wake_recovery(&db, thread, "native_queue_resume_warning", id).unwrap();
+            // The accepted input was persisted, but the process stopped before ack_delivery.
+        }
+        let mut db = Connection::open(&path).unwrap();
+        assert!(
+            pr_ci::claim_deliveries(&mut db, 2_001, 1, Duration::from_secs(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            recover_native_wake_retries(&db, 2_001, |destination, ids| {
+                assert_eq!(destination, thread);
+                assert_eq!(ids, &[id]);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        let uncertain: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_deliveries WHERE state='needs_attention'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            uncertain, 2,
+            "wake recovery must not change uncertain send outcomes"
+        );
+    }
+
+    #[test]
+    fn stale_wake_recovery_cannot_delete_a_recreated_generation_with_the_same_id() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "00000000-0000-4000-8000-000000000001";
+        let first = "10000000-0000-4000-8000-000000000001";
+        record_native_wake_recovery(&db, thread, "native_queue_resume_warning", first).unwrap();
+        assert_eq!(
+            recover_native_wake_retries(&db, 1_000, |_, ids| {
+                assert_eq!(ids, &[first]);
+                assert_eq!(recover_native_wake_retries(&db, 2_001, |_, _| Ok(()))?, 1);
+                record_native_wake_recovery(&db, thread, "native_queue_resume_warning", first)?;
+                Ok(())
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            recover_native_wake_retries(&db, 2_002, |_, ids| {
+                assert_eq!(ids, &[first]);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn wake_recovery_respects_the_callers_transaction_and_rejects_invalid_ids() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "00000000-0000-4000-8000-000000000001";
+        initialize_native_wake_recovery(&db).unwrap();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        record_native_wake_recovery(
+            &tx,
+            thread,
+            "native_queue_resume_warning",
+            "10000000-0000-4000-8000-000000000001",
+        )
+        .unwrap();
+        tx.rollback().unwrap();
+        assert!(
+            record_native_wake_recovery(&db, thread, "native_queue_resume_warning", "not-an-id")
+                .is_err()
+        );
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM native_wake_recovery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[cfg(target_os = "linux")]
