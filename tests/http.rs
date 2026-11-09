@@ -55,6 +55,7 @@ fn cli(db: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
     let state = root.join("codex-wake");
     fs::create_dir_all(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    prepare_webhook_config(root);
     Command::new(env!("CARGO_BIN_EXE_codex-wake"))
         .args([
             "--db",
@@ -64,11 +65,30 @@ fn cli(db: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
         ])
         .args(args)
         .env("XDG_STATE_HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("CODEX_HOME", root.join("codex-home"))
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .output()
         .unwrap()
+}
+
+fn prepare_webhook_config(root: &Path) {
+    let config = root.join("config/codex-wake");
+    fs::create_dir_all(&config).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+    let secret = config.join("webhook.secret");
+    fs::write(&secret, SECRET).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn assert_status(receiver: &Receiver, actual: u16, expected: u16, context: &str) {
+    assert_eq!(
+        actual,
+        expected,
+        "{context}; webhook receiver log:\n{}",
+        fs::read_to_string(&receiver.log).unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    );
 }
 
 fn request(
@@ -183,6 +203,7 @@ fn start_receiver_with_executable(
     defer: bool,
     executable: &Path,
 ) -> (Receiver, std::net::SocketAddr) {
+    prepare_webhook_config(temp.path());
     let webhook = receiver_path().expect(
         "set CODEX_WAKE_WEBHOOK to a verified webhook executable or install the verified local binary",
     );
@@ -209,6 +230,7 @@ fn start_receiver_with_executable(
         .env("GITHUB_WEBHOOK_SECRET", SECRET)
         .env("CODEX_WAKE_DEFER", if defer { "1" } else { "0" })
         .env("XDG_STATE_HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("CODEX_HOME", temp.path().join("codex-home"))
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
@@ -316,7 +338,7 @@ fn real_webhook_preserves_signed_raw_body_and_dispatches_once() {
         String::from_utf8_lossy(&registered.stderr)
     );
 
-    let (_receiver, addr) = start_receiver(&temp, &db, &codex, false);
+    let (receiver, addr) = start_receiver(&temp, &db, &codex, false);
 
     // The real webhook must pass these exact bytes to `handle`: JSON re-encoding
     // changes both the deliberate key order and whitespace covered by this HMAC.
@@ -333,13 +355,17 @@ fn real_webhook_preserves_signed_raw_body_and_dispatches_once() {
 }"#
     .to_vec();
     let signature = signed(&body, SECRET.as_bytes());
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &body, Some("workflow_run"), Some(&signature)),
-        200
+        200,
+        "completed workflow_run should be accepted",
     );
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &body, Some("workflow_run"), Some(&signature)),
-        200
+        200,
+        "duplicate workflow_run should be accepted idempotently",
     );
     assert_eq!(
         fs::read_to_string(&capture).unwrap().lines().count(),
@@ -462,25 +488,29 @@ fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
     }))
     .unwrap();
     let signature = signed(&comment, SECRET.as_bytes());
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(
             addr,
             "POST",
             &comment,
             Some("issue_comment"),
-            Some(&signature)
+            Some(&signature),
         ),
-        200
+        200,
+        "issue_comment should be accepted",
     );
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(
             addr,
             "POST",
             &comment,
             Some("issue_comment"),
-            Some(&signature)
+            Some(&signature),
         ),
-        200
+        200,
+        "duplicate issue_comment should be accepted",
     );
 
     let custom = serde_json::to_vec(&json!({
@@ -489,13 +519,17 @@ fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
     }))
     .unwrap();
     let signature = signed(&custom, SECRET.as_bytes());
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &custom, Some("codex_wake"), Some(&signature)),
-        200
+        200,
+        "codex_wake event should be accepted",
     );
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &custom, Some("codex_wake"), Some(&signature)),
-        200
+        200,
+        "duplicate codex_wake event should be accepted idempotently",
     );
 
     let db = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
