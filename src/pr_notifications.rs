@@ -1561,7 +1561,8 @@ fn claim_next(
     };
     let sql = format!(
             "SELECT id,kind,repo,pr,thread,event,event_key,source FROM automatic_pr_notifications
-             WHERE state='pending' AND available_at_ms<=?1{exclusion} ORDER BY created_at,rowid LIMIT 1"
+             WHERE state='pending' AND available_at_ms<=?1{exclusion}
+             ORDER BY MAX(available_at_ms,COALESCE(CAST(ROUND((julianday(created_at)-2440587.5)*86400000) AS INTEGER),0)),rowid LIMIT 1"
         );
     let mut values = Vec::with_capacity(excluded_ids.len() + 1);
     values.push(rusqlite::types::Value::Integer(now_ms));
@@ -2970,6 +2971,113 @@ mod tests {
             1
         );
         assert!(retried);
+    }
+
+    #[test]
+    fn claim_order_uses_fractional_creation_time_and_respects_retry_gate() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        for key in ["later", "earlier"] {
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "closed",
+                "2099-01-01T00:00:00Z",
+                key,
+                &json!({"action":"closed"}),
+            )
+            .unwrap();
+        }
+        db.execute_batch(
+            "UPDATE automatic_pr_notifications SET created_at=CASE event_key
+            WHEN 'later' THEN '2000-01-01 00:00:00.750' ELSE '2000-01-01 00:00:00.250' END;",
+        )
+        .unwrap();
+        let selected = claim_next(&db, 946_684_801_000, &HashSet::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.event_key, "earlier");
+        db.execute("UPDATE automatic_pr_notifications SET created_at='invalid',available_at_ms=946684802000 WHERE event_key='later'", []).unwrap();
+        assert!(
+            claim_next(&db, 946_684_801_999, &HashSet::new())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            claim_next(&db, 946_684_802_000, &HashSet::new())
+                .unwrap()
+                .unwrap()
+                .event_key,
+            "later"
+        );
+    }
+
+    #[test]
+    fn slow_retries_do_not_starve_a_newer_notification() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        for index in 0..17 {
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "closed",
+                "2099-01-01T00:00:00Z",
+                &format!("event-{index:02}"),
+                &json!({"action":"closed"}),
+            )
+            .unwrap();
+        }
+        db.execute_batch("UPDATE automatic_pr_notifications SET created_at='2000-01-01 00:00:00.250';
+            UPDATE automatic_pr_notifications SET created_at='2000-01-01 00:00:00.750' WHERE event_key='event-16';").unwrap();
+        let healthy: String = db
+            .query_row(
+                "SELECT id FROM automatic_pr_notifications WHERE event_key='event-16'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let clock = std::cell::Cell::new(946_684_801_000_i64);
+        let mut attempts = Vec::new();
+        let mut queue = |_: &str, _: &str, id: &str, _: bool| {
+            attempts.push(id.to_owned());
+            if id == healthy {
+                Ok(("queued".into(), None))
+            } else {
+                clock.set(clock.get() + 6_000);
+                Err(crate::execution::TargetUnavailableBeforeSend.into())
+            }
+        };
+        assert_eq!(
+            dispatch_with_clock(&mut db, &mut queue, || clock.get()).unwrap(),
+            16
+        );
+        assert_eq!(
+            dispatch_with_clock(&mut db, &mut queue, || clock.get()).unwrap(),
+            16
+        );
+        assert!(!attempts[..16].contains(&healthy));
+        assert_eq!(attempts[16], healthy);
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|id| id.as_str() == healthy.as_str())
+                .count(),
+            1
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id=?1",
+                [&healthy],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "queued");
     }
 
     #[test]
