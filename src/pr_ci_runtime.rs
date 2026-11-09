@@ -2048,23 +2048,31 @@ esac
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut reserved = false;
+        let mut last_stat = None;
         while Instant::now() < deadline {
             if let Ok(pid) = fs::read_to_string(&leader_file)
                 && let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-                && stat
-                    .split_once(") ")
-                    .is_some_and(|(_, rest)| rest.starts_with("Z "))
             {
-                reserved = true;
-                break;
+                reserved = stat
+                    .split_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("Z "));
+                last_stat = Some(stat);
+                if reserved {
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(10));
         }
         let result = worker.join().unwrap();
-        if let Ok(pid) = fs::read_to_string(escaped_file) {
+        let escaped = fs::read_to_string(escaped_file);
+        if let Ok(pid) = &escaped {
             let _ = Command::new("kill").arg("-KILL").arg(pid.trim()).status();
         }
-        assert!(reserved, "exited leader must remain unreaped until cleanup");
+        assert!(
+            reserved,
+            "exited leader must remain unreaped until cleanup; worker={result:?}; leader={:?}; escaped={escaped:?}; last_stat={last_stat:?}",
+            fs::read_to_string(leader_file),
+        );
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 
