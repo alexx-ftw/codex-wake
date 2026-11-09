@@ -850,8 +850,8 @@ fn resolve_pending_reopen_interval_in(
     after_sec: i64,
     closed_at_sec: Option<i64>,
 ) -> Result<()> {
-    // Remove rows only when one observation fits the interval. Equal-second events and
-    // multiple candidates stay pending; retained payloads contain only routing and time.
+    // A single timeline event identifies this interval. Retain webhook evidence unless
+    // it can be paired using the existing exact-second rule.
     let mut candidates: Vec<PendingReopen> = {
         let mut statement = db.prepare(
             "SELECT source_kind,source_id,event_at_sec,event_at
@@ -875,26 +875,24 @@ fn resolve_pending_reopen_interval_in(
     candidates.dedup();
     // A timeline event is authoritative for the transition. A webhook observation can
     // be folded into it only when both provider timestamps agree to the second.
-    let mut paired_webhook_id = None;
-    if candidates.len() == 2
+    let paired_webhook_id = if candidates.len() == 2
         && candidates[0].event_at_sec == candidates[1].event_at_sec
         && candidates[0].source_kind != candidates[1].source_kind
     {
-        paired_webhook_id = candidates
+        candidates
             .iter()
             .find(|candidate| candidate.source_kind == "webhook")
-            .map(|candidate| candidate.source_id.clone());
-        let poll = candidates
-            .iter()
-            .find(|candidate| candidate.source_kind == "poll")
-            .ok_or_else(|| anyhow::anyhow!("Matched reopen pair has no timeline source"))?
-            .clone();
-        candidates = vec![poll];
-    }
-    if candidates.len() != 1 || candidates[0].source_kind != "poll" {
+            .map(|candidate| candidate.source_id.clone())
+    } else {
+        None
+    };
+    let polls: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.source_kind == "poll")
+        .collect();
+    let [candidate] = polls.as_slice() else {
         return Ok(());
-    }
-    let candidate = &candidates[0];
+    };
     let source = minimal_reopen_source(repo, pr, &candidate.event_at);
     let event_key = format!("reopened:{after_sec}");
     record_event_in(
@@ -1436,7 +1434,7 @@ mod tests {
         register(&db, "review", "owner/repo", "7", first).unwrap();
         register(&db, "review", "owner/repo", "7", second).unwrap();
 
-        let targets = super::super::targets(&db).unwrap();
+        let targets = super::super::targets(&db, true).unwrap();
         assert!(
             targets
                 .pull_requests
@@ -2053,6 +2051,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn timeline_reopen_survives_an_unmatched_webhook_in_the_same_interval() {
+        for webhook_first in [true, false] {
+            let db = Connection::open_in_memory().unwrap();
+            register(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .unwrap();
+            for closed_at in ["2099-01-01T00:00:10Z", "2099-01-01T00:00:30Z"] {
+                let close = json!({"action":"closed","number":7,
+                    "repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"merged":false,"closed_at":closed_at}});
+                accept_authenticated_webhook(&db, "pull_request", &close).unwrap();
+            }
+            let webhook = json!({"action":"reopened","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:25Z"}});
+            let record_webhook = || {
+                accept_authenticated_webhook_with_delivery_id(
+                    &db,
+                    "pull_request",
+                    "ambiguous",
+                    &webhook,
+                )
+                .unwrap();
+            };
+            let record_timeline = || {
+                record_reopened_event_with_id(
+                    &db,
+                    "owner/repo",
+                    "7",
+                    "poll",
+                    "2099-01-01T00:00:20Z",
+                    "timeline:20",
+                )
+                .unwrap();
+            };
+            if webhook_first {
+                record_webhook();
+                record_timeline();
+            } else {
+                record_timeline();
+                record_webhook();
+            }
+            record_timeline();
+            record_webhook();
+
+            let reopened: Vec<_> = pending(&db)
+                .unwrap()
+                .into_iter()
+                .filter(|notice| notice.event == "reopened")
+                .collect();
+            assert_eq!(reopened.len(), 1);
+            assert_eq!(
+                reopened[0].event_key,
+                reopen_key(&db, "2099-01-01T00:00:10Z")
+            );
+            let unresolved: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM automatic_pr_pending_reopens
+                     WHERE source_kind='webhook' AND source_id='webhook:ambiguous'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unresolved, 1, "unmatched webhook identity remains pending");
+        }
+    }
+
+    #[test]
+    fn multiple_timeline_reopens_in_one_interval_remain_pending() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        for at in ["2099-01-01T00:00:10Z", "2099-01-01T00:00:30Z"] {
+            ensure_closed_cycle(&db, "owner/repo", "7", at).unwrap();
+        }
+        for (id, at) in [
+            ("timeline:20", "2099-01-01T00:00:20Z"),
+            ("timeline:21", "2099-01-01T00:00:21Z"),
+        ] {
+            store_pending_reopen_in(
+                &db,
+                "owner/repo",
+                "7",
+                "poll",
+                id,
+                timestamp_second(&db, at).unwrap(),
+                at,
+            )
+            .unwrap();
+        }
+        reconcile_pending_reopens_in(&db, "owner/repo", "7").unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(pending(&db).unwrap().is_empty());
     }
 
     #[test]
