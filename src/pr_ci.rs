@@ -53,6 +53,9 @@ const TRACKER_GENERATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_track
     generation INTEGER NOT NULL DEFAULT 0, closed_sweep_generation INTEGER,
     PRIMARY KEY(repo,pull_number,thread)
 );";
+const PR_CI_MIGRATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_schema_migrations (
+    name TEXT PRIMARY KEY
+);";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Delivery {
@@ -129,16 +132,54 @@ pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(REOPEN_EVENTS_SCHEMA)?;
     db.execute_batch(PR_OBSERVATIONS_SCHEMA)?;
     db.execute_batch(TRACKER_GENERATIONS_SCHEMA)?;
-    db.execute(
-        "INSERT OR IGNORE INTO pr_ci_tracker_generations(repo,pull_number,thread)
-         SELECT repo,pull_number,thread FROM pr_ci_trackers",
-        [],
-    )?;
+    db.execute_batch(PR_CI_MIGRATIONS_SCHEMA)?;
+    backfill_tracker_generations_once(db)?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS pr_ci_due ON pr_ci_trackers(active,next_poll_ms);
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_queue ON pr_ci_deliveries(state,id);
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_lease ON pr_ci_deliveries(state,lease_until_ms);",
     )?;
+    Ok(())
+}
+
+fn backfill_tracker_generations_once(db: &Connection) -> Result<()> {
+    let complete: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pr_ci_schema_migrations
+         WHERE name='tracker_generations_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if complete {
+        return Ok(());
+    }
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        backfill_tracker_generations_in(&tx)?;
+        tx.commit()?;
+    } else {
+        backfill_tracker_generations_in(db)?;
+    }
+    Ok(())
+}
+
+fn backfill_tracker_generations_in(db: &Connection) -> Result<()> {
+    let complete: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pr_ci_schema_migrations
+         WHERE name='tracker_generations_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !complete {
+        db.execute(
+            "INSERT OR IGNORE INTO pr_ci_tracker_generations(repo,pull_number,thread)
+             SELECT repo,pull_number,thread FROM pr_ci_trackers",
+            [],
+        )?;
+        db.execute(
+            "INSERT INTO pr_ci_schema_migrations(name) VALUES('tracker_generations_v1')",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -295,6 +336,14 @@ fn observe_pull_request_state_tx(
         )?;
     }
     if state == "open" {
+        if previous_state.as_deref() == Some("closed") && observed != 0 {
+            db.execute(
+                "UPDATE pr_ci_trackers SET next_poll_ms=0,backoff_ms=60000,
+                     error=NULL,updated_at_ms=?1
+                 WHERE repo=?2 AND pull_number=?3 AND active=1",
+                params![observed_at_ms, repo, number],
+            )?;
+        }
         db.execute(
             "UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,
                  error=NULL,updated_at_ms=?1
@@ -1228,6 +1277,60 @@ mod tests {
     }
 
     #[test]
+    fn tracker_generation_backfill_runs_once_and_registration_still_creates_rows() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(TRACKERS_SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_trackers(repo,pull_number,thread,active)
+             VALUES('owner/project',7,?1,0)",
+            [THREAD],
+        )
+        .unwrap();
+
+        initialize(&db).unwrap();
+        let migrated: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_tracker_generations
+                 WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, 1);
+
+        db.execute(
+            "DELETE FROM pr_ci_tracker_generations
+             WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+            [THREAD],
+        )
+        .unwrap();
+        initialize(&db).unwrap();
+        let repeated_backfill: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_tracker_generations
+                 WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repeated_backfill, 0, "initialize must not rescan trackers");
+
+        register_in(&db, "owner/project", "7", THREAD).unwrap();
+        let registered: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_tracker_generations
+                 WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            registered, 1,
+            "registration still creates its generation row"
+        );
+    }
+
+    #[test]
     fn poll_selects_oldest_due_tracker_first() {
         use std::cell::Cell;
 
@@ -1613,6 +1716,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!((active, reopened_deliveries), (1, 1));
+    }
+
+    #[test]
+    fn reopening_resets_backoff_for_active_tracker_without_reactivation() {
+        let db = db();
+        register_in(&db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        db.execute(
+            "UPDATE pr_ci_trackers SET next_poll_ms=3600000,backoff_ms=?1,error='temporary failure'
+             WHERE repo='owner/project' AND pull_number=7 AND thread=?2",
+            params![MAX_BACKOFF_MS, THREAD],
+        )
+        .unwrap();
+
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 20).unwrap());
+        let tracker: (i64, i64, i64, Option<String>) = db
+            .query_row(
+                "SELECT active,next_poll_ms,backoff_ms,error FROM pr_ci_trackers
+                 WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+                [THREAD],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(tracker, (1, 0, 60_000, None));
     }
 
     #[test]

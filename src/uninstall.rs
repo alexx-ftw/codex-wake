@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','automatic_pr_rules','automatic_pr_notification_listeners','automatic_pr_notifications','automatic_pr_lifecycle','automatic_pr_pending_reopens','automatic_pr_closed_cycles','automatic_pr_event_journal','automatic_pr_schema_migrations','pr_ci_trackers','pr_ci_runs','pr_ci_deliveries','pr_ci_auto_closed_trackers','pr_ci_reopen_events','pr_ci_pr_observations','pr_ci_tracker_generations','pr_ci_delivery_retry_after','pr_hook_pre_observations','pr_hook_candidates','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','native_wake_recovery','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','automatic_pr_rules','automatic_pr_notification_listeners','automatic_pr_notifications','automatic_pr_lifecycle','automatic_pr_pending_reopens','automatic_pr_closed_cycles','automatic_pr_event_journal','automatic_pr_schema_migrations','pr_ci_trackers','pr_ci_runs','pr_ci_deliveries','pr_ci_auto_closed_trackers','pr_ci_reopen_events','pr_ci_pr_observations','pr_ci_tracker_generations','pr_ci_delivery_retry_after','pr_ci_schema_migrations','pr_hook_pre_observations','pr_hook_candidates','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','native_wake_recovery','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -246,6 +246,7 @@ mod tests {
         crate::validation_obligations::initialize(&db).unwrap();
         crate::circular_waits::initialize(&db).unwrap();
         crate::polling::pr_notifications::initialize(&db).unwrap();
+        crate::pr_ci::initialize(&db).unwrap();
         let application_id: i32 = db
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
@@ -417,6 +418,7 @@ mod tests {
             "pr_ci_pr_observations",
             "pr_ci_tracker_generations",
             "pr_ci_delivery_retry_after",
+            "pr_ci_schema_migrations",
             "native_wake_recovery",
             "automatic_pr_lifecycle",
             "automatic_pr_pending_reopens",
