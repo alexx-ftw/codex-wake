@@ -3790,22 +3790,44 @@ mod tests {
             rusqlite::params![cursor.to_string(), route],
         )
         .unwrap();
+        let mut reopened_again = reopened.clone();
+        reopened_again["updated_at"] = json!("2099-01-03T00:00:00Z");
+        let mut recovery_requests = Vec::new();
         let report = tick_with(&db, INTERVAL_MS * 4 + 1, |requested, _| {
-            assert_eq!(requested, route);
-            Ok(response(reopened.clone(), false))
+            recovery_requests.push(requested.to_owned());
+            let body = match requested {
+                requested if requested == route => reopened_again.clone(),
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => json!([
+                    {"id":7001,"event":"reopened","created_at":"2099-01-01T00:00:00Z"},
+                    {"id":7002,"event":"closed","created_at":"2099-01-02T00:00:00Z"},
+                    {"id":7003,"event":"reopened","created_at":"2099-01-03T00:00:00Z"}
+                ]),
+                _ => panic!("unexpected recovery route: {requested}"),
+            };
+            Ok(response(body, false))
         })
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
+        assert_eq!(
+            recovery_requests,
+            vec![
+                route.to_owned(),
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1".to_owned()
+            ]
+        );
 
         let notices = crate::polling::pr_notifications::pending(&db).unwrap();
-        assert_eq!(notices.len(), 2);
+        assert_eq!(notices.len(), 3);
         let reopened_notices: Vec<_> = notices
             .iter()
             .filter(|notice| notice.event == "reopened")
             .collect();
-        assert_eq!(reopened_notices.len(), 1);
-        assert_eq!(reopened_notices[0].kind, "pull_request");
-        assert_eq!(reopened_notices[0].source["action"], "reopened");
+        assert_eq!(reopened_notices.len(), 2);
+        for notice in &reopened_notices {
+            assert_eq!(notice.kind, "pull_request");
+            assert_eq!(notice.source["action"], "reopened");
+        }
+        assert_ne!(reopened_notices[0].event_key, reopened_notices[1].event_key);
         assert_eq!(
             notices
                 .iter()
