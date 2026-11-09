@@ -4591,7 +4591,7 @@ mod tests {
             "head":{"sha":"a".repeat(40),"repo":{"full_name":"owner/repo"}},
             "base":{"ref":"main","repo":{"full_name":"owner/repo"}}});
         let fetch_pr = |snapshot: Value| {
-            move |route: &str, _| {
+            move |route: &str, _etag: Option<&str>| {
                 Ok(response(
                     if route.contains("/timeline") {
                         json!([])

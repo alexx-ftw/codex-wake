@@ -1908,7 +1908,16 @@ mod tests {
     fn reopen_without_a_known_cycle_stays_pending_until_close_arrives() {
         let db = Connection::open_in_memory().unwrap();
         let thread = "11111111-1111-4111-8111-111111111111";
-        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let registration_floor = timestamp_second(&db, "2098-12-31T23:58:00Z").unwrap();
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            registration_floor,
+        )
+        .unwrap();
         let reopen = json!({
             "action":"reopened","number":7,
             "repository":{"full_name":"owner/repo"},
@@ -1923,14 +1932,6 @@ mod tests {
             0,
             "an identical webhook redelivery must not create another pending source"
         );
-        let registration_floor: i64 = db
-            .query_row(
-                "SELECT registered_at_sec FROM automatic_pr_notification_listeners
-                 WHERE repo='owner/repo' AND pr='7' AND thread=?1",
-                [thread],
-                |row| row.get(0),
-            )
-            .unwrap();
         assert_eq!(
             reopen_timeline_floor(&db, "owner/repo", "7").unwrap(),
             (Some(registration_floor), true),
