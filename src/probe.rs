@@ -597,6 +597,7 @@ fn valid_repo(repo: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn isolated_webhook_secret_is_private_and_matches_receiver_secret() {
