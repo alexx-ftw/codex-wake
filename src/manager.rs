@@ -426,20 +426,27 @@ fn service_lock(config: &Config) -> Result<File> {
 }
 
 pub(crate) fn cooperative_lock(config: &Config) -> Result<File> {
-    let file = service_lock(config)?;
-    // A valid cooperative transition can outlive the ordinary 90-second admission timeout.
-    file.lock().context("Wait for cooperative service lock")?;
-    Ok(file)
+    // Cover drain (60s), preparation/heartbeat (30s each), plus systemctl (20s per
+    // call), RPC/SQLite waits and probes that can finish after a phase deadline.
+    wait_service_lock(service_lock(config)?, Duration::from_secs(600))
 }
 
 pub(crate) fn lock(config: &Config) -> Result<File> {
-    let file = service_lock(config)?;
-    let deadline = Instant::now() + Duration::from_secs(90);
+    wait_service_lock(service_lock(config)?, Duration::from_secs(90))
+}
+
+fn wait_service_lock(file: File, timeout: Duration) -> Result<File> {
+    let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(50))
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                ensure!(
+                    !remaining.is_zero(),
+                    "Timed out waiting for service lock after {timeout:?}; inspect lifecycle owner before retrying"
+                );
+                thread::sleep(remaining.min(Duration::from_millis(50)));
             }
             Err(error) => bail!("Cannot acquire service lock: {error}"),
         }
@@ -1736,6 +1743,49 @@ pub fn remove_service(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_lock_wait_times_out_without_releasing_owner() {
+        const CASE: &str = "manager::tests::service_lock_wait_times_out_without_releasing_owner";
+        if env::var_os("WAKE_LOCK_TEST_CHILD").is_none() {
+            let output = run(
+                Command::new(env::current_exe().unwrap())
+                    .args(["--exact", CASE])
+                    .env_clear()
+                    .env("WAKE_LOCK_TEST_CHILD", "1"),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("service.lock");
+        let owner = File::create(&path).unwrap();
+        owner.lock().unwrap();
+        let waiter = File::open(&path).unwrap();
+        let timeout = Duration::from_millis(125);
+        let start = Instant::now();
+        let error = wait_service_lock(waiter, timeout).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Timed out waiting for service lock")
+        );
+        assert!(start.elapsed() >= timeout);
+        let probe = File::open(&path).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(owner);
+        wait_service_lock(probe, Duration::ZERO).unwrap();
+    }
 
     #[test]
     fn receiver_admission_error_latches_stop() {

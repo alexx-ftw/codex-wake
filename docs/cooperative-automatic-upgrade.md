@@ -16,7 +16,15 @@ this does not make external outcomes exactly once.
 
 Subsequent `ensure` calls (including MCP startup and SessionStart) detect the
 private `cooperative-upgrade.json` journal automatically. For an identical
-binary they only verify readiness. For a different binary they:
+binary they only verify readiness.
+
+Lock acquisition waits at most ten minutes. This covers the 60-second drain,
+two 30-second readiness windows, the lifecycle commands (up to 20 seconds each),
+RPC/SQLite waits and final probes that can overrun a phase's deadline. A timeout
+leaves the lock owner, journal and database untouched; inspect the owner before
+retrying. Ordinary lifecycle operations retain their 90-second lock wait.
+
+For a different binary they:
 
 1. Hold `service.lock`, verify the exact managed unit, no overrides, executable
    inode/checksum, process membership and systemd invocation. Restart is disabled.
@@ -65,7 +73,10 @@ generation retention/collection are not introduced by this path.
 
 `automatic_upgrade_cli` runs actual CLI subprocesses with private HOME and a
 manager fixture that rejects mutations. It checks untouched legacy state and
-repeated rejection/closure of an interrupted transition without replay.
+repeated rejection/closure of an interrupted transition without replay. Concurrent
+admission holds a real file lock for 200 ms; a unit subprocess checks its shared
+wait loop's 125 ms timeout, retained ownership and acquisition after release.
+Both regressions have five-second watchdogs instead of minute-long sleeps.
 Unit tests reject altered exit status, invocation and cgroup paths, malformed
 binding metadata, and manual transfer of a live bound receiver.
 

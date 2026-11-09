@@ -8,6 +8,7 @@ use std::{
     thread,
     time::Duration,
 };
+use wait_timeout::ChildExt;
 fn command(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_codex-wake"));
     cmd.env_clear()
@@ -126,7 +127,6 @@ fn socket_preflight_failure_does_not_close_a_running_generation() {
 }
 
 #[test]
-#[ignore = "hosted qualification holds the lifecycle lock beyond its former 90-second limit"]
 fn concurrent_ensure_waits_for_transition_without_retrying_pending_journal() {
     let temp = setup();
     let root = temp.path();
@@ -150,9 +150,18 @@ fn concurrent_ensure_waits_for_transition_without_retrying_pending_journal() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_secs(92));
+    thread::sleep(Duration::from_millis(200));
     let waiting = waiter.try_wait().unwrap().is_none();
     drop(lock);
+    if waiter
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .is_none()
+    {
+        waiter.kill().unwrap();
+        waiter.wait().unwrap();
+        panic!("ensure did not finish after the lifecycle owner released its lock");
+    }
     let output = waiter.wait_with_output().unwrap();
     assert!(
         waiting,
