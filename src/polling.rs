@@ -321,8 +321,30 @@ where
                 )?;
             }
         }
-        let (timeline_floor, pending_reopen_needs_close) =
+        let (mut timeline_floor, pending_reopen_needs_close) =
             pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)?;
+        let ci_needs_timeline: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_ci_tracker_generations AS generation
+             JOIN pr_ci_trackers AS tracker USING(repo,pull_number,thread)
+             WHERE generation.repo=?1 COLLATE NOCASE AND generation.pull_number=?2
+               AND tracker.active=1 AND generation.closed_sweep_generation=generation.generation)
+             OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers
+               WHERE repo=?1 COLLATE NOCASE AND pull_number=?2)",
+            params![resource.repo, number],
+            |row| row.get(0),
+        )?;
+        if ci_needs_timeline {
+            let close_floor = cached
+                .as_ref()
+                .and_then(|saved| saved.body.as_deref())
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .and_then(|pull| {
+                    pull["closed_at"]
+                        .as_str()
+                        .and_then(|at| pr_notifications::timestamp_second(db, at).ok())
+                });
+            timeline_floor = [timeline_floor, close_floor].into_iter().flatten().min();
+        }
         let pending_reopen_watermark: i64 = db.query_row(
             "SELECT COALESCE(MAX(id),0) FROM automatic_pr_pending_reopens
              WHERE repo=?1 COLLATE NOCASE AND pr=?2",
@@ -356,7 +378,8 @@ where
             .and_then(|pull| pull["updated_at"].as_str().map(str::to_owned));
         let timeline_retry_due = timeline_due
             && timeline_floor.is_some()
-            && (timeline_has_error
+            && (ci_needs_timeline
+                || timeline_has_error
                 || pending_reopen_needs_close
                 || timeline_checkpoint.is_none()
                 || timeline_checkpoint.as_deref() != cached_updated_at.as_deref());
@@ -411,7 +434,8 @@ where
                 let updated_at = pull["updated_at"]
                     .as_str()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
-                let needs_scan = pending_reopen_needs_close
+                let needs_scan = (ci_needs_timeline && pull["state"] == "closed")
+                    || pending_reopen_needs_close
                     || timeline_has_error
                     || timeline_checkpoint.as_deref() != Some(updated_at);
                 if timeline_due && needs_scan {
@@ -468,12 +492,38 @@ where
                 let observed_state = pr["state"]
                     .as_str()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
-                codex_wake::pr_ci::observe_pull_request_state_in(
+                let close_second = pr["closed_at"]
+                    .as_str()
+                    .and_then(|at| pr_notifications::timestamp_second(db, at).ok());
+                let ambiguous_cycle = lifecycle_events.borrow().as_ref().is_some_and(|batch| {
+                    let mut closes = 0;
+                    let mut reopen = false;
+                    for event in &batch.events {
+                        if pr_notifications::timestamp_second(db, &event.event_at).ok()
+                            == close_second
+                            && close_second.is_some()
+                        {
+                            closes += usize::from(event.event == "closed");
+                            reopen |= event.event == "reopened";
+                        }
+                    }
+                    reopen || closes > 1
+                });
+                let mut ci_snapshot = pr.clone();
+                if observed_state == "closed"
+                    && ci_needs_timeline
+                    && lifecycle_events.borrow().is_none()
+                {
+                    ci_snapshot["closed_at"] = Value::Null;
+                }
+                codex_wake::pr_ci::observe_pull_request_snapshot_with_ambiguity_in(
                     db,
                     &resource.repo,
                     &resource.resource,
-                    observed_state,
+                    &ci_snapshot,
                     now,
+                    ambiguous_cycle,
+                    lifecycle_events.borrow().is_some(),
                 )
                 .map_err(|_| Failure::new("database"))?;
                 if observed_state == "open" {
@@ -1361,6 +1411,7 @@ struct Targets {
 
 fn targets(db: &Connection, include_waits: bool) -> Result<Targets> {
     crate::conditions::initialize(db)?;
+    codex_wake::pr_ci::initialize(db)?;
     let mut out = Targets::default();
     if include_waits {
         let mut s =
@@ -1516,6 +1567,26 @@ fn targets(db: &Connection, include_waits: bool) -> Result<Targets> {
                     out.reviews.insert(target);
                 }
                 _ => {}
+            }
+        }
+    }
+    {
+        let mut s = db.prepare("SELECT repo,pull_number FROM pr_ci_trackers AS tracker
+            WHERE active=1 OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+              WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number AND closed.thread=tracker.thread)")?;
+        for row in s.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (repo, pr) = row?;
+            let pr = pr.to_string();
+            if valid_repo(&repo)
+                && positive_text(&pr)
+                && !out
+                    .pull_requests
+                    .iter()
+                    .any(|target| target.repo.eq_ignore_ascii_case(&repo) && target.resource == pr)
+            {
+                out.pull_requests.insert(Resource { repo, resource: pr });
             }
         }
     }
@@ -4378,6 +4449,7 @@ mod tests {
 
         let ci_closed_pull = json!({
             "number":7,"state":"closed",
+            "closed_at":"2099-01-02T00:00:00Z",
             "base":{"repo":{"full_name":"owner/repo"}},
             "head":{"sha":"a".repeat(40),"repo":{"full_name":"owner/repo"}}
         });
@@ -4403,8 +4475,18 @@ mod tests {
         assert_eq!(closed_sweep_generation, Some(generation));
 
         let report = tick_with(&db, INTERVAL_MS * 3 + 1, |requested, _| {
-            assert_eq!(requested, route);
-            Ok(response(closed_poll.clone(), false))
+            Ok(response(
+                if requested == route {
+                    closed_poll.clone()
+                } else {
+                    assert_eq!(
+                        requested,
+                        "/repos/owner/repo/issues/7/timeline?per_page=100&page=1"
+                    );
+                    json!([])
+                },
+                false,
+            ))
         })
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
@@ -4493,6 +4575,274 @@ mod tests {
             tracker_states,
             vec![(thread.into(), true), (unregistered_thread.into(), false)]
         );
+    }
+
+    #[test]
+    fn closed_to_closed_new_cycle_waits_for_matching_ci_sweep() {
+        let mut db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let manual = "22222222-2222-4222-8222-222222222222";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", manual).unwrap();
+        codex_wake::pr_ci::unregister(&db, "owner/repo", "7", manual).unwrap();
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let mut snapshot = json!({"number":7,"state":"closed","merged":false,
+            "closed_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40),"repo":{"full_name":"owner/repo"}},
+            "base":{"ref":"main","repo":{"full_name":"owner/repo"}}});
+        let fetch_pr = |snapshot: Value| {
+            move |route: &str, _| {
+                Ok(response(
+                    if route.contains("/timeline") {
+                        json!([])
+                    } else {
+                        snapshot.clone()
+                    },
+                    false,
+                ))
+            }
+        };
+        tick_with(&db, 1, fetch_pr(snapshot.clone())).unwrap();
+        let fetch_ci = |snapshot: Value| {
+            move |route: &str| {
+                Ok(codex_wake::pr_ci::ApiResponse {
+                    status: 200,
+                    body: if route.contains("/pulls/") {
+                        snapshot.clone()
+                    } else if snapshot["head"]["sha"] == "b".repeat(40) {
+                        let sha = "b".repeat(40);
+                        json!({"total_count":1,"workflow_runs":[{"id":99,"run_attempt":1,
+                            "head_sha":sha,"status":"completed","conclusion":"success",
+                            "event":"pull_request","pull_requests":[{"number":7,"head":{"sha":sha}}]}]})
+                    } else {
+                        json!({"total_count":0,"workflow_runs":[]})
+                    },
+                })
+            }
+        };
+        codex_wake::pr_ci::poll(&db, 2, fetch_ci(snapshot.clone())).unwrap();
+        snapshot["closed_at"] = json!("2099-01-02T00:00:00Z");
+        snapshot["updated_at"] = json!("2099-01-02T00:00:00Z");
+        snapshot["head"]["sha"] = json!("b".repeat(40));
+        tick_with(&db, INTERVAL_MS + 1, fetch_pr(snapshot.clone())).unwrap();
+        let active: Vec<i64> = db
+            .prepare("SELECT active FROM pr_ci_trackers ORDER BY thread")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(active, vec![1, 0], "new cycle must be swept before pausing");
+        codex_wake::pr_ci::poll(&db, INTERVAL_MS + 2, fetch_ci(snapshot.clone())).unwrap();
+        let (runs, deliveries): (i64, i64) = db
+            .query_row(
+                "SELECT (SELECT count(*) FROM pr_ci_runs WHERE run_id=99),
+                    (SELECT count(*) FROM pr_ci_deliveries WHERE run_id=99 AND thread=?1)",
+                [thread],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((runs, deliveries), (1, 1));
+        tick_with(&db, INTERVAL_MS * 2 + 1, fetch_pr(snapshot)).unwrap();
+        let active: Vec<i64> = db
+            .prepare("SELECT active FROM pr_ci_trackers ORDER BY thread")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(active, vec![0, 0]);
+    }
+
+    #[test]
+    fn ci_targets_respect_manual_unregistration_and_repo_case() {
+        let mut db = db();
+        pr_notifications::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        subscribe(&db, "pull_request", "7", "closed");
+        db.execute(
+            "UPDATE subscriptions SET repo='Owner/Repo' WHERE kind='pull_request'",
+            [],
+        )
+        .unwrap();
+        let found = targets(&db, true).unwrap();
+        assert_eq!(
+            found
+                .pull_requests
+                .iter()
+                .filter(|resource| resource.repo.eq_ignore_ascii_case("owner/repo")
+                    && resource.resource == "7")
+                .count(),
+            1
+        );
+        db.execute("DELETE FROM subscriptions", []).unwrap();
+        codex_wake::pr_ci::unregister(&db, "owner/repo", "7", thread).unwrap();
+        assert!(targets(&db, true).unwrap().pull_requests.is_empty());
+    }
+
+    #[test]
+    fn same_second_timeline_cycles_cannot_certify_ci_sweep() {
+        let mut db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        let snapshot = json!({"number":7,"state":"closed","merged":false,
+            "closed_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40),"repo":{"full_name":"owner/repo"}},
+            "base":{"ref":"main","repo":{"full_name":"owner/repo"}}});
+        tick_with(&db, 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    json!([])
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        let sweep = |snapshot: Value| {
+            move |route: &str| {
+                Ok(codex_wake::pr_ci::ApiResponse {
+                    status: 200,
+                    body: if route.contains("/pulls/") {
+                        snapshot.clone()
+                    } else {
+                        json!({"total_count":0,"workflow_runs":[]})
+                    },
+                })
+            }
+        };
+        codex_wake::pr_ci::poll(&db, 2, sweep(snapshot.clone())).unwrap();
+        tick_with(&db, INTERVAL_MS + 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    json!([])
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        let paused: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paused, 0, "the first cycle must be paused before reopening");
+        let mut fetched_timeline = false;
+        let recovered = tick_with(&db, INTERVAL_MS * 2 + 1, |route, _| {
+            if !route.contains("/timeline") {
+                return Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                });
+            }
+            fetched_timeline = true;
+            Ok(response(
+                json!([
+                    {"id":1,"event":"closed","created_at":"2099-01-01T00:00:00Z"},
+                    {"id":2,"event":"reopened","created_at":"2099-01-01T00:00:00Z"},
+                    {"id":3,"event":"closed","created_at":"2099-01-01T00:00:00Z"}
+                ]),
+                false,
+            ))
+        })
+        .unwrap();
+        assert!(fetched_timeline);
+        assert_eq!(recovered["errors"], json!({}), "{recovered}");
+        let reactivated: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reactivated, 1,
+            "the ambiguous newer cycle must reactivate CI"
+        );
+        codex_wake::pr_ci::poll(&db, INTERVAL_MS * 2 + 2, sweep(snapshot.clone())).unwrap();
+        tick_with(&db, INTERVAL_MS * 3 + 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    json!([])
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active, 1,
+            "same-second evidence cannot certify a close cycle"
+        );
+    }
+
+    #[test]
+    fn failed_timeline_cannot_pause_a_certified_closed_tracker() {
+        let mut db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let snapshot = json!({"number":7,"state":"closed","merged":false,
+            "closed_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40),"repo":{"full_name":"owner/repo"}},
+            "base":{"ref":"main","repo":{"full_name":"owner/repo"}}});
+        tick_with(&db, 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    json!([])
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        codex_wake::pr_ci::poll(&db, 2, |route| {
+            Ok(codex_wake::pr_ci::ApiResponse {
+                status: 200,
+                body: if route.contains("/pulls/") {
+                    snapshot.clone()
+                } else {
+                    json!({"total_count":0,"workflow_runs":[]})
+                },
+            })
+        })
+        .unwrap();
+        tick_with(&db, INTERVAL_MS + 1, |route, _| {
+            if route.contains("/timeline") {
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            } else {
+                Ok(response(snapshot.clone(), false))
+            }
+        })
+        .unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
     }
 
     #[test]

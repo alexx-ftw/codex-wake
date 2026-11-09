@@ -46,6 +46,7 @@ const PR_OBSERVATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_pr_observ
     repo TEXT NOT NULL, pull_number INTEGER NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('open','closed')),
     observed_at_ms INTEGER NOT NULL,
+    closed_at TEXT, head_sha TEXT,
     PRIMARY KEY(repo,pull_number)
 );";
 const TRACKER_GENERATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_tracker_generations (
@@ -131,6 +132,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(CLOSED_TRACKERS_SCHEMA)?;
     db.execute_batch(REOPEN_EVENTS_SCHEMA)?;
     db.execute_batch(PR_OBSERVATIONS_SCHEMA)?;
+    migrate_observation_identity(db)?;
     db.execute_batch(TRACKER_GENERATIONS_SCHEMA)?;
     db.execute_batch(PR_CI_MIGRATIONS_SCHEMA)?;
     backfill_tracker_generations_once(db)?;
@@ -139,6 +141,27 @@ pub fn initialize(db: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_queue ON pr_ci_deliveries(state,id);
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_lease ON pr_ci_deliveries(state,lease_until_ms);",
     )?;
+    Ok(())
+}
+
+fn migrate_observation_identity(db: &Connection) -> Result<()> {
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        migrate_observation_identity(&tx)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    let columns: Vec<String> = db
+        .prepare("PRAGMA table_info(pr_ci_pr_observations)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for column in ["closed_at", "head_sha"] {
+        if !columns.iter().any(|name| name == column) {
+            db.execute_batch(&format!(
+                "ALTER TABLE pr_ci_pr_observations ADD COLUMN {column} TEXT"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -273,6 +296,91 @@ pub fn observe_pull_request_state_in(
     state: &str,
     observed_at_ms: i64,
 ) -> Result<bool> {
+    observe_pull_request_identity_in(db, repo, number, state, None, observed_at_ms, false)
+}
+
+/// Reconcile a PR snapshot, including the identity needed to certify a closed sweep.
+#[cfg(test)]
+pub fn observe_pull_request_snapshot_in(
+    db: &Connection,
+    repo: &str,
+    number: &str,
+    snapshot: &Value,
+    observed_at_ms: i64,
+) -> Result<bool> {
+    observe_pull_request_snapshot_with_ambiguity_in(
+        db,
+        repo,
+        number,
+        snapshot,
+        observed_at_ms,
+        false,
+        true,
+    )
+}
+
+/// Retain uncertainty when timeline events share the closing second.
+pub fn observe_pull_request_snapshot_with_ambiguity_in(
+    db: &Connection,
+    repo: &str,
+    number: &str,
+    snapshot: &Value,
+    observed_at_ms: i64,
+    ambiguous: bool,
+    allow_pause: bool,
+) -> Result<bool> {
+    let state = snapshot["state"].as_str().context("Missing PR state")?;
+    let mut identity = closed_identity(db, snapshot)?;
+    if let Some((closed_at, _)) = identity.as_mut()
+        && ambiguous
+    {
+        *closed_at = format!("ambiguous:{closed_at}");
+    }
+    observe_pull_request_identity_in(
+        db,
+        repo,
+        number,
+        state,
+        identity.as_ref(),
+        observed_at_ms,
+        allow_pause,
+    )
+}
+
+fn closed_identity(db: &Connection, snapshot: &Value) -> Result<Option<(String, String)>> {
+    if snapshot["state"] != "closed" {
+        return Ok(None);
+    }
+    let Some(closed_at) = snapshot["closed_at"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let valid_time: Option<i64> = db.query_row(
+        "SELECT CAST(strftime('%s',?1) AS INTEGER)",
+        [closed_at],
+        |row| row.get(0),
+    )?;
+    let Some(sha) = snapshot
+        .pointer("/head/sha")
+        .and_then(Value::as_str)
+        .filter(|sha| valid_sha(sha))
+    else {
+        return Ok(None);
+    };
+    Ok(valid_time.map(|_| (closed_at.to_owned(), sha.to_ascii_lowercase())))
+}
+
+fn observe_pull_request_identity_in(
+    db: &Connection,
+    repo: &str,
+    number: &str,
+    state: &str,
+    identity: Option<&(String, String)>,
+    observed_at_ms: i64,
+    allow_pause: bool,
+) -> Result<bool> {
     initialize(db)?;
     ensure!(
         matches!(state, "open" | "closed"),
@@ -283,37 +391,69 @@ pub fn observe_pull_request_state_in(
     let repo = repo.to_ascii_lowercase();
     if db.is_autocommit() {
         let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-        let changed = observe_pull_request_state_tx(&tx, &repo, number, state, observed_at_ms)?;
+        let changed = observe_pull_request_state_tx(
+            &tx,
+            &repo,
+            number,
+            state,
+            identity,
+            observed_at_ms,
+            allow_pause,
+        )?;
         tx.commit()?;
         Ok(changed)
     } else {
-        observe_pull_request_state_tx(db, &repo, number, state, observed_at_ms)
+        observe_pull_request_state_tx(
+            db,
+            &repo,
+            number,
+            state,
+            identity,
+            observed_at_ms,
+            allow_pause,
+        )
     }
 }
+
+type ObservedPullRequest = (String, Option<String>, Option<String>);
 
 fn observe_pull_request_state_tx(
     db: &Connection,
     repo: &str,
     number: i64,
     state: &str,
+    identity: Option<&(String, String)>,
     observed_at_ms: i64,
+    allow_pause: bool,
 ) -> Result<bool> {
-    let previous_state: Option<String> = db
+    let previous: Option<ObservedPullRequest> = db
         .query_row(
-            "SELECT state FROM pr_ci_pr_observations WHERE repo=?1 AND pull_number=?2",
+            "SELECT state,closed_at,head_sha FROM pr_ci_pr_observations WHERE repo=?1 AND pull_number=?2",
             params![repo, number],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    let previous_state = previous.as_ref().map(|row| row.0.as_str());
+    let mut identity = identity.cloned();
+    if let Some((closed_at, _)) = identity.as_mut()
+        && previous.as_ref().and_then(|row| row.1.as_deref())
+            == Some(format!("ambiguous:{closed_at}").as_str())
+    {
+        *closed_at = format!("ambiguous:{closed_at}");
+    }
+    let identity = identity.as_ref();
+    let closed_at = identity.map(|row| row.0.as_str());
+    let head_sha = identity.map(|row| row.1.as_str());
     let observed = db.execute(
-        "INSERT INTO pr_ci_pr_observations(repo,pull_number,state,observed_at_ms)
-         VALUES(?1,?2,?3,?4)
+        "INSERT INTO pr_ci_pr_observations(repo,pull_number,state,observed_at_ms,closed_at,head_sha)
+         VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(repo,pull_number) DO UPDATE SET
-             state=excluded.state,observed_at_ms=excluded.observed_at_ms
+             state=excluded.state,observed_at_ms=excluded.observed_at_ms,
+             closed_at=excluded.closed_at,head_sha=excluded.head_sha
          WHERE excluded.observed_at_ms>pr_ci_pr_observations.observed_at_ms
             OR (excluded.observed_at_ms=pr_ci_pr_observations.observed_at_ms
                 AND excluded.state='open' AND pr_ci_pr_observations.state='closed')",
-        params![repo, number, state, observed_at_ms],
+        params![repo, number, state, observed_at_ms, closed_at, head_sha],
     )?;
     if observed == 0 {
         let current_state: Option<String> = db
@@ -323,11 +463,20 @@ fn observe_pull_request_state_tx(
                 |row| row.get(0),
             )
             .optional()?;
-        if current_state.as_deref() != Some(state) {
+        if current_state.as_deref() != Some(state)
+            || (state == "closed"
+                && previous.as_ref().is_none_or(|row| {
+                    row.1.as_deref() != closed_at || row.2.as_deref() != head_sha
+                }))
+        {
             return Ok(false);
         }
     }
-    if previous_state.as_deref() != Some(state) && observed != 0 {
+    let identity_changed = state == "closed"
+        && previous
+            .as_ref()
+            .is_some_and(|row| row.1.as_deref() != closed_at || row.2.as_deref() != head_sha);
+    if (previous_state != Some(state) || identity_changed) && observed != 0 {
         db.execute(
             "UPDATE pr_ci_tracker_generations SET generation=generation+1,
                  closed_sweep_generation=NULL
@@ -336,7 +485,7 @@ fn observe_pull_request_state_tx(
         )?;
     }
     if state == "open" {
-        if previous_state.as_deref() == Some("closed") && observed != 0 {
+        if previous_state == Some("closed") && observed != 0 {
             db.execute(
                 "UPDATE pr_ci_trackers SET next_poll_ms=0,backoff_ms=60000,
                      error=NULL,updated_at_ms=?1
@@ -359,13 +508,26 @@ fn observe_pull_request_state_tx(
             params![repo, number],
         )?;
     } else {
+        if identity_changed && observed != 0 {
+            db.execute("UPDATE pr_ci_trackers SET next_poll_ms=0,backoff_ms=60000,error=NULL,updated_at_ms=?1
+                WHERE repo=?2 AND pull_number=?3 AND active=1", params![observed_at_ms, repo, number])?;
+            db.execute("UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,error=NULL,updated_at_ms=?1
+                WHERE repo=?2 AND pull_number=?3 AND active=0 AND EXISTS(
+                    SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=pr_ci_trackers.repo
+                    AND closed.pull_number=pr_ci_trackers.pull_number AND closed.thread=pr_ci_trackers.thread)",
+                params![observed_at_ms, repo, number])?;
+            db.execute(
+                "DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2",
+                params![repo, number],
+            )?;
+        }
         let pending_runs: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pr_ci_runs
              WHERE repo=?1 AND pull_number=?2 AND status!='completed')",
             params![repo, number],
             |row| row.get(0),
         )?;
-        if !pending_runs {
+        if !pending_runs && identity.is_some() && allow_pause {
             db.execute(
                 "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
                  SELECT tracker.repo,tracker.pull_number,tracker.thread
@@ -452,7 +614,7 @@ fn consume_reopened_notification_tx(
     {
         return Ok(false);
     }
-    observe_pull_request_state_tx(db, &repo, number, "open", observed_at_ms)?;
+    observe_pull_request_state_tx(db, &repo, number, "open", None, observed_at_ms, false)?;
     Ok(true)
 }
 
@@ -521,7 +683,7 @@ where
         let elapsed_ms = i64::try_from(poll_started.elapsed().as_millis()).unwrap_or(i64::MAX);
         let finished_ms = now_ms.saturating_add(elapsed_ms);
         match poll_result {
-            Ok((discovered, queued, unlinked, is_closed)) => {
+            Ok((discovered, queued, unlinked, closed_identity)) => {
                 report.discovered += discovered;
                 report.queued += queued;
                 report.unlinked_runs += unlinked;
@@ -536,8 +698,14 @@ where
                 )?;
                 let observed_closed: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM pr_ci_pr_observations
-                     WHERE repo=?1 AND pull_number=?2 AND state='closed')",
-                    params![repo, number],
+                     WHERE repo=?1 AND pull_number=?2 AND state='closed'
+                       AND closed_at=?3 AND head_sha=?4)",
+                    params![
+                        repo,
+                        number,
+                        closed_identity.as_ref().map(|id| &id.0),
+                        closed_identity.as_ref().map(|id| &id.1)
+                    ],
                     |row| row.get(0),
                 )?;
                 let pending_runs: bool = tx.query_row(
@@ -546,7 +714,8 @@ where
                     params![repo, number],
                     |row| row.get(0),
                 )?;
-                if tracker_current && is_closed && observed_closed && !pending_runs {
+                if tracker_current && closed_identity.is_some() && observed_closed && !pending_runs
+                {
                     tx.execute(
                         "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=?1
                          WHERE repo=?2 AND pull_number=?3 AND thread=?4 AND generation=?1",
@@ -611,6 +780,8 @@ fn schedule_after_completion_ms(started_ms: i64, elapsed_ms: i64, delay_ms: i64)
         .saturating_add(delay_ms)
 }
 
+type PollOneResult = (usize, usize, usize, Option<(String, String)>);
+
 fn poll_one<F>(
     db: &Connection,
     now: i64,
@@ -619,7 +790,7 @@ fn poll_one<F>(
     thread: &str,
     old_sha: Option<&str>,
     fetch: &mut F,
-) -> Result<(usize, usize, usize, bool)>
+) -> Result<PollOneResult>
 where
     F: FnMut(&str) -> Result<ApiResponse>,
 {
@@ -718,7 +889,7 @@ where
         |row| row.get(0),
     )?;
     if !still_active {
-        return Ok((0, 0, 0, false));
+        return Ok((0, 0, 0, None));
     }
     let mut discovered = 0;
     let mut queued = 0;
@@ -814,7 +985,14 @@ where
             process_run_attempt(db, now, identity, attempt_run, &mut discovered, &mut queued)?;
         }
     }
-    Ok((discovered, queued, unlinked, pull["state"] == "closed"))
+    let first_identity = closed_identity(db, &pull)?;
+    let confirmed_identity = closed_identity(db, &confirmed)?;
+    let certified = if first_identity == confirmed_identity {
+        first_identity
+    } else {
+        None
+    };
+    Ok((discovered, queued, unlinked, certified))
 }
 
 fn fetch_runs_for_sha<F>(repo: &str, sha: &str, fetch: &mut F) -> Result<Vec<Value>>
@@ -1218,7 +1396,178 @@ mod tests {
 
     fn pull(number: i64, state: &str, sha: &str) -> Value {
         json!({"number":number,"state":state,"base":{"repo":{"full_name":"owner/project"}},
+            "closed_at": if state == "closed" { Some("2026-01-01T00:00:00Z") } else { None },
             "head":{"sha":sha,"repo":{"full_name":HEAD_REPO}}})
+    }
+
+    fn observe_fixture(
+        db: &Connection,
+        repo: &str,
+        number: &str,
+        state: &str,
+        at: i64,
+    ) -> Result<bool> {
+        observe_pull_request_snapshot_in(db, repo, number, &pull(number.parse()?, state, SHA), at)
+    }
+
+    #[test]
+    fn closed_cycle_and_head_require_their_own_sweep() {
+        let mut db = db();
+        let manual = "22222222-2222-4222-8222-222222222222";
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        register(&mut db, "owner/project", "7", manual).unwrap();
+        unregister(&db, "owner/project", "7", manual).unwrap();
+        let first = pull(7, "closed", SHA);
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &first, 10).unwrap();
+        let sweep = |snapshot: Value| {
+            move |route: &str| -> Result<ApiResponse> {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: if route.contains("/pulls/") {
+                        snapshot.clone()
+                    } else {
+                        json!({"total_count":0,"workflow_runs":[]})
+                    },
+                })
+            }
+        };
+        poll(&db, 11, sweep(first.clone())).unwrap();
+        let mut second = pull(7, "closed", &"b".repeat(40));
+        second["closed_at"] = json!("2026-01-02T00:00:00Z");
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &second, 20).unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1, "old sweep cannot pause the new close cycle");
+        assert!(!observe_pull_request_snapshot_in(&db, "owner/project", "7", &first, 15).unwrap());
+        poll(&db, 21, sweep(second.clone())).unwrap();
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &second, 30).unwrap();
+        let active: Vec<i64> = db
+            .prepare("SELECT active FROM pr_ci_trackers ORDER BY thread")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(active, vec![0, 0]);
+    }
+
+    #[test]
+    fn closed_without_cycle_identity_never_pauses() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let mut snapshot = pull(7, "closed", SHA);
+        snapshot["closed_at"] = Value::Null;
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &snapshot, 10).unwrap();
+        poll(&db, 11, |route| {
+            Ok(ApiResponse {
+                status: 200,
+                body: if route.contains("/pulls/") {
+                    snapshot.clone()
+                } else {
+                    json!({"total_count":0,"workflow_runs":[]})
+                },
+            })
+        })
+        .unwrap();
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &snapshot, 20).unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn changed_close_between_ci_reads_does_not_certify() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let first = pull(7, "closed", SHA);
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &first, 10).unwrap();
+        let mut second = first.clone();
+        second["closed_at"] = json!("2026-01-02T00:00:00Z");
+        let mut reads = 0;
+        poll(&db, 11, |route| {
+            let body = if route.contains("/pulls/") {
+                reads += 1;
+                if reads == 1 {
+                    first.clone()
+                } else {
+                    second.clone()
+                }
+            } else {
+                json!({"total_count":0,"workflow_runs":[]})
+            };
+            Ok(ApiResponse { status: 200, body })
+        })
+        .unwrap();
+        let certificate: Option<i64> = db
+            .query_row(
+                "SELECT closed_sweep_generation FROM pr_ci_tracker_generations WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(certificate.is_none());
+    }
+
+    #[test]
+    fn ambiguous_same_second_cycle_cannot_reuse_sweep() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let snapshot = pull(7, "closed", SHA);
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &snapshot, 10).unwrap();
+        poll(&db, 11, |route| {
+            Ok(ApiResponse {
+                status: 200,
+                body: if route.contains("/pulls/") {
+                    snapshot.clone()
+                } else {
+                    json!({"total_count":0,"workflow_runs":[]})
+                },
+            })
+        })
+        .unwrap();
+        observe_pull_request_snapshot_with_ambiguity_in(
+            &db,
+            "owner/project",
+            "7",
+            &snapshot,
+            20,
+            true,
+            true,
+        )
+        .unwrap();
+        poll(&db, 21, |route| {
+            Ok(ApiResponse {
+                status: 200,
+                body: if route.contains("/pulls/") {
+                    snapshot.clone()
+                } else {
+                    json!({"total_count":0,"workflow_runs":[]})
+                },
+            })
+        })
+        .unwrap();
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &snapshot, 30).unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active, 1,
+            "ambiguous cycle cannot be certified by a timestamp-only snapshot"
+        );
     }
 
     fn run(number: i64, sha: &str, id: i64, attempt: i64, conclusion: &str) -> Value {
@@ -1624,7 +1973,7 @@ mod tests {
     fn closed_pr_remains_tracked_and_picks_up_ci_after_reopen() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 1).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 1).unwrap());
         let mut response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 return Ok(ApiResponse {
@@ -1655,7 +2004,7 @@ mod tests {
         };
 
         assert_eq!(poll(&db, 2, pending_response).unwrap().queued, 0);
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
         let active_with_pending: i64 = db
             .query_row(
                 "SELECT count(*) FROM pr_ci_trackers WHERE active=1 AND repo='owner/project' AND pull_number=7",
@@ -1668,7 +2017,7 @@ mod tests {
         db.execute("UPDATE pr_ci_trackers SET next_poll_ms=0", [])
             .unwrap();
         assert_eq!(poll(&db, 3, &mut response).unwrap().queued, 1);
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 20).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 20).unwrap());
         let (active_after_close, deliveries): (i64, i64) = db
             .query_row(
                 "SELECT (SELECT count(*) FROM pr_ci_trackers WHERE active=1),
@@ -1690,7 +2039,7 @@ mod tests {
         .unwrap();
         assert!(consume_reopened_notification_in(&db, "reopened-7", 30).unwrap());
         assert!(!consume_reopened_notification_in(&db, "reopened-7", 31).unwrap());
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 31).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "open", 31).unwrap());
         let open_response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 Ok(ApiResponse {
@@ -1722,7 +2071,7 @@ mod tests {
     fn reopening_resets_backoff_for_active_tracker_without_reactivation() {
         let db = db();
         register_in(&db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
         db.execute(
             "UPDATE pr_ci_trackers SET next_poll_ms=3600000,backoff_ms=?1,error='temporary failure'
              WHERE repo='owner/project' AND pull_number=7 AND thread=?2",
@@ -1730,7 +2079,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 20).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "open", 20).unwrap());
         let tracker: (i64, i64, i64, Option<String>) = db
             .query_row(
                 "SELECT active,next_poll_ms,backoff_ms,error FROM pr_ci_trackers
@@ -1746,7 +2095,7 @@ mod tests {
     fn closed_pr_is_paused_only_after_successful_ci_scan_discovers_runs() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
         let mut pending = run(7, SHA, 88, 1, "success");
         pending["status"] = json!("in_progress");
         pending["conclusion"] = Value::Null;
@@ -1780,7 +2129,7 @@ mod tests {
     fn new_closed_poll_invalidates_old_sweep_before_pr_poller_reconciles() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
         db.execute(
             "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation
              WHERE repo='owner/project' AND pull_number=7",
@@ -1795,7 +2144,7 @@ mod tests {
                     observed_during_fetch = true;
                     // The PR poller observes the close before this CI scan has
                     // discovered and persisted the newly pending run.
-                    observe_pull_request_state_in(&db, "owner/project", "7", "closed", 11)?;
+                    observe_fixture(&db, "owner/project", "7", "closed", 11)?;
                 }
                 Ok(ApiResponse {
                     status: 200,
@@ -1832,7 +2181,7 @@ mod tests {
     fn equal_time_close_and_reopen_invalidate_an_in_flight_poll() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 100).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 100).unwrap());
         db.execute(
             "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation
              WHERE repo='owner/project' AND pull_number=7",
@@ -1844,8 +2193,8 @@ mod tests {
             if route.contains("/pulls/") {
                 if !reopened {
                     reopened = true;
-                    observe_pull_request_state_in(&db, "owner/project", "7", "closed", 200)?;
-                    observe_pull_request_state_in(&db, "owner/project", "7", "open", 200)?;
+                    observe_fixture(&db, "owner/project", "7", "closed", 200)?;
+                    observe_fixture(&db, "owner/project", "7", "open", 200)?;
                 }
                 Ok(ApiResponse {
                     status: 200,
@@ -1877,7 +2226,7 @@ mod tests {
     fn older_overlapping_poll_cannot_certify_newer_claim() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
         let mut nested_started = false;
         let response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") && !nested_started {
@@ -1918,7 +2267,7 @@ mod tests {
     fn unregister_after_auto_pause_stays_inactive_when_pr_reopens() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
         let response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 Ok(ApiResponse {
@@ -1941,7 +2290,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active_before_pr_reconciliation, 1);
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 21).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 21).unwrap());
         let active: i64 = db
             .query_row(
                 "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
@@ -1951,7 +2300,7 @@ mod tests {
             .unwrap();
         assert_eq!(active, 0);
         assert!(unregister(&db, "owner/project", "7", THREAD).unwrap());
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 30).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "open", 30).unwrap());
         let active: i64 = db
             .query_row(
                 "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
@@ -1991,9 +2340,9 @@ mod tests {
     fn stale_closed_observation_cannot_pause_a_newer_open_pr() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 100).unwrap());
-        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 200).unwrap());
-        assert!(!observe_pull_request_state_in(&db, "owner/project", "7", "closed", 150).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 100).unwrap());
+        assert!(observe_fixture(&db, "owner/project", "7", "open", 200).unwrap());
+        assert!(!observe_fixture(&db, "owner/project", "7", "closed", 150).unwrap());
         let active: i64 = db
             .query_row(
                 "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
