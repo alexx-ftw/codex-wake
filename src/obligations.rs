@@ -69,6 +69,22 @@ pub fn initialize(db: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS obligations_pending ON obligations(thread, resolved);
         CREATE INDEX IF NOT EXISTS obligations_publication
             ON obligations(kind, repo, resource, outcome, resolved);
+        CREATE TABLE IF NOT EXISTS obligation_reviews (
+            thread TEXT PRIMARY KEY,
+            digest TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS obligation_review_events (
+            fingerprint TEXT NOT NULL,
+            obligation_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            scope TEXT,
+            execution_id TEXT,
+            attempt TEXT,
+            PRIMARY KEY(fingerprint,obligation_id)
+        );
         CREATE TABLE IF NOT EXISTS coordinators (
             responsible TEXT PRIMARY KEY,
             coordinator TEXT NOT NULL,
@@ -312,6 +328,198 @@ pub fn pending_digest(db: &Connection, thread: &str) -> Result<(i64, String)> {
         count += 1;
     }
     Ok((count, format!("{:x}", hash.finalize())))
+}
+
+/// Snapshot pending work and observable results for the responsible chat.
+pub fn review_digest(db: &Connection, thread: &str) -> Result<(i64, String)> {
+    let thread = Uuid::parse_str(thread)?.to_string();
+    let (count, pending) = pending_digest(db, &thread)?;
+    let mut hash = Sha256::new();
+    hash.update(pending.as_bytes());
+    let mut stmt = db.prepare(
+        "SELECT s.id,coalesce(s.outcome,''),coalesce(s.source_event_key,''),CASE WHEN s.state='needs_attention' THEN coalesce(s.reason,'needs_attention') ELSE '' END FROM subscriptions s
+         WHERE s.thread=?1 AND s.state!='waiting' AND EXISTS (
+           SELECT 1 FROM obligations o LEFT JOIN validation_scope_links l ON l.obligation_id=o.id
+           WHERE o.thread=s.thread AND o.resolved=0 AND
+             ((o.kind=s.kind AND o.repo=s.repo AND o.resource=s.resource) OR
+              (l.kind=s.kind AND l.repo=s.repo AND (l.resource=s.resource OR (l.kind='chat' AND l.resource COLLATE NOCASE=s.resource)))))
+         ORDER BY s.id COLLATE BINARY",
+    )?;
+    let mut rows = stmt.query([&thread])?;
+    while let Some(row) = rows.next()? {
+        for i in 0..4 {
+            let value: String = row.get(i)?;
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+    }
+    let mut stmt = db.prepare(
+        "SELECT w.repo,CAST(w.run_id AS TEXT),CAST(w.attempt AS TEXT),w.conclusion,
+         CASE WHEN w.state='needs_attention' THEN coalesce(w.reason,'needs_attention') ELSE '' END FROM waits w
+         WHERE w.thread=?1 AND w.conclusion IS NOT NULL AND EXISTS (
+         SELECT 1 FROM obligations o LEFT JOIN validation_scope_links l ON l.obligation_id=o.id
+         WHERE o.thread=w.thread AND o.resolved=0 AND
+         ((o.kind='job' AND o.repo=w.repo AND o.resource=CAST(w.run_id AS TEXT)) OR
+         (l.kind='job' AND l.repo=w.repo AND l.resource=CAST(w.run_id AS TEXT)) OR
+         (o.kind='validation' AND l.obligation_id IS NULL)))
+         ORDER BY w.repo,w.run_id,w.attempt",
+    )?;
+    let mut rows = stmt.query([&thread])?;
+    while let Some(row) = rows.next()? {
+        for i in 0..5 {
+            let value: String = row.get(i)?;
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+    }
+    let mut stmt = db.prepare(
+        "SELECT l.obligation_id,l.kind,l.repo,l.resource,l.scope FROM validation_scope_links l
+         JOIN obligations o ON o.id=l.obligation_id WHERE o.thread=?1 AND o.resolved=0
+         ORDER BY l.obligation_id COLLATE BINARY",
+    )?;
+    let mut rows = stmt.query([&thread])?;
+    while let Some(row) = rows.next()? {
+        for i in 0..5 {
+            let value: String = row.get(i)?;
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+    }
+    let mut stmt = db.prepare(
+        "SELECT e.fingerprint FROM obligation_review_events e
+         JOIN obligations o ON o.id=e.obligation_id
+         WHERE o.thread=?1 AND o.resolved=0
+         ORDER BY e.fingerprint COLLATE BINARY",
+    )?;
+    let mut rows = stmt.query([&thread])?;
+    while let Some(row) = rows.next()? {
+        let fingerprint: String = row.get(0)?;
+        hash.update(fingerprint.as_bytes());
+    }
+    Ok((count, format!("{:x}", hash.finalize())))
+}
+
+pub fn unreviewed_count(db: &Connection, thread: &str) -> Result<i64> {
+    let thread = Uuid::parse_str(thread)?.to_string();
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Deferred)?;
+    let (count, digest) = review_digest(&tx, &thread)?;
+    let reviewed: Option<String> = tx
+        .query_row(
+            "SELECT digest FROM obligation_reviews WHERE thread=?1",
+            [&thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(if reviewed.as_deref() == Some(&digest) {
+        0
+    } else {
+        count
+    })
+}
+
+pub fn acknowledge_review(
+    db: &Connection,
+    thread: &str,
+    digest: &str,
+    ids: &[String],
+) -> Result<()> {
+    let thread = Uuid::parse_str(thread)?.to_string();
+    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let (count, current) = review_digest(&tx, &thread)?;
+    ensure!(
+        count > 0 && digest == current,
+        "Obligations or results changed; list all pages again"
+    );
+    let mut supplied = ids.to_vec();
+    supplied.sort_unstable();
+    let mut stmt = tx.prepare(
+        "SELECT id FROM obligations WHERE thread=?1 AND resolved=0 ORDER BY id COLLATE BINARY",
+    )?;
+    let expected = stmt
+        .query_map([&thread], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    ensure!(
+        supplied == expected,
+        "Review must include every pending obligation exactly once"
+    );
+    tx.execute("INSERT INTO obligation_reviews(thread,digest) VALUES (?1,?2) ON CONFLICT(thread) DO UPDATE SET digest=excluded.digest", params![thread, digest])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Reopen reviews for linked validations when a distinct result is published.
+#[allow(clippy::too_many_arguments)]
+pub fn note_result(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &serde_json::Value,
+    event_key: Option<&str>,
+    scope: Option<&serde_json::Value>,
+    identity: Option<(&str, u64)>,
+) -> Result<()> {
+    let initialized: bool = db.query_row(
+        "SELECT count(*)=2 FROM sqlite_master WHERE type='table' AND name IN ('obligation_review_events','validation_scope_links')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !initialized {
+        return Ok(());
+    }
+    let mut hash = Sha256::new();
+    let source_json = serde_json::to_string(source)?;
+    for value in [
+        kind,
+        repo,
+        resource,
+        outcome,
+        event_key.unwrap_or(&source_json),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    if let Some(scope) = scope {
+        hash.update(serde_json::to_vec(scope)?);
+    }
+    let fingerprint = format!("{:x}", hash.finalize());
+    db.execute(
+        "INSERT OR IGNORE INTO obligation_review_events(fingerprint,kind,repo,resource,outcome,scope,obligation_id,execution_id,attempt)
+         SELECT ?1,?2,?3,?4,?5,?6,o.id,?7,?8 FROM obligations o LEFT JOIN validation_scope_links l ON l.obligation_id=o.id
+         WHERE o.resolved=0 AND ((o.kind=?2 AND o.repo=?3 AND o.resource=?4) OR
+         (l.kind=?2 AND l.repo=?3 AND (l.resource=?4 OR (?2='chat' AND l.resource COLLATE NOCASE=?4))))",
+        params![fingerprint, kind, repo, resource, outcome, scope.map(serde_json::to_string).transpose()?,
+            identity.map(|x| x.0.to_owned()).or_else(|| crate::delivery_evidence::identity_component(source.pointer("/workflow_run/id")).or_else(|| crate::delivery_evidence::identity_component(source.get("execution_id")))),
+            identity.map(|x| x.1.to_string()).or_else(|| crate::delivery_evidence::identity_component(source.pointer("/workflow_run/run_attempt")).or_else(|| crate::delivery_evidence::identity_component(source.get("attempt"))))],
+    )?;
+    Ok(())
+}
+
+pub fn linked_results(db: &Connection, obligation_id: &str) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = db.prepare(
+        "SELECT e.kind,e.repo,e.resource,e.outcome,e.scope,e.execution_id,e.attempt FROM obligation_review_events e
+         WHERE e.obligation_id=?1 ORDER BY e.rowid DESC",
+    )?;
+    let mut values = stmt
+        .query_map([obligation_id], |row| {
+            Ok(
+                serde_json::json!({"kind":row.get::<_,String>(0)?,"repo":row.get::<_,String>(1)?,
+            "resource":row.get::<_,String>(2)?,"outcome":row.get::<_,String>(3)?,"scope":row.get::<_,Option<String>>(4)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),"execution_id":row.get::<_,Option<String>>(5)?,"attempt":row.get::<_,Option<String>>(6)?}),
+            )
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut stmt = db.prepare("SELECT w.repo,w.run_id,w.attempt,w.conclusion,CASE WHEN w.state='needs_attention' THEN coalesce(w.reason,'needs_attention') ELSE NULL END FROM waits w
+        JOIN obligations o ON o.id=?1 AND o.thread=w.thread LEFT JOIN validation_scope_links l ON l.obligation_id=o.id
+        WHERE w.conclusion IS NOT NULL AND ((o.kind='job' AND o.repo=w.repo AND o.resource=CAST(w.run_id AS TEXT)) OR
+        (l.kind='job' AND l.repo=w.repo AND l.resource=CAST(w.run_id AS TEXT)) OR
+        (o.kind='validation' AND l.obligation_id IS NULL)) ORDER BY w.repo,w.run_id,w.attempt")?;
+    values.extend(stmt.query_map([obligation_id], |row| Ok(serde_json::json!({"kind":"job","repo":row.get::<_,String>(0)?,
+        "resource":row.get::<_,i64>(1)?.to_string(),"attempt":row.get::<_,i64>(2)?,"outcome":row.get::<_,String>(3)?,
+        "delivery_issue":row.get::<_,Option<String>>(4)?})))?.collect::<rusqlite::Result<Vec<_>>>()?);
+    Ok(values)
 }
 
 const MAX_COLLISION_PREVIEW_BYTES: usize = 7 * 1024;
@@ -1082,6 +1290,10 @@ pub fn accept_transfer(
         "Obligation is no longer pending with its original owner"
     );
     tx.execute(
+        "DELETE FROM obligation_reviews WHERE thread IN (?1,?2)",
+        params![source_thread, target_thread],
+    )?;
+    tx.execute(
         "UPDATE obligation_transfers SET state='accepted', accepted_at=CURRENT_TIMESTAMP,
              notification_message=NULL
          WHERE id=?1 AND state='pending'",
@@ -1218,15 +1430,6 @@ pub fn pending_page(
 #[cfg(test)]
 pub fn pending(db: &Connection, thread: &str) -> Result<Vec<Obligation>> {
     Ok(pending_page(db, thread, None)?.0)
-}
-
-pub fn pending_count(db: &Connection, thread: &str) -> Result<i64> {
-    let thread = Uuid::parse_str(thread)?.to_string();
-    Ok(db.query_row(
-        "SELECT count(*) FROM obligations WHERE thread=?1 AND resolved=0",
-        [thread],
-        |row| row.get(0),
-    )?)
 }
 
 /// Call only for an explicit agent publication; notification delivery does not resolve obligations.

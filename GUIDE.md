@@ -149,7 +149,8 @@ for the dated external delivery evidence in `VALIDATION.md`.
 | `register_resource_wait` | Record a wait on a non-chat resource and its declared continuation |
 | `update_wait_continuation` | Update an active wait’s declared continuation without resolving it |
 | `register_coordinator` | Explicitly set the coordinator for a responsible chat |
-| `list_obligations` | List a chat's pending publications |
+| `list_obligations` | List a chat's pending publications and validations |
+| `acknowledge_obligation_review` | Record review of a complete, unchanged pending list |
 | `resolve_obligation` | Resolve a pending obligation explicitly |
 | `propose_obligation_transfer` | Propose transferring a pending obligation to another chat |
 | `list_obligation_transfers` | List transfer proposals addressed to a chat |
@@ -485,7 +486,11 @@ work has finished or that a result is successful. A matching explicit
 the same transaction that accepts the publication. Delivery to subscribers is
 separate and can still require attention. `list_obligations` shows pending
 records in pages of eight (`next_cursor` is supplied as `after`);
-`resolve_obligation` permits an agent to resolve one explicitly. Local MCP or
+after reviewing every page, call `acknowledge_obligation_review` with every ID
+and the `review_digest` shared by all pages. If the digest changes, start the
+listing again. Acknowledging suppresses repeat reminders for that snapshot; it
+does not resolve obligations. New or changed obligations and relevant results
+require another review. `resolve_obligation` permits an agent to resolve one explicitly. Local MCP or
 CLI callers can register and publish obligations; Wake does not authenticate
 their agent identity. An emitted hook response is not proof that Codex consumed
 it, and the loop guard permits a pending obligation to survive the current turn.

@@ -524,7 +524,7 @@ fn ready(
     outcome: &str,
     source: &Value,
 ) -> Result<usize> {
-    let changed = ready_update(db, kind, repo, resource, event, outcome, source, None)?;
+    let changed = ready_update(db, kind, repo, resource, event, outcome, source, None, true)?;
     log_accept(kind, repo, resource, event, changed);
     Ok(changed)
 }
@@ -539,6 +539,7 @@ fn ready_update(
     outcome: &str,
     source: &Value,
     source_event_key: Option<&str>,
+    track_result: bool,
 ) -> Result<usize> {
     ensure!(valid_kind_event(kind, event), "Unsupported event");
     let source_event_key = match source_event_key {
@@ -548,6 +549,19 @@ fn ready_update(
     let source_json = serde_json::to_string(source)?;
     let update = || {
         let now = epoch_ms()?;
+        if track_result {
+            crate::obligations::note_result(
+                db,
+                kind,
+                repo,
+                resource,
+                outcome,
+                source,
+                source_event_key.as_deref(),
+                None,
+                None,
+            )?;
+        }
         ready_update_at(
             db,
             kind,
@@ -727,9 +741,12 @@ pub fn accept(db: &Connection, event_header: &str, payload: &Value) -> Result<us
                     event,
                     payload,
                     None,
+                    true,
                 )?;
                 let specific = if event != "submitted" {
-                    ready_update(db, "review", repo, &resource, event, event, payload, None)?
+                    ready_update(
+                        db, "review", repo, &resource, event, event, payload, None, true,
+                    )?
                 } else {
                     0
                 };
@@ -972,6 +989,20 @@ pub fn publish_report_with_conditions(
     source: &Value,
     identity: Option<(&str, u64)>,
 ) -> Result<(usize, usize, Vec<Value>, crate::conditions::EventRecord)> {
+    publish_report_with_scope(db, kind, repo, resource, outcome, source, identity, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn publish_report_with_scope(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    outcome: &str,
+    source: &Value,
+    identity: Option<(&str, u64)>,
+    scope: Option<&Value>,
+) -> Result<(usize, usize, Vec<Value>, crate::conditions::EventRecord)> {
     let resource = validate_publication(kind, repo, resource, outcome, source)?;
     ensure!(
         identity.is_none() || kind == "job",
@@ -989,6 +1020,9 @@ pub fn publish_report_with_conditions(
     } else {
         None
     };
+    let source_event_key = source_event_key.or(source_event_identity(
+        kind, repo, &resource, outcome, outcome, source,
+    )?);
     initialize(db)?;
     crate::conditions::initialize(db)?;
     if kind == "dependency" && outcome == "progress" {
@@ -1001,6 +1035,17 @@ pub fn publish_report_with_conditions(
     }
     let (matched, resolved, conflicts, condition_record) = immediate(db, || {
         let mut condition_record = crate::conditions::EventRecord::default();
+        crate::obligations::note_result(
+            db,
+            kind,
+            repo,
+            &resource,
+            outcome,
+            source,
+            source_event_key.as_deref(),
+            scope,
+            identity,
+        )?;
         let conflicts = if let Some((execution, attempt)) = identity {
             if matches!(outcome, "success" | "failure" | "cancelled") {
                 crate::result_conflicts::record(
@@ -1021,6 +1066,7 @@ pub fn publish_report_with_conditions(
             outcome,
             source,
             source_event_key.as_deref(),
+            false,
         )?;
         let condition_key = source_event_key.clone().or(source_event_identity(
             kind, repo, &resource, outcome, outcome, source,
@@ -1120,6 +1166,7 @@ pub fn publish_report_with_conditions(
                 outcome,
                 source,
                 completed_key.as_deref(),
+                false,
             )?;
             let condition_key = completed_key.or(source_event_identity(
                 kind,
@@ -1205,13 +1252,27 @@ pub fn publish_observation(
         );
         let source_event_key =
             source_event_identity(&kind, &repo, &resource, &event, outcome, source)?;
-        Ok(db.execute(
+        let changed = db.execute(
             "UPDATE subscriptions SET state='ready',outcome=?1,reason=NULL,source_event_key=?2,
                 source_json=CASE WHEN message_template IS NOT NULL OR required_source IS NOT NULL
                     THEN ?3 ELSE source_json END,updated=CURRENT_TIMESTAMP
              WHERE id=?4 AND state='waiting' AND (expires_at_ms IS NULL OR expires_at_ms>?5)",
             params![outcome, source_event_key, source_json, id, now],
-        )?)
+        )?;
+        if changed > 0 {
+            crate::obligations::note_result(
+                db,
+                &kind,
+                &repo,
+                &resource,
+                outcome,
+                source,
+                source_event_key.as_deref(),
+                None,
+                None,
+            )?;
+        }
+        Ok(changed)
     })?;
     crate::observability::emit(
         "event.accept",

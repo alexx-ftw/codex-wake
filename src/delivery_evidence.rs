@@ -108,7 +108,7 @@ pub fn github_comment_event_identity(event_header: &str, source: &Value) -> Resu
     )?))
 }
 
-fn identity_component(value: Option<&Value>) -> Option<String> {
+pub(crate) fn identity_component(value: Option<&Value>) -> Option<String> {
     let value = value?;
     let component = match value {
         Value::String(value) => value.clone(),

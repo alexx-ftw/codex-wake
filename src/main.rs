@@ -243,6 +243,16 @@ struct ObligationListInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ObligationReviewInput {
+    thread: String,
+    /// Snapshot returned by every page of list_obligations.
+    digest: String,
+    /// IDs of all pending obligations reviewed across every page.
+    obligation_ids: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LegacyCollisionInput {
     /// Inspect one diagnostic by ID, or omit to list diagnostics.
     alert_id: Option<String>,
@@ -1161,7 +1171,7 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
         && payload["stop_hook_active"] != true
         && payload["agent_id"].as_str().is_none_or(|id| id == resource)
     {
-        obligations::pending_count(&db, &resource)
+        obligations::unreviewed_count(&db, &resource)
     } else {
         Ok(0)
     };
@@ -1311,7 +1321,7 @@ fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
             .extend(steer.as_object().unwrap().clone());
         if count > 0 {
             let reminder = format!(
-                "Wake: {count} publication or validation obligation(s) remain pending for chat {resource}. Call list_obligations with this chat ID to review them. Publish only when a result is available; resolve a validation only with evidence of the check performed. If work is ongoing or blocked, continue or report that status without inventing a result. Existing authorization only."
+                "Wake: {count} publication or validation obligation(s) need review for chat {resource}. Call list_obligations and review every page, then call acknowledge_obligation_review with the common digest and all reviewed IDs if work remains pending. Publish only when a result is available; resolve a validation only with evidence of the check performed. If work is ongoing or blocked, continue or report that status without inventing a result. Existing authorization only."
             );
             let previous = output["reason"].as_str().unwrap_or_default();
             let reason = if previous.is_empty() {
@@ -1856,7 +1866,7 @@ impl WakeTools {
                 Vec::new()
             };
             let (matched, resolved, conflicts, condition_record) =
-                subscriptions::publish_report_with_conditions(
+                subscriptions::publish_report_with_scope(
                     &db,
                     &input.kind,
                     &input.repo,
@@ -1864,6 +1874,12 @@ impl WakeTools {
                     &input.outcome,
                     &source,
                     identity,
+                    input
+                        .scope
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()?
+                        .as_ref(),
                 )?;
             let mut result = publication_result(&self.config, matched, resolved);
             result["condition_members_matched"] = json!(condition_record.new_members);
@@ -1954,7 +1970,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "List a chat's pending publication and validation obligations; pass next_cursor as after for the next page.",
+        description = "List pending obligations; follow next_cursor through all pages and check review_digest is unchanged before acknowledging a review.",
         annotations(read_only_hint = true)
     )]
     fn list_obligations(
@@ -1962,12 +1978,43 @@ impl WakeTools {
         Parameters(input): Parameters<ObligationListInput>,
     ) -> CallToolResult {
         tool_result((|| {
-            let (items, next) = obligations::pending_page(
+            let db = database(&self.config)?;
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Deferred)?;
+            let (items, next) =
+                obligations::pending_page(&tx, &input.thread, input.after.as_deref())?;
+            let (_, digest) = obligations::review_digest(&tx, &input.thread)?;
+            let linked_results = items
+                .iter()
+                .map(|item| Ok((item.id.clone(), obligations::linked_results(&tx, &item.id)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            tx.commit()?;
+            Ok(
+                json!({"obligations":items,"next_cursor":next,"review_digest":digest,"linked_results":linked_results}),
+            )
+        })())
+    }
+
+    #[tool(
+        description = "Confirm you reviewed every pending obligation in the given unchanged snapshot. Does not resolve obligations.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    fn acknowledge_obligation_review(
+        &self,
+        Parameters(input): Parameters<ObligationReviewInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            obligations::acknowledge_review(
                 &database(&self.config)?,
                 &input.thread,
-                input.after.as_deref(),
+                &input.digest,
+                &input.obligation_ids,
             )?;
-            Ok(json!({"obligations":items,"next_cursor":next}))
+            Ok(json!({"reviewed":true}))
         })())
     }
 
@@ -2256,6 +2303,7 @@ impl rmcp::ServerHandler for WakeTools {
             "update_wait_continuation" => "mcp.update_wait_continuation",
             "resolve_circular_wait" => "mcp.resolve_circular_wait",
             "list_obligations" => "mcp.list_obligations",
+            "acknowledge_obligation_review" => "mcp.acknowledge_obligation_review",
             "inspect_legacy_alert_collisions" => "mcp.inspect_legacy_alert_collisions",
             "resolve_obligation" => "mcp.resolve_obligation",
             "propose_obligation_transfer" => "mcp.propose_obligation_transfer",
@@ -3793,6 +3841,466 @@ mod hook_output_tests {
         )
         .unwrap();
         assert!(again.get("decision").is_none());
+    }
+
+    #[test]
+    fn reviewed_obligations_stop_repeating_and_changed_work_rearms() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let tools = WakeTools { config };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let db = database(&tools.config).unwrap();
+        for i in 0..9 {
+            validation_obligations::register(&db, thread, &format!("Check {i}"), None, None)
+                .unwrap();
+        }
+        let stop = json!({"hook_event_name":"Stop", "session_id":thread});
+        assert_eq!(
+            run_hook_inner(&tools.config, &stop).unwrap()["decision"],
+            "block"
+        );
+        let first = tools
+            .list_obligations(Parameters(ObligationListInput {
+                thread: thread.into(),
+                after: None,
+            }))
+            .structured_content
+            .unwrap();
+        let digest = first["review_digest"].as_str().unwrap().to_owned();
+        let mut ids: Vec<String> = first["obligations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["id"].as_str().unwrap().to_owned())
+            .collect();
+        let partial = tools.acknowledge_obligation_review(Parameters(ObligationReviewInput {
+            thread: thread.into(),
+            digest: digest.clone(),
+            obligation_ids: ids.clone(),
+        }));
+        assert_eq!(partial.is_error, Some(true));
+        let second = tools
+            .list_obligations(Parameters(ObligationListInput {
+                thread: thread.into(),
+                after: first["next_cursor"].as_str().map(str::to_owned),
+            }))
+            .structured_content
+            .unwrap();
+        assert_eq!(second["review_digest"], digest);
+        ids.extend(
+            second["obligations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["id"].as_str().unwrap().to_owned()),
+        );
+        assert_ne!(
+            tools
+                .acknowledge_obligation_review(Parameters(ObligationReviewInput {
+                    thread: thread.into(),
+                    digest: digest.clone(),
+                    obligation_ids: ids.clone()
+                }))
+                .is_error,
+            Some(true)
+        );
+        for _ in 0..2 {
+            assert!(
+                run_hook_inner(&tools.config, &stop)
+                    .unwrap()
+                    .get("decision")
+                    .is_none()
+            );
+        }
+        assert_eq!(obligations::pending_digest(&db, thread).unwrap().0, 9);
+        validation_obligations::register(&db, thread, "New check", None, None).unwrap();
+        assert_eq!(
+            run_hook_inner(&tools.config, &stop).unwrap()["decision"],
+            "block"
+        );
+        assert_eq!(
+            tools
+                .acknowledge_obligation_review(Parameters(ObligationReviewInput {
+                    thread: thread.into(),
+                    digest,
+                    obligation_ids: ids
+                }))
+                .is_error,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn concurrent_registration_invalidates_review_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = validation_obligations::register(&db, thread, "First check", None, None).unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        obligations::register(
+            &db,
+            thread,
+            "artifact",
+            "ci",
+            "new-report",
+            "available",
+            "Publish",
+        )
+        .unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let path = config.db.clone();
+        let ack = std::thread::spawn(move || {
+            let other = rusqlite::Connection::open(&path).unwrap();
+            other.busy_timeout(Duration::from_secs(15)).unwrap();
+            started.send(()).unwrap();
+            obligations::acknowledge_review(&other, thread, &digest, &[id])
+        });
+        waiting.recv().unwrap();
+        db.execute_batch("COMMIT").unwrap();
+        assert!(ack.join().unwrap().is_err());
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 2);
+    }
+
+    #[test]
+    fn linked_result_rearms_review_without_repeating_duplicate_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let link = validation_obligations::PublicationLink {
+            kind: "artifact".into(),
+            repo: "ci".into(),
+            resource: "report".into(),
+        };
+        let scope = BTreeMap::from([("environment".to_string(), "test".to_string())]);
+        let id = validation_obligations::register(
+            &db,
+            thread,
+            "Check report",
+            Some(&link),
+            Some(&scope),
+        )
+        .unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, std::slice::from_ref(&id)).unwrap();
+        db.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread,state,outcome) VALUES ('unrelated','artifact','ci','other','available',?1,'queued','available')", [thread]).unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 0);
+        let source = json!({"kind":"artifact","repo":"ci","resource":"report","event":"available","outcome":"available"});
+        subscriptions::publish_report_with_conditions(
+            &db,
+            "artifact",
+            "ci",
+            "report",
+            "available",
+            &source,
+            None,
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 1);
+        assert_eq!(obligations::linked_results(&db, &id).unwrap().len(), 1);
+        assert_eq!(
+            obligations::linked_results(&db, &id).unwrap()[0]["outcome"],
+            "available"
+        );
+        assert!(
+            obligations::acknowledge_review(&db, thread, &digest, std::slice::from_ref(&id))
+                .is_err()
+        );
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, &[id]).unwrap();
+        subscriptions::publish_report_with_conditions(
+            &db,
+            "artifact",
+            "ci",
+            "report",
+            "available",
+            &source,
+            None,
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 0);
+    }
+
+    #[test]
+    fn unlinked_validation_surfaces_completed_ci_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = validation_obligations::register(&db, thread, "Check CI", None, None).unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, std::slice::from_ref(&id)).unwrap();
+        db.execute("INSERT INTO waits(repo,run_id,attempt,thread,sha,state,conclusion) VALUES ('owner/repo',1,1,?1,'abc','ready','failure')", [thread]).unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 1);
+        assert_eq!(
+            obligations::linked_results(&db, &id).unwrap()[0]["outcome"],
+            "failure"
+        );
+    }
+
+    #[test]
+    fn ci_completion_and_linked_observation_rearm_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let link = validation_obligations::PublicationLink {
+            kind: "artifact".into(),
+            repo: "ci".into(),
+            resource: "report".into(),
+        };
+        let scope = BTreeMap::from([("environment".into(), "test".into())]);
+        let id = validation_obligations::register(
+            &db,
+            thread,
+            "Check report",
+            Some(&link),
+            Some(&scope),
+        )
+        .unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, std::slice::from_ref(&id)).unwrap();
+        db.execute("INSERT INTO waits(repo,run_id,attempt,thread,sha,state,conclusion) VALUES ('owner/repo',1,1,?1,'abc','ready','failure')", [thread]).unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 0);
+        let job = obligations::register(
+            &db,
+            thread,
+            "job",
+            "owner/repo",
+            "1",
+            "success",
+            "Publish job",
+        )
+        .unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, &[id.clone(), job.clone()]).unwrap();
+        db.execute(
+            "UPDATE waits SET state='needs_attention',reason='delivery failed' WHERE run_id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 2);
+        assert_eq!(
+            obligations::linked_results(&db, &job).unwrap()[0]["outcome"],
+            "failure"
+        );
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, &[id.clone(), job.clone()]).unwrap();
+        db.execute("INSERT INTO subscriptions(id,kind,repo,resource,event,thread) VALUES ('observation','artifact','ci','report','available','22222222-2222-4222-8222-222222222222')", []).unwrap();
+        subscriptions::publish_observation(&db, "observation", "available", &json!({})).unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 2);
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, &[id, job]).unwrap();
+        subscriptions::accept(&db, "artifact", &json!({"event":"available","outcome":"available","repo":"ci","resource":"report","generation":2})).unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 2);
+    }
+
+    #[test]
+    fn transferred_back_obligation_requires_review_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let mut db = database(&config).unwrap();
+        let a = "11111111-1111-4111-8111-111111111111";
+        let b = "22222222-2222-4222-8222-222222222222";
+        let id = obligations::register(&db, a, "artifact", "ci", "report", "available", "Publish")
+            .unwrap();
+        let (_, digest) = obligations::review_digest(&db, a).unwrap();
+        obligations::acknowledge_review(&db, a, &digest, std::slice::from_ref(&id)).unwrap();
+        let forward = obligations::propose_transfer(
+            &mut db, &id, a, b, "Publish", "Pending", "None", "Continue",
+        )
+        .unwrap();
+        obligations::accept_transfer(&mut db, &forward.id, b, &forward.confirmation_code).unwrap();
+        let back = obligations::propose_transfer(
+            &mut db, &id, b, a, "Publish", "Pending", "None", "Continue",
+        )
+        .unwrap();
+        obligations::accept_transfer(&mut db, &back.id, a, &back.confirmation_code).unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, a).unwrap(), 1);
+    }
+
+    #[test]
+    fn direct_publication_failure_and_scope_change_rearm_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = obligations::register(
+            &db,
+            thread,
+            "job",
+            "owner/repo",
+            "123",
+            "success",
+            "Publish success",
+        )
+        .unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, std::slice::from_ref(&id)).unwrap();
+        let source = json!({});
+        subscriptions::publish_report_with_scope(
+            &db,
+            "job",
+            "owner/repo",
+            "123",
+            "failure",
+            &source,
+            Some(("123", 1)),
+            Some(&json!({"env":"test"})),
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 1);
+        let result = &obligations::linked_results(&db, &id).unwrap()[0];
+        assert_eq!(result["execution_id"], "123");
+        assert_eq!(result["attempt"], "1");
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, std::slice::from_ref(&id)).unwrap();
+        subscriptions::publish_report_with_scope(
+            &db,
+            "job",
+            "owner/repo",
+            "123",
+            "failure",
+            &source,
+            Some(("123", 1)),
+            Some(&json!({"env":"production"})),
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 1);
+        assert_eq!(obligations::linked_results(&db, &id).unwrap().len(), 2);
+        let link = validation_obligations::PublicationLink {
+            kind: "job".into(),
+            repo: "owner/repo".into(),
+            resource: "123".into(),
+        };
+        let scope = BTreeMap::from([("environment".into(), "test".into())]);
+        let later = validation_obligations::register(
+            &db,
+            thread,
+            "Later validation",
+            Some(&link),
+            Some(&scope),
+        )
+        .unwrap();
+        assert!(obligations::linked_results(&db, &later).unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_job_result_with_changed_metadata_does_not_rearm_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let link = validation_obligations::PublicationLink {
+            kind: "job".into(),
+            repo: "owner/repo".into(),
+            resource: "123".into(),
+        };
+        let scope = BTreeMap::from([("environment".into(), "test".into())]);
+        let id =
+            validation_obligations::register(&db, thread, "Check job", Some(&link), Some(&scope))
+                .unwrap();
+        let first = json!({"metadata":"first"});
+        let second = json!({"metadata":"second"});
+        subscriptions::publish_report_with_conditions(
+            &db,
+            "job",
+            "owner/repo",
+            "123",
+            "success",
+            &first,
+            Some(("123", 1)),
+        )
+        .unwrap();
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, &[id]).unwrap();
+        subscriptions::publish_report_with_conditions(
+            &db,
+            "job",
+            "owner/repo",
+            "123",
+            "success",
+            &second,
+            Some(("123", 1)),
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 0);
+    }
+
+    #[test]
+    fn job_identity_in_source_deduplicates_changed_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = obligations::register(
+            &db,
+            thread,
+            "job",
+            "owner/repo",
+            "123",
+            "success",
+            "Publish success",
+        )
+        .unwrap();
+        let first = json!({"execution_id":"123","attempt":"1","metadata":"first"});
+        let second = json!({"execution_id":"123","attempt":"1","metadata":"second"});
+        subscriptions::publish_report_with_conditions(
+            &db,
+            "job",
+            "owner/repo",
+            "123",
+            "failure",
+            &first,
+            None,
+        )
+        .unwrap();
+        let result = &obligations::linked_results(&db, &id).unwrap()[0];
+        assert_eq!(result["execution_id"], "123");
+        assert_eq!(result["attempt"], "1");
+        let (_, digest) = obligations::review_digest(&db, thread).unwrap();
+        obligations::acknowledge_review(&db, thread, &digest, &[id]).unwrap();
+        subscriptions::publish_report_with_conditions(
+            &db,
+            "job",
+            "owner/repo",
+            "123",
+            "failure",
+            &second,
+            None,
+        )
+        .unwrap();
+        assert_eq!(obligations::unreviewed_count(&db, thread).unwrap(), 0);
     }
 
     #[test]
