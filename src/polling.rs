@@ -38,13 +38,135 @@ pub fn tick(db: &Connection, gh: &Path) -> Result<Value> {
     tick_with(db, now_ms(), |route, etag| github_fetch(gh, route, etag))
 }
 
+/// Capture an HMAC-verified PR webhook and reconcile reopen evidence through the same
+/// REST timeline path used by polling before returning to the webhook handler. The caller
+/// must verify the signature over the raw body before invoking this function.
+pub fn accept_authenticated_pr_webhook_with_rest(
+    db: &Connection,
+    gh: &Path,
+    event: &str,
+    delivery_id: Option<&str>,
+    payload: &Value,
+) -> Result<usize> {
+    accept_authenticated_pr_webhook_with_fetch_at(
+        db,
+        now_ms(),
+        event,
+        delivery_id,
+        payload,
+        |route, etag| github_fetch(gh, route, etag),
+    )
+}
+
+fn accept_authenticated_pr_webhook_with_fetch_at<F>(
+    db: &Connection,
+    now: i64,
+    event: &str,
+    delivery_id: Option<&str>,
+    payload: &Value,
+    mut fetch: F,
+) -> Result<usize>
+where
+    F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
+{
+    anyhow::ensure!(
+        db.is_autocommit(),
+        "Webhook REST reconciliation requires an autocommit connection"
+    );
+    let accepted = match delivery_id.filter(|id| !id.is_empty()) {
+        Some(delivery_id) => pr_notifications::accept_authenticated_webhook_with_delivery_id(
+            db,
+            event,
+            delivery_id,
+            payload,
+        )?,
+        None => pr_notifications::accept_authenticated_webhook(db, event, payload)?,
+    };
+    if event != "pull_request" || payload["action"] != "reopened" {
+        return Ok(accepted);
+    }
+    let Some(repo) = payload["repository"]["full_name"].as_str() else {
+        return Ok(accepted);
+    };
+    let Some(number) = payload["pull_request"]["number"]
+        .as_i64()
+        .filter(|number| *number > 0)
+    else {
+        return Ok(accepted);
+    };
+    initialize(db)?;
+    crate::subscriptions::initialize(db)?;
+    crate::rules::initialize(db)?;
+    for endpoint in [
+        format!("/repos/{repo}/pulls/{number}"),
+        format!("/repos/{repo}/issues/{number}/timeline"),
+    ] {
+        db.execute(
+            "UPDATE github_poll_state SET next_poll_ms=?2
+             WHERE endpoint=?1 AND error_category IS NULL",
+            params![endpoint, now],
+        )?;
+    }
+    let report = tick_with_pull_request(db, now, &mut fetch, repo, &number.to_string())?;
+    Ok(accepted + report["accepted"].as_u64().unwrap_or_default() as usize)
+}
+
 fn tick_with<F>(db: &Connection, now: i64, mut fetch: F) -> Result<Value>
+where
+    F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
+{
+    tick_with_filter(db, now, &mut fetch, None)
+}
+
+fn tick_with_pull_request<F>(
+    db: &Connection,
+    now: i64,
+    mut fetch: F,
+    repo: &str,
+    pr: &str,
+) -> Result<Value>
+where
+    F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
+{
+    tick_with_filter(db, now, &mut fetch, Some((repo, pr)))
+}
+
+fn tick_with_filter<F>(
+    db: &Connection,
+    now: i64,
+    mut fetch: &mut F,
+    only_pr: Option<(&str, &str)>,
+) -> Result<Value>
 where
     F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
 {
     initialize(db)?;
     pr_notifications::initialize(db)?;
-    let targets = targets(db)?;
+    let mut targets = targets(db, only_pr.is_none())?;
+    if let Some((repo, pr)) = only_pr {
+        let target = targets
+            .pull_requests
+            .iter()
+            .find(|resource| resource.repo.eq_ignore_ascii_case(repo) && resource.resource == pr)
+            .cloned()
+            .unwrap_or_else(|| Resource {
+                repo: repo.to_ascii_lowercase(),
+                resource: pr.to_owned(),
+            });
+        targets.pull_requests.clear();
+        targets.pull_requests.insert(target);
+        targets.rule_prs.clear();
+        targets.condition_members.retain(|member| {
+            member.selector.kind == "pull_request"
+                && member.selector.repo.eq_ignore_ascii_case(repo)
+                && member.selector.resource == pr
+        });
+        targets.runs.clear();
+        targets.waits.clear();
+        targets.reviews.clear();
+        targets.deployments.clear();
+        targets.refs.clear();
+    }
     let mut report = Report::default();
     db.execute("UPDATE github_poll_state SET error_category=NULL WHERE endpoint='__global__' AND next_poll_ms<=?1",[now])?;
 
@@ -200,6 +322,12 @@ where
         }
         let (timeline_floor, pending_reopen_needs_close) =
             pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)?;
+        let pending_reopen_watermark: i64 = db.query_row(
+            "SELECT COALESCE(MAX(id),0) FROM automatic_pr_pending_reopens
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2",
+            params![resource.repo, resource.resource],
+            |row| row.get(0),
+        )?;
         let timeline_route = format!(
             "/repos/{}/issues/{}/timeline",
             resource.repo, resource.resource
@@ -234,6 +362,7 @@ where
         let lifecycle_events = std::cell::RefCell::new(None::<TimelineLifecycleBatch>);
         let timeline_error = std::cell::Cell::new(None::<&'static str>);
         let timeline_calls = std::cell::Cell::new(0_u64);
+        let pr_observed_open = std::cell::Cell::new(false);
         let repo_for_timeline = resource.repo.clone();
         let number_for_timeline = resource.resource.clone();
         let route_for_timeline = route.clone();
@@ -282,6 +411,7 @@ where
                     .as_str()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
                 let needs_scan = pending_reopen_needs_close
+                    || timeline_has_error
                     || timeline_checkpoint.as_deref() != Some(updated_at);
                 if timeline_due && needs_scan {
                     match fetch_reopened_timeline(
@@ -299,6 +429,7 @@ where
                                 updated_at: updated_at.to_owned(),
                                 route: timeline_route.clone(),
                                 calls: timeline_calls.get() as i64,
+                                pending_reopen_watermark,
                             }));
                         }
                         Err(error) => {
@@ -345,6 +476,7 @@ where
                 )
                 .map_err(|_| Failure::new("database"))?;
                 if observed_state == "open" {
+                    pr_observed_open.set(true);
                     consume_durable_reopen_notifications(
                         db,
                         &resource.repo,
@@ -392,15 +524,6 @@ where
                 let baseline = cursor_number(prior_sequence.unwrap_or(now));
                 let event_cursor = prior_sequence.map(|last| cursor_number(last.saturating_add(1)));
                 let mut condition_observations = Vec::new();
-                if let Some(batch) = lifecycle_events.borrow().as_ref() {
-                    apply_timeline_lifecycle_events(
-                        db,
-                        &resource.repo,
-                        &resource.resource,
-                        batch,
-                        now,
-                    )?;
-                }
                 if pr["state"] == "closed" {
                     if pr["merged"].as_bool().is_none() {
                         return Err(Failure::new("invalid_response"));
@@ -602,6 +725,34 @@ where
             ))
             },
         )?;
+        if outcome.error.is_none()
+            && let Some(batch) = lifecycle_events.borrow().as_ref()
+        {
+            match apply_timeline_lifecycle_events(
+                db,
+                &resource.repo,
+                &resource.resource,
+                batch,
+                now,
+            ) {
+                Ok(accepted) => {
+                    outcome.accepted = outcome.accepted.saturating_add(accepted as u64);
+                    if pr_observed_open.get() {
+                        consume_durable_reopen_notifications(
+                            db,
+                            &resource.repo,
+                            &resource.resource,
+                            now,
+                        )
+                        .map_err(|_| anyhow::anyhow!("could not consume reopened PR notices"))?;
+                    }
+                }
+                Err(error) => {
+                    record_failure(db, &timeline_route, 0, now, &error, timeline_calls.get())?;
+                    outcome.error = Some(error.category);
+                }
+            }
+        }
         outcome.calls = outcome.calls.saturating_add(timeline_calls.get());
         if outcome.error.is_none() && outcome.skipped && cached_pr_is_valid(db, &route, number)? {
             validated_prs.insert(resource.clone());
@@ -1163,10 +1314,10 @@ struct Targets {
     rule_prs: BTreeSet<Resource>,
 }
 
-fn targets(db: &Connection) -> Result<Targets> {
+fn targets(db: &Connection, include_waits: bool) -> Result<Targets> {
     crate::conditions::initialize(db)?;
     let mut out = Targets::default();
-    {
+    if include_waits {
         let mut s =
             db.prepare("SELECT repo,run_id,attempt,sha FROM waits WHERE state='waiting'")?;
         for row in s.query_map([], |r| {
@@ -2382,6 +2533,7 @@ struct TimelineLifecycleBatch {
     updated_at: String,
     route: String,
     calls: i64,
+    pending_reopen_watermark: i64,
 }
 
 fn apply_timeline_lifecycle_events(
@@ -2390,12 +2542,13 @@ fn apply_timeline_lifecycle_events(
     pr: &str,
     batch: &TimelineLifecycleBatch,
     now: i64,
-) -> std::result::Result<(), Failure> {
+) -> std::result::Result<usize, Failure> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| Failure::new("database"))?;
+    let mut accepted = 0;
     for event in &batch.events {
         if event.event == "closed" {
-            pr_notifications::record_closed_event_in(
+            accepted += pr_notifications::record_closed_event_in(
                 &tx,
                 repo,
                 pr,
@@ -2411,7 +2564,8 @@ fn apply_timeline_lifecycle_events(
                 ),
                 &event.source,
             )
-            .map_err(|_| Failure::new("database"))?;
+            .map_err(|_| Failure::new("database"))?
+            .len();
             continue;
         }
         let cycle = pr_notifications::record_reopened_event_in(
@@ -2423,30 +2577,18 @@ fn apply_timeline_lifecycle_events(
             &format!("timeline:{}", event.event_id),
         )
         .map_err(|_| Failure::new("database"))?;
-        let Some((event_key, _)) = cycle else {
+        let Some((_, notifications)) = cycle else {
             continue;
         };
-        let notification_ids: Vec<String> = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT id FROM automatic_pr_notifications
-                     WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2
-                       AND event='reopened' AND event_key=?3",
-                )
-                .map_err(|_| Failure::new("database"))?;
-            statement
-                .query_map(params![repo, pr, event_key], |row| row.get(0))
-                .map_err(|_| Failure::new("database"))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|_| Failure::new("database"))?
-        };
-        for notification_id in notification_ids {
-            codex_wake::pr_ci::consume_reopened_notification_in(&tx, &notification_id, now)
-                .map_err(|_| Failure::new("database"))?;
-        }
+        accepted += notifications.len();
     }
-    pr_notifications::mark_pending_reopens_timeline_scanned_in(&tx, repo, pr)
-        .map_err(|_| Failure::new("database"))?;
+    pr_notifications::mark_pending_reopens_timeline_scanned_in(
+        &tx,
+        repo,
+        pr,
+        batch.pending_reopen_watermark,
+    )
+    .map_err(|_| Failure::new("database"))?;
     tx.execute(
         "INSERT INTO github_poll_state
          (endpoint,page,cursor,next_poll_ms,backoff_ms,last_success_ms,error_category,calls)
@@ -2465,7 +2607,8 @@ fn apply_timeline_lifecycle_events(
         ],
     )
     .map_err(|_| Failure::new("database"))?;
-    tx.commit().map_err(|_| Failure::new("database"))
+    tx.commit().map_err(|_| Failure::new("database"))?;
+    Ok(accepted)
 }
 
 fn fetch_reopened_timeline<F>(
@@ -3858,8 +4001,11 @@ mod tests {
                 let body = match route {
                     "/repos/owner/repo/pulls/7" => pull(state, closed_at, updated_at),
                     "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
-                        assert_eq!(state, "open");
-                        json!([{"id":7001,"event":"reopened","created_at":updated_at}])
+                        if state == "open" {
+                            json!([{"id":7001,"event":"reopened","created_at":updated_at}])
+                        } else {
+                            json!([])
+                        }
                     }
                     _ => panic!("unexpected route: {route}"),
                 };
@@ -3931,8 +4077,15 @@ mod tests {
             "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
         });
         let report = tick_with(&db, INTERVAL_MS * 2 + 1, |requested, _| {
-            assert_eq!(requested, route);
-            Ok(response(closed_poll.clone(), false))
+            if requested == route {
+                Ok(response(closed_poll.clone(), false))
+            } else {
+                assert_eq!(
+                    requested,
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1"
+                );
+                Ok(response(json!([]), false))
+            }
         })
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
@@ -4262,13 +4415,20 @@ mod tests {
         let db = db();
         let thread = "11111111-1111-4111-8111-111111111111";
         pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let previous_closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&previous_closed));
         let closed = json!({
             "number":7,"state":"closed","merged":false,"merged_at":null,
             "closed_at":"2099-01-01T00:00:30Z","updated_at":"2099-01-01T00:00:30Z",
             "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
         });
 
-        let report = tick_with(&db, now_ms(), |route, _| match route {
+        let now = now_ms();
+        let report = tick_with(&db, now, |route, _| match route {
             "/repos/owner/repo/pulls/7" => Ok(response(closed.clone(), false)),
             "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
                 json!([
@@ -4291,6 +4451,24 @@ mod tests {
                 .map(|notice| notice.event_key.as_str())
                 .collect::<Vec<_>>(),
             ["reopened:4070908810"]
+        );
+        let repeated = tick_with(&db, now + INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            _ => panic!("unchanged closed snapshot must not replay timeline: {route}"),
+        })
+        .unwrap();
+        assert_eq!(repeated["errors"], json!({}), "{repeated}");
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1
         );
     }
 
@@ -4326,6 +4504,234 @@ mod tests {
                 .filter(|notice| notice.event == "reopened")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn reopened_webhook_reconciles_rest_before_return_and_keeps_pending_on_failure() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        pr_notifications::accept_authenticated_webhook(
+            &db,
+            "pull_request",
+            &json!({
+                "action":"closed","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":false,
+                    "closed_at":"2099-01-01T00:00:10Z"}
+            }),
+        )
+        .unwrap();
+        let reopen = json!({
+            "action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"state":"open",
+                "updated_at":"2099-01-01T00:00:20Z"}
+        });
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let delivery_id = "00000000-0000-4000-8000-000000000007";
+        let accepted = accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            INTERVAL_MS + 1,
+            "pull_request",
+            Some(delivery_id),
+            &reopen,
+            |route, _| match route {
+                "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                    json!([
+                        {"id":8300,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                        {"id":8301,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                    ]),
+                    false,
+                )),
+                _ => panic!("unexpected REST route {route}"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            accepted, 1,
+            "the REST-confirmed reopen is captured before return"
+        );
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|notice| notice.event == "closed"));
+        assert!(notices.iter().any(|notice| notice.event == "reopened"));
+        let pending_reopens: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_reopens, 0);
+
+        let replay = accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            2 * INTERVAL_MS + 1,
+            "pull_request",
+            Some(delivery_id),
+            &reopen,
+            |route, _| match route {
+                "/repos/owner/repo/pulls/7" => Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                }),
+                _ => panic!("replayed delivery must not need another timeline scan: {route}"),
+            },
+        )
+        .unwrap();
+        assert_eq!(replay, 0, "a redelivery adds no second notification");
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 2);
+
+        let failed_db = Connection::open_in_memory().unwrap();
+        failed_db
+            .execute_batch(
+                "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+            )
+            .unwrap();
+        crate::subscriptions::initialize(&failed_db).unwrap();
+        crate::rules::initialize(&failed_db).unwrap();
+        crate::conditions::initialize(&failed_db).unwrap();
+        initialize(&failed_db).unwrap();
+        pr_notifications::register(&failed_db, "pull_request", "owner/repo", "7", thread).unwrap();
+        seed_legacy_pr_cursor(&failed_db, Some(&closed));
+        let failed = accept_authenticated_pr_webhook_with_fetch_at(
+            &failed_db,
+            INTERVAL_MS + 1,
+            "pull_request",
+            Some(delivery_id),
+            &reopen,
+            |route, _| match route {
+                "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                }),
+                _ => panic!("unexpected REST route {route}"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            failed, 0,
+            "unconfirmed webhook stays pending on REST failure"
+        );
+        let pending_reopens: i64 = failed_db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_reopens, 1);
+        assert!(
+            pr_notifications::pending(&failed_db)
+                .unwrap()
+                .iter()
+                .all(|notice| notice.event != "reopened")
+        );
+    }
+
+    #[test]
+    fn reopened_webhook_journals_rest_event_before_listener_registration() {
+        let db = db();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        let close = json!({
+            "action":"closed","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false,
+                "closed_at":"2099-01-01T00:00:10Z"}
+        });
+        assert_eq!(
+            pr_notifications::accept_authenticated_webhook(&db, "pull_request", &close).unwrap(),
+            0
+        );
+        let reopen = json!({
+            "action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"state":"open",
+                "updated_at":"2099-01-01T00:00:20Z"}
+        });
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        assert_eq!(
+            accept_authenticated_pr_webhook_with_fetch_at(
+                &db,
+                INTERVAL_MS + 1,
+                "pull_request",
+                Some("delivery-before-listener"),
+                &reopen,
+                |route, _| match route {
+                    "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                        json!([
+                            {"id":8400,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                            {"id":8401,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                        ]),
+                        false,
+                    )),
+                    _ => panic!("unexpected REST route {route}"),
+                },
+            )
+            .unwrap(),
+            0,
+            "without listeners the webhook is journaled without a destination delivery"
+        );
+        let journal_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_event_journal
+                 WHERE kind='pull_request' AND repo='owner/repo' AND pr='7'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journal_count, 2);
+
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let boundary = pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap();
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            boundary,
+        )
+        .unwrap();
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|notice| notice.event == "closed"));
+        assert!(notices.iter().any(|notice| notice.event == "reopened"));
+        assert_eq!(
+            pr_notifications::replay_listener_events_in(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                thread,
+            )
+            .unwrap(),
+            0
         );
     }
 
@@ -4366,6 +4772,114 @@ mod tests {
     }
 
     #[test]
+    fn webhook_arriving_during_timeline_fetch_triggers_a_second_scan_on_304() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        pr_notifications::accept_authenticated_webhook(
+            &db,
+            "pull_request",
+            &json!({"action":"closed","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":false,
+                    "closed_at":"2099-01-01T00:00:00Z"}}),
+        )
+        .unwrap();
+        let reopen = |at| {
+            json!({"action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":at}})
+        };
+        pr_notifications::accept_authenticated_webhook_with_delivery_id(
+            &db,
+            "pull_request",
+            "first",
+            &reopen("2099-01-01T00:00:10Z"),
+        )
+        .unwrap();
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let now = now_ms();
+        let first = tick_with(&db, now, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                    &db,
+                    "pull_request",
+                    "second",
+                    &reopen("2099-01-01T00:00:20Z"),
+                )
+                .unwrap();
+                Ok(response(
+                    json!([
+                        {"id":8500,"event":"closed","created_at":"2099-01-01T00:00:00Z"},
+                        {"id":8501,"event":"reopened","created_at":"2099-01-01T00:00:10Z"}
+                    ]),
+                    false,
+                ))
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}), "{first}");
+        let scanned: i64 = db
+            .query_row(
+                "SELECT timeline_scanned FROM automatic_pr_pending_reopens
+                 WHERE source_kind='webhook' AND source_id='webhook:second'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scanned, 0,
+            "a later webhook was not covered by the first response"
+        );
+
+        let second = tick_with(&db, now + INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":8500,"event":"closed","created_at":"2099-01-01T00:00:00Z"},
+                    {"id":8501,"event":"reopened","created_at":"2099-01-01T00:00:10Z"},
+                    {"id":8502,"event":"closed","created_at":"2099-01-01T00:00:15Z"},
+                    {"id":8503,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected retry route {route}"),
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+        let reopened: Vec<_> = pr_notifications::pending(&db)
+            .unwrap()
+            .into_iter()
+            .filter(|notice| notice.event == "reopened")
+            .map(|notice| notice.event_key)
+            .collect();
+        assert_eq!(reopened.len(), 2);
+        assert_ne!(reopened[0], reopened[1]);
+    }
+
+    #[test]
     fn reopened_webhook_and_timeline_poll_share_identity_in_both_orders() {
         let thread = "11111111-1111-4111-8111-111111111111";
         let reopened_at = "2099-01-01T00:00:00Z";
@@ -4402,6 +4916,26 @@ mod tests {
             })
             .unwrap()
         };
+        let reconcile_webhook = |db: &Connection, now| {
+            accept_authenticated_pr_webhook_with_fetch_at(
+                db,
+                now,
+                "pull_request",
+                Some("delivery-reopen-7001"),
+                &webhook,
+                |route, _| match route {
+                    "/repos/owner/repo/pulls/7" => {
+                        Ok(response(open_with_later_edit.clone(), false))
+                    }
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                        json!([{"id":7001,"event":"reopened","created_at":reopened_at}]),
+                        false,
+                    )),
+                    _ => panic!("unexpected focused webhook REST route {route}"),
+                },
+            )
+            .unwrap()
+        };
 
         let webhook_first = db();
         crate::polling::pr_notifications::register(
@@ -4422,30 +4956,20 @@ mod tests {
             .unwrap(),
             1
         );
-        assert_eq!(
-            crate::polling::pr_notifications::accept_authenticated_webhook(
-                &webhook_first,
-                "pull_request",
-                &webhook,
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            crate::polling::pr_notifications::accept_authenticated_webhook(
-                &webhook_first,
-                "pull_request",
-                &webhook,
-            )
-            .unwrap(),
-            0
-        );
-        assert!(
-            poll(&webhook_first)["errors"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(reconcile_webhook(&webhook_first, INTERVAL_MS + 1), 1);
+        let replay = accept_authenticated_pr_webhook_with_fetch_at(
+            &webhook_first,
+            2 * INTERVAL_MS + 1,
+            "pull_request",
+            Some("delivery-reopen-7001"),
+            &webhook,
+            |route, _| match route {
+                "/repos/owner/repo/pulls/7" => Ok(response(open_with_later_edit.clone(), false)),
+                _ => panic!("replayed delivery must not rescan REST: {route}"),
+            },
+        )
+        .unwrap();
+        assert_eq!(replay, 0);
         let notices = pr_notifications::pending(&webhook_first).unwrap();
         assert_eq!(notices.len(), 2);
         let shared_key = notices
@@ -4476,15 +5000,7 @@ mod tests {
             1
         );
         assert!(poll(&poll_first)["errors"].as_object().unwrap().is_empty());
-        assert_eq!(
-            crate::polling::pr_notifications::accept_authenticated_webhook(
-                &poll_first,
-                "pull_request",
-                &webhook,
-            )
-            .unwrap(),
-            0
-        );
+        assert_eq!(reconcile_webhook(&poll_first, 2 * INTERVAL_MS + 1), 0);
         let notices = pr_notifications::pending(&poll_first).unwrap();
         assert_eq!(notices.len(), 2);
         let reopened_notice = notices
@@ -4527,24 +5043,35 @@ mod tests {
             .unwrap(),
             1
         );
-        assert_eq!(
-            crate::polling::pr_notifications::accept_authenticated_webhook(
+        let timeline = || {
+            json!([
+                {"id":7000,"event":"closed","created_at":"2098-12-31T23:59:00Z"},
+                {"id":7001,"event":"reopened","created_at":"2099-01-01T00:00:00Z"}
+            ])
+        };
+        let reconcile = |now| {
+            accept_authenticated_pr_webhook_with_fetch_at(
                 &db,
+                now,
                 "pull_request",
+                Some("delivery-reopen-7001"),
                 &reopen,
+                |route, _| match route {
+                    "/repos/owner/repo/pulls/7" => {
+                        let mut current = open.clone();
+                        current["updated_at"] = json!("2099-01-01T00:00:00Z");
+                        Ok(response(current, false))
+                    }
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                        Ok(response(timeline(), false))
+                    }
+                    _ => panic!("unexpected REST route {route}"),
+                },
             )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            crate::polling::pr_notifications::accept_authenticated_webhook(
-                &db,
-                "pull_request",
-                &reopen,
-            )
-            .unwrap(),
-            0
-        );
+            .unwrap()
+        };
+        assert_eq!(reconcile(0), 1);
+        assert_eq!(reconcile(1), 0);
         let mut reopened_id = None;
         for now in [INTERVAL_MS + 1, 2 * INTERVAL_MS + 1] {
             let mut requested = Vec::new();
@@ -4699,6 +5226,16 @@ mod tests {
         let db = db();
         let thread = "11111111-1111-4111-8111-111111111111";
         pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let reopened_webhook = json!({
+            "action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}
+        });
+        assert_eq!(
+            pr_notifications::accept_authenticated_webhook(&db, "pull_request", &reopened_webhook,)
+                .unwrap(),
+            0
+        );
         let baseline = json!({
             "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
             "updated_at":"2099-01-01T00:00:00Z",
@@ -4748,11 +5285,39 @@ mod tests {
             journal_count, 0,
             "failed application must roll back journal writes"
         );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                state(&db, "/repos/owner/repo/pulls/7", 0)
+                    .unwrap()
+                    .unwrap()
+                    .body
+                    .as_deref()
+                    .unwrap()
+            )
+            .unwrap()["updated_at"],
+            current["updated_at"],
+            "the PR snapshot can advance while the failed timeline checkpoint stays old"
+        );
+        let pending_reopens: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_reopens, 1,
+            "webhook evidence survives timeline rollback"
+        );
         db.execute_batch("DROP TRIGGER fail_reopen_journal")
             .unwrap();
 
         let retried = tick_with(&db, 3 * INTERVAL_MS, |route, _| match route {
-            "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+            "/repos/owner/repo/pulls/7" => Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
             "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
                 Ok(response(timeline(), false))
             }
@@ -4779,6 +5344,63 @@ mod tests {
                 .filter(|notice| notice.event == "reopened")
                 .count(),
             1
+        );
+        let pending_reopens: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_reopens, 0,
+            "REST replay resolves the queued webhook"
+        );
+    }
+
+    #[test]
+    fn timeline_error_retries_even_when_304_updated_at_matches_checkpoint() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let updated_at = "2099-01-01T00:00:20Z";
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":updated_at,
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&current));
+        db.execute(
+            "INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,
+             last_success_ms,error_category,calls)
+             VALUES('/repos/owner/repo/issues/7/timeline',0,?1,0,60000,0,'server_error',1)",
+            [json!({"updated_at":updated_at}).to_string()],
+        )
+        .unwrap();
+        let mut scanned = false;
+        let report = tick_with(&db, 3 * INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                scanned = true;
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        assert!(
+            scanned,
+            "a timeline error must force retry despite a matching 304 snapshot"
         );
     }
 
@@ -5540,6 +6162,8 @@ mod tests {
             routes.insert(route.to_owned());
             let body = if route == "/repos/owner/repo/pulls/7" {
                 closed.clone()
+            } else if route == "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" {
+                json!([])
             } else if route.starts_with("/repos/owner/repo/issues/7/comments") {
                 json!([comment.clone()])
             } else {
@@ -5629,6 +6253,8 @@ mod tests {
         let repeated = tick_with(&db, INTERVAL_MS * 2 + 1, |route, _| {
             let body = if route == "/repos/owner/repo/pulls/7" {
                 closed.clone()
+            } else if route == "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" {
+                json!([])
             } else if route.starts_with("/repos/owner/repo/issues/7/comments") {
                 json!([comment.clone()])
             } else {

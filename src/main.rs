@@ -537,12 +537,21 @@ fn verified_webhook_payload(
 
 fn capture_authenticated_pr_notification(
     db: &rusqlite::Connection,
+    gh: &Path,
     event: &str,
     delivery_id: Option<&str>,
     payload: &Value,
 ) -> Result<usize> {
-    let is_supported = (event == "pull_request"
-        && matches!(payload["action"].as_str(), Some("closed" | "reopened")))
+    if event == "pull_request" && payload["action"] == "reopened" {
+        return polling::accept_authenticated_pr_webhook_with_rest(
+            db,
+            gh,
+            event,
+            delivery_id,
+            payload,
+        );
+    }
+    let is_supported = (event == "pull_request" && payload["action"] == "closed")
         || (event == "pull_request_review" && payload["action"] == "submitted");
     if is_supported {
         if let Some(delivery_id) = delivery_id.filter(|id| !id.is_empty()) {
@@ -2915,6 +2924,7 @@ async fn run_command(
             let automatic_pr_notifications = if authenticated_webhook {
                 capture_authenticated_pr_notification(
                     &db,
+                    &config.gh,
                     &event,
                     delivery_id.as_deref(),
                     &payload,
@@ -3026,6 +3036,23 @@ mod hook_output_tests {
         };
         let secret = manager::load_secret(&config.config.join("webhook.secret")).unwrap();
         let db = rusqlite::Connection::open_in_memory().unwrap();
+        std::fs::write(
+            &config.gh,
+            r##"#!/bin/sh
+for route do :; done
+printf '%s\n' "$route" >> "$(dirname "$0")/gh-routes"
+case "$route" in
+  /repos/owner/repo/pulls/7)
+    body='{"number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,"updated_at":"2099-01-01T00:00:00Z","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main"}}' ;;
+  '/repos/owner/repo/issues/7/timeline?per_page=100&page=1')
+    body='[{"id":7001,"event":"closed","created_at":"2098-12-31T23:59:00Z"},{"id":7002,"event":"reopened","created_at":"2099-01-01T00:00:00Z"}]' ;;
+  *) exit 1 ;;
+esac
+printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s' "$body"
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&config.gh, std::fs::Permissions::from_mode(0o700)).unwrap();
         let thread = "11111111-1111-4111-8111-111111111111";
         polling::pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread)
             .unwrap();
@@ -3056,17 +3083,37 @@ mod hook_output_tests {
             let signature = format!("sha256={:x}", mac.finalize().into_bytes());
             let parsed = verified_webhook_payload(&config, &raw, &signature).unwrap();
             assert_eq!(
-                capture_authenticated_pr_notification(&db, "pull_request", None, &parsed).unwrap(),
+                capture_authenticated_pr_notification(
+                    &db,
+                    &config.gh,
+                    "pull_request",
+                    Some(*action),
+                    &parsed
+                )
+                .unwrap(),
                 1,
                 "signed {action} webhook should enqueue once"
             );
             if *action == "reopened" {
+                let routes = std::fs::read_to_string(root.join("gh-routes")).unwrap();
+                assert!(routes.contains("/repos/owner/repo/pulls/7\n"));
+                assert!(
+                    routes.contains("/repos/owner/repo/issues/7/timeline?per_page=100&page=1\n")
+                );
                 let replay = verified_webhook_payload(&config, &raw, &signature).unwrap();
                 assert_eq!(
-                    capture_authenticated_pr_notification(&db, "pull_request", None, &replay,)
-                        .unwrap(),
+                    capture_authenticated_pr_notification(
+                        &db,
+                        &config.gh,
+                        "pull_request",
+                        Some(*action),
+                        &replay,
+                    )
+                    .unwrap(),
                     0
                 );
+            } else {
+                assert!(!root.join("gh-routes").exists());
             }
         }
         let notices = polling::pr_notifications::pending(&db).unwrap();

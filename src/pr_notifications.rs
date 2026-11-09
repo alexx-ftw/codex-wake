@@ -687,9 +687,11 @@ pub(crate) fn record_reopened_event_in(
         reconcile_pending_reopens_in(db, &repo, pr)?;
         return Ok(None);
     };
-    let same_cycle = if source_kind == "webhook" {
-        // `pull_request.updated_at` is not the lifecycle event timestamp. A late close
-        // may still split this apparent tail interval, so keep webhook evidence pending.
+    let same_cycle = if source_kind == "webhook" && current.state == "reopened" {
+        current.webhook_reopen_source_id.as_deref() == Some(source_id)
+    } else if source_kind == "webhook" {
+        // `pull_request.updated_at` is not the lifecycle event timestamp. Keep new
+        // webhook evidence pending until the REST timeline identifies its cycle.
         false
     } else if current.state == "closed" {
         event_at_sec > current.closed_at_sec
@@ -768,6 +770,7 @@ pub(crate) fn record_reopened_event_in(
     Ok(Some((event_key, notifications)))
 }
 
+#[cfg(test)]
 pub(crate) fn record_reopened_event(
     db: &Connection,
     repo: &str,
@@ -936,11 +939,12 @@ pub(crate) fn mark_pending_reopens_timeline_scanned_in(
     db: &Connection,
     repo: &str,
     pr: &str,
+    through_id: i64,
 ) -> Result<()> {
     db.execute(
         "UPDATE automatic_pr_pending_reopens SET timeline_scanned=1
-         WHERE repo=?1 COLLATE NOCASE AND pr=?2",
-        params![repo, pr],
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND id<=?3",
+        params![repo, pr, through_id],
     )?;
     Ok(())
 }
@@ -1052,7 +1056,18 @@ fn accept_authenticated_webhook_inner(
                         db, repo, &pr, "webhook", event_at, &source_id,
                     );
                 }
-                return record_reopened_event(db, repo, &pr, "webhook", event_at);
+                let source = serde_json::to_string(payload)?;
+                let source_id = super::stable_source_key(
+                    "pull_request",
+                    &repo.to_ascii_lowercase(),
+                    &pr,
+                    "webhook_reopened",
+                    "",
+                    &[&source],
+                );
+                return record_reopened_event_with_id(
+                    db, repo, &pr, "webhook", event_at, &source_id,
+                );
             }
             if action != "closed" {
                 return Ok(0);
@@ -1663,6 +1678,19 @@ mod tests {
             .unwrap(),
             0
         );
+        assert_eq!(
+            record_reopened_event_with_id(
+                &db,
+                "owner/repo",
+                "7",
+                "poll",
+                "2099-01-01T00:00:20Z",
+                "timeline:92",
+            )
+            .unwrap(),
+            0,
+            "REST evidence should finalize the pending webhook before listener replay"
+        );
 
         let thread = "11111111-1111-4111-8111-111111111111";
         let boundary = timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap();
@@ -1834,11 +1862,21 @@ mod tests {
             0
         );
         assert_eq!(
+            accept_authenticated_webhook(&db, "pull_request", &reopen).unwrap(),
+            0,
+            "an identical webhook redelivery must not create another pending source"
+        );
+        let registration_floor: i64 = db
+            .query_row(
+                "SELECT registered_at_sec FROM automatic_pr_notification_listeners
+                 WHERE repo='owner/repo' AND pr='7' AND thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
             reopen_timeline_floor(&db, "owner/repo", "7").unwrap(),
-            (
-                Some(timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap()),
-                true
-            ),
+            (Some(registration_floor), true),
             "an unresolved webhook reopen must trigger timeline recovery even while the PR snapshot is open"
         );
         assert_eq!(pending(&db).unwrap().len(), 0);
@@ -2537,6 +2575,7 @@ mod tests {
         let initial_pr = pull_request(&"b".repeat(40), "2026-01-01T00:00:00Z");
         super::super::tick_with(&db, 1, |route, _| match route {
             "/repos/owner/repo/pulls/7" => Ok(response(initial_pr.clone())),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(json!([]))),
             route if route.starts_with("/repos/owner/repo/pulls/7/reviews") => {
                 Ok(response(json!([old_review.clone(), raced_review.clone()])))
             }
@@ -2552,6 +2591,7 @@ mod tests {
         let new_review = review(12, "2099-01-01T00:00:00Z", "CHANGES_REQUESTED");
         let mut fetch = |route: &str, _etag: Option<&str>| match route {
             "/repos/owner/repo/pulls/7" => Ok(response(next_pr.clone())),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(json!([]))),
             route if route.starts_with("/repos/owner/repo/pulls/7/reviews") => {
                 Ok(response(json!([
                     old_review.clone(),

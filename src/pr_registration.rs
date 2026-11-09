@@ -303,6 +303,18 @@ mod tests {
             .unwrap(),
             0
         );
+        assert_eq!(
+            crate::polling::pr_notifications::record_reopened_event_with_id(
+                &db,
+                "owner/repo",
+                "7",
+                "poll",
+                reopened_at,
+                "timeline-reopen-before-registration",
+            )
+            .unwrap(),
+            0
+        );
 
         let expected_events: Vec<(String, String)> = {
             let mut statement = db
