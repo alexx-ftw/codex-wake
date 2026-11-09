@@ -352,13 +352,14 @@ pub fn private_dir(path: &Path) -> Result<()> {
 }
 
 pub fn run(command: &mut Command, timeout: Duration) -> Result<Output> {
-    let stdout = tempfile::tempfile()?;
-    let stderr = tempfile::tempfile()?;
+    let stdout = tempfile::tempfile().context("Create command stdout buffer")?;
+    let stderr = tempfile::tempfile().context("Create command stderr buffer")?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?)
-        .spawn()?;
+        .spawn()
+        .context("Spawn lifecycle helper")?;
     let status = match child.wait_timeout(timeout)? {
         Some(status) => status,
         None => {
@@ -1041,14 +1042,15 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             );
         }
     }
-    let root = env::current_exe()?
+    let root = env::current_exe()
+        .context("Resolve receiver executable")?
         .parent()
         .context("Executable has no directory")?
         .to_path_buf();
     let binary = env::var_os("CODEX_WAKE_WEBHOOK")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("webhook"));
-    private_dir(&config.state)?;
+    private_dir(&config.state).context("Prepare receiver state")?;
     let mut controller = if config.rpc_socket == config.state.join("app-server.sock") {
         remove_stale_socket(&config.rpc_socket)?;
         Some(ChildGuard(
@@ -1117,7 +1119,8 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             !standby && cooperative && env::var("CODEX_WAKE_RECEIVER_LIFECYCLE")? == "1",
             "Invalid lifecycle receiver mode"
         );
-        let mut db = crate::bridge::open_existing_owned(&config.db)?;
+        let mut db = crate::bridge::open_existing_owned(&config.db)
+            .context("Open receiver lifecycle database")?;
         crate::bridge::bind_receiver_gate(
             &mut db,
             &env::var("CODEX_WAKE_GATE_OWNER")?,

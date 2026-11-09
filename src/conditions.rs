@@ -286,8 +286,9 @@ pub(crate) fn current_sender_identity() -> Result<SenderIdentity> {
     let start = crate::obligations::process_start_time(pid)
         .and_then(|value| i64::try_from(value).ok())
         .context("Could not verify condition sender start time")?;
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    let namespace = std::fs::read_link("/proc/self/ns/pid")?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("Read sender boot identity")?;
+    let namespace = std::fs::read_link("/proc/self/ns/pid").context("Read sender PID namespace")?;
     let boot = boot.trim().to_owned();
     let namespace = namespace
         .to_str()

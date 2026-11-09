@@ -325,7 +325,7 @@ pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> R
         "Lifecycle generation mismatch"
     );
     let config = Config::from_env()?;
-    let initial = snapshot()?;
+    let initial = snapshot().context("Query receiver service identity")?;
     let state = match (
         field(&initial, "ActiveState")?,
         field(&initial, "SubState")?,
@@ -347,7 +347,9 @@ pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> R
     let s = loop {
         match running(&config, &spec) {
             Ok(s) => break s,
-            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error.context("Validate receiver service identity"));
+            }
             Err(_) => thread::sleep(Duration::from_millis(50)),
         }
     };

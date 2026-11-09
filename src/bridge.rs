@@ -328,9 +328,11 @@ fn receiver_token() -> &'static uuid::Uuid {
 // Called only by the waiting receiver itself. A different process cannot use
 // the resulting gate even if it knows the cohort UUID and generation.
 pub(crate) fn bind_receiver_gate(db: &mut Connection, owner: &str, generation: i64) -> Result<()> {
-    let identity = crate::conditions::current_sender_identity()?;
+    let identity =
+        crate::conditions::current_sender_identity().context("Read receiver process identity")?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let lifecycle = crate::upgrade::verify_binding(&tx, owner, generation)?;
+    let lifecycle = crate::upgrade::verify_binding(&tx, owner, generation)
+        .context("Verify receiver lifecycle identity")?;
     bind_receiver_gate_in(&tx, owner, generation, &identity, lifecycle)?;
     tx.commit()?;
     Ok(())
