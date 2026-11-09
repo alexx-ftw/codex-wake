@@ -406,7 +406,7 @@ pub(crate) fn systemctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-pub(crate) fn lock(config: &Config) -> Result<File> {
+fn service_lock(config: &Config) -> Result<File> {
     private_dir(&config.state)?;
     let file = OpenOptions::new()
         .read(true)
@@ -422,6 +422,18 @@ pub(crate) fn lock(config: &Config) -> Result<File> {
             && meta.uid() == fs::metadata("/proc/self")?.uid(),
         "Service lock is not a private owned file"
     );
+    Ok(file)
+}
+
+pub(crate) fn cooperative_lock(config: &Config) -> Result<File> {
+    let file = service_lock(config)?;
+    // A valid cooperative transition can outlive the ordinary 90-second admission timeout.
+    file.lock().context("Wait for cooperative service lock")?;
+    Ok(file)
+}
+
+pub(crate) fn lock(config: &Config) -> Result<File> {
+    let file = service_lock(config)?;
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         match file.try_lock() {

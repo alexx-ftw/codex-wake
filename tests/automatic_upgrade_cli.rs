@@ -1,6 +1,13 @@
 //! Real CLI, private environment and a manager fixture that rejects every mutation.
 use serde_json::json;
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 fn command(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_codex-wake"));
     cmd.env_clear()
@@ -116,4 +123,45 @@ fn socket_preflight_failure_does_not_close_a_running_generation() {
     );
     assert_eq!(fs::read(path).unwrap(), record);
     assert!(!root.join("mutated").exists());
+}
+
+#[test]
+#[ignore = "hosted qualification holds the lifecycle lock beyond its former 90-second limit"]
+fn concurrent_ensure_waits_for_transition_without_retrying_pending_journal() {
+    let temp = setup();
+    let root = temp.path();
+    let state = root.join("state/codex-wake");
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let journal = state.join("cooperative-upgrade.json");
+    let bytes = serde_json::to_vec(&json!({"phase":"pending","spec":{"protocol":1,"owner":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","generation":2,"executable":"/no/candidate","binary":"fixture","unit":"fixture"}})).unwrap();
+    fs::write(&journal, &bytes).unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let lock = fs::File::create(state.join("service.lock")).unwrap();
+    fs::set_permissions(
+        state.join("service.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    lock.lock().unwrap();
+    let mut waiter = command(root)
+        .arg("ensure")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(92));
+    let waiting = waiter.try_wait().unwrap().is_none();
+    drop(lock);
+    let output = waiter.wait_with_output().unwrap();
+    assert!(
+        waiting,
+        "waiter exited before the transition released its lock: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("do not retry automatically"));
+    assert_eq!(fs::read(journal).unwrap(), bytes);
+    assert!(!root.join("mutated").exists());
+    assert!(!state.join("state.sqlite3").exists());
 }

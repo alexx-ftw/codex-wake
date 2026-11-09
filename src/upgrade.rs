@@ -377,7 +377,7 @@ fn install_spec(db: &Connection, spec: &Spec) -> Result<()> {
 
 pub(crate) fn ensure_receiver(config: &Config) -> Result<Value> {
     manager::require_installed(config)?;
-    let _lock = manager::lock(config)?;
+    let _lock = manager::cooperative_lock(config)?;
     ensure_locked(config)
 }
 

@@ -137,6 +137,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes sqlite3
+      - name: Check cooperative admission beyond the ordinary lock deadline
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --jobs "$(nproc)" --bin codex-wake --test automatic_upgrade_cli -- -D warnings
+          cargo test --locked --jobs "$(nproc)" --test automatic_upgrade_cli -- --include-ignored
       - name: Obtain native Codex for the isolated test
         run: npm install --prefix "$RUNNER_TEMP/codex-qualification" --no-save --no-audit --no-fund @openai/codex@0.166.0
       - name: Qualify native receiver handoff in private namespaces
