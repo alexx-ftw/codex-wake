@@ -599,11 +599,11 @@ where
     match pull.pointer("/head/repo") {
         Some(Value::Null) | None => {}
         Some(Value::Object(head_repo)) => {
-            if let Some(full_name) = head_repo.get("full_name") {
-                if !full_name.is_null() {
-                    let full_name = full_name.as_str().context("Invalid PR head repository")?;
-                    ensure!(valid_repo(full_name), "Invalid PR head repository");
-                }
+            if let Some(full_name) = head_repo.get("full_name")
+                && !full_name.is_null()
+            {
+                let full_name = full_name.as_str().context("Invalid PR head repository")?;
+                ensure!(valid_repo(full_name), "Invalid PR head repository");
             }
         }
         Some(_) => bail!("Invalid PR head repository"),

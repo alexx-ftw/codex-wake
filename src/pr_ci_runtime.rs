@@ -299,7 +299,7 @@ where
 
 /// Dispatch already durable CI outbox rows without polling GitHub. Schedule it
 /// in the CI worker, independently of Wake's existing dispatcher.
-pub fn dispatch<D>(db: &mut Connection, now_ms: i64, mut deliver: D) -> Result<DispatchReport>
+pub fn dispatch<D>(db: &mut Connection, now_ms: i64, deliver: D) -> Result<DispatchReport>
 where
     D: FnMut(&Delivery, &str) -> Result<(String, Option<String>)>,
 {
@@ -687,8 +687,8 @@ mod tests {
 
         let writer_path = database_path.clone();
         assert_eq!(
-            recover_native_wake_retries(&db, 1_001, move |thread| {
-                let writer = Connection::open(writer_path).unwrap();
+            recover_native_wake_retries(&db, 1_001, |thread| {
+                let writer = Connection::open(&writer_path).unwrap();
                 assert!(record_native_wake_recovery(
                     &writer,
                     thread,

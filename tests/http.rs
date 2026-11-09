@@ -213,7 +213,7 @@ fn start_receiver(
 
 #[test]
 #[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
-fn real_webhook_authenticates_and_dispatches_once() {
+fn real_webhook_preserves_signed_raw_body_and_dispatches_once() {
     let temp = TempDir::new().unwrap();
     #[cfg(unix)]
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -247,7 +247,20 @@ fn real_webhook_authenticates_and_dispatches_once() {
 
     let (_receiver, addr) = start_receiver(&temp, &db, &codex, false);
 
-    let body = payload("completed", SHA, "completed");
+    // The real webhook must pass these exact bytes to `handle`: JSON re-encoding
+    // changes both the deliberate key order and whitespace covered by this HMAC.
+    let body = br#"{
+  "workflow_run": {
+    "status": "completed",
+    "conclusion": "success",
+    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "run_attempt": 1,
+    "id": 123
+  },
+  "repository": { "full_name": "owner/repo" },
+  "action": "completed"
+}"#
+    .to_vec();
     let signature = signed(&body, SECRET.as_bytes());
     assert_eq!(
         request(addr, "POST", &body, Some("workflow_run"), Some(&signature)),

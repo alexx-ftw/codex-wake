@@ -54,14 +54,39 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             poll_reopen_at_sec INTEGER,
             PRIMARY KEY(repo,pr));
         CREATE TABLE IF NOT EXISTS automatic_pr_pending_reopens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             repo TEXT NOT NULL,
             pr TEXT NOT NULL,
             source_kind TEXT NOT NULL CHECK(source_kind IN ('webhook','poll')),
             event_at_sec INTEGER NOT NULL,
             event_at TEXT NOT NULL,
-            source TEXT NOT NULL,
-            PRIMARY KEY(repo,pr,source_kind,event_at_sec));",
+            source TEXT NOT NULL);",
     )?;
+    let has_pending_id = {
+        let mut statement = db.prepare("PRAGMA table_info(automatic_pr_pending_reopens)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "id")
+    };
+    if !has_pending_id {
+        db.execute_batch(
+            "ALTER TABLE automatic_pr_pending_reopens RENAME TO automatic_pr_pending_reopens_old;
+             CREATE TABLE automatic_pr_pending_reopens (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 repo TEXT NOT NULL,
+                 pr TEXT NOT NULL,
+                 source_kind TEXT NOT NULL CHECK(source_kind IN ('webhook','poll')),
+                 event_at_sec INTEGER NOT NULL,
+                 event_at TEXT NOT NULL,
+                 source TEXT NOT NULL);
+             INSERT INTO automatic_pr_pending_reopens(repo,pr,source_kind,event_at_sec,event_at,source)
+             SELECT repo,pr,source_kind,event_at_sec,event_at,source
+             FROM automatic_pr_pending_reopens_old;
+             DROP TABLE automatic_pr_pending_reopens_old;",
+        )?;
+    }
     let has_available_at = {
         let mut statement = db.prepare("PRAGMA table_info(automatic_pr_notifications)")?;
         statement
@@ -384,22 +409,34 @@ fn ensure_closed_cycle_in(db: &Connection, repo: &str, pr: &str, closed_at_sec: 
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let (epoch, begin_cycle) = match current {
+    let (epoch, begin_cycle) = match current.as_ref() {
         None => (1, true),
-        Some((epoch, state, closed_at, reopened_at)) if state == "closed" => {
-            if closed_at_sec == closed_at {
-                (epoch, false)
-            } else if closed_at_sec > closed_at {
+        Some((epoch, state, closed_at, _)) if state == "closed" => {
+            if closed_at_sec == *closed_at {
+                (*epoch, false)
+            } else if closed_at_sec > *closed_at {
                 (epoch.saturating_add(1), true)
             } else {
-                (epoch, false)
+                (*epoch, false)
             }
         }
-        Some((epoch, _, _, Some(reopened_at))) if closed_at_sec > reopened_at => {
+        Some((epoch, _, _, Some(reopened_at))) if closed_at_sec > *reopened_at => {
             (epoch.saturating_add(1), true)
         }
-        Some((epoch, _, _, _)) => (epoch, false),
+        Some((epoch, _, _, _)) => (*epoch, false),
     };
+    if let Some((previous_epoch, _, previous_closed_at, _)) = current.as_ref()
+        && closed_at_sec > *previous_closed_at
+    {
+        resolve_pending_reopen_interval_in(
+            db,
+            repo,
+            pr,
+            *previous_epoch,
+            *previous_closed_at,
+            Some(closed_at_sec),
+        )?;
+    }
     if begin_cycle {
         db.execute(
             "INSERT INTO automatic_pr_lifecycle
@@ -421,7 +458,12 @@ fn ensure_closed_cycle_in(db: &Connection, repo: &str, pr: &str, closed_at_sec: 
         )
         .optional()?;
     if let Some(closed_at_sec) = current_closed_at {
-        resolve_one_pending_reopen_in(db, repo, pr, closed_at_sec)?;
+        let epoch: i64 = db.query_row(
+            "SELECT epoch FROM automatic_pr_lifecycle WHERE repo=?1 AND pr=?2 AND state='closed'",
+            params![repo, pr],
+            |row| row.get(0),
+        )?;
+        resolve_pending_reopen_interval_in(db, repo, pr, epoch, closed_at_sec, None)?;
     }
     Ok(())
 }
@@ -440,10 +482,9 @@ pub(crate) fn record_reopened_event_in(
     );
     initialize(db)?;
     let event_at_sec = timestamp_second(db, event_at)?;
-    let current: Option<(i64, String, i64, Option<i64>, Option<i64>, Option<i64>)> = db
+    let current: Option<(i64, String, i64, Option<i64>, Option<i64>)> = db
         .query_row(
-            "SELECT epoch,state,closed_at_sec,reopened_at_sec,
-                    webhook_reopen_at_sec,poll_reopen_at_sec
+            "SELECT epoch,state,closed_at_sec,webhook_reopen_at_sec,poll_reopen_at_sec
              FROM automatic_pr_lifecycle WHERE repo=?1 AND pr=?2",
             params![repo, pr],
             |row| {
@@ -453,30 +494,24 @@ pub(crate) fn record_reopened_event_in(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((epoch, state, closed_at, reopened_at, webhook_at, poll_at)) = current else {
+    let Some((epoch, state, closed_at, webhook_at, poll_at)) = current else {
         store_pending_reopen_in(db, repo, pr, source_kind, event_at_sec, event_at, source)?;
         return Ok(None);
     };
-    let (same_cycle, source_seen_at) = if state == "closed" {
-        (event_at_sec > closed_at, None)
+    let same_cycle = if state == "closed" {
+        event_at_sec > closed_at
     } else {
         let seen_at = if source_kind == "webhook" {
             webhook_at
         } else {
             poll_at
         };
-        // The other source may report a later PR edit than the timeline reopen time.
-        let within_cycle = reopened_at.is_some() && event_at_sec > closed_at;
-        (
-            within_cycle && (seen_at == Some(event_at_sec) || seen_at.is_none()),
-            seen_at,
-        )
+        seen_at == Some(event_at_sec)
     };
     if !same_cycle {
         store_pending_reopen_in(db, repo, pr, source_kind, event_at_sec, event_at, source)?;
@@ -492,7 +527,7 @@ pub(crate) fn record_reopened_event_in(
         "reopened",
         event_at,
         &event_key,
-        source,
+        &minimal_reopen_source(repo, pr, event_at),
     )?;
     if state == "closed" {
         let webhook_reopen_at = (source_kind == "webhook").then_some(event_at_sec);
@@ -509,19 +544,6 @@ pub(crate) fn record_reopened_event_in(
                 poll_reopen_at,
                 epoch
             ],
-        )?;
-    } else if source_seen_at.is_none() {
-        let column = if source_kind == "webhook" {
-            "webhook_reopen_at_sec"
-        } else {
-            "poll_reopen_at_sec"
-        };
-        db.execute(
-            &format!(
-                "UPDATE automatic_pr_lifecycle SET {column}=?3
-                 WHERE repo=?1 AND pr=?2 AND epoch=?4 AND state='reopened'"
-            ),
-            params![repo, pr, event_at_sec, epoch],
         )?;
     }
     Ok(Some((event_key, notifications)))
@@ -557,10 +579,10 @@ fn store_pending_reopen_in(
     source_kind: &str,
     event_at_sec: i64,
     event_at: &str,
-    source: &Value,
+    _source: &Value,
 ) -> Result<()> {
     db.execute(
-        "INSERT OR IGNORE INTO automatic_pr_pending_reopens
+        "INSERT INTO automatic_pr_pending_reopens
          (repo,pr,source_kind,event_at_sec,event_at,source) VALUES(?1,?2,?3,?4,?5,?6)",
         params![
             repo,
@@ -568,44 +590,52 @@ fn store_pending_reopen_in(
             source_kind,
             event_at_sec,
             event_at,
-            serde_json::to_string(source)?
+            serde_json::to_string(&minimal_reopen_source(repo, pr, event_at))?
         ],
     )?;
     Ok(())
 }
 
-fn resolve_one_pending_reopen_in(
+fn minimal_reopen_source(repo: &str, pr: &str, event_at: &str) -> Value {
+    serde_json::json!({
+        "action":"reopened",
+        "number":pr.parse::<i64>().ok(),
+        "repository":{"full_name":repo},
+        "pull_request":{"number":pr.parse::<i64>().ok(),"updated_at":event_at}
+    })
+}
+
+fn resolve_pending_reopen_interval_in(
     db: &Connection,
     repo: &str,
     pr: &str,
-    closed_at_sec: i64,
+    epoch: i64,
+    after_sec: i64,
+    closed_at_sec: Option<i64>,
 ) -> Result<()> {
-    // Timestamps have second precision; leave zero or multiple possible cycles pending.
-    let candidates: Vec<(String, i64, String, String)> = {
+    // Remove rows only when one observation fits the interval. Equal-second events and
+    // multiple candidates stay pending; retained payloads contain only routing and time.
+    let mut candidates: Vec<(String, i64, String, String)> = {
         let mut statement = db.prepare(
             "SELECT source_kind,event_at_sec,event_at,source
              FROM automatic_pr_pending_reopens
              WHERE repo=?1 AND pr=?2 AND event_at_sec>?3
+               AND (?4 IS NULL OR event_at_sec<?4)
              ORDER BY event_at_sec,source_kind",
         )?;
         statement
-            .query_map(params![repo, pr, closed_at_sec], |row| {
+            .query_map(params![repo, pr, after_sec, closed_at_sec], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    candidates.sort();
+    candidates.dedup();
     if candidates.len() != 1 {
         return Ok(());
     }
-    let Some((source_kind, event_at_sec, event_at, source)) = candidates.into_iter().next() else {
-        return Ok(());
-    };
+    let (source_kind, event_at_sec, event_at, source) = candidates[0].clone();
     let source: Value = serde_json::from_str(&source)?;
-    let epoch: i64 = db.query_row(
-        "SELECT epoch FROM automatic_pr_lifecycle WHERE repo=?1 AND pr=?2 AND state='closed'",
-        params![repo, pr],
-        |row| row.get(0),
-    )?;
     let event_key = format!("reopened:{epoch}");
     record_event_in(
         db,
@@ -632,8 +662,9 @@ fn resolve_one_pending_reopen_in(
     )?;
     db.execute(
         "DELETE FROM automatic_pr_pending_reopens
-         WHERE repo=?1 AND pr=?2 AND source_kind=?3 AND event_at_sec=?4",
-        params![repo, pr, source_kind, event_at_sec],
+         WHERE repo=?1 AND pr=?2 AND event_at_sec>?3
+           AND (?4 IS NULL OR event_at_sec<?4)",
+        params![repo, pr, after_sec, closed_at_sec],
     )?;
     Ok(())
 }
@@ -1259,6 +1290,134 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn late_close_splits_pending_reopens_into_their_actual_intervals() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+
+        let close = |at: &str| {
+            let payload = json!({"action":"closed","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":false,"closed_at":at}});
+            accept_authenticated_webhook(&db, "pull_request", &payload).unwrap();
+        };
+        let reopen = |at: &str| {
+            let payload = json!({"action":"reopened","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"updated_at":at}});
+            accept_authenticated_webhook(&db, "pull_request", &payload).unwrap();
+        };
+
+        reopen("2099-01-01T00:00:20Z");
+        reopen("2099-01-01T00:00:40Z");
+        close("2099-01-01T00:00:10Z");
+        let unresolved: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 2);
+
+        close("2099-01-01T00:00:30Z");
+        let mut reopened: Vec<_> = pending(&db)
+            .unwrap()
+            .into_iter()
+            .filter(|notification| notification.event == "reopened")
+            .map(|notification| notification.event_key)
+            .collect();
+        reopened.sort();
+        assert_eq!(reopened, ["reopened:1", "reopened:2"]);
+        let unresolved: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn reopen_after_observed_cycle_waits_for_late_intervening_close() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let close = |at: &str| {
+            let payload = json!({"action":"closed","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":false,"closed_at":at}});
+            accept_authenticated_webhook(&db, "pull_request", &payload).unwrap();
+        };
+        close("2099-01-01T00:00:10Z");
+        assert_eq!(
+            record_reopened_event(
+                &db,
+                "owner/repo",
+                "7",
+                "poll",
+                "2099-01-01T00:00:20Z",
+                &json!({"action":"reopened"}),
+            )
+            .unwrap(),
+            1
+        );
+        let later_webhook = json!({"action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:40Z"}});
+        assert_eq!(
+            accept_authenticated_webhook(&db, "pull_request", &later_webhook).unwrap(),
+            0
+        );
+        close("2099-01-01T00:00:30Z");
+
+        let mut reopened: Vec<_> = pending(&db)
+            .unwrap()
+            .into_iter()
+            .filter(|notification| notification.event == "reopened")
+            .map(|notification| notification.event_key)
+            .collect();
+        reopened.sort();
+        assert_eq!(reopened, ["reopened:1", "reopened:2"]);
+        let unresolved: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 0);
+    }
+
+    #[test]
+    fn same_second_reopen_remains_ambiguous_and_retained() {
+        let db = Connection::open_in_memory().unwrap();
+        let close = json!({"action":"closed","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false,
+                "closed_at":"2099-01-01T00:00:10Z"}});
+        accept_authenticated_webhook(&db, "pull_request", &close).unwrap();
+        let reopen = json!({"action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:10Z"}});
+        accept_authenticated_webhook(&db, "pull_request", &reopen).unwrap();
+        let later_close = json!({"action":"closed","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false,
+                "closed_at":"2099-01-01T00:00:20Z"}});
+        accept_authenticated_webhook(&db, "pull_request", &later_close).unwrap();
+        let unresolved: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1);
     }
 
     #[test]

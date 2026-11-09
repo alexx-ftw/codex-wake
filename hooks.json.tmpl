@@ -17,7 +17,7 @@
       {"source": "header", "name": "X-Hub-Signature-256", "envname": "CODEX_WAKE_SIGNATURE"}
     ],
     "pass-file-to-command": [
-      {"source": "entire-payload", "envname": "CODEX_WAKE_PAYLOAD"}
+      {"source": "raw-request-body", "envname": "CODEX_WAKE_PAYLOAD"}
     ],
     "trigger-rule-mismatch-http-response-code": 403,
     "trigger-rule": {

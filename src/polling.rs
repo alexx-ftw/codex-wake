@@ -162,7 +162,7 @@ where
         let number: i64 = resource.resource.parse().unwrap_or(0);
         let route = format!("/repos/{}/pulls/{}", resource.repo, resource.resource);
         let validated = &mut validated_prs;
-        let cached = state(db, &route, 0).map_err(|_| Failure::new("database"))?;
+        let cached = state(db, &route, 0)?;
         let cached_cursor: Value = cached
             .as_ref()
             .and_then(|cached| cached.cursor.as_deref())
@@ -195,8 +195,7 @@ where
                     &resource.repo,
                     &resource.resource,
                     closed_at,
-                )
-                .map_err(|_| Failure::new("database"))?;
+                )?;
             }
         }
         let reopened_at = std::cell::RefCell::new(None::<String>);

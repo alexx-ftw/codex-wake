@@ -42,7 +42,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, Read},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     time::Duration,
 };
@@ -524,6 +524,15 @@ fn verify_webhook_signature(config: &manager::Config, raw: &[u8], signature: &st
     mac.update(raw);
     mac.verify_slice(&supplied)
         .context("Webhook signature does not match payload")
+}
+
+fn verified_webhook_payload(
+    config: &manager::Config,
+    raw: &[u8],
+    signature: &str,
+) -> Result<Value> {
+    verify_webhook_signature(config, raw, signature)?;
+    Ok(serde_json::from_slice(raw)?)
 }
 
 fn capture_authenticated_pr_notification(
@@ -2940,9 +2949,12 @@ mod hook_output_tests {
         mac.update(body);
         let signature = format!("sha256={:x}", mac.finalize().into_bytes());
 
-        assert!(verify_webhook_signature(&config, body, &signature).is_ok());
+        assert_eq!(
+            verified_webhook_payload(&config, body, &signature).unwrap(),
+            json!({"action":"closed"})
+        );
         assert!(
-            verify_webhook_signature(&config, br#"{"action":"reopened"}"#, &signature).is_err()
+            verified_webhook_payload(&config, br#"{"action":"reopened"}"#, &signature).is_err()
         );
     }
 
@@ -2999,16 +3011,14 @@ mod hook_output_tests {
             let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
             mac.update(&raw);
             let signature = format!("sha256={:x}", mac.finalize().into_bytes());
-            verify_webhook_signature(&config, &raw, &signature).unwrap();
-            let parsed: Value = serde_json::from_slice(&raw).unwrap();
+            let parsed = verified_webhook_payload(&config, &raw, &signature).unwrap();
             assert_eq!(
                 capture_authenticated_pr_notification(&db, "pull_request", &parsed).unwrap(),
                 1,
                 "signed {action} webhook should enqueue once"
             );
             if *action == "reopened" {
-                verify_webhook_signature(&config, &raw, &signature).unwrap();
-                let replay: Value = serde_json::from_slice(&raw).unwrap();
+                let replay = verified_webhook_payload(&config, &raw, &signature).unwrap();
                 assert_eq!(
                     capture_authenticated_pr_notification(&db, "pull_request", &replay).unwrap(),
                     0
