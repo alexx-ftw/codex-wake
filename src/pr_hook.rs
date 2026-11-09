@@ -399,9 +399,9 @@ fn github_url_path(url: &str) -> Option<&str> {
 }
 
 /// A PreToolUse observation linked to a PostToolUse by the observation layer.
-/// `exact_call_and_result` says whether that link and the direct result meet
-/// the attribution requirements, including a direct result from an accredited
-/// GitHub host.
+/// `exact_call_and_result` says whether that link and the native result meet
+/// the attribution gate. It does not assert the effective network host; CLI
+/// configuration can route some calls through a configured API gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreToolUseObservation {
     /// UTC Unix milliseconds when this PreToolUse was observed by the caller.

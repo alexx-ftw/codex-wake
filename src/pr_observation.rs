@@ -1543,7 +1543,8 @@ fn command_output_can_be_filtered(tool_name: &str, input: Option<&Value>) -> boo
 // Native `gh pr create` output and relative `gh api` output remain eligible
 // when the exact call is correlated. Hook events do not capture `api_host`, so
 // a configured gateway can still serve these commands; only an explicit
-// foreign `--hostname` is rejected here.
+// foreign `--hostname` on a relative API route is rejected here. Absolute
+// canonical API URLs use their URL authority instead.
 fn command_has_explicit_foreign_api_host(tool_name: &str, input: Option<&Value>) -> bool {
     if tool_name != "Bash" {
         return false;
@@ -1560,6 +1561,14 @@ fn command_has_explicit_foreign_api_host(tool_name: &str, input: Option<&Value>)
     if tokens.first().map(String::as_str) != Some("gh")
         || tokens.get(1).map(String::as_str) != Some("api")
     {
+        return false;
+    }
+    if api_endpoint(&tokens[2..]).is_some_and(|endpoint| {
+        endpoint
+            .strip_prefix("https://api.github.com/")
+            .and_then(api_pulls_repository)
+            .is_some()
+    }) {
         return false;
     }
 
@@ -1841,13 +1850,17 @@ mod tests {
             let input = json!({"command":command});
             assert!(!command_has_explicit_foreign_api_host("Bash", Some(&input)));
         }
-        for command in [
-            "gh api --hostname api.attacker.test repos/acme/widget/pulls",
-            "gh api --hostname=api.attacker.test https://api.github.com/repos/acme/widget/pulls",
-        ] {
+        for command in ["gh api --hostname api.attacker.test repos/acme/widget/pulls"] {
             let input = json!({"command":command});
             assert!(command_has_explicit_foreign_api_host("Bash", Some(&input)));
         }
+        let absolute_with_foreign_hostname = json!({
+            "command":"gh api --hostname=api.attacker.test -X POST https://api.github.com/repos/acme/widget/pulls"
+        });
+        assert!(!command_has_explicit_foreign_api_host(
+            "Bash",
+            Some(&absolute_with_foreign_hostname)
+        ));
     }
 
     #[test]
@@ -1970,6 +1983,7 @@ mod tests {
         for command in [
             TRUSTED_API_CREATE,
             "gh api -X POST repos/acme/widget/pulls -f title=test",
+            "gh api --hostname=api.attacker.test -X POST https://api.github.com/repos/acme/widget/pulls -f title=test",
         ] {
             let mut db = Connection::open_in_memory().unwrap();
             record_pre_tool_use(
