@@ -161,6 +161,9 @@ fn process_group(pid: u32) -> Result<String> {
         .context("Missing cgroup v2 membership")?
         .into())
 }
+fn outside_receiver(controller: &str, receiver: &str) -> bool {
+    controller != receiver && !controller.starts_with(&format!("{receiver}/"))
+}
 fn running(config: &Config, spec: &Spec) -> Result<Snapshot> {
     let s = snapshot()?;
     verify_unit(config, spec, &s)?;
@@ -192,10 +195,13 @@ struct Controller {
     start: u64,
     device: u64,
     inode: u64,
+    socket_device: u64,
+    socket_inode: u64,
     group: String,
 }
 fn controller(config: &Config) -> Result<Controller> {
     let socket = UnixStream::connect(&config.rpc_socket)?;
+    let endpoint = fs::metadata(&config.rpc_socket)?;
     let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
     ensure!(
@@ -221,6 +227,8 @@ fn controller(config: &Config) -> Result<Controller> {
         start,
         device: meta.dev(),
         inode: meta.ino(),
+        socket_device: endpoint.dev(),
+        socket_inode: endpoint.ino(),
         group: process_group(pid)?,
     })
 }
@@ -310,7 +318,7 @@ pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> R
         "Receiver invocation is not this process"
     );
     ensure!(
-        controller(&config)?.group != group(&s)?,
+        outside_receiver(&controller(&config)?.group, group(&s)?),
         "Controller shares receiver cgroup"
     );
     Ok(())
@@ -376,7 +384,7 @@ fn ensure_locked(config: &Config) -> Result<Value> {
     let old_snapshot = previous.as_ref().map(|p| running(config, p)).transpose()?;
     if let Some(old) = &previous {
         ensure!(
-            peer.group != group(old_snapshot.as_ref().unwrap())?,
+            outside_receiver(&peer.group, group(old_snapshot.as_ref().unwrap())?),
             "Controller shares receiver cgroup"
         );
         if old.binary == binary {
@@ -582,6 +590,18 @@ mod tests {
     }
     #[test]
     fn group_paths_cannot_escape_or_alias_the_root() {
+        assert!(!outside_receiver(
+            "/user.slice/codex-wake.service/child",
+            "/user.slice/codex-wake.service"
+        ));
+        assert!(!outside_receiver(
+            "/user.slice/codex-wake.service",
+            "/user.slice/codex-wake.service"
+        ));
+        assert!(outside_receiver(
+            "/user.slice/controller.service",
+            "/user.slice/codex-wake.service"
+        ));
         for value in [
             "",
             "/",

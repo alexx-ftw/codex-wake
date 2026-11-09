@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Actual lifecycle under the disposable hosted user's manager, never the real service.
-set -euo pipefail
+set -Eeuo pipefail
 [[ ${WAKE_PRIVATE_QUALIFICATION:-} == 1 && $HOME =~ ^/tmp/wq\.[[:alnum:]]{8}/h$ && $(id -u) != 0 && $# == 3 ]] || exit 1
 root=${HOME%/h}
 wake=$1 codex=$2 socket=$3
@@ -14,6 +14,8 @@ unit=$XDG_CONFIG_HOME/systemd/user/codex-wake.service
 runtime=$XDG_DATA_HOME/codex-wake/runtime
 journal=$state/cooperative-upgrade.json
 upgrader='' contender='' helper='' stopped=''
+stage=legacy
+trap 'printf "stage=%s line=%s status=%s\n" "$stage" "$LINENO" "$?" > "$root/upgrade-failure"' ERR
 cleanup_upgrade() {
   local rc=$?
   trap - EXIT
@@ -40,6 +42,7 @@ ctl daemon-reload
 rm -rf -- "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
 export CODEX_WAKE_PRODUCER_ID=dddddddd-dddd-4ddd-8ddd-dddddddddddd
 export CODEX_WAKE_COOPERATIVE_RECEIVER=1
+stage=bootstrap
 # Distinct ELF files of one supported protocol; no claim about historical cooperative releases.
 cp -- "$wake" "$root/old"
 printf '\ncooperative-previous-generation\n' >> "$root/old"
@@ -55,9 +58,11 @@ printf fixture-secret > "$secret"
 # A claimed, uncertain send must never be made ready again by replacement.
 sqlite3 "$db" "INSERT INTO waits(repo,run_id,attempt,thread,sha,state) VALUES('fixture/repo',9,1,'11111111-1111-4111-8111-111111111111','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sending');"
 # A live descendant must keep the barrier closed after MainPID has exited.
+stage=descendant
 sleep 120 & helper=$!
 printf '%s\n' "$helper" > "/sys/fs/cgroup$old_group/cgroup.procs"
 kill -STOP "$old_pid"; stopped=$old_pid
+stage=closure
 "$wake" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
 for ((i=0;i<300;i++)); do
   [[ $(sqlite3 -readonly "$db" 'SELECT is_open FROM wake_delivery_claim_gate') == 0 ]] && break
@@ -72,6 +77,7 @@ if "$wake" cooperative-gate transfer --owner "$old_owner" --generation 1 --next-
 printf '%s' '{"thread":"11111111-1111-4111-8111-111111111111","message_template":"fixture","request_id":"22222222-2222-4222-8222-222222222222"}' | "$wake" queue-direct > "$root/retained"
 jq -e '.state == "pending"' "$root/retained" >/dev/null
 kill -CONT "$old_pid"; stopped=
+stage=drain
 for ((i=0;i<300;i++)); do
   [[ $(ctl show codex-wake.service -p MainPID --value) == 0 ]] && break
   sleep .05
@@ -82,6 +88,7 @@ done
 kill -0 "$upgrader"
 grep -qx 'populated 1' "/sys/fs/cgroup$old_group/cgroup.events"
 kill "$helper"; wait "$helper" 2>/dev/null || true; helper=
+stage=activation
 wait "$upgrader"; upgrader=
 wait "$contender"; contender=
 for file in second contender-result; do jq -e '.local_ready == true and .generation == 2' "$root/$file" >/dev/null; done
@@ -90,6 +97,7 @@ for file in second contender-result; do jq -e '.local_ready == true and .generat
 [[ $(sqlite3 -readonly "$db" 'SELECT state FROM waits WHERE run_id=9') == sending ]]
 [[ $(cat "$secret") == fixture-secret && $controller == "$(ctl show wake-qualification-controller.service -p MainPID -p InvocationID)" ]]
 # Kill the coordinator after it closes admission: later ensure must not resume the uncertain switch.
+stage=interruption
 cp -- "$wake" "$root/third"
 printf '\ncooperative-next-generation\n' >> "$root/third"
 pid=$(ctl show codex-wake.service -p MainPID --value)

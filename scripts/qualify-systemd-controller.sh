@@ -298,7 +298,15 @@ if [[ $handoff_mode != 0 ]]; then
   controller_identity=$(as_qual_user /usr/bin/systemctl --user show wake-qualification-controller.service -p MainPID -p InvocationID) \
     || fail 'cannot identify isolated controller'
   as_qual_user /usr/bin/timeout 240 "$qual_root/handoff" "$qual_root/wake" "$qual_root/codex" "$qual_root/socket" >/dev/null 2>&1 \
-    || fail 'cooperative handoff qualification failed'
+    || {
+      if [[ $handoff_mode == 2 ]]; then
+        diagnostic=$(as_qual_user cat "$qual_root/upgrade-failure" 2>/dev/null || true)
+        if [[ $diagnostic =~ ^stage=(legacy|bootstrap|descendant|closure|drain|activation|interruption)\ line=[0-9]+\ status=[0-9]+$ ]]; then
+          printf 'upgrade qualification: %s\n' "$diagnostic" >&2
+        fi
+      fi
+      fail 'cooperative handoff qualification failed'
+    }
   controller_after=$(as_qual_user /usr/bin/systemctl --user show wake-qualification-controller.service -p MainPID -p InvocationID) \
     || fail 'cannot reidentify isolated controller'
   [[ $controller_identity == "$controller_after" ]] || fail 'isolated controller changed during handoff'
