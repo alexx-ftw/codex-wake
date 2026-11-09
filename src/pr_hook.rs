@@ -152,7 +152,7 @@ fn gh_pr_option_takes_value(option: &str) -> bool {
     )
 }
 
-fn parse_gh_api_create(args: &[String]) -> Option<String> {
+pub(crate) fn parse_gh_api_create(args: &[String]) -> Option<String> {
     let mut endpoint = None;
     let mut method = None;
     let mut has_field = false;

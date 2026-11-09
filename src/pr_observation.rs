@@ -1436,8 +1436,7 @@ fn is_pr_creation_intent(tool_name: &str, input: &Value) -> bool {
         tokens.get(2).map(String::as_str),
     ) {
         (Some("pr"), Some("create")) => !crate::pr_hook::gh_pr_has_dry_run(&tokens[3..]),
-        (Some("api"), _) => api_endpoint(&tokens[2..])
-            .is_some_and(|endpoint| api_pulls_repository(endpoint).is_some()),
+        (Some("api"), _) => crate::pr_hook::parse_gh_api_create(&tokens).is_some(),
         _ => false,
     }
 }
@@ -1580,63 +1579,6 @@ fn shell_tokens(command: &str) -> Option<Vec<String>> {
         words.push(word);
     }
     Some(words)
-}
-
-/// Find the positional endpoint without mistaking values to `-H`, `-f`, or
-/// other `gh api` options for it. Only the endpoint is retained.
-fn api_endpoint(args: &[String]) -> Option<&str> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if !arg.starts_with('-') {
-            return Some(arg);
-        }
-        if matches!(
-            arg,
-            "-H" | "--header"
-                | "-f"
-                | "--field"
-                | "-F"
-                | "--raw-field"
-                | "-X"
-                | "--method"
-                | "--input"
-                | "--preview"
-                | "-p"
-                | "--cache"
-                | "--hostname"
-                | "-q"
-                | "--jq"
-                | "-t"
-                | "--template"
-        ) {
-            index += 2;
-        } else {
-            index += 1;
-        }
-    }
-    None
-}
-
-fn api_pulls_repository(endpoint: &str) -> Option<&str> {
-    let endpoint = if let Some(path) = endpoint.strip_prefix("https://api.github.com/") {
-        if path.starts_with('/') {
-            return None;
-        }
-        path
-    } else {
-        endpoint
-    };
-    let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
-    let tail = path.strip_prefix("repos/")?;
-    let mut parts = tail.split('/');
-    let owner = parts.next()?;
-    let repo = parts.next()?;
-    if parts.next()? != "pulls" || parts.next().is_some() {
-        return None;
-    }
-    let repository = tail.get(..owner.len() + 1 + repo.len())?;
-    safe_repository(repository)
 }
 
 fn safe_repository(value: &str) -> Option<&str> {
@@ -2750,48 +2692,40 @@ mod tests {
     }
 
     #[test]
-    fn gh_api_route_accepts_optional_leading_slash_and_never_stores_body_or_headers() {
-        assert_eq!(
-            api_pulls_repository("repos/acme/widget/pulls"),
-            Some("acme/widget")
-        );
-        assert_eq!(
-            api_pulls_repository("/repos/acme/widget/pulls"),
-            Some("acme/widget")
-        );
-        assert_eq!(
-            api_pulls_repository("https://api.github.com/repos/acme/widget/pulls"),
-            Some("acme/widget")
-        );
-        assert_eq!(
-            api_pulls_repository("https://api.github.com.evil/repos/acme/widget/pulls"),
-            None
-        );
-        assert_eq!(
-            api_pulls_repository("https://api.github.com//repos/acme/widget/pulls"),
-            None
-        );
-        assert_eq!(api_pulls_repository("repos/acme/widget/pulls/42"), None);
-        let secret = "Bearer-very-secret-42";
-        let input = json!({"command": format!(
-            "gh api -H 'Authorization: {secret}' -f title={secret} -f head=feature repos/acme/widget/pulls"
-        )});
-        assert!(is_pr_creation_intent("Bash", &input));
-        let (repo, head, base, author) = intent_metadata("Bash", &input);
-        assert_eq!((repo, head, base, author), (None, None, None, None));
+    fn read_only_gh_api_does_not_compete_with_pr_creation() {
         let mut db = Connection::open_in_memory().unwrap();
-        record_pre_tool_use(
-            &mut db,
-            &json!({"hook_event_name":"PreToolUse","session_id":"s","turn_id":"t","tool_use_id":"c","tool_name":"Bash","tool_input":input}),
-            100,
-            1000,
-        ).unwrap();
-        let stored: String = db.query_row(
-            "SELECT COALESCE(repository,'') || COALESCE(head_ref,'') || COALESCE(base_ref,'') || COALESCE(author_login,'') FROM pr_hook_pre_observations",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert!(!stored.contains(secret));
-        assert!(!stored.contains("feature"));
+        for (call, command) in [
+            ("read", "gh api -X GET repos/acme/widget/pulls"),
+            (
+                "read-input",
+                "gh api --method GET --input body.json repos/acme/widget/pulls",
+            ),
+        ] {
+            let event = pre("s", "t", call, command);
+            assert!(!is_relevant_pre_tool_use(&event), "{command}");
+            assert_eq!(
+                record_pre_tool_use(&mut db, &event, 100, 1000).unwrap(),
+                PreRecord::Ignored,
+                "{command}"
+            );
+        }
+        let create = pre(
+            "s",
+            "t",
+            "create",
+            "gh api repos/acme/widget/pulls --input body.json",
+        );
+        assert!(is_relevant_pre_tool_use(&create));
+        assert!(matches!(
+            record_pre_tool_use(&mut db, &create, 100, 1000).unwrap(),
+            PreRecord::Recorded { .. }
+        ));
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM pr_hook_pre_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
