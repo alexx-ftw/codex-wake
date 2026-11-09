@@ -246,7 +246,7 @@ mod tests {
         crate::validation_obligations::initialize(&db).unwrap();
         crate::circular_waits::initialize(&db).unwrap();
         crate::polling::pr_notifications::initialize(&db).unwrap();
-        crate::pr_ci::initialize(&db).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
         let application_id: i32 = db
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();

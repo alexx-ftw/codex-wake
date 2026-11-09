@@ -1278,7 +1278,7 @@ mod tests {
 
     #[test]
     fn tracker_generation_backfill_runs_once_and_registration_still_creates_rows() {
-        let mut db = Connection::open_in_memory().unwrap();
+        let db = Connection::open_in_memory().unwrap();
         db.execute_batch(TRACKERS_SCHEMA).unwrap();
         db.execute(
             "INSERT INTO pr_ci_trackers(repo,pull_number,thread,active)
