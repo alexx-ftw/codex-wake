@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Register PR listeners without changing pre-existing subscriptions or deliveries.
+#[cfg(test)]
 pub fn register(db: &mut Connection, repo: &str, number: &str, thread: &str) -> Result<()> {
     let (thread, number) =
         crate::subscriptions::validate_source("pull_request", repo, number, "closed", thread)?;

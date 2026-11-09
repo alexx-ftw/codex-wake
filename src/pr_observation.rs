@@ -256,7 +256,34 @@ pub enum HandleResult {
 
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(SCHEMA)
-        .context("initialize PR observation tables")
+        .context("initialize PR observation tables")?;
+    ensure_candidate_column(db, "exact_id_correlation", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_candidate_column(db, "raw_creation_result", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+fn ensure_candidate_column(db: &Connection, name: &str, definition: &str) -> Result<()> {
+    let exists = || -> Result<bool> {
+        let mut statement = db.prepare("PRAGMA table_info(pr_hook_candidates)")?;
+        let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for column in names {
+            if column? == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !exists()? {
+        let sql = format!("ALTER TABLE pr_hook_candidates ADD COLUMN {name} {definition}");
+        if let Err(error) = db.execute(&sql, []) {
+            // Another connection may have completed this idempotent migration
+            // after our schema read.
+            if !exists()? {
+                return Err(error).context("migrate PR observation candidate columns");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn candidate_result(
@@ -344,6 +371,7 @@ pub fn claim_verified_pending(
 
 /// Acknowledge only after the caller's registration succeeds. Returns false
 /// if the row is not verified, is already consumed, or its claim has expired.
+#[cfg(test)]
 pub fn mark_candidate_consumed(db: &Connection, id: i64, now_ms: i64) -> Result<bool> {
     initialize(db)?;
     Ok(db.execute(
@@ -597,7 +625,8 @@ pub fn handle_post_tool_use(
                 params![
                     pre_id,
                     exact_tool_use_id,
-                    !command_output_can_be_filtered(tool_name, event.get("tool_input")),
+                    !command_output_can_be_filtered(tool_name, event.get("tool_input"))
+                        && !command_has_untrusted_api_host(tool_name, event.get("tool_input")),
                     candidate_id
                 ],
             )?;
@@ -1500,6 +1529,84 @@ fn command_output_can_be_filtered(tool_name: &str, input: Option<&Value>) -> boo
     })
 }
 
+fn command_has_untrusted_api_host(tool_name: &str, input: Option<&Value>) -> bool {
+    if tool_name != "Bash" {
+        return false;
+    }
+    let Some(command) = input
+        .and_then(|value| value.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(tokens) = shell_tokens(command) else {
+        return true;
+    };
+    if tokens.first().map(String::as_str) != Some("gh")
+        || tokens.get(1).map(String::as_str) != Some("api")
+    {
+        return false;
+    }
+    api_host_is_unaccredited(&tokens, std::env::var_os("GH_HOST").as_deref())
+}
+
+fn api_host_is_unaccredited(tokens: &[String], inherited_host: Option<&std::ffi::OsStr>) -> bool {
+    let mut explicit_host = None;
+    let mut index = 2;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        let (option, inline) = token
+            .split_once('=')
+            .map_or((token, None), |(option, value)| (option, Some(value)));
+        if option == "--hostname" {
+            let host = if let Some(host) = inline {
+                host
+            } else {
+                index += 1;
+                let Some(host) = tokens.get(index).map(String::as_str) else {
+                    return true;
+                };
+                host
+            };
+            if explicit_host.replace(host).is_some() {
+                return true;
+            }
+        } else if matches!(
+            option,
+            "-H" | "--header"
+                | "-f"
+                | "--field"
+                | "-F"
+                | "--raw-field"
+                | "-X"
+                | "--method"
+                | "--input"
+                | "--preview"
+                | "-p"
+                | "--cache"
+                | "-q"
+                | "--jq"
+                | "-t"
+                | "--template"
+        ) && inline.is_none()
+        {
+            index += 1;
+        }
+        index += 1;
+    }
+    let host = if let Some(host) = explicit_host {
+        Some(host)
+    } else if let Some(host) = inherited_host {
+        let Some(host) = host.to_str() else {
+            return true;
+        };
+        Some(host)
+    } else {
+        None
+    };
+    host.is_some_and(|host| !host.eq_ignore_ascii_case("github.com"))
+}
+
 fn candidate_invocation_key(
     session_id: Option<&str>,
     turn_id: Option<&str>,
@@ -1631,6 +1738,106 @@ mod tests {
             response: Ok(fixture_response()),
             calls: Cell::new(0),
         }
+    }
+
+    #[test]
+    fn initialize_migrates_legacy_candidates_without_losing_rows() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pr_hook_candidates (
+                id INTEGER PRIMARY KEY, session_id TEXT, turn_id TEXT, tool_use_id TEXT,
+                tool_name TEXT NOT NULL, input_digest TEXT, number INTEGER NOT NULL,
+                url TEXT NOT NULL, invocation_key TEXT NOT NULL UNIQUE, pre_id INTEGER,
+                state TEXT NOT NULL, reason TEXT, get_status INTEGER, verified_json TEXT,
+                consumed_at_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at_ms INTEGER, work_claim_until_ms INTEGER,
+                created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO pr_hook_candidates
+                (id,tool_name,number,url,invocation_key,state,created_at_ms,updated_at_ms)
+             VALUES (7,'Bash',42,'https://github.com/acme/widget/pull/42','legacy','pending',10,11);",
+        )
+        .unwrap();
+
+        initialize(&db).unwrap();
+        initialize(&db).unwrap();
+
+        let (state, created_at, updated_at, exact, raw): (String, i64, i64, bool, bool) = db
+            .query_row(
+                "SELECT state,created_at_ms,updated_at_ms,exact_id_correlation,raw_creation_result
+                 FROM pr_hook_candidates WHERE id=7",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), created_at, updated_at),
+            ("pending", 10, 11)
+        );
+        assert!(!exact);
+        assert!(!raw);
+    }
+
+    #[test]
+    fn unaccredited_gh_api_host_blocks_same_second_attribution() {
+        let command =
+            "gh api --hostname api.attacker.test -X POST repos/acme/widget/pulls -f title=test";
+        let observed_at_ms = 1_735_787_046_500;
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call", command),
+            observed_at_ms,
+            60_000,
+        )
+        .unwrap();
+        let mut event = post("s", "t", Some("call"), command);
+        event["tool_response"] = json!({
+            "number":42,
+            "html_url":"https://github.com/acme/widget/pull/42",
+            "created_at":"2025-01-02T03:04:06Z"
+        });
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } =
+            handle_post_tool_use(&mut db, &event, &transport, Duration::from_secs(2), 60_000)
+                .unwrap()
+        else {
+            panic!("recognized result should remain a candidate")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
+        assert_eq!(transport.calls.get(), 1);
+    }
+
+    #[test]
+    fn gh_host_environment_is_untrusted_unless_it_is_github_com() {
+        use std::ffi::OsStr;
+
+        let tokens = |command: &str| shell_tokens(command).unwrap();
+        assert!(api_host_is_unaccredited(
+            &tokens("gh api repos/acme/widget/pulls"),
+            Some(OsStr::new("ghe.example.test"))
+        ));
+        assert!(!api_host_is_unaccredited(
+            &tokens("gh api repos/acme/widget/pulls"),
+            Some(OsStr::new("github.com"))
+        ));
+        assert!(!api_host_is_unaccredited(
+            &tokens("gh api --hostname github.com repos/acme/widget/pulls"),
+            Some(OsStr::new("ghe.example.test"))
+        ));
+        assert!(api_host_is_unaccredited(
+            &tokens("gh api -H '--hostname=github.com' repos/acme/widget/pulls"),
+            Some(OsStr::new("ghe.example.test"))
+        ));
     }
 
     #[test]
