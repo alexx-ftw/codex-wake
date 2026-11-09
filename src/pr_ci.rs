@@ -1860,15 +1860,17 @@ mod tests {
         };
 
         assert_eq!(poll(&db, 100, response).unwrap().checked, 1);
-        let (active, next_poll): (i64, i64) = db
+        let (active, next_poll, closed_sweep): (i64, i64, Option<i64>) = db
             .query_row(
-                "SELECT active,next_poll_ms FROM pr_ci_trackers
-                 WHERE repo='owner/project' AND pull_number=7",
+                "SELECT tracker.active,tracker.next_poll_ms,generation.closed_sweep_generation
+                 FROM pr_ci_trackers AS tracker
+                 JOIN pr_ci_tracker_generations AS generation USING(repo,pull_number,thread)
+                 WHERE tracker.repo='owner/project' AND tracker.pull_number=7",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((active, next_poll), (1, 60_100));
+        assert_eq!((active, next_poll, closed_sweep), (1, 0, None));
     }
 
     #[test]
