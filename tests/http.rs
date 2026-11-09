@@ -21,6 +21,7 @@ type HmacSha256 = Hmac<Sha256>;
 const SECRET: &str = "local-http-test-secret";
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const THREAD: &str = "11111111-1111-4111-8111-111111111111";
+const DELIVERY_ID: &str = "11111111-2222-4333-8444-555555555555";
 
 struct Receiver {
     child: Child,
@@ -77,7 +78,7 @@ fn request(
     event: Option<&str>,
     signature: Option<&str>,
 ) -> u16 {
-    request_with_delivery(addr, method, body, event, signature, None)
+    request_with_delivery(addr, method, body, event, signature, Some(DELIVERY_ID))
 }
 
 fn request_with_delivery(
@@ -265,7 +266,7 @@ fn real_webhook_passes_delivery_id_and_exact_request_bytes_to_command() {
   "repository": { "full_name": "owner/repo" },
   "action": "completed"
 }"#;
-    let delivery_id = "11111111-2222-4333-8444-555555555555";
+    let delivery_id = DELIVERY_ID;
     assert_eq!(
         request_with_delivery(
             addr,
