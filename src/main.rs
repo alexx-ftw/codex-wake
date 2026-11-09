@@ -310,6 +310,13 @@ struct CatalogInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct PrNotificationAttentionInput {
+    /// Cursor returned by the previous page; omit for the first page.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CoordinationViewInput {
     /// Zero-based chat offset from a previous response.
     offset: Option<u32>,
@@ -2456,7 +2463,25 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Read local receiver health, supported events and delivery states. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
+        description = "Read a page of uncertain automatic PR deliveries without payloads. Pass next_cursor to continue. This is a live view; restart to see changes made before the cursor.",
+        annotations(read_only_hint = true)
+    )]
+    fn get_pr_notification_attention(
+        &self,
+        Parameters(input): Parameters<PrNotificationAttentionInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            manager::require_installed(&self.config)?;
+            let db = rusqlite::Connection::open_with_flags(
+                &self.config.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            polling::pr_notifications::attention_page(&db, input.cursor.as_deref())
+        })())
+    }
+
+    #[tool(
+        description = "Read local receiver health, supported events and delivery states. Use get_pr_notification_attention to page through uncertain PR deliveries. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
         annotations(read_only_hint = true)
     )]
     fn get_status(&self) -> CallToolResult {
@@ -2540,6 +2565,7 @@ impl rmcp::ServerHandler for WakeTools {
             "get_result_conflicts" => "mcp.get_result_conflicts",
             "register_wait" => "mcp.register_wait",
             "get_status" => "mcp.get_status",
+            "get_pr_notification_attention" => "mcp.get_pr_notification_attention",
             "get_coordination" => "mcp.get_coordination",
             "recover_ready" => "mcp.recover_ready",
             _ => "mcp.unknown_tool",
@@ -3460,6 +3486,46 @@ printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s' "$body"
         let output = response.structured_content.unwrap();
         assert_eq!(output["chats"][0]["obligations"]["total"], 1);
         assert!(!output.to_string().contains("private"));
+    }
+
+    #[test]
+    fn attention_tool_pages_without_exposing_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        polling::pr_notifications::initialize(&db).unwrap();
+        for index in 0..51 {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state,created_at)
+                VALUES(?1,'pull_request','owner/repo','7','thread','closed',?1,
+                '{\"secret\":\"private-payload\"}','needs_attention','2000-01-01 00:00:00')",
+                [format!("id-{index:02}")],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let first = tools.get_pr_notification_attention(Parameters(PrNotificationAttentionInput {
+            cursor: None,
+        }));
+        assert_ne!(first.is_error, Some(true));
+        let first = first.structured_content.unwrap();
+        assert_eq!(first["items"].as_array().unwrap().len(), 50);
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let second =
+            tools.get_pr_notification_attention(Parameters(PrNotificationAttentionInput {
+                cursor: Some(cursor),
+            }));
+        assert_ne!(second.is_error, Some(true));
+        let second = second.structured_content.unwrap();
+        assert_eq!(second["items"][0]["queue_identity"], "id-50");
+        assert_eq!(second["has_more"], false);
+        assert!(!first.to_string().contains("private-payload"));
+        assert!(!second.to_string().contains("private-payload"));
     }
 
     #[test]

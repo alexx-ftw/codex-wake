@@ -1424,6 +1424,55 @@ pub(crate) fn attention_details(db: &Connection) -> Result<(i64, Vec<Value>)> {
     Ok((count, rows.into_iter().map(|row| row.1).collect()))
 }
 
+/// Read one live page without loading event payloads or modifying deliveries.
+pub(crate) fn attention_page(db: &Connection, cursor: Option<&str>) -> Result<Value> {
+    let after: Option<(String, String)> = cursor
+        .map(|cursor| -> Result<(String, String)> {
+            ensure!(cursor.len() <= 256, "Invalid attention cursor");
+            let (created, id): (String, String) =
+                serde_json::from_str(cursor).context("Invalid attention cursor")?;
+            ensure!(
+                !created.is_empty() && created.len() <= 64 && !id.is_empty() && id.len() <= 128,
+                "Invalid attention cursor"
+            );
+            Ok((created, id))
+        })
+        .transpose()?;
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='automatic_pr_notifications')", [], |row| row.get(0))?;
+    if !exists {
+        return Ok(serde_json::json!({"items":[],"has_more":false,"next_cursor":null}));
+    }
+    let mut statement = db.prepare(
+        "SELECT id,kind,repo,pr,thread,event,event_key,state,created_at
+         FROM automatic_pr_notifications WHERE state IN ('sending','needs_attention')
+         AND (?1 IS NULL OR (created_at,id)>(?1,?2)) ORDER BY created_at,id LIMIT 51",
+    )?;
+    let mut rows = statement.query_map(params![after.as_ref().map(|v| &v.0), after.as_ref().map(|v| &v.1)], |row| {
+        let id: String = row.get(0)?;
+        let created: String = row.get(8)?;
+        let item = serde_json::json!({"queue_identity":id.clone(),"kind":row.get::<_,String>(1)?,
+            "repo":row.get::<_,String>(2)?,"pr":row.get::<_,String>(3)?,
+            "thread":row.get::<_,String>(4)?,"event":row.get::<_,String>(5)?,
+            "event_key":row.get::<_,String>(6)?,"state":row.get::<_,String>(7)?});
+        Ok((created,id,item))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = rows.len() > 50;
+    if has_more {
+        rows.pop();
+    }
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|row| serde_json::to_string(&(&row.0, &row.1)))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(
+        serde_json::json!({"items":rows.into_iter().map(|row| row.2).collect::<Vec<_>>(),
+        "has_more":has_more,"next_cursor":next_cursor}),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn needs_attention(db: &Connection) -> Result<Vec<Notification>> {
     initialize(db)?;
@@ -1918,6 +1967,20 @@ mod tests {
         );
         assert_eq!(notifications["attention_details"][49]["state"], "sending");
         assert!(!status.to_string().contains("secret-payload"));
+        db.execute_batch("PRAGMA query_only=ON").unwrap();
+        let first = attention_page(&db, None).unwrap();
+        assert_eq!(first["items"].as_array().unwrap().len(), 50);
+        assert_eq!(first["has_more"], true);
+        let cursor = first["next_cursor"].as_str().unwrap();
+        let second = attention_page(&db, Some(cursor)).unwrap();
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["queue_identity"], "id-50");
+        assert_eq!(second["has_more"], false);
+        assert!(second["next_cursor"].is_null());
+        assert!(!first.to_string().contains("secret-payload"));
+        assert!(!second.to_string().contains("secret-payload"));
+        assert!(attention_page(&db, Some("invalid")).is_err());
+        assert_eq!(db.total_changes(), before);
     }
 
     #[test]
