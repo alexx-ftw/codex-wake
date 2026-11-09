@@ -75,7 +75,7 @@ jq -Rsc '[
     ] as $rules | . as $message | [$rules[] | . as $rule | select($message | contains($rule[1])) | $rule[0]]'
 }
 diagnose() {
-  local state_json gate_json health_json codes phase matches expected actual unit_pid event_pid
+  local state_json gate_json health_json codes phase matches expected actual unit_pid event_pid delivery_json
   state_json=$(ctl show codex-wake.service -p LoadState -p ActiveState -p SubState -p MainPID -p Result -p ExecMainCode -p ExecMainStatus |
     jq -Rn '[inputs | split("=") | {(.[0]):.[1]}] | add') || state_json='{}'
   unit_pid=$(jq -r '.MainPID // "0"' <<< "$state_json")
@@ -96,10 +96,11 @@ diagnose() {
   expected=$(jq -r .spec.unit "$journal" 2>/dev/null) || expected=missing
   actual=$(sha256sum "$unit" 2>/dev/null | cut -d' ' -f1) || actual=absent
   matches=false; [[ $expected == "$actual" ]] && matches=true
+  delivery_json=$(jq -c '{state:(.state | select(. == "pending" or . == "sending" or . == "queued" or . == "needs_attention")),replayed:(.replayed == true),turn_execution_verified:(.turn_execution_verified == true)}' "$root/delivered" 2>/dev/null) || delivery_json='null'
   jq -n --arg stage "$stage" --arg phase "$phase" --arg class "$3" --argjson line "$2" --argjson status "$1" \
     --argjson service "$state_json" --argjson gate "$gate_json" --argjson health "$health_json" \
-    --argjson codes "$codes" --argjson unit_matches "$matches" \
-    '{stage:$stage,line:$line,status:$status,error_class:$class,journal_phase:$phase,service:$service,gate:$gate,health:$health,error_codes:$codes,unit_matches_journal:$unit_matches}' > "$root/upgrade-diagnostic.json"
+    --argjson codes "$codes" --argjson unit_matches "$matches" --argjson delivery "${delivery_json:-null}" \
+    '{stage:$stage,line:$line,status:$status,error_class:$class,journal_phase:$phase,service:$service,gate:$gate,health:$health,error_codes:$codes,unit_matches_journal:$unit_matches,delivery:$delivery}' > "$root/upgrade-diagnostic.json"
 }
 trap 'failure "$?" "$LINENO"' ERR
 cleanup_upgrade() {
@@ -152,6 +153,9 @@ rm -rf -- "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME
 export CODEX_WAKE_PRODUCER_ID=dddddddd-dddd-4ddd-8ddd-dddddddddddd
 export CODEX_WAKE_COOPERATIVE_RECEIVER=1
 stage=bootstrap
+# A service must not inherit a bus/runtime belonging to another user.
+# Only this disposable manager is modified; the caller retains its correct bus.
+ctl set-environment XDG_RUNTIME_DIR=/root/wake-test-runtime DBUS_SESSION_BUS_ADDRESS=unix:path=/root/wake-test-bus
 # Distinct ELF files of one supported protocol; no claim about historical cooperative releases.
 cp -- "$wake" "$root/old"
 printf '\ncooperative-previous-generation\n' >> "$root/old"
@@ -161,6 +165,15 @@ old_pid=$(ctl show codex-wake.service -p MainPID --value)
 old_invocation=$(ctl show codex-wake.service -p InvocationID --value)
 old_group=$(ctl show codex-wake.service -p ControlGroup --value)
 old_owner=$(jq -r .spec.owner "$journal")
+# Read only these two values from the actual fixture process; never export its environment.
+actual_runtime=missing actual_bus=missing
+while IFS= read -r -d '' item; do
+  case $item in
+    XDG_RUNTIME_DIR=*) actual_runtime=${item#*=} ;;
+    DBUS_SESSION_BUS_ADDRESS=*) actual_bus=${item#*=} ;;
+  esac
+done < "/proc/$old_pid/environ"
+[[ $actual_runtime == "/run/user/$(id -u)" && $actual_bus == "unix:path=/run/user/$(id -u)/bus" ]]
 delivery_thread=$("$root/probe" create-thread "$codex" "$socket")
 controller=$(ctl show wake-qualification-controller.service -p MainPID -p InvocationID)
 secret=$HOME/preserved-secret

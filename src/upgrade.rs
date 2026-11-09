@@ -89,6 +89,7 @@ fn unit(config: &Config, spec: &Spec) -> Result<String> {
         .executable
         .parent()
         .context("Missing generation directory")?;
+    let uid = unsafe { libc::geteuid() };
     Ok(manager::unit(config)?
         .replace(&format!("ExecStart=:{} receiver\n",executable(&config.runtime.join("codex-wake"))?),
             &format!("ExecStart=:{} receiver\n",executable(&spec.executable)?))
@@ -96,7 +97,7 @@ fn unit(config: &Config, spec: &Spec) -> Result<String> {
             &format!("WorkingDirectory={}\n",directory.to_str().context("Invalid generation path")?.replace('%',"%%")))
         .replace("Type=simple\n", "Type=exec\nRemainAfterExit=yes\nKillMode=control-group\n")
         .replace("Restart=on-failure\n", "Restart=no\n")
-        .replace("[Service]\n", &format!("[Service]\nEnvironment=CODEX_WAKE_COOPERATIVE_RECEIVER=1\nEnvironment=CODEX_WAKE_RECEIVER_LIFECYCLE=1\nEnvironment=CODEX_WAKE_GATE_OWNER={}\nEnvironment=CODEX_WAKE_GATE_GENERATION={}\n", spec.owner, spec.generation)))
+        .replace("[Service]\n", &format!("[Service]\nEnvironment=XDG_RUNTIME_DIR=/run/user/{uid}\nEnvironment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus\nEnvironment=CODEX_WAKE_COOPERATIVE_RECEIVER=1\nEnvironment=CODEX_WAKE_RECEIVER_LIFECYCLE=1\nEnvironment=CODEX_WAKE_GATE_OWNER={}\nEnvironment=CODEX_WAKE_GATE_GENERATION={}\n", spec.owner, spec.generation)))
 }
 
 type Snapshot = BTreeMap<String, String>;
@@ -799,6 +800,11 @@ mod tests {
         };
         let original = manager::unit(&config).unwrap();
         let generated = unit(&config, &spec).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(generated.contains(&format!("Environment=XDG_RUNTIME_DIR=/run/user/{uid}\n")));
+        assert!(generated.contains(&format!(
+            "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus\n"
+        )));
         for line in original
             .lines()
             .filter(|line| line.starts_with("Environment="))
