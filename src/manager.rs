@@ -944,7 +944,15 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
-    for source in ["github", "external", "native", "delivery"] {
+    for source in [
+        "github",
+        "external",
+        "native",
+        "delivery",
+        "pr-ci",
+        "pr-ci-delivery",
+        "pr-registration",
+    ] {
         let poll_config = config.clone();
         thread::spawn(move || {
             let mut history_scans = std::collections::HashMap::new();
@@ -966,6 +974,73 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                 &poll_config.codex,
                                 &mut history_scans,
                             )?;
+                        }
+                        "pr-ci" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            let report = codex_wake::pr_ci_runtime::poll_one_with_gh(
+                                &db,
+                                &poll_config.gh,
+                                now,
+                            )?;
+                            if !report.errors.is_empty() {
+                                bail!("PR CI polling failed; see tracking status");
+                            }
+                            if report.unlinked_runs > 0 {
+                                crate::observability::emit(
+                                    "poll.pr_ci",
+                                    "partial",
+                                    "unlinked_runs",
+                                    None,
+                                    Duration::ZERO,
+                                    report.unlinked_runs as u64,
+                                );
+                            }
+                        }
+                        "pr-ci-delivery" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            codex_wake::pr_ci_runtime::dispatch(
+                                &mut db,
+                                now,
+                                |delivery, message| {
+                                    let run = delivery.run_id.to_string();
+                                    let attempt = delivery.attempt.to_string();
+                                    let key = crate::delivery_evidence::source_fields_identity(
+                                        "github.workflow_run.completed",
+                                        &[&delivery.repo, &run, &attempt],
+                                    )?;
+                                    let evidence_db = crate::bridge::connect(&poll_config.db)?;
+                                    let (id, _) = crate::delivery_evidence::begin(
+                                        &evidence_db,
+                                        &key,
+                                        &delivery.thread,
+                                        true,
+                                    )?;
+                                    crate::execution::queue_with_identity(
+                                        &poll_config.codex,
+                                        &delivery.thread,
+                                        message,
+                                        &id,
+                                        true,
+                                        Duration::from_secs(120),
+                                    )
+                                },
+                            )?;
+                        }
+                        "pr-registration" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            crate::pr_registration::reconcile(&mut db, &poll_config, now)?;
                         }
                         _ => {
                             crate::native_poll::tick(&db, &poll_config.codex)?;
@@ -1016,6 +1091,11 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 crate::process_interrupts(&config, &db)?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::polling::pr_notifications::dispatch(
+                    &mut db,
+                    &config.codex,
+                    Duration::from_secs(120),
+                )?;
                 crate::conditions::initialize(&db)?;
                 crate::dispatch_conditions(&db, &config.codex)?;
                 crate::obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;

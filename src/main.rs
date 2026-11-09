@@ -13,6 +13,9 @@ mod obligations;
 mod observability;
 mod observers;
 mod polling;
+mod pr_hook;
+mod pr_observation;
+mod pr_registration;
 mod probe;
 mod producers;
 mod result_conflicts;
@@ -1094,6 +1097,7 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
         Some("Stop") => "hook.stop",
         Some("SubagentStop") => "hook.subagent_stop",
         Some("PostToolUse") => "hook.post_tool_use",
+        Some("PreToolUse") => "hook.pre_tool_use",
         _ => "hook.unsupported",
     };
     let span = observability::Span::new(
@@ -1108,8 +1112,30 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
 }
 
 fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
+    if payload["hook_event_name"] == "PreToolUse" {
+        if !pr_observation::is_relevant_pre_tool_use(payload) {
+            return Ok(json!({}));
+        }
+        let mut db = database(config)?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        pr_observation::record_pre_tool_use(&mut db, payload, now, 3_600_000)?;
+        return Ok(json!({}));
+    }
     if payload["hook_event_name"] == "PostToolUse" {
-        return steer::take(&mut database(config)?, payload);
+        let mut db = database(config)?;
+        let transport = pr_observation::GhCliPullRequestGet::from_config(config);
+        pr_observation::handle_post_tool_use(
+            &mut db,
+            payload,
+            &transport,
+            Duration::from_secs(20),
+            3_600_000,
+        )?;
+        return steer::take(&mut db, payload);
     }
     if payload["hook_event_name"] == "SessionStart" {
         let status = manager::ensure_receiver(config)?;

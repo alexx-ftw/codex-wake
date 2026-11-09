@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[path = "pr_notifications.rs"]
+pub(crate) mod pr_notifications;
+
 const PAGE_LIMIT: usize = 10;
 const MAX_OUTPUT: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -40,6 +43,7 @@ where
     F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
 {
     initialize(db)?;
+    pr_notifications::initialize(db)?;
     let targets = targets(db)?;
     let mut report = Report::default();
     db.execute("UPDATE github_poll_state SET error_category=NULL WHERE endpoint='__global__' AND next_poll_ms<=?1",[now])?;
@@ -216,6 +220,14 @@ where
                 } else {
                     "closed"
                 };
+                let event_key = stable_source_key(
+                    "pull_request",
+                    &resource.repo,
+                    &resource.resource,
+                    event_name,
+                    "",
+                    &[event_time],
+                );
                 let ambiguous_baseline = !old.is_null() && prior_state.is_none();
                 let ambiguous_event_cursor = ambiguous_baseline
                     .then(|| event_cursor.clone().unwrap_or_else(|| cursor_number(now)));
@@ -253,22 +265,34 @@ where
                     &resource.resource,
                     None,
                 )? as u64;
+                pr_notifications::record_event(
+                    db,
+                    "pull_request",
+                    &resource.repo,
+                    &resource.resource,
+                    event_name,
+                    event_time,
+                    &event_key,
+                    &event,
+                )
+                .map_err(|_| Failure::new("database"))?;
             } else if !old.is_null() {
                 let changed_at = pr["updated_at"].as_str();
                 if old["head"].as_str().is_some_and(|v| v != head) {
+                    let event_key = stable_source_key(
+                        "pull_request",
+                        &resource.repo,
+                        &resource.resource,
+                        "synchronize",
+                        "",
+                        &[changed_at.unwrap_or_default(), head],
+                    );
                     if let Some(cursor) = event_cursor.as_ref() {
                         condition_observations.push(ConditionObservation {
                             resource: resource.resource.clone(),
                             event: "synchronize".into(),
                             outcome: None,
-                            key: stable_source_key(
-                                "pull_request",
-                                &resource.repo,
-                                &resource.resource,
-                                "synchronize",
-                                "",
-                                &[changed_at.unwrap_or_default(), head],
-                            ),
+                            key: event_key.clone(),
                             cursor: cursor.clone(),
                             ci: None,
                             order_ambiguous: false,
@@ -283,21 +307,35 @@ where
                         &resource.resource,
                         changed_at,
                     )? as u64;
+                    if let Some(event_at) = changed_at {
+                        pr_notifications::record_event(
+                            db,
+                            "pull_request",
+                            &resource.repo,
+                            &resource.resource,
+                            "synchronize",
+                            event_at,
+                            &event_key,
+                            &full("synchronize", Value::Null),
+                        )
+                        .map_err(|_| Failure::new("database"))?;
+                    }
                 }
                 if old["base"].as_str().is_some_and(|v| v != base) {
+                    let event_key = stable_source_key(
+                        "pull_request",
+                        &resource.repo,
+                        &resource.resource,
+                        "base_changed",
+                        "",
+                        &[changed_at.unwrap_or_default(), base],
+                    );
                     if let Some(cursor) = event_cursor.as_ref() {
                         condition_observations.push(ConditionObservation {
                             resource: resource.resource.clone(),
                             event: "base_changed".into(),
                             outcome: None,
-                            key: stable_source_key(
-                                "pull_request",
-                                &resource.repo,
-                                &resource.resource,
-                                "base_changed",
-                                "",
-                                &[changed_at.unwrap_or_default(), base],
-                            ),
+                            key: event_key.clone(),
                             cursor: cursor.clone(),
                             ci: None,
                             order_ambiguous: false,
@@ -312,6 +350,19 @@ where
                         &resource.resource,
                         changed_at,
                     )? as u64;
+                    if let Some(event_at) = changed_at {
+                        pr_notifications::record_event(
+                            db,
+                            "pull_request",
+                            &resource.repo,
+                            &resource.resource,
+                            "base_changed",
+                            event_at,
+                            &event_key,
+                            &full("edited", json!({"base":{"ref":old["base"]}})),
+                        )
+                        .map_err(|_| Failure::new("database"))?;
+                    }
                 }
             }
             accepted += observe_conditions(
@@ -411,6 +462,29 @@ where
                         number,
                         Some(submitted),
                     )? as u64;
+                    let notification_event = match normalized {
+                        "approved" | "changes_requested" => normalized,
+                        _ => "submitted",
+                    };
+                    let event_key = stable_source_key(
+                        "review",
+                        &repo,
+                        number,
+                        notification_event,
+                        normalized,
+                        &[&id, submitted],
+                    );
+                    pr_notifications::record_event(
+                        db,
+                        "review",
+                        &repo,
+                        number,
+                        notification_event,
+                        submitted,
+                        &event_key,
+                        &event,
+                    )
+                    .map_err(|_| Failure::new("database"))?;
                 }
                 matched += observe_conditions(
                     db,
@@ -712,6 +786,30 @@ pub fn status(db: &Connection) -> Result<Value> {
         "SELECT count(*) FROM subscriptions WHERE state='waiting' AND kind IN ('pull_request','review','deployment','git_ref')",
     )?;
     let rules = count("rules", "SELECT count(*) FROM rules WHERE enabled=1")?;
+    let automatic_notifications_pending = count(
+        "automatic_pr_notifications",
+        "SELECT count(*) FROM automatic_pr_notifications WHERE state='pending'",
+    )?;
+    let automatic_notifications_attention = count(
+        "automatic_pr_notifications",
+        "SELECT count(*) FROM automatic_pr_notifications WHERE state IN ('sending','needs_attention')",
+    )?;
+    let pr_ci_trackers = count(
+        "pr_ci_trackers",
+        "SELECT count(*) FROM pr_ci_trackers WHERE active=1",
+    )?;
+    let pr_ci_pending = count(
+        "pr_ci_deliveries",
+        "SELECT count(*) FROM pr_ci_deliveries WHERE state='pending'",
+    )?;
+    let pr_ci_attention = count(
+        "pr_ci_deliveries",
+        "SELECT count(*) FROM pr_ci_deliveries WHERE state IN ('claimed','needs_attention')",
+    )?;
+    let pr_ci_errors = count(
+        "pr_ci_trackers",
+        "SELECT count(*) FROM pr_ci_trackers WHERE active=1 AND error IS NOT NULL",
+    )?;
     let (last_success, next_poll, calls): (Option<i64>, Option<i64>, i64) = db.query_row(
         "SELECT max(last_success_ms),min(next_poll_ms),coalesce(sum(calls),0) FROM github_poll_state", [],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -726,6 +824,8 @@ pub fn status(db: &Connection) -> Result<Value> {
     )?;
     Ok(
         json!({"active":{"waits":waits,"subscriptions":subscriptions,"rules":rules},
+        "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention},
+        "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors},
         "last_success_ms":last_success,"errors":errors,"next_poll_ms":next_poll,
         "calls":calls,"cached_pages":pages}),
     )
@@ -926,6 +1026,31 @@ fn targets(db: &Connection) -> Result<Targets> {
                     out.pull_requests.insert(target.clone());
                     out.rule_prs.insert(target);
                 }
+            }
+        }
+    }
+    {
+        let mut s = db.prepare("SELECT kind,repo,pr FROM automatic_pr_notification_listeners")?;
+        for row in s.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (kind, repo, pr) = row?;
+            if !valid_repo(&repo) || !positive_text(&pr) {
+                continue;
+            }
+            let target = Resource { repo, resource: pr };
+            match kind.as_str() {
+                "pull_request" => {
+                    out.pull_requests.insert(target);
+                }
+                "review" => {
+                    out.reviews.insert(target);
+                }
+                _ => {}
             }
         }
     }
