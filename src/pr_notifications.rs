@@ -484,6 +484,119 @@ pub(crate) fn record_event_in(
     Ok(notifications)
 }
 
+// A snapshot and a webhook have no shared transition ID. Keep a possible
+// cross-source duplicate in the journal, outside replay and the delivery queue.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_change_in(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+    event: &str,
+    event_at: &str,
+    event_key: &str,
+    source: &Value,
+    webhook: bool,
+    force_pending: bool,
+    candidate_floor: Option<i64>,
+) -> Result<usize> {
+    initialize(db)?;
+    let repo = repo.to_ascii_lowercase();
+    let (_, pr) = crate::subscriptions::validate_source(
+        "pull_request",
+        &repo,
+        pr,
+        event,
+        "11111111-1111-4111-8111-111111111111",
+    )?;
+    ensure!(
+        !event_key.is_empty()
+            && event_key.len() <= MAX_EVENT_KEY
+            && event_key.bytes().all(|byte| byte.is_ascii_graphic()),
+        "Invalid provider event identity"
+    );
+    ensure!(
+        !event_at.is_empty() && event_at.len() <= 64,
+        "Invalid event timestamp"
+    );
+    ensure!(
+        serde_json::to_vec(source)?.len() <= MAX_SOURCE_BYTES,
+        "Provider event exceeds 1 MiB"
+    );
+    let pending_event = format!("pending_{event}");
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+         WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event_key=?3)",
+        params![repo, pr, event_key],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(0);
+    }
+    let path = if event == "synchronize" {
+        "$.pull_request.head.sha"
+    } else {
+        "$.pull_request.base.ref"
+    };
+    let target = if event == "synchronize" {
+        source.pointer("/pull_request/head/sha")
+    } else {
+        source.pointer("/pull_request/base/ref")
+    }
+    .and_then(Value::as_str)
+    .context("Change is missing its target")?;
+    let current_second = timestamp_second(db, event_at)?;
+    let ambiguous: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+         WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2
+           AND event IN (?3,?4) AND json_extract(source,?5)=?6
+           AND COALESCE(json_extract(source,'$._wake_change_origin'),'poll') != ?7
+           AND (?8 IS NULL OR event_at_sec>=?8)
+           AND (?7!='poll' OR event_at_sec<=?9)
+           AND (?7!='webhook' OR json_extract(source,'$._wake_change_lower_sec') IS NULL
+                OR json_extract(source,'$._wake_change_lower_sec')<=?9))",
+        params![
+            repo,
+            pr,
+            event,
+            pending_event,
+            path,
+            target,
+            if webhook { "webhook" } else { "poll" },
+            candidate_floor,
+            current_second
+        ],
+        |row| row.get(0),
+    )?;
+    if force_pending || ambiguous {
+        db.execute(
+            "INSERT INTO automatic_pr_event_journal
+             (kind,repo,pr,event,event_key,event_at_sec,event_at,source)
+             VALUES('pull_request',?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                repo,
+                pr,
+                pending_event,
+                event_key,
+                current_second,
+                event_at,
+                serde_json::to_string(source)?
+            ],
+        )?;
+        return Ok(0);
+    }
+    Ok(record_event_in(
+        db,
+        "pull_request",
+        &repo,
+        &pr,
+        event,
+        event_at,
+        event_key,
+        source,
+    )?
+    .len())
+}
+
 pub(crate) fn record_closed_event(
     db: &Connection,
     repo: &str,
@@ -1044,6 +1157,60 @@ fn accept_authenticated_webhook_inner(
     match event {
         "pull_request" => {
             let action = payload["action"].as_str().unwrap_or_default();
+            let change = match action {
+                "synchronize" => Some("synchronize"),
+                "edited"
+                    if payload
+                        .pointer("/changes/base/ref/from")
+                        .and_then(Value::as_str)
+                        .is_some() =>
+                {
+                    Some("base_changed")
+                }
+                _ => None,
+            };
+            if let Some(change) = change {
+                ensure!(
+                    serde_json::to_vec(payload)?.len() <= MAX_SOURCE_BYTES,
+                    "Provider event exceeds 1 MiB"
+                );
+                let event_at = payload["pull_request"]["updated_at"]
+                    .as_str()
+                    .context("Changed pull request webhook is missing updated_at")?;
+                let identity = delivery_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let key = super::stable_source_key(
+                    "pull_request",
+                    &repo.to_ascii_lowercase(),
+                    &pr,
+                    change,
+                    "",
+                    &["webhook", &identity],
+                );
+                let mut source = payload.clone();
+                source["_wake_change_origin"] = Value::String("webhook".into());
+                if change == "base_changed" {
+                    source["changes"]["base"]["ref"] =
+                        payload["changes"]["base"]["ref"]["from"].clone();
+                }
+                initialize(db)?;
+                let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+                let count = record_change_in(
+                    &tx,
+                    repo,
+                    &pr,
+                    change,
+                    event_at,
+                    &key,
+                    &source,
+                    true,
+                    delivery_id.is_none(),
+                    Some(timestamp_second(&tx, event_at)?),
+                )?;
+                tx.commit()?;
+                return Ok(count);
+            }
             if action == "reopened" {
                 let event_at = payload["pull_request"]["updated_at"]
                     .as_str()
@@ -1813,6 +1980,89 @@ mod tests {
             .unwrap();
         assert_eq!(close.event_key, closed_key);
         assert_eq!(close.source, closed);
+    }
+
+    #[test]
+    fn webhook_only_changes_replay_each_delivery_once() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let payload = |action: &str, head: &str, base: &str, from: &str| {
+            json!({
+                "action":action,"number":7,"repository":{"full_name":"Owner/Repo"},
+                "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z",
+                    "head":{"sha":head},"base":{"ref":base}},
+                "changes":{"base":{"ref":{"from":from}}}
+            })
+        };
+        let events = [
+            ("h1", payload("synchronize", "b", "main", "main")),
+            ("h2", payload("synchronize", "a", "main", "main")),
+            ("b1", payload("edited", "a", "release", "main")),
+            ("b2", payload("edited", "a", "main", "release")),
+        ];
+        for (id, event) in &events {
+            assert_eq!(
+                accept_authenticated_webhook_with_delivery_id(&db, "pull_request", id, event)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                accept_authenticated_webhook_with_delivery_id(&db, "pull_request", id, event)
+                    .unwrap(),
+                0
+            );
+        }
+        let boundary = timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap();
+        register_in_since(&db, "pull_request", "owner/repo", "7", thread, boundary).unwrap();
+        assert_eq!(pending(&db).unwrap().len(), 4);
+        assert_eq!(
+            replay_listener_events_in(&db, "pull_request", "owner/repo", "7", thread).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unidentified_webhook_stays_pending_and_failed_journal_rolls_back() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let payload = json!({"action":"synchronize","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z","head":{"sha":"b"}}});
+        assert_eq!(
+            accept_authenticated_webhook(&db, "pull_request", &payload).unwrap(),
+            0
+        );
+        assert!(pending(&db).unwrap().is_empty());
+        let uncertain: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_synchronize'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(uncertain, 1);
+        db.execute_batch("CREATE TRIGGER reject_change BEFORE INSERT ON automatic_pr_event_journal BEGIN SELECT RAISE(ABORT, 'stop'); END;").unwrap();
+        assert!(
+            accept_authenticated_webhook_with_delivery_id(
+                &db,
+                "pull_request",
+                "delivery",
+                &payload
+            )
+            .is_err()
+        );
+        db.execute_batch("DROP TRIGGER reject_change").unwrap();
+        assert_eq!(
+            accept_authenticated_webhook_with_delivery_id(
+                &db,
+                "pull_request",
+                "delivery",
+                &payload
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(pending(&db).unwrap().len(), 1);
     }
 
     #[test]

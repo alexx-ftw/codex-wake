@@ -1315,6 +1315,10 @@ pub fn status(db: &Connection) -> Result<Value> {
         "automatic_pr_notifications",
         "SELECT count(*) FROM automatic_pr_notifications WHERE state IN ('sending','needs_attention')",
     )?;
+    let automatic_change_identity_pending = count(
+        "automatic_pr_event_journal",
+        "SELECT count(*) FROM automatic_pr_event_journal WHERE event IN ('pending_synchronize','pending_base_changed')",
+    )?;
     let pr_ci_trackers = count(
         "pr_ci_trackers",
         "SELECT count(*) FROM pr_ci_trackers WHERE active=1",
@@ -1345,7 +1349,7 @@ pub fn status(db: &Connection) -> Result<Value> {
     )?;
     Ok(
         json!({"active":{"waits":waits,"subscriptions":subscriptions,"rules":rules},
-        "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention},
+        "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention,"identity_pending":automatic_change_identity_pending},
         "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors},
         "last_success_ms":last_success,"errors":errors,"next_poll_ms":next_poll,
         "calls":calls,"cached_pages":pages}),
@@ -2194,6 +2198,9 @@ fn record_automatic_pr_changes(
         .and_then(|cursor| serde_json::from_str::<Value>(cursor).ok())
         .unwrap_or_else(|| route_cursor.clone());
     let mut sequence = previous_cursor["automatic_sequence"].as_i64().unwrap_or(0);
+    let candidate_floor = previous_cursor["updated_at"]
+        .as_str()
+        .and_then(|timestamp| pr_notifications::timestamp_second(&tx, timestamp).ok());
     for (event, field, action) in [
         ("synchronize", "head", "synchronize"),
         ("base_changed", "base", "edited"),
@@ -2223,23 +2230,26 @@ fn record_automatic_pr_changes(
                 Value::Null
             };
             let source = json!({"action":action,"number":pr["number"],"pull_request":pr,
-                "repository":{"full_name":resource.repo},"changes":changes});
-            pr_notifications::record_event_in(
+                "repository":{"full_name":resource.repo},"changes":changes,
+                "_wake_change_origin":"poll","_wake_change_lower_sec":candidate_floor});
+            pr_notifications::record_change_in(
                 &tx,
-                "pull_request",
                 &repo,
                 &resource.resource,
                 event,
                 event_at,
                 &event_key,
                 &source,
+                false,
+                false,
+                candidate_floor,
             )
             .map_err(|_| Failure::new("database"))?;
             sequence = sequence.saturating_add(1);
         }
     }
     let cursor = json!({"head":pr["head"]["sha"],"base":pr["base"]["ref"],
-        "automatic_sequence":sequence})
+        "updated_at":pr["updated_at"],"automatic_sequence":sequence})
     .to_string();
     tx.execute(
         "INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls)
@@ -7219,6 +7229,224 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!((count, unique), (3, 3), "{event}");
+        }
+    }
+
+    #[test]
+    fn webhook_changes_keep_ambiguous_poll_candidates_and_deduplicate_delivery() {
+        for poll_first in [false, true] {
+            let db = db();
+            let thread = "11111111-1111-4111-8111-111111111111";
+            pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+            let resource = Resource {
+                repo: "Owner/Repo".into(),
+                resource: "7".into(),
+            };
+            let cursor = json!({"head":"a","base":"main"});
+            let snapshot = json!({"number":7,"state":"open","updated_at":"2099-01-01T00:00:00Z",
+                "head":{"sha":"b"},"base":{"ref":"release"}});
+            let webhook = |action: &str, head: &str, base: &str, previous: &str| {
+                json!({
+                    "action":action,"number":7,"repository":{"full_name":"OWNER/repo"},
+                    "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z",
+                        "head":{"sha":head},"base":{"ref":base}},
+                    "changes":{"base":{"ref":{"from":previous}}}
+                })
+            };
+            let head_b = webhook("synchronize", "b", "main", "main");
+            let head_a = webhook("synchronize", "a", "main", "main");
+            let base_release = webhook("edited", "a", "release", "main");
+            let base_main = webhook("edited", "a", "main", "release");
+            let accept = |id: &str, payload: &Value| {
+                pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                    &db,
+                    "pull_request",
+                    id,
+                    payload,
+                )
+                .unwrap()
+            };
+            let poll =
+                || record_automatic_pr_changes(&db, &resource, &snapshot, &cursor, 0).unwrap();
+            if poll_first {
+                poll();
+            }
+            // D3 arrives before D1; identical content does not imply identical events.
+            accept("head-d3", &head_b);
+            accept("head-d2", &head_a);
+            accept("head-d1", &head_b);
+            accept("base-d3", &base_release);
+            accept("base-d2", &base_main);
+            accept("base-d1", &base_release);
+            if !poll_first {
+                poll();
+            }
+            accept("head-d3", &head_b);
+            accept("base-d3", &base_release);
+            for event in ["synchronize", "base_changed"] {
+                let (total, waiting): (i64, i64) = db.query_row(
+                    "SELECT count(*),sum(event=?1) FROM automatic_pr_event_journal WHERE event IN (?1,?2)",
+                    params![format!("pending_{event}"),event], |row| Ok((row.get(0)?,row.get(1)?)),
+                ).unwrap();
+                assert_eq!(total, 4, "{event}");
+                assert!(waiting >= 1, "{event}");
+            }
+            assert!(
+                status(&db).unwrap()["automatic_pr_notifications"]["identity_pending"]
+                    .as_i64()
+                    .unwrap()
+                    >= 2
+            );
+            let before = pr_notifications::pending(&db).unwrap().len();
+            pr_notifications::replay_listener_events_in(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                thread,
+            )
+            .unwrap();
+            assert_eq!(pr_notifications::pending(&db).unwrap().len(), before);
+        }
+    }
+
+    #[test]
+    fn later_change_to_same_target_is_not_blocked_by_an_older_source() {
+        for poll_first in [false, true] {
+            let db = db();
+            let thread = "11111111-1111-4111-8111-111111111111";
+            pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+            let resource = Resource {
+                repo: "owner/repo".into(),
+                resource: "7".into(),
+            };
+            let snapshot = |head: &str, time: &str| {
+                json!({"number":7,"state":"open", "updated_at":time,
+                "head":{"sha":head},"base":{"ref":"main"}})
+            };
+            let webhook = |time: &str| {
+                json!({"action":"synchronize", "number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":snapshot("b", time)})
+            };
+            let a = json!({"head":"a","base":"main"});
+            if poll_first {
+                record_automatic_pr_changes(
+                    &db,
+                    &resource,
+                    &snapshot("b", "2099-01-01T00:00:10Z"),
+                    &a,
+                    0,
+                )
+                .unwrap();
+                pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                    &db,
+                    "pull_request",
+                    "new",
+                    &webhook("2099-01-01T00:00:30Z"),
+                )
+                .unwrap();
+            } else {
+                pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                    &db,
+                    "pull_request",
+                    "old",
+                    &webhook("2099-01-01T00:00:10Z"),
+                )
+                .unwrap();
+                record_automatic_pr_changes(
+                    &db,
+                    &resource,
+                    &snapshot("a", "2099-01-01T00:00:20Z"),
+                    &a,
+                    0,
+                )
+                .unwrap();
+                let generation =
+                    poll_generation(&db, &automatic_pr_generation_key(&resource)).unwrap();
+                record_automatic_pr_changes(
+                    &db,
+                    &resource,
+                    &snapshot("b", "2099-01-01T00:00:30Z"),
+                    &a,
+                    generation,
+                )
+                .unwrap();
+            }
+            assert_eq!(pr_notifications::pending(&db).unwrap().len(), 2);
+            assert_eq!(
+                pr_notifications::replay_listener_events_in(
+                    &db,
+                    "pull_request",
+                    "owner/repo",
+                    "7",
+                    thread
+                )
+                .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_outside_poll_snapshot_interval_can_progress_in_either_order() {
+        for poll_first in [false, true] {
+            let db = db();
+            let thread = "11111111-1111-4111-8111-111111111111";
+            pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+            let resource = Resource {
+                repo: "owner/repo".into(),
+                resource: "7".into(),
+            };
+            let snapshot = |head: &str, time: &str| {
+                json!({"number":7,"state":"open","updated_at":time,
+                "head":{"sha":head},"base":{"ref":"main"}})
+            };
+            let initial = json!({"head":"a","base":"main"});
+            record_automatic_pr_changes(
+                &db,
+                &resource,
+                &snapshot("a", "2099-01-01T00:00:20Z"),
+                &initial,
+                0,
+            )
+            .unwrap();
+            let generation = poll_generation(&db, &automatic_pr_generation_key(&resource)).unwrap();
+            let poll = || {
+                record_automatic_pr_changes(
+                    &db,
+                    &resource,
+                    &snapshot("b", "2099-01-01T00:00:30Z"),
+                    &initial,
+                    generation,
+                )
+                .unwrap()
+            };
+            let time = if poll_first {
+                "2099-01-01T00:00:10Z"
+            } else {
+                "2099-01-01T00:00:40Z"
+            };
+            let webhook = json!({"action":"synchronize","number":7,"repository":{"full_name":"owner/repo"},
+                "pull_request":snapshot("b",time)});
+            if poll_first {
+                poll();
+            }
+            pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                &db,
+                "pull_request",
+                "distinct",
+                &webhook,
+            )
+            .unwrap();
+            if !poll_first {
+                poll();
+            }
+            assert_eq!(pr_notifications::pending(&db).unwrap().len(), 2);
+            assert_eq!(
+                status(&db).unwrap()["automatic_pr_notifications"]["identity_pending"],
+                0
+            );
         }
     }
 

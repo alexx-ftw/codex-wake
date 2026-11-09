@@ -551,7 +551,11 @@ fn capture_authenticated_pr_notification(
             payload,
         );
     }
-    let is_supported = (event == "pull_request" && payload["action"] == "closed")
+    let is_supported = (event == "pull_request"
+        && matches!(
+            payload["action"].as_str(),
+            Some("closed" | "synchronize" | "edited")
+        ))
         || (event == "pull_request_review" && payload["action"] == "submitted");
     if is_supported {
         if let Some(delivery_id) = delivery_id.filter(|id| !id.is_empty()) {
@@ -3101,6 +3105,45 @@ mod hook_output_tests {
         );
         assert!(
             verified_webhook_payload(&config, br#"{"action":"reopened"}"#, &signature).is_err()
+        );
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        polling::pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let change = json!({"action":"synchronize","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z","head":{"sha":"b"}}});
+        let raw = serde_json::to_vec(&change).unwrap();
+        assert!(verified_webhook_payload(&config, &raw, &signature).is_err());
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(&raw);
+        let signed = format!("sha256={:x}", mac.finalize().into_bytes());
+        let parsed = verified_webhook_payload(&config, &raw, &signed).unwrap();
+        assert_eq!(
+            capture_authenticated_pr_notification(
+                &db,
+                &config.gh,
+                "pull_request",
+                Some("delivery"),
+                &parsed
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            capture_authenticated_pr_notification(
+                &db,
+                &config.gh,
+                "pull_request",
+                Some("delivery"),
+                &parsed
+            )
+            .unwrap(),
+            0
         );
     }
 

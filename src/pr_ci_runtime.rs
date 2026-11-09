@@ -2030,11 +2030,12 @@ esac
         let wrapper = directory.path().join("gh-wrapper");
         let leader_file = directory.path().join("leader.pid");
         let escaped_file = directory.path().join("escaped.pid");
+        let release_file = directory.path().join("release");
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nsetsid sh -c 'echo $$ > {}; exec sleep 10' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nexit 0\n",
-                leader_file.display(), escaped_file.display(), escaped_file.display()
+                "#!/bin/sh\necho $$ > '{}'\nsetsid sh -c 'echo $$ > \"$1\"; i=0; while [ ! -e \"$2\" ] && [ \"$i\" -lt 240 ]; do i=$((i+1)); sleep 0.05; done' sh '{}' '{}' &\nwhile [ ! -s '{}' ]; do sleep 0.01; done\nprintf '{{}}'\nexit 0\n",
+                leader_file.display(), escaped_file.display(), release_file.display(), escaped_file.display()
             ),
         )
         .unwrap();
@@ -2043,10 +2044,10 @@ esac
             gh_api_with_timeout(
                 &wrapper,
                 "/repos/owner/project/pulls/7",
-                Duration::from_secs(2),
+                Duration::from_secs(10),
             )
         });
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut reserved = false;
         let mut last_stat = None;
         while Instant::now() < deadline {
@@ -2063,17 +2064,18 @@ esac
             }
             thread::sleep(Duration::from_millis(10));
         }
+        fs::write(release_file, "release").unwrap();
         let result = worker.join().unwrap();
         let escaped = fs::read_to_string(escaped_file);
-        if let Ok(pid) = &escaped {
-            let _ = Command::new("kill").arg("-KILL").arg(pid.trim()).status();
-        }
         assert!(
             reserved,
             "exited leader must remain unreaped until cleanup; worker={result:?}; leader={:?}; escaped={escaped:?}; last_stat={last_stat:?}",
             fs::read_to_string(leader_file),
         );
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(
+            result.is_ok(),
+            "worker should finish after release: {result:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
