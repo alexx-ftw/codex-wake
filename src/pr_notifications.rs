@@ -2,6 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const MAX_EVENT_KEY: usize = 512;
@@ -34,14 +35,6 @@ struct PendingReopen {
     source_id: String,
     event_at_sec: i64,
     event_at: String,
-}
-
-struct PendingReopenSourceRow {
-    id: i64,
-    repo: String,
-    pr: String,
-    event_at: String,
-    source: String,
 }
 
 pub(crate) fn initialize(db: &Connection) -> Result<()> {
@@ -92,8 +85,6 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             pr TEXT NOT NULL,
             closed_at_sec INTEGER NOT NULL,
             PRIMARY KEY(repo,pr,closed_at_sec));
-        CREATE TABLE IF NOT EXISTS automatic_pr_schema_migrations (
-            name TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS automatic_pr_pending_reopens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             repo TEXT NOT NULL,
@@ -105,294 +96,6 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             source TEXT NOT NULL,
             UNIQUE(repo,pr,source_kind,source_id));",
     )?;
-    db.execute(
-        "INSERT OR IGNORE INTO automatic_pr_closed_cycles(repo,pr,closed_at_sec)
-         SELECT repo,pr,closed_at_sec FROM automatic_pr_lifecycle",
-        [],
-    )?;
-    migrate_pending_reopens(db)?;
-    sanitize_pending_reopen_sources(db)?;
-    let lifecycle_columns = {
-        let mut statement = db.prepare("PRAGMA table_info(automatic_pr_lifecycle)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for column in ["webhook_reopen_source_id", "poll_reopen_source_id"] {
-        if !lifecycle_columns.iter().any(|existing| existing == column) {
-            db.execute_batch(&format!(
-                "ALTER TABLE automatic_pr_lifecycle ADD COLUMN {column} TEXT;"
-            ))?;
-        }
-    }
-    let has_available_at = {
-        let mut statement = db.prepare("PRAGMA table_info(automatic_pr_notifications)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|column| column == "available_at_ms")
-    };
-    if !has_available_at {
-        db.execute_batch(
-            "ALTER TABLE automatic_pr_notifications
-             ADD COLUMN available_at_ms INTEGER NOT NULL DEFAULT 0;",
-        )?;
-    }
-    let has_registration_time = {
-        let mut statement = db.prepare("PRAGMA table_info(automatic_pr_notification_listeners)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|column| column == "registered_at_sec")
-    };
-    if !has_registration_time {
-        db.execute_batch(
-            "ALTER TABLE automatic_pr_notification_listeners
-             ADD COLUMN registered_at_sec INTEGER NOT NULL DEFAULT 0;
-             UPDATE automatic_pr_notification_listeners
-             SET registered_at_sec=CAST(strftime('%s','now') AS INTEGER)
-             WHERE registered_at_sec=0;",
-        )?;
-    }
-    migrate_reopen_notification_identity(db)?;
-    Ok(())
-}
-
-fn migrate_reopen_notification_identity(db: &Connection) -> Result<()> {
-    struct LegacyNotification {
-        id: String,
-        kind: String,
-        repo: String,
-        pr: String,
-        thread: String,
-        state: String,
-        available_at_ms: i64,
-        closed_at_sec: i64,
-    }
-    db.execute_batch("SAVEPOINT reopen_notification_identity_v1")?;
-    let migration = (|| -> Result<()> {
-        let rows: Vec<LegacyNotification> = {
-            let mut statement = db.prepare(
-                "SELECT notification.id,notification.kind,notification.repo,
-                        notification.pr,notification.thread,notification.state,
-                        notification.available_at_ms,lifecycle.closed_at_sec
-                 FROM automatic_pr_notifications AS notification
-                 JOIN automatic_pr_lifecycle AS lifecycle
-                   ON lifecycle.repo=notification.repo AND lifecycle.pr=notification.pr
-                 WHERE notification.event='reopened'
-                   AND lifecycle.state='closed'
-                   AND notification.event_key='reopened:' || lifecycle.epoch",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok(LegacyNotification {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        repo: row.get(2)?,
-                        pr: row.get(3)?,
-                        thread: row.get(4)?,
-                        state: row.get(5)?,
-                        available_at_ms: row.get(6)?,
-                        closed_at_sec: row.get(7)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for row in rows {
-            let new_key = format!("reopened:{}", row.closed_at_sec);
-            let duplicate: Option<String> = db
-                .query_row(
-                    "SELECT id FROM automatic_pr_notifications
-                 WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4 AND event='reopened'
-                   AND event_key=?5",
-                    params![row.kind, row.repo, row.pr, row.thread, new_key],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(target_id) = duplicate {
-                db.execute(
-                    "UPDATE automatic_pr_notifications SET
-                        state=CASE
-                            WHEN CASE state
-                                WHEN 'queued' THEN 4 WHEN 'needs_attention' THEN 3
-                                WHEN 'sending' THEN 2 ELSE 1 END >= CASE ?2
-                                WHEN 'queued' THEN 4 WHEN 'needs_attention' THEN 3
-                                WHEN 'sending' THEN 2 ELSE 1 END
-                            THEN state ELSE ?2 END,
-                        available_at_ms=MAX(available_at_ms,?3)
-                     WHERE id=?1",
-                    params![target_id, row.state, row.available_at_ms],
-                )?;
-                db.execute(
-                    "DELETE FROM automatic_pr_notifications WHERE id=?1",
-                    [row.id],
-                )?;
-            } else {
-                db.execute(
-                    "UPDATE automatic_pr_notifications SET event_key=?2 WHERE id=?1",
-                    params![row.id, new_key],
-                )?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = migration {
-        let _ = db.execute_batch(
-            "ROLLBACK TO reopen_notification_identity_v1;
-             RELEASE reopen_notification_identity_v1;",
-        );
-        return Err(error);
-    }
-    db.execute_batch("RELEASE reopen_notification_identity_v1")?;
-    Ok(())
-}
-
-fn migrate_pending_reopens(db: &Connection) -> Result<()> {
-    let columns = {
-        let mut statement = db.prepare("PRAGMA table_info(automatic_pr_pending_reopens)")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if columns.iter().any(|column| column == "source_id") {
-        return Ok(());
-    }
-
-    db.execute_batch("SAVEPOINT pending_reopens_migration")?;
-    let id_column = if columns.iter().any(|column| column == "id") {
-        "id"
-    } else {
-        "rowid"
-    };
-    let migration = (|| -> rusqlite::Result<()> {
-        db.execute_batch(
-            "ALTER TABLE automatic_pr_pending_reopens RENAME TO automatic_pr_pending_reopens_old;
-             CREATE TABLE automatic_pr_pending_reopens (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 repo TEXT NOT NULL,
-                 pr TEXT NOT NULL,
-                 source_kind TEXT NOT NULL CHECK(source_kind IN ('webhook','poll')),
-                 source_id TEXT NOT NULL,
-                 event_at_sec INTEGER NOT NULL,
-                 event_at TEXT NOT NULL,
-                 source TEXT NOT NULL,
-                 UNIQUE(repo,pr,source_kind,source_id));",
-        )?;
-        let rows = {
-            let mut statement = db.prepare(&format!(
-                "SELECT {id_column},repo,pr,source_kind,event_at_sec,event_at
-                 FROM automatic_pr_pending_reopens_old ORDER BY {id_column}"
-            ))?;
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (id, repo, pr, source_kind, event_at_sec, event_at) in rows {
-            let number = pr.parse::<i64>().ok();
-            let source = serde_json::json!({
-                "action":"reopened",
-                "number":number,
-                "repository":{"full_name":repo.as_str()},
-                "pull_request":{"number":number,"updated_at":event_at.as_str()}
-            });
-            let source = serde_json::to_string(&source)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            db.execute(
-                "INSERT INTO automatic_pr_pending_reopens
-                 (id,repo,pr,source_kind,source_id,event_at_sec,event_at,source)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    id,
-                    repo,
-                    pr,
-                    source_kind,
-                    format!("legacy:{id}"),
-                    event_at_sec,
-                    event_at,
-                    source
-                ],
-            )?;
-        }
-        db.execute_batch("DROP TABLE automatic_pr_pending_reopens_old;")?;
-        Ok(())
-    })();
-    if let Err(error) = migration {
-        let _ = db.execute_batch(
-            "ROLLBACK TO pending_reopens_migration; RELEASE pending_reopens_migration;",
-        );
-        return Err(error.into());
-    }
-    db.execute_batch("RELEASE pending_reopens_migration")?;
-    Ok(())
-}
-
-fn sanitize_pending_reopen_sources(db: &Connection) -> Result<()> {
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS automatic_pr_schema_migrations(name TEXT PRIMARY KEY);",
-    )?;
-    let done: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM automatic_pr_schema_migrations
-         WHERE name='pending_reopen_payload_v1')",
-        [],
-        |row| row.get(0),
-    )?;
-    if done {
-        return Ok(());
-    }
-    db.execute_batch("SAVEPOINT pending_reopen_payload_migration")?;
-    let migration = (|| -> Result<()> {
-        let rows: Vec<PendingReopenSourceRow> = {
-            let mut statement = db.prepare(
-                "SELECT id,repo,pr,event_at,source FROM automatic_pr_pending_reopens ORDER BY id",
-            )?;
-            statement
-                .query_map([], |row| {
-                    Ok(PendingReopenSourceRow {
-                        id: row.get(0)?,
-                        repo: row.get(1)?,
-                        pr: row.get(2)?,
-                        event_at: row.get(3)?,
-                        source: row.get(4)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for row in rows {
-            let source =
-                serde_json::to_string(&minimal_reopen_source(&row.repo, &row.pr, &row.event_at))?;
-            if source != row.source {
-                db.execute(
-                    "UPDATE automatic_pr_pending_reopens SET source=?2 WHERE id=?1",
-                    params![row.id, source],
-                )?;
-            }
-        }
-        db.execute(
-            "INSERT OR IGNORE INTO automatic_pr_schema_migrations(name)
-             VALUES('pending_reopen_payload_v1')",
-            [],
-        )?;
-        Ok(())
-    })();
-    if let Err(error) = migration {
-        let _ = db.execute_batch(
-            "ROLLBACK TO pending_reopen_payload_migration;
-             RELEASE pending_reopen_payload_migration;",
-        );
-        return Err(error);
-    }
-    db.execute_batch("RELEASE pending_reopen_payload_migration")?;
     Ok(())
 }
 
@@ -448,13 +151,14 @@ fn register_in_with_boundary(
     let (thread, pr) =
         crate::subscriptions::validate_source(kind, repo, pr, validation_event, thread)?;
     initialize(db)?;
+    let repo = repo.to_ascii_lowercase();
     if db.is_autocommit() {
         let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-        let inserted = insert_listener(&tx, kind, repo, &pr, &thread, registered_at_sec)?;
+        let inserted = insert_listener(&tx, kind, &repo, &pr, &thread, registered_at_sec)?;
         tx.commit()?;
         Ok(inserted)
     } else {
-        insert_listener(db, kind, repo, &pr, &thread, registered_at_sec)
+        insert_listener(db, kind, &repo, &pr, &thread, registered_at_sec)
     }
 }
 
@@ -466,17 +170,27 @@ fn insert_listener(
     thread: &str,
     registered_at_sec: Option<i64>,
 ) -> Result<bool> {
-    let inserted = match registered_at_sec {
-        Some(registered_at_sec) => db.execute(
-            "INSERT OR IGNORE INTO automatic_pr_notification_listeners
-             (kind,repo,pr,thread,registered_at_sec) VALUES(?1,?2,?3,?4,?5)",
-            params![kind, repo, pr, thread, registered_at_sec],
-        )?,
-        None => db.execute(
-            "INSERT OR IGNORE INTO automatic_pr_notification_listeners(kind,repo,pr,thread)
-             VALUES(?1,?2,?3,?4)",
-            params![kind, repo, pr, thread],
-        )?,
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automatic_pr_notification_listeners
+         WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4)",
+        params![kind, repo, pr, thread],
+        |row| row.get(0),
+    )?;
+    let inserted = if exists {
+        0
+    } else {
+        match registered_at_sec {
+            Some(registered_at_sec) => db.execute(
+                "INSERT OR IGNORE INTO automatic_pr_notification_listeners
+                 (kind,repo,pr,thread,registered_at_sec) VALUES(?1,?2,?3,?4,?5)",
+                params![kind, repo, pr, thread, registered_at_sec],
+            )?,
+            None => db.execute(
+                "INSERT OR IGNORE INTO automatic_pr_notification_listeners(kind,repo,pr,thread)
+                 VALUES(?1,?2,?3,?4)",
+                params![kind, repo, pr, thread],
+            )?,
+        }
     };
     if inserted == 0
         && let Some(registered_at_sec) = registered_at_sec
@@ -484,7 +198,7 @@ fn insert_listener(
         db.execute(
             "UPDATE automatic_pr_notification_listeners
              SET registered_at_sec=MIN(registered_at_sec,?5)
-             WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4",
+             WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4",
             params![kind, repo, pr, thread, registered_at_sec],
         )?;
     }
@@ -504,12 +218,18 @@ pub(crate) fn replay_listener_events_in(
 ) -> Result<usize> {
     let registered_at_sec: i64 = db.query_row(
         "SELECT registered_at_sec FROM automatic_pr_notification_listeners
-         WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4",
+         WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4",
         params![kind, repo, pr, thread],
         |row| row.get(0),
     )?;
     let replayable_events: &[&str] = if kind == "pull_request" {
-        &["closed", "merged", "reopened"]
+        &[
+            "closed",
+            "merged",
+            "reopened",
+            "synchronize",
+            "base_changed",
+        ]
     } else {
         &["submitted", "approved", "changes_requested"]
     };
@@ -520,7 +240,7 @@ pub(crate) fn replay_listener_events_in(
         .join(",");
     let sql = format!(
         "SELECT event,event_key,source FROM automatic_pr_event_journal
-         WHERE kind=?1 AND repo=?2 AND pr=?3 AND event_at_sec>=?4
+         WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND event_at_sec>=?4
            AND event IN ({placeholders}) ORDER BY event_at_sec,event_key"
     );
     let rows: Vec<(String, String, String)> = {
@@ -544,6 +264,15 @@ pub(crate) fn replay_listener_events_in(
     };
     let mut inserted = 0;
     for (event, event_key, source) in rows {
+        let already_delivered: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_pr_notifications
+             WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4 AND event_key=?5)",
+            params![kind, repo, pr, thread, event_key],
+            |row| row.get(0),
+        )?;
+        if already_delivered {
+            continue;
+        }
         inserted += db.execute(
             "INSERT OR IGNORE INTO automatic_pr_notifications
              (id,kind,repo,pr,thread,event,event_key,source)
@@ -600,6 +329,8 @@ pub(crate) fn record_event_in(
     event_key: &str,
     source: &Value,
 ) -> Result<Vec<Notification>> {
+    initialize(db)?;
+    let repo = repo.to_ascii_lowercase();
     // `reopened` is an internal durable notification, not a subscription rule event.
     let validation_event = if kind == "pull_request" && event == "reopened" {
         "closed"
@@ -608,7 +339,7 @@ pub(crate) fn record_event_in(
     };
     let (_, pr) = crate::subscriptions::validate_source(
         kind,
-        repo,
+        &repo,
         pr,
         validation_event,
         "11111111-1111-4111-8111-111111111111",
@@ -627,7 +358,6 @@ pub(crate) fn record_event_in(
         serde_json::to_vec(source)?.len() <= MAX_SOURCE_BYTES,
         "Provider event exceeds 1 MiB"
     );
-    initialize(db)?;
     let event_at_sec: Option<i64> = db.query_row(
         "SELECT CAST(strftime('%s',?1) AS INTEGER)",
         [event_at],
@@ -635,30 +365,46 @@ pub(crate) fn record_event_in(
     )?;
     let event_at_sec = event_at_sec.context("Invalid event timestamp")?;
     let source = serde_json::to_string(source)?;
-    let journalable = (kind == "pull_request" && matches!(event, "closed" | "merged" | "reopened"))
+    let mut delivery_at_sec = event_at_sec;
+    let mut delivery_source = source.clone();
+    let journalable = (kind == "pull_request"
+        && matches!(
+            event,
+            "closed" | "merged" | "reopened" | "synchronize" | "base_changed"
+        ))
         || (kind == "review" && matches!(event, "submitted" | "approved" | "changes_requested"));
     if journalable {
-        db.execute(
-            "INSERT OR IGNORE INTO automatic_pr_event_journal
-             (kind,repo,pr,event,event_key,event_at_sec,event_at,source)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                kind,
-                repo,
-                pr,
-                event,
-                event_key,
-                event_at_sec,
-                event_at,
-                source
-            ],
-        )?;
-        let journal_event: String = db.query_row(
-            "SELECT event FROM automatic_pr_event_journal
-             WHERE kind=?1 AND repo=?2 AND pr=?3 AND event_key=?4",
-            params![kind, repo, pr, event_key],
-            |row| row.get(0),
-        )?;
+        let journal_row: Option<(String, i64, String, String)> = db
+            .query_row(
+                "SELECT event,event_at_sec,event_at,source FROM automatic_pr_event_journal
+                 WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND event_key=?4 LIMIT 1",
+                params![kind, repo, pr, event_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let journal_event =
+            if let Some((existing, original_at_sec, _, original_source)) = journal_row {
+                delivery_at_sec = original_at_sec;
+                delivery_source = original_source;
+                existing
+            } else {
+                db.execute(
+                    "INSERT OR IGNORE INTO automatic_pr_event_journal
+                 (kind,repo,pr,event,event_key,event_at_sec,event_at,source)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        kind,
+                        repo,
+                        pr,
+                        event,
+                        event_key,
+                        event_at_sec,
+                        event_at,
+                        source
+                    ],
+                )?;
+                event.to_owned()
+            };
         ensure!(
             journal_event == event,
             "Provider event identity was reused for another event type"
@@ -667,22 +413,47 @@ pub(crate) fn record_event_in(
     let listeners = {
         let mut statement = db.prepare(
             "SELECT thread FROM automatic_pr_notification_listeners
-             WHERE kind=?1 AND repo=?2 AND pr=?3 AND registered_at_sec<=?4 ORDER BY thread",
+             WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND registered_at_sec<=?4 ORDER BY thread",
         )?;
         statement
-            .query_map(params![kind, repo, pr, event_at_sec], |row| {
+            .query_map(params![kind, repo, pr, delivery_at_sec], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut notifications = Vec::new();
     for thread in listeners {
+        let existing: Option<String> = db
+            .query_row(
+                "SELECT event FROM automatic_pr_notifications
+                 WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4 AND event_key=?5
+                 LIMIT 1",
+                params![kind, repo, pr, thread, event_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_event) = existing {
+            ensure!(
+                existing_event == event,
+                "Provider event identity changed event type"
+            );
+            continue;
+        }
         let id = Uuid::new_v4().to_string();
         let inserted = db.execute(
             "INSERT OR IGNORE INTO automatic_pr_notifications
              (id,kind,repo,pr,thread,event,event_key,source)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, kind, repo, pr, thread, event, event_key, source],
+            params![
+                id,
+                kind,
+                repo,
+                pr,
+                thread,
+                event,
+                event_key,
+                delivery_source
+            ],
         )?;
         if inserted != 0 {
             notifications.push(Notification {
@@ -693,7 +464,7 @@ pub(crate) fn record_event_in(
                 thread,
                 event: event.to_owned(),
                 event_key: event_key.to_owned(),
-                source: serde_json::from_str(&source)?,
+                source: serde_json::from_str(&delivery_source)?,
                 state: "pending".into(),
             });
         } else {
@@ -743,12 +514,13 @@ pub(crate) fn record_closed_event_in(
     source: &Value,
 ) -> Result<Vec<Notification>> {
     initialize(db)?;
+    let repo = repo.to_ascii_lowercase();
     let event_at_sec = timestamp_second(db, event_at)?;
-    ensure_closed_cycle_in(db, repo, pr, event_at_sec)?;
+    ensure_closed_cycle_in(db, &repo, pr, event_at_sec)?;
     let notifications = record_event_in(
         db,
         "pull_request",
-        repo,
+        &repo,
         pr,
         event,
         event_at,
@@ -782,9 +554,12 @@ pub(crate) fn ensure_closed_cycle_in(
     pr: &str,
     closed_at_sec: i64,
 ) -> Result<()> {
+    let repo = repo.to_ascii_lowercase();
     db.execute(
         "INSERT OR IGNORE INTO automatic_pr_closed_cycles(repo,pr,closed_at_sec)
-         VALUES(?1,?2,?3)",
+         SELECT ?1,?2,?3 WHERE NOT EXISTS(
+             SELECT 1 FROM automatic_pr_closed_cycles
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND closed_at_sec=?3)",
         params![repo, pr, closed_at_sec],
     )?;
     let current: Option<(i64, String, i64, Option<i64>)> = db
@@ -798,7 +573,7 @@ pub(crate) fn ensure_closed_cycle_in(
     if let Some((_, _, known_closed_at, _)) = current.as_ref()
         && closed_at_sec < *known_closed_at
     {
-        reconcile_pending_reopens_in(db, repo, pr)?;
+        reconcile_pending_reopens_in(db, &repo, pr)?;
         return Ok(());
     }
     let (epoch, begin_cycle) = match current.as_ref() {
@@ -818,18 +593,23 @@ pub(crate) fn ensure_closed_cycle_in(
         Some((epoch, _, _, _)) => (*epoch, false),
     };
     if begin_cycle {
-        db.execute(
-            "INSERT INTO automatic_pr_lifecycle
-             (repo,pr,epoch,state,closed_at_sec,reopened_at_sec,
-              webhook_reopen_source_id,poll_reopen_source_id)
-             VALUES(?1,?2,?3,'closed',?4,NULL,NULL,NULL)
-             ON CONFLICT(repo,pr) DO UPDATE SET epoch=excluded.epoch,state='closed',
-                closed_at_sec=excluded.closed_at_sec,reopened_at_sec=NULL,
-                webhook_reopen_source_id=NULL,poll_reopen_source_id=NULL",
+        let changed = db.execute(
+            "UPDATE automatic_pr_lifecycle SET epoch=?3,state='closed',closed_at_sec=?4,
+                 reopened_at_sec=NULL,webhook_reopen_source_id=NULL,poll_reopen_source_id=NULL
+             WHERE repo=?1 AND pr=?2",
             params![repo, pr, epoch, closed_at_sec],
         )?;
+        if changed == 0 {
+            db.execute(
+                "INSERT INTO automatic_pr_lifecycle
+                 (repo,pr,epoch,state,closed_at_sec,reopened_at_sec,
+                  webhook_reopen_source_id,poll_reopen_source_id)
+                 VALUES(?1,?2,?3,'closed',?4,NULL,NULL,NULL)",
+                params![repo, pr, epoch, closed_at_sec],
+            )?;
+        }
     }
-    reconcile_pending_reopens_in(db, repo, pr)?;
+    reconcile_pending_reopens_in(db, &repo, pr)?;
     Ok(())
 }
 
@@ -837,7 +617,7 @@ fn reconcile_pending_reopens_in(db: &Connection, repo: &str, pr: &str) -> Result
     let closed_at: Vec<i64> = {
         let mut statement = db.prepare(
             "SELECT closed_at_sec FROM automatic_pr_closed_cycles
-             WHERE repo=?1 AND pr=?2 ORDER BY closed_at_sec",
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2 ORDER BY closed_at_sec",
         )?;
         statement
             .query_map(params![repo, pr], |row| row.get(0))?
@@ -877,6 +657,7 @@ pub(crate) fn record_reopened_event_in(
         "Missing PR reopen event identity"
     );
     initialize(db)?;
+    let repo = repo.to_ascii_lowercase();
     let event_at_sec = timestamp_second(db, event_at)?;
     let current: Option<PrLifecycleState> = db
         .query_row(
@@ -896,8 +677,16 @@ pub(crate) fn record_reopened_event_in(
         .optional()?;
 
     let Some(current) = current else {
-        store_pending_reopen_in(db, repo, pr, source_kind, source_id, event_at_sec, event_at)?;
-        reconcile_pending_reopens_in(db, repo, pr)?;
+        store_pending_reopen_in(
+            db,
+            &repo,
+            pr,
+            source_kind,
+            source_id,
+            event_at_sec,
+            event_at,
+        )?;
+        reconcile_pending_reopens_in(db, &repo, pr)?;
         return Ok(None);
     };
     let same_cycle = if current.state == "closed" {
@@ -911,8 +700,16 @@ pub(crate) fn record_reopened_event_in(
         seen_id == Some(source_id)
     };
     if !same_cycle {
-        store_pending_reopen_in(db, repo, pr, source_kind, source_id, event_at_sec, event_at)?;
-        reconcile_pending_reopens_in(db, repo, pr)?;
+        store_pending_reopen_in(
+            db,
+            &repo,
+            pr,
+            source_kind,
+            source_id,
+            event_at_sec,
+            event_at,
+        )?;
+        reconcile_pending_reopens_in(db, &repo, pr)?;
         return Ok(None);
     }
 
@@ -920,12 +717,12 @@ pub(crate) fn record_reopened_event_in(
     let notifications = record_event_in(
         db,
         "pull_request",
-        repo,
+        &repo,
         pr,
         "reopened",
         event_at,
         &event_key,
-        &minimal_reopen_source(repo, pr, event_at),
+        &minimal_reopen_source(&repo, pr, event_at),
     )?;
     if current.state == "closed" {
         db.execute(
@@ -992,7 +789,9 @@ fn store_pending_reopen_in(
     db.execute(
         "INSERT OR IGNORE INTO automatic_pr_pending_reopens
          (repo,pr,source_kind,source_id,event_at_sec,event_at,source)
-         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+         SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(
+             SELECT 1 FROM automatic_pr_pending_reopens
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind=?3 AND source_id=?4)",
         params![
             repo,
             pr,
@@ -1028,7 +827,7 @@ fn resolve_pending_reopen_interval_in(
         let mut statement = db.prepare(
             "SELECT source_kind,source_id,event_at_sec,event_at
              FROM automatic_pr_pending_reopens
-             WHERE repo=?1 AND pr=?2 AND event_at_sec>?3
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND event_at_sec>?3
                AND (?4 IS NULL OR event_at_sec<?4)
              ORDER BY event_at_sec,source_kind",
         )?;
@@ -1076,21 +875,43 @@ fn resolve_pending_reopen_interval_in(
     )?;
     db.execute(
         "DELETE FROM automatic_pr_pending_reopens
-         WHERE repo=?1 AND pr=?2 AND source_kind=?3 AND source_id=?4",
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind=?3 AND source_id=?4",
         params![repo, pr, candidate.source_kind, candidate.source_id],
     )?;
     Ok(())
 }
 
-pub(crate) fn reopen_timeline_floor(db: &Connection, repo: &str, pr: &str) -> Result<Option<i64>> {
+pub(crate) fn reopen_timeline_floor(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+) -> Result<(Option<i64>, bool)> {
     initialize(db)?;
-    Ok(db.query_row(
+    let repo = repo.to_ascii_lowercase();
+    let closed_floor: Option<i64> = db.query_row(
         "SELECT MIN(cycle.closed_at_sec) FROM automatic_pr_closed_cycles AS cycle
-         JOIN automatic_pr_lifecycle AS lifecycle USING(repo,pr)
-         WHERE cycle.repo=?1 AND cycle.pr=?2 AND lifecycle.state='closed'",
+         JOIN automatic_pr_lifecycle AS lifecycle
+           ON cycle.repo=lifecycle.repo COLLATE NOCASE AND cycle.pr=lifecycle.pr
+         WHERE cycle.repo=?1 COLLATE NOCASE AND cycle.pr=?2
+           AND cycle.repo=lifecycle.repo COLLATE NOCASE AND cycle.pr=lifecycle.pr
+           AND lifecycle.repo=?1 AND lifecycle.state='closed'",
         params![repo, pr],
         |row| row.get(0),
-    )?)
+    )?;
+    let pending_floor: Option<i64> = db.query_row(
+        "SELECT MIN(event_at_sec) FROM automatic_pr_pending_reopens
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2",
+        params![repo, pr],
+        |row| row.get(0),
+    )?;
+    Ok((
+        match (closed_floor, pending_floor) {
+            (Some(closed), Some(pending)) => Some(closed.min(pending)),
+            (Some(floor), None) | (None, Some(floor)) => Some(floor),
+            (None, None) => None,
+        },
+        pending_floor.is_some(),
+    ))
 }
 
 pub(crate) fn timestamp_second(db: &Connection, timestamp: &str) -> Result<i64> {
@@ -1170,8 +991,14 @@ fn accept_authenticated_webhook_inner(
                 pull["closed_at"].as_str()
             }
             .context("Closed pull request webhook is missing its event timestamp")?;
-            let key =
-                super::stable_source_key("pull_request", repo, &pr, event_name, "", &[event_at]);
+            let key = super::stable_source_key(
+                "pull_request",
+                &repo.to_ascii_lowercase(),
+                &pr,
+                event_name,
+                "",
+                &[event_at],
+            );
             Ok(record_closed_event(db, repo, &pr, event_name, event_at, &key, payload)?.len())
         }
         "pull_request_review" => {
@@ -1198,13 +1025,14 @@ fn accept_authenticated_webhook_inner(
                 "approved" | "changes_requested" => state,
                 _ => "submitted",
             };
+            let identity = [review_id.as_str(), submitted_at];
             let key = super::stable_source_key(
                 "review",
-                repo,
+                &repo.to_ascii_lowercase(),
                 &pr,
                 notification_event,
                 state,
-                &[&review_id, submitted_at],
+                &identity,
             );
             let mut normalized = payload.clone();
             normalized["review"]["state"] = Value::String(state.to_owned());
@@ -1361,10 +1189,12 @@ fn dispatch_with_clock(
     const BATCH: usize = 16;
     const BEFORE_SEND_RETRY_MS: i64 = 5_000;
     let mut attempted = 0;
+    let mut attempted_ids = HashSet::new();
     for _ in 0..BATCH {
-        let Some(notification) = claim_next(db, now())? else {
+        let Some(notification) = claim_next(db, now(), &attempted_ids)? else {
             break;
         };
+        attempted_ids.insert(notification.id.clone());
         let message = format!(
             "Automatic GitHub PR notification: {}#{} {}. Review: https://github.com/{}/pull/{}",
             notification.repo,
@@ -1406,35 +1236,57 @@ fn dispatch_with_clock(
     Ok(attempted)
 }
 
-fn claim_next(db: &Connection, now_ms: i64) -> Result<Option<Notification>> {
+fn claim_next(
+    db: &Connection,
+    now_ms: i64,
+    excluded_ids: &HashSet<String>,
+) -> Result<Option<Notification>> {
     initialize(db)?;
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    let row = tx
-        .query_row(
-            "SELECT id,kind,repo,pr,thread,event,event_key,source FROM automatic_pr_notifications
-             WHERE state='pending' AND available_at_ms<=?1 ORDER BY created_at,id LIMIT 1",
-            [now_ms],
-            |row| {
-                let source: String = row.get(7)?;
-                Ok(Notification {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    repo: row.get(2)?,
-                    pr: row.get(3)?,
-                    thread: row.get(4)?,
-                    event: row.get(5)?,
-                    event_key: row.get(6)?,
-                    source: serde_json::from_str(&source).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            7,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    state: "sending".into(),
-                })
-            },
+    let exclusion = if excluded_ids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND id NOT IN ({})",
+            (2..=excluded_ids.len() + 1)
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
         )
+    };
+    let sql = format!(
+            "SELECT id,kind,repo,pr,thread,event,event_key,source FROM automatic_pr_notifications
+             WHERE state='pending' AND available_at_ms<=?1{exclusion} ORDER BY created_at,id LIMIT 1"
+        );
+    let mut values = Vec::with_capacity(excluded_ids.len() + 1);
+    values.push(rusqlite::types::Value::Integer(now_ms));
+    values.extend(
+        excluded_ids
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text),
+    );
+    let row = tx
+        .query_row(&sql, rusqlite::params_from_iter(values), |row| {
+            let source: String = row.get(7)?;
+            Ok(Notification {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                repo: row.get(2)?,
+                pr: row.get(3)?,
+                thread: row.get(4)?,
+                event: row.get(5)?,
+                event_key: row.get(6)?,
+                source: serde_json::from_str(&source).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                state: "sending".into(),
+            })
+        })
         .optional()?;
     let Some(notification) = row else {
         tx.commit()?;
@@ -1754,6 +1606,144 @@ mod tests {
     }
 
     #[test]
+    fn listener_registration_replays_journaled_head_and_base_transitions() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let head_source = json!({
+            "action":"synchronize","repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"head":{"sha":"b".repeat(40)}}
+        });
+        let base_source = json!({
+            "action":"edited","repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"base":{"ref":"release"}},
+            "changes":{"base":{"ref":"main"}}
+        });
+        assert!(
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "synchronize",
+                "2099-01-01T00:00:20Z",
+                "head-transition:1",
+                &head_source,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "base_changed",
+                "2099-01-01T00:00:30Z",
+                "base-transition:1",
+                &base_source,
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            timestamp_second(&db, "2099-01-01T00:00:10Z").unwrap(),
+        )
+        .unwrap();
+        let notices = pending(&db).unwrap();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices
+                .iter()
+                .find(|notice| notice.event == "synchronize")
+                .unwrap()
+                .source,
+            head_source
+        );
+        let base = notices
+            .iter()
+            .find(|notice| notice.event == "base_changed")
+            .unwrap();
+        assert_eq!(base.source, base_source);
+        assert_eq!(base.source["changes"]["base"]["ref"], "main");
+        assert_eq!(base.source["pull_request"]["base"]["ref"], "release");
+    }
+
+    #[test]
+    fn journal_retry_keeps_original_time_and_source_for_listener_boundary() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            timestamp_second(&db, "2099-01-03T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let original_source = json!({
+            "action":"synchronize","repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-02T00:00:00Z",
+                "head":{"sha":"b".repeat(40)}}
+        });
+        assert!(
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "synchronize",
+                "2099-01-02T00:00:00Z",
+                "transition-stable-key",
+                &original_source,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let retry_source = json!({
+            "action":"synchronize","repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-04T00:00:00Z",
+                "head":{"sha":"b".repeat(40)}}
+        });
+        assert!(
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "synchronize",
+                "2099-01-04T00:00:00Z",
+                "transition-stable-key",
+                &retry_source,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let (event_at, source): (String, String) = db
+            .query_row(
+                "SELECT event_at,source FROM automatic_pr_event_journal
+                 WHERE event_key='transition-stable-key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event_at, "2099-01-02T00:00:00Z");
+        assert_eq!(
+            serde_json::from_str::<Value>(&source).unwrap(),
+            original_source
+        );
+        assert!(pending(&db).unwrap().is_empty());
+    }
+
+    #[test]
     fn reopen_without_a_known_cycle_stays_pending_until_close_arrives() {
         let db = Connection::open_in_memory().unwrap();
         let thread = "11111111-1111-4111-8111-111111111111";
@@ -1766,6 +1756,14 @@ mod tests {
         assert_eq!(
             accept_authenticated_webhook(&db, "pull_request", &reopen).unwrap(),
             0
+        );
+        assert_eq!(
+            reopen_timeline_floor(&db, "owner/repo", "7").unwrap(),
+            (
+                Some(timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap()),
+                true
+            ),
+            "an unresolved webhook reopen must trigger timeline recovery even while the PR snapshot is open"
         );
         assert_eq!(pending(&db).unwrap().len(), 0);
         let unresolved: i64 = db
@@ -2037,160 +2035,44 @@ mod tests {
     }
 
     #[test]
-    fn pending_reopen_schema_migration_rolls_back_and_can_resume() {
+    fn repository_case_variants_share_listener_and_event_identity() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE automatic_pr_pending_reopens (
-                repo TEXT NOT NULL, pr TEXT NOT NULL,
-                source_kind TEXT NOT NULL CHECK(source_kind IN ('webhook','poll')),
-                event_at_sec INTEGER NOT NULL, event_at TEXT NOT NULL, source TEXT NOT NULL,
-                PRIMARY KEY(repo,pr,source_kind,event_at_sec));
-             PRAGMA ignore_check_constraints=ON;
-             INSERT INTO automatic_pr_pending_reopens
-            VALUES('owner/repo','7','invalid',1,'2099-01-01T00:00:01Z','discard-me-payload');
-             PRAGMA ignore_check_constraints=OFF;",
-        )
-        .unwrap();
-        assert!(migrate_pending_reopens(&db).is_err());
-        let old_columns = {
-            let mut statement = db
-                .prepare("PRAGMA table_info(automatic_pr_pending_reopens)")
-                .unwrap();
-            statement
-                .query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert!(!old_columns.iter().any(|column| column == "source_id"));
-        db.execute(
-            "UPDATE automatic_pr_pending_reopens SET source_kind='webhook'",
-            [],
-        )
-        .unwrap();
-        migrate_pending_reopens(&db).unwrap();
-        let (source_id, source_json, rows): (String, String, i64) = db
-            .query_row(
-                "SELECT source_id,source,(SELECT count(*) FROM automatic_pr_pending_reopens)
-                 FROM automatic_pr_pending_reopens",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(source_id, "legacy:1");
-        let migrated: Value = serde_json::from_str(&source_json).unwrap();
-        assert_eq!(migrated["action"], "reopened");
-        assert_eq!(migrated["repository"]["full_name"], "owner/repo");
-        assert_eq!(
-            migrated["pull_request"]["updated_at"],
-            "2099-01-01T00:00:01Z"
-        );
-        assert!(migrated.get("huge").is_none());
-        assert_eq!(rows, 1);
-    }
-
-    #[test]
-    fn legacy_reopen_migration_does_not_infer_epochs_from_close_order() {
-        let db = Connection::open_in_memory().unwrap();
-        initialize(&db).unwrap();
         let thread = "11111111-1111-4111-8111-111111111111";
-        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
-        db.execute_batch(
-            "INSERT INTO automatic_pr_closed_cycles(repo,pr,closed_at_sec) VALUES
-                ('owner/repo','7',10),('owner/repo','7',30),('owner/repo','7',20);
-             INSERT INTO automatic_pr_lifecycle
-                (repo,pr,epoch,state,closed_at_sec,reopened_at_sec)
-                VALUES('owner/repo','7',2,'closed',30,NULL);",
+        register(&db, "pull_request", "Owner/Repo", "7", thread).unwrap();
+        let first = record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            "2099-01-01T00:00:00Z",
+            "same-provider-event",
+            &json!({"action":"closed"}),
         )
         .unwrap();
-        for (id, epoch, state) in [("n1", 1, "queued"), ("n2", 2, "pending")] {
-            db.execute(
-                "INSERT INTO automatic_pr_notifications
-                (id,kind,repo,pr,thread,event,event_key,source,state)
-                 VALUES(?1,'pull_request','owner/repo','7',?2,'reopened',?3,'{}',?4)",
-                params![id, thread, format!("reopened:{epoch}"), state],
-            )
-            .unwrap();
-        }
-
-        migrate_reopen_notification_identity(&db).unwrap();
-        let migrated: Vec<(String, String)> = {
-            let mut statement = db
-                .prepare("SELECT event_key,state FROM automatic_pr_notifications ORDER BY id")
-                .unwrap();
-            statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        assert_eq!(
-            migrated,
-            [
-                ("reopened:1".into(), "queued".into()),
-                ("reopened:30".into(), "pending".into())
-            ]
-        );
-        assert!(
-            record_event(
-                &db,
-                "pull_request",
-                "owner/repo",
-                "7",
-                "reopened",
-                "1970-01-01T00:05:00Z",
-                "reopened:30",
-                &json!({"action":"reopened"}),
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn pending_reopen_payloads_are_sanitized_when_source_id_already_exists() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE automatic_pr_pending_reopens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repo TEXT NOT NULL, pr TEXT NOT NULL,
-                source_kind TEXT NOT NULL CHECK(source_kind IN ('webhook','poll')),
-                source_id TEXT NOT NULL,
-                event_at_sec INTEGER NOT NULL, event_at TEXT NOT NULL, source TEXT NOT NULL,
-                UNIQUE(repo,pr,source_kind,source_id));",
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO automatic_pr_pending_reopens
-             (repo,pr,source_kind,source_id,event_at_sec,event_at,source)
-             VALUES('owner/repo','7','webhook','delivery-1',1,?1,?2)",
-            params![
-                "2099-01-01T00:00:01Z",
-                r#"{"action":"reopened","secret":"remove-me"}"#
-            ],
+        let replay = record_event(
+            &db,
+            "pull_request",
+            "OWNER/REPO",
+            "7",
+            "closed",
+            "2099-01-01T00:00:00Z",
+            "same-provider-event",
+            &json!({"action":"closed"}),
         )
         .unwrap();
 
-        sanitize_pending_reopen_sources(&db).unwrap();
-        let (source_id, event_at, source): (String, String, String) = db
+        assert_eq!(first.len(), 1);
+        assert!(replay.is_empty());
+        assert_eq!(pending(&db).unwrap().len(), 1);
+        let stored_repo: String = db
             .query_row(
-                "SELECT source_id,event_at,source FROM automatic_pr_pending_reopens",
+                "SELECT repo FROM automatic_pr_notification_listeners",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(source_id, "delivery-1");
-        assert_eq!(event_at, "2099-01-01T00:00:01Z");
-        let source: Value = serde_json::from_str(&source).unwrap();
-        assert_eq!(source["repository"]["full_name"], "owner/repo");
-        assert_eq!(source["pull_request"]["updated_at"], event_at);
-        assert!(source.get("secret").is_none());
+        assert_eq!(stored_repo, "owner/repo");
     }
 
     #[test]
@@ -2317,6 +2199,61 @@ mod tests {
             1
         );
         assert!(retried);
+    }
+
+    #[test]
+    fn before_send_retry_is_not_retried_again_in_same_batch() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let failed_thread = "11111111-1111-4111-8111-111111111111";
+        let healthy_thread = "22222222-2222-4222-8222-222222222222";
+        register(&db, "pull_request", "owner/repo", "7", failed_thread).unwrap();
+        register(&db, "pull_request", "owner/repo", "7", healthy_thread).unwrap();
+        record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            "2099-01-01T00:00:00Z",
+            "close-retry-batch",
+            &json!({"action":"closed"}),
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE automatic_pr_notifications SET created_at=CASE thread
+                WHEN ?1 THEN '2000-01-01 00:00:00' ELSE '2000-01-01 00:00:01' END",
+            params![failed_thread],
+        )
+        .unwrap();
+
+        let now_calls = std::cell::Cell::new(0);
+        let mut fail_once = true;
+        let mut attempts = Vec::new();
+        assert_eq!(
+            dispatch_with_clock(
+                &mut db,
+                |thread, _, _, _| {
+                    attempts.push(thread.to_owned());
+                    if thread == failed_thread && fail_once {
+                        fail_once = false;
+                        Err(crate::execution::TargetUnavailableBeforeSend.into())
+                    } else {
+                        Ok(("queued".into(), None))
+                    }
+                },
+                || {
+                    let call = now_calls.get();
+                    now_calls.set(call + 1);
+                    match call {
+                        0 | 1 => 10_000,
+                        _ => 30_000,
+                    }
+                },
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(attempts, [failed_thread, healthy_thread]);
     }
 
     #[test]
