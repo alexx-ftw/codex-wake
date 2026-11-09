@@ -47,18 +47,15 @@ fn parse_bash_candidate(event: &Value) -> Option<PrCandidate> {
         .get(0..3)
         .is_some_and(|parts| parts[0] == "gh" && parts[1] == "pr" && parts[2] == "create")
     {
-        if args[3..]
-            .iter()
-            .any(|arg| arg == "--dry-run" || arg.starts_with("--dry-run="))
-        {
+        if gh_pr_has_dry_run(&args[3..]) {
             return None;
         }
         let requested_repo = gh_repo_option(&args[3..])?;
         let candidate = parse_cli_url_output(response)?;
-        if let Some(repo) = requested_repo.as_deref() {
-            if !same_repo(repo, &repository_from_url(&candidate.url)?) {
-                return None;
-            }
+        if let Some(repo) = requested_repo.as_deref()
+            && !same_repo(repo, &repository_from_url(&candidate.url)?)
+        {
+            return None;
         }
         return Some(candidate);
     }
@@ -102,11 +99,56 @@ fn gh_repo_option(args: &[String]) -> Option<Option<String>> {
                     return None;
                 }
             }
+            option if gh_pr_option_takes_value(option) => i += 1,
             _ => {}
         }
         i += 1;
     }
     Some(repo)
+}
+
+pub(crate) fn gh_pr_has_dry_run(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let (option, inline_value) = args[i]
+            .split_once('=')
+            .map_or((args[i].as_str(), None), |(key, value)| (key, Some(value)));
+        if option == "--dry-run" {
+            return true;
+        }
+        if inline_value.is_none() && gh_pr_option_takes_value(option) {
+            i += 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn gh_pr_option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "-R" | "--repo"
+            | "-B"
+            | "--base"
+            | "-H"
+            | "--head"
+            | "-a"
+            | "--assignee"
+            | "-b"
+            | "--body"
+            | "-F"
+            | "--body-file"
+            | "-l"
+            | "--label"
+            | "-m"
+            | "--milestone"
+            | "--project"
+            | "-r"
+            | "--reviewer"
+            | "--recover"
+            | "-t"
+            | "--title"
+    )
 }
 
 fn parse_gh_api_create(args: &[String]) -> Option<String> {
@@ -247,19 +289,17 @@ fn parse_mcp_candidate(event: &Value) -> Option<PrCandidate> {
         .get("tool_input")?
         .get("repository_full_name")?
         .as_str()?;
-    if parse_repo(expected_repo).is_none() {
-        return None;
-    }
+    parse_repo(expected_repo)?;
     let response = event.get("tool_response")?;
     if response.get("isError").and_then(Value::as_bool) == Some(true) {
         return None;
     }
 
     let mut candidates = Vec::new();
-    if let Some(snapshot) = response.get("structuredContent") {
-        if let Some(candidate) = parse_pr_snapshot(snapshot, expected_repo) {
-            candidates.push(candidate);
-        }
+    if let Some(snapshot) = response.get("structuredContent")
+        && let Some(candidate) = parse_pr_snapshot(snapshot, expected_repo)
+    {
+        candidates.push(candidate);
     }
     if let Some(content) = response.get("content").and_then(Value::as_array) {
         for text in content.iter().filter_map(|item| {
@@ -267,10 +307,10 @@ fn parse_mcp_candidate(event: &Value) -> Option<PrCandidate> {
                 .then(|| item.get("text")?.as_str())
                 .flatten()
         }) {
-            if let Ok(snapshot) = serde_json::from_str::<Value>(text) {
-                if let Some(candidate) = parse_pr_snapshot(&snapshot, expected_repo) {
-                    candidates.push(candidate);
-                }
+            if let Ok(snapshot) = serde_json::from_str::<Value>(text)
+                && let Some(candidate) = parse_pr_snapshot(&snapshot, expected_repo)
+            {
+                candidates.push(candidate);
             }
         }
     }
@@ -699,6 +739,15 @@ mod tests {
     }
 
     #[test]
+    fn option_values_that_look_like_flags_are_not_reparsed_as_options() {
+        let event = bash(
+            "gh pr create --title '--dry-run' --body '--repo=other/repo'",
+            "https://github.com/acme/widget/pull/42\n",
+        );
+        assert_eq!(parse_pr_candidate(&event).unwrap().number, 42);
+    }
+
+    #[test]
     fn rejects_dry_run_headers_and_forged_or_composed_commands() {
         for (command, output) in [
             (
@@ -1018,7 +1067,7 @@ mod tests {
         assert!(matches!(
             verify_pr_candidate(
                 &candidate(),
-                &[pre.clone()],
+                std::slice::from_ref(&pre),
                 TEST_ATTRIBUTION_WINDOW_MS,
                 404,
                 &get_fixture(),
@@ -1032,7 +1081,7 @@ mod tests {
         assert!(matches!(
             verify_pr_candidate(
                 &candidate(),
-                &[pre.clone()],
+                std::slice::from_ref(&pre),
                 TEST_ATTRIBUTION_WINDOW_MS,
                 200,
                 &wrong_number,
@@ -1046,7 +1095,7 @@ mod tests {
         assert!(matches!(
             verify_pr_candidate(
                 &inconsistent_candidate,
-                &[pre.clone()],
+                std::slice::from_ref(&pre),
                 TEST_ATTRIBUTION_WINDOW_MS,
                 200,
                 &get_fixture(),

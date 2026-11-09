@@ -130,8 +130,6 @@ pub struct CandidateRecord {
 pub enum TransportFailure {
     Timeout,
     Network,
-    Unauthorized,
-    RateLimited,
     Other,
 }
 
@@ -249,7 +247,7 @@ fn valid_repository(repository: &str) -> bool {
 pub enum HandleResult {
     Ignored,
     Candidate {
-        record: CandidateRecord,
+        record: Box<CandidateRecord>,
         verified: Option<VerifiedPullRequest>,
     },
 }
@@ -257,6 +255,18 @@ pub enum HandleResult {
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(SCHEMA)
         .context("initialize PR observation tables")
+}
+
+fn candidate_result(
+    db: &Connection,
+    id: i64,
+    verified: Option<VerifiedPullRequest>,
+) -> Result<HandleResult> {
+    let record = candidate_record(db, id)?.ok_or_else(|| anyhow!("candidate disappeared"))?;
+    Ok(HandleResult::Candidate {
+        record: Box::new(record),
+        verified,
+    })
 }
 
 /// Cheap, side-effect-free gate for `PreToolUse`: callers can skip opening the
@@ -271,31 +281,6 @@ pub fn is_relevant_pre_tool_use(event: &Value) -> bool {
     event
         .get("tool_input")
         .is_some_and(|input| is_pr_creation_intent(tool_name, input))
-}
-
-fn list_candidates(
-    db: &Connection,
-    query: &str,
-    limit: usize,
-    now_ms: Option<i64>,
-) -> Result<Vec<CandidateRecord>> {
-    let mut statement = db.prepare(query)?;
-    let ids = statement
-        .query_map(
-            params![
-                now_ms.unwrap_or_default(),
-                limit.min(i64::MAX as usize) as i64
-            ],
-            |row| row.get::<_, i64>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    ids.into_iter()
-        .filter_map(|id| match candidate_record(db, id) {
-            Ok(Some(record)) => Some(Ok(record)),
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
 }
 
 fn claim_candidates(
@@ -344,18 +329,6 @@ fn claim_candidates(
         .collect()
 }
 
-/// Read verified candidates that have not yet been acknowledged by the
-/// registration worker. Does not claim or mutate rows.
-pub fn list_verified_pending(db: &Connection, limit: usize) -> Result<Vec<CandidateRecord>> {
-    initialize(db)?;
-    list_candidates(
-        db,
-        "SELECT id FROM pr_hook_candidates WHERE state='verified' AND consumed_at_ms IS NULL ORDER BY id LIMIT ?2",
-        limit,
-        None,
-    )
-}
-
 /// Atomically claim verified candidates for a worker. Lease expiry makes work
 /// recoverable after a crash and prevents concurrent workers handling a row.
 pub fn claim_verified_pending(
@@ -376,25 +349,6 @@ pub fn mark_candidate_consumed(db: &Connection, id: i64, now_ms: i64) -> Result<
          WHERE id=?2 AND state='verified' AND consumed_at_ms IS NULL AND work_claim_until_ms>?1",
         params![now_ms, id],
     )? == 1)
-}
-
-/// Read candidates whose timeout/network backoff has elapsed, plus pending
-/// verifications whose worker lease expired after an interruption.
-pub fn list_due_retries(
-    db: &Connection,
-    now_ms: i64,
-    limit: usize,
-) -> Result<Vec<CandidateRecord>> {
-    initialize(db)?;
-    list_candidates(
-        db,
-        "SELECT id FROM pr_hook_candidates
-         WHERE (state IN ('timeout','transport_error') AND next_retry_at_ms<=?1)
-            OR (state='pending' AND (work_claim_until_ms IS NULL OR work_claim_until_ms<=?1))
-         ORDER BY COALESCE(next_retry_at_ms,created_at_ms),id LIMIT ?2",
-        limit,
-        Some(now_ms),
-    )
 }
 
 /// Atomically lease due retries or interrupted pending verifications so
@@ -613,15 +567,13 @@ pub fn handle_post_tool_use(
         }
         tx.execute(
             "UPDATE pr_hook_candidates SET state='ambiguous',
-             reason='duplicate invocation carried conflicting candidate data',updated_at_ms=?1
+             reason='duplicate invocation carried conflicting candidate data',
+             work_claim_until_ms=NULL,updated_at_ms=?1
              WHERE id=?2",
             params![now_ms, id],
         )?;
         tx.commit()?;
-        return Ok(HandleResult::Candidate {
-            record: candidate_record(db, id)?.expect("candidate already committed"),
-            verified: None,
-        });
+        return candidate_result(db, id, None);
     };
 
     let correlation = correlate_pre(
@@ -649,10 +601,7 @@ pub fn handle_post_tool_use(
                 params![reason, candidate_id],
             )?;
             tx.commit()?;
-            return Ok(HandleResult::Candidate {
-                record: candidate_record(db, candidate_id)?.expect("candidate committed"),
-                verified: None,
-            });
+            return candidate_result(db, candidate_id, None);
         }
     }
     if command_output_can_be_filtered(tool_name, event.get("tool_input")) {
@@ -662,10 +611,7 @@ pub fn handle_post_tool_use(
             params![now_ms, candidate_id],
         )?;
         tx.commit()?;
-        return Ok(HandleResult::Candidate {
-            record: candidate_record(db, candidate_id)?.expect("candidate committed"),
-            verified: None,
-        });
+        return candidate_result(db, candidate_id, None);
     }
     tx.commit()?;
     resume_pending_candidate(db, candidate_id, timeout, transport, max_pre_to_creation_ms)
@@ -688,12 +634,20 @@ fn resume_pending_candidate(
         params![until, candidate_id, now],
     )? == 1;
     if claimed {
-        verify_persisted_candidate(db, candidate_id, transport, timeout, max_pre_to_creation_ms)
+        verify_persisted_candidate(
+            db,
+            candidate_id,
+            until,
+            CandidateState::Pending,
+            transport,
+            timeout,
+            max_pre_to_creation_ms,
+        )
     } else {
         Ok(candidate_status(db, candidate_id)?
             .map(|record| HandleResult::Candidate {
                 verified: record.verified.clone(),
-                record,
+                record: Box::new(record),
             })
             .unwrap_or(HandleResult::Ignored))
     }
@@ -717,15 +671,26 @@ pub fn retry_candidate(
         )
         .optional()?
         .flatten();
-    if !lease_until.is_some_and(|until| until > unix_now_ms()) {
+    let Some(lease_until) = lease_until.filter(|until| *until > unix_now_ms()) else {
         return Ok(candidate_status(db, candidate_id)?
             .map(|record| HandleResult::Candidate {
                 verified: record.verified.clone(),
-                record,
+                record: Box::new(record),
             })
             .unwrap_or(HandleResult::Ignored));
-    }
-    verify_persisted_candidate(db, candidate_id, transport, timeout, max_pre_to_creation_ms)
+    };
+    let state = load_candidate_for_verify(db, candidate_id)?
+        .map(|stored| stored.state)
+        .unwrap_or(CandidateState::Ambiguous);
+    verify_persisted_candidate(
+        db,
+        candidate_id,
+        lease_until,
+        state,
+        transport,
+        timeout,
+        max_pre_to_creation_ms,
+    )
 }
 
 pub fn candidate_status(db: &Connection, candidate_id: i64) -> Result<Option<CandidateRecord>> {
@@ -815,6 +780,8 @@ fn correlate_pre(
 fn verify_persisted_candidate(
     db: &mut Connection,
     candidate_id: i64,
+    expected_lease_until: i64,
+    expected_state: CandidateState,
     transport: &dyn PullRequestGetTransport,
     timeout: Duration,
     max_pre_to_creation_ms: i64,
@@ -828,38 +795,33 @@ fn verify_persisted_candidate(
         state,
     } = stored;
     if matches!(state, CandidateState::Verified | CandidateState::Ambiguous) {
-        return Ok(HandleResult::Candidate {
-            record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-            verified: None,
-        });
+        return candidate_result(db, candidate_id, None);
     }
     let Some(pre_id) = pre_id else {
         set_candidate_state(
             db,
             candidate_id,
             CandidateState::Ambiguous,
+            expected_state,
+            expected_lease_until,
             Some("candidate has no correlated PreToolUse"),
             None,
             None,
         )?;
-        return Ok(HandleResult::Candidate {
-            record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-            verified: None,
-        });
+        return candidate_result(db, candidate_id, None);
     };
     let Some(pre) = load_pre_observation(db, pre_id)? else {
         set_candidate_state(
             db,
             candidate_id,
             CandidateState::Ambiguous,
+            expected_state,
+            expected_lease_until,
             Some("correlated PreToolUse evidence is unavailable"),
             None,
             None,
         )?;
-        return Ok(HandleResult::Candidate {
-            record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-            verified: None,
-        });
+        return candidate_result(db, candidate_id, None);
     };
     let repo = repository_from_pr_url(&candidate.url)
         .ok_or_else(|| anyhow!("persisted candidate URL has invalid repository"))?;
@@ -878,28 +840,26 @@ fn verify_persisted_candidate(
                 db,
                 candidate_id,
                 CandidateState::Timeout,
+                expected_state,
+                expected_lease_until,
                 Some("GitHub GET timed out"),
                 None,
                 None,
             )?;
-            return Ok(HandleResult::Candidate {
-                record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-                verified: None,
-            });
+            return candidate_result(db, candidate_id, None);
         }
         Err(failure) => {
             set_candidate_state(
                 db,
                 candidate_id,
                 CandidateState::TransportError,
+                expected_state,
+                expected_lease_until,
                 Some(failure.safe_label()),
                 None,
                 None,
             )?;
-            return Ok(HandleResult::Candidate {
-                record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-                verified: None,
-            });
+            return candidate_result(db, candidate_id, None);
         }
     };
     if let Some(reason) = retryable_http_failure(response.status, &response.body) {
@@ -907,14 +867,13 @@ fn verify_persisted_candidate(
             db,
             candidate_id,
             CandidateState::TransportError,
+            expected_state,
+            expected_lease_until,
             Some(reason),
             Some(response.status),
             None,
         )?;
-        return Ok(HandleResult::Candidate {
-            record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-            verified: None,
-        });
+        return candidate_result(db, candidate_id, None);
     }
     let outcome = verify_pr_candidate(
         &candidate,
@@ -933,24 +892,28 @@ fn verify_persisted_candidate(
             (CandidateState::Inconclusive, Some(reason), None)
         }
     };
-    set_candidate_state(
+    let changed = set_candidate_state(
         db,
         candidate_id,
         state,
+        expected_state,
+        expected_lease_until,
         reason,
         Some(response.status),
         verified.as_ref(),
     )?;
-    Ok(HandleResult::Candidate {
-        record: candidate_record(db, candidate_id)?.expect("candidate exists"),
-        verified,
-    })
+    let verified = if changed {
+        verified
+    } else {
+        candidate_record(db, candidate_id)?.and_then(|record| record.verified)
+    };
+    candidate_result(db, candidate_id, verified)
 }
 
 fn retryable_http_failure(status: u16, body: &Value) -> Option<&'static str> {
     match status {
         429 => Some("GitHub API rate limited"),
-        503 => Some("GitHub API temporarily unavailable"),
+        500 | 502 | 503 | 504 => Some("GitHub API temporarily unavailable"),
         403 if body
             .get("message")
             .and_then(Value::as_str)
@@ -1098,10 +1061,12 @@ fn set_candidate_state(
     db: &Connection,
     id: i64,
     state: CandidateState,
+    expected_state: CandidateState,
+    expected_lease_until: i64,
     reason: Option<&str>,
     get_status: Option<u16>,
     verified: Option<&VerifiedPullRequest>,
-) -> Result<()> {
+) -> Result<bool> {
     let verified_json = verified.map(verified_to_json).transpose()?;
     let retry_count: u32 = db.query_row(
         "SELECT retry_count FROM pr_hook_candidates WHERE id=?1",
@@ -1122,7 +1087,8 @@ fn set_candidate_state(
         "UPDATE pr_hook_candidates SET state=?1,reason=?2,get_status=?3,
          verified_json=COALESCE(?4,verified_json),
          retry_count=retry_count+CASE WHEN ?1 IN ('timeout','transport_error') THEN 1 ELSE 0 END,
-         next_retry_at_ms=?5,work_claim_until_ms=NULL,updated_at_ms=?6 WHERE id=?7",
+         next_retry_at_ms=?5,work_claim_until_ms=NULL,updated_at_ms=?6
+         WHERE id=?7 AND state=?8 AND work_claim_until_ms=?9",
         params![
             state.as_str(),
             reason,
@@ -1130,10 +1096,12 @@ fn set_candidate_state(
             verified_json,
             next_retry,
             unix_now_ms(),
-            id
+            id,
+            expected_state.as_str(),
+            expected_lease_until
         ],
     )?;
-    Ok(())
+    Ok(db.changes() == 1)
 }
 
 fn verified_to_json(pr: &VerifiedPullRequest) -> Result<String> {
@@ -1202,7 +1170,7 @@ fn is_pr_creation_intent(tool_name: &str, input: &Value) -> bool {
         tokens.get(1).map(String::as_str),
         tokens.get(2).map(String::as_str),
     ) {
-        (Some("pr"), Some("create")) => !tokens[3..].iter().any(|arg| arg == "--dry-run"),
+        (Some("pr"), Some("create")) => !crate::pr_hook::gh_pr_has_dry_run(&tokens[3..]),
         (Some("api"), _) => api_endpoint(&tokens[2..])
             .is_some_and(|endpoint| api_pulls_repository(endpoint).is_some()),
         _ => false,
@@ -1507,8 +1475,6 @@ impl TransportFailure {
         match self {
             Self::Timeout => "GitHub GET timed out",
             Self::Network => "GitHub GET transport failed",
-            Self::Unauthorized => "GitHub GET was unauthorized",
-            Self::RateLimited => "GitHub GET was rate limited",
             Self::Other => "GitHub GET failed",
         }
     }
@@ -1519,6 +1485,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::cell::Cell;
+    use std::sync::mpsc;
 
     struct FixtureTransport {
         response: std::result::Result<GetPullRequestResponse, TransportFailure>,
@@ -1607,16 +1574,11 @@ mod tests {
             60_000,
         )
         .unwrap();
-        assert!(matches!(
-            result,
-            HandleResult::Candidate {
-                record: CandidateRecord {
-                    state: CandidateState::Verified,
-                    ..
-                },
-                verified: Some(_)
-            }
-        ));
+        let HandleResult::Candidate { record, verified } = result else {
+            panic!("verification should return the stored candidate")
+        };
+        assert_eq!(record.state, CandidateState::Verified);
+        assert!(verified.is_some());
         assert_eq!(transport.calls.get(), 1);
 
         let stored: String = db
@@ -1756,7 +1718,6 @@ mod tests {
         )
         .unwrap();
         let now = unix_now_ms();
-        assert_eq!(list_due_retries(&db, now, 10).unwrap().len(), 1);
         let claimed = claim_due_retries(&mut db, now, 60_000, 10).unwrap();
         assert_eq!(claimed.len(), 1);
         let transport = fixture_transport();
@@ -1778,6 +1739,82 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn conflicting_post_during_get_cannot_overwrite_ambiguous_state() {
+        struct BlockingTransport {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            response: GetPullRequestResponse,
+        }
+        impl PullRequestGetTransport for BlockingTransport {
+            fn get_pull_request(
+                &self,
+                _repository: &str,
+                _number: u64,
+                _timeout: Duration,
+            ) -> std::result::Result<GetPullRequestResponse, TransportFailure> {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(self.response.clone())
+            }
+        }
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let command = "gh pr create --title original";
+        {
+            let mut setup = Connection::open(file.path()).unwrap();
+            record_pre_tool_use(
+                &mut setup,
+                &pre("s", "t", "call", command),
+                1_735_787_045_500,
+                60_000,
+            )
+            .unwrap();
+        }
+        let path = file.path().to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let post_event = post("s", "t", Some("call"), command);
+        let verifier = std::thread::spawn(move || {
+            let mut db = Connection::open(path).unwrap();
+            let transport = BlockingTransport {
+                started: started_tx,
+                release: release_rx,
+                response: fixture_response(),
+            };
+            handle_post_tool_use(
+                &mut db,
+                &post_event,
+                &transport,
+                Duration::from_secs(3),
+                60_000,
+            )
+            .unwrap()
+        });
+
+        started_rx.recv().unwrap();
+        let mut conflicting_db = Connection::open(file.path()).unwrap();
+        let conflict = handle_post_tool_use(
+            &mut conflicting_db,
+            &post("s", "t", Some("call"), "gh pr create --title conflicting"),
+            &fixture_transport(),
+            Duration::from_secs(3),
+            60_000,
+        )
+        .unwrap();
+        let HandleResult::Candidate { record, .. } = conflict else {
+            panic!("conflicting observation should be retained")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        release_tx.send(()).unwrap();
+
+        let HandleResult::Candidate { record, verified } = verifier.join().unwrap() else {
+            panic!("in-flight observation should remain queryable")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
     }
 
     #[test]
@@ -1847,8 +1884,10 @@ mod tests {
     #[test]
     fn gh_pr_body_value_cannot_be_misread_as_head_metadata() {
         let secret = "Bearer-SECRET-value";
-        let command = format!("gh pr create --body '--head={secret}'");
+        let command =
+            format!("gh pr create --title '--dry-run' --body '--head={secret} --repo=other/repo'");
         let event = pre("s", "t", "c", &command);
+        assert!(is_relevant_pre_tool_use(&event));
         let mut db = Connection::open_in_memory().unwrap();
         record_pre_tool_use(&mut db, &event, 100, 1000).unwrap();
         let (repo, head, base, author) = intent_metadata("Bash", &event["tool_input"]);
@@ -1858,6 +1897,7 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert!(!persisted.contains(secret));
+        assert!(!persisted.contains("other/repo"));
     }
 
     #[test]
@@ -1888,6 +1928,21 @@ mod tests {
             (
                 503,
                 json!({"message":"service unavailable"}),
+                "GitHub API temporarily unavailable",
+            ),
+            (
+                500,
+                json!({"message":"server error"}),
+                "GitHub API temporarily unavailable",
+            ),
+            (
+                502,
+                json!({"message":"bad gateway"}),
+                "GitHub API temporarily unavailable",
+            ),
+            (
+                504,
+                json!({"message":"gateway timeout"}),
                 "GitHub API temporarily unavailable",
             ),
         ] {
@@ -2104,7 +2159,7 @@ mod tests {
         assert_eq!(record.reason.as_deref(), Some("GitHub GET timed out"));
         assert_eq!(record.retry_count, 1);
         assert!(
-            list_due_retries(&db, record.next_retry_at_ms.unwrap() - 1, 10)
+            claim_due_retries(&mut db, record.next_retry_at_ms.unwrap() - 1, 60_000, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2120,16 +2175,13 @@ mod tests {
         let retry = fixture_transport();
         let result =
             retry_candidate(&mut db, record.id, &retry, Duration::from_secs(3), 60_000).unwrap();
-        assert!(matches!(
-            result,
-            HandleResult::Candidate {
-                record: CandidateRecord {
-                    state: CandidateState::Verified,
-                    ..
-                },
-                ..
-            }
-        ));
+        let HandleResult::Candidate {
+            record: retried, ..
+        } = result
+        else {
+            panic!("retry should return the stored candidate")
+        };
+        assert_eq!(retried.state, CandidateState::Verified);
         let stored = candidate_status(&db, record.id).unwrap().unwrap();
         assert_eq!(stored.state, CandidateState::Verified);
         assert_eq!(stored.retry_count, 1);
@@ -2157,7 +2209,6 @@ mod tests {
         .unwrap() else {
             panic!()
         };
-        assert_eq!(list_verified_pending(&db, 10).unwrap().len(), 1);
         let now = unix_now_ms();
         assert!(!mark_candidate_consumed(&db, record.id, now).unwrap());
         let claimed = claim_verified_pending(&mut db, now, 60_000, 10).unwrap();
@@ -2168,7 +2219,11 @@ mod tests {
                 .is_empty()
         );
         assert!(mark_candidate_consumed(&db, record.id, now + 1).unwrap());
-        assert!(list_verified_pending(&db, 10).unwrap().is_empty());
+        assert!(
+            claim_verified_pending(&mut db, now + 2, 60_000, 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(!mark_candidate_consumed(&db, record.id, now + 2).unwrap());
     }
 

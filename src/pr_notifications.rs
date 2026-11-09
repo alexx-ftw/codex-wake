@@ -64,6 +64,7 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
 }
 
 /// Idempotently enable repeat notifications for one PR or review stream and destination.
+#[cfg(test)]
 pub(crate) fn register(
     db: &Connection,
     kind: &str,
@@ -117,6 +118,7 @@ fn insert_listener(
 
 /// Record one provider event for every registered destination. `event_key` must be the
 /// stable identity of this provider event; replaying it returns no new notifications.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_event(
     db: &Connection,
     kind: &str,
@@ -207,6 +209,7 @@ pub(crate) fn record_event(
 }
 
 /// List durable notifications not yet accepted by the downstream queue.
+#[cfg(test)]
 pub(crate) fn pending(db: &Connection) -> Result<Vec<Notification>> {
     initialize(db)?;
     let mut statement = db.prepare(
@@ -239,6 +242,7 @@ pub(crate) fn pending(db: &Connection) -> Result<Vec<Notification>> {
 }
 
 /// Claim before calling the downstream queue. Claims are never retried automatically.
+#[cfg(test)]
 pub(crate) fn claim(db: &Connection, id: &str) -> Result<bool> {
     initialize(db)?;
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
@@ -282,6 +286,7 @@ pub(crate) fn release_before_send(db: &Connection, id: &str) -> Result<bool> {
 }
 
 /// Surface interrupted and uncertain sends for explicit reconciliation, never retry them.
+#[cfg(test)]
 pub(crate) fn needs_attention(db: &Connection) -> Result<Vec<Notification>> {
     initialize(db)?;
     let mut statement = db.prepare(
@@ -686,7 +691,7 @@ mod tests {
         let raced_review = review(11, "2099-01-01T00:00:00Z", "APPROVED");
         let initial_pr = pull_request(&"b".repeat(40), "2026-01-01T00:00:00Z");
         super::super::tick_with(&db, 1, |route, _| match route {
-            route if route == "/repos/owner/repo/pulls/7" => Ok(response(initial_pr.clone())),
+            "/repos/owner/repo/pulls/7" => Ok(response(initial_pr.clone())),
             route if route.starts_with("/repos/owner/repo/pulls/7/reviews") => {
                 Ok(response(json!([old_review.clone(), raced_review.clone()])))
             }

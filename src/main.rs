@@ -5041,6 +5041,131 @@ mod hook_output_tests {
 }
 
 #[cfg(test)]
+mod pr_hook_registration_integration_tests {
+    use super::*;
+    use std::{os::unix::fs::PermissionsExt, thread, time::Duration};
+
+    #[test]
+    fn pre_post_candidate_retries_and_reconcile_registers_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let gh = root.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nif [ ! -e \"$0.seen\" ]; then : > \"$0.seen\"; exit 1; fi\nprintf 'HTTP/2 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\\\"number\\\":42,\\\"html_url\\\":\\\"https://github.com/owner/repo/pull/42\\\",\\\"created_at\\\":\\\"'\ndate -u +'%Y-%m-%dT%H:%M:%SZ'\nprintf '\\\",\\\"base\\\":{\\\"ref\\\":\\\"main\\\",\\\"repo\\\":{\\\"full_name\\\":\\\"owner/repo\\\"}},\\\"head\\\":{\\\"ref\\\":\\\"feature\\\"},\\\"user\\\":{\\\"login\\\":\\\"alice\\\"}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state,
+            runtime: root.join("runtime"),
+            config: root.join("config"),
+            unit: root.join("unit"),
+            db: root.join("state.sqlite3"),
+            codex: root.join("codex"),
+            gh,
+            webhooks_enabled: false,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let session = "11111111-1111-4111-8111-111111111111";
+        let command = "gh pr create --repo owner/repo --title test";
+        let pre = json!({
+            "hook_event_name":"PreToolUse", "session_id":session, "turn_id":"turn-1",
+            "tool_use_id":"call-1", "tool_name":"Bash", "tool_input":{"command":command}
+        });
+        let post = json!({
+            "hook_event_name":"PostToolUse", "session_id":session, "turn_id":"turn-1",
+            "tool_use_id":"call-1", "tool_name":"Bash", "tool_input":{"command":command},
+            "tool_response":"https://github.com/owner/repo/pull/42"
+        });
+
+        run_hook_inner(&config, &pre).unwrap();
+        thread::sleep(Duration::from_millis(2100));
+        run_hook_inner(&config, &post).unwrap();
+
+        let mut db = bridge::connect(&config.db).unwrap();
+        let first_state: String = db
+            .query_row("SELECT state FROM pr_hook_candidates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(first_state, "transport_error");
+        let pre_state: String = db
+            .query_row("SELECT state FROM pr_hook_pre_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pre_state, "linked");
+        db.execute("UPDATE pr_hook_candidates SET next_retry_at_ms=0", [])
+            .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        pr_registration::reconcile(&mut db, &config, now).unwrap();
+        let after_recovery: (String, Option<i64>, i64, i64, i64, i64) = db
+            .query_row(
+                "SELECT state,consumed_at_ms,
+                    (SELECT count(*) FROM rules),
+                    (SELECT count(*) FROM automatic_pr_rules),
+                    (SELECT count(*) FROM automatic_pr_notification_listeners),
+                    (SELECT count(*) FROM pr_ci_trackers)
+                 FROM pr_hook_candidates",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after_recovery.0, "verified");
+        assert!(after_recovery.1.is_some());
+        assert_eq!(
+            (
+                after_recovery.2,
+                after_recovery.3,
+                after_recovery.4,
+                after_recovery.5
+            ),
+            (1, 1, 2, 1)
+        );
+
+        run_hook_inner(&config, &post).unwrap();
+        pr_registration::reconcile(&mut db, &config, now + 1).unwrap();
+        let repeats: (i64, i64, i64, i64, i64) = db
+            .query_row(
+                "SELECT count(*),
+                    (SELECT count(*) FROM rules),
+                    (SELECT count(*) FROM automatic_pr_notification_listeners WHERE kind='pull_request'),
+                    (SELECT count(*) FROM automatic_pr_notification_listeners WHERE kind='review'),
+                    (SELECT count(*) FROM pr_ci_trackers)
+                 FROM pr_hook_candidates",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(repeats, (1, 1, 1, 1, 1));
+        assert_eq!(
+            std::fs::read_to_string(config.gh.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
 mod bounded_collision_tool_tests {
     use super::*;
 
