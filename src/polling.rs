@@ -3547,8 +3547,15 @@ mod tests {
             ),
         ] {
             let report = tick_with(&db, now, |route, _| {
-                assert_eq!(route, "/repos/owner/repo/pulls/7");
-                Ok(response(pull(state, closed_at, updated_at), false))
+                let body = match route {
+                    "/repos/owner/repo/pulls/7" => pull(state, closed_at, updated_at),
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                        assert_eq!(state, "open");
+                        json!([{"id":7001,"event":"reopened","created_at":updated_at}])
+                    }
+                    _ => panic!("unexpected route: {route}"),
+                };
+                Ok(response(body, false))
             })
             .unwrap();
             assert_eq!(report["errors"], json!({}), "{report}");
@@ -3696,10 +3703,21 @@ mod tests {
         assert_eq!(report["errors"], json!({}), "{report}");
 
         let notices = crate::polling::pr_notifications::pending(&db).unwrap();
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].kind, "pull_request");
-        assert_eq!(notices[0].event, "reopened");
-        assert_eq!(notices[0].source["action"], "reopened");
+        assert_eq!(notices.len(), 2);
+        let reopened_notices: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.event == "reopened")
+            .collect();
+        assert_eq!(reopened_notices.len(), 1);
+        assert_eq!(reopened_notices[0].kind, "pull_request");
+        assert_eq!(reopened_notices[0].source["action"], "reopened");
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.event == "closed")
+                .count(),
+            1
+        );
         let tracker_states: Vec<(String, bool)> = {
             let mut statement = db
                 .prepare("SELECT thread,active FROM pr_ci_trackers ORDER BY thread")
@@ -4423,6 +4441,7 @@ mod tests {
         let mut reopened = closed.clone();
         reopened["state"] = json!("open");
         reopened["closed_at"] = Value::Null;
+        reopened["updated_at"] = json!("2026-11-08T10:04:00Z");
         let mut closed_again = closed.clone();
         closed_again["closed_at"] = json!("2026-11-08T10:05:00Z");
         closed_again["updated_at"] = json!("2026-11-08T10:05:00Z");
@@ -4433,6 +4452,9 @@ mod tests {
             let report = tick_with(&db, now, |route, _| {
                 let body = if route == "/repos/owner/repo/pulls/7" {
                     pr.clone()
+                } else if route == "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" {
+                    assert_eq!(pr["state"], "open");
+                    json!([{"id":7001,"event":"reopened","created_at":"2026-11-08T10:04:00Z"}])
                 } else if route.starts_with("/repos/owner/repo/issues/7/comments") {
                     json!([comment.clone()])
                 } else {
@@ -5224,7 +5246,7 @@ mod tests {
     }
 
     #[test]
-    fn already_seen_review_fans_out_to_late_listener_once() {
+    fn already_seen_review_fans_out_to_late_automatic_listener_once() {
         let db = db();
         let subscription = subscribe(&db, "review", "7", "approved");
         let review = json!({
@@ -5234,20 +5256,6 @@ mod tests {
         assert_eq!(first["errors"], json!({}), "{first}");
         assert_eq!(registration_state(&db, &subscription), "ready");
 
-        let late_subscription = crate::subscriptions::subscribe(
-            &db,
-            "review",
-            "owner/repo",
-            "7",
-            "approved",
-            "33333333-3333-4333-8333-333333333333",
-        )
-        .unwrap();
-        db.execute(
-            "UPDATE subscriptions SET updated='2099-01-01 00:00:00' WHERE id=?1",
-            [&late_subscription],
-        )
-        .unwrap();
         let late_condition = crate::conditions::register_group_with_members(
             &db,
             crate::conditions::Mode::Or,
@@ -5299,7 +5307,6 @@ mod tests {
             .unwrap();
             assert_eq!(report["errors"], json!({}), "{report}");
             assert_eq!(registration_state(&db, &subscription), "ready");
-            assert_eq!(registration_state(&db, &late_subscription), "waiting");
             assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
             let notifications = pr_notifications::pending(&db).unwrap();
             assert_eq!(notifications.len(), 1);

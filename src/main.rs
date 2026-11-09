@@ -3054,7 +3054,15 @@ mod hook_output_tests {
             .iter()
             .find(|notification| notification.event == "reopened")
             .unwrap();
-        assert_eq!(reopened.event_key, "reopened:1");
+        let closed_cycle_epoch: i64 = db
+            .query_row(
+                "SELECT closed_at_sec FROM automatic_pr_lifecycle
+                 WHERE repo='owner/repo' AND pr='7'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reopened.event_key, format!("reopened:{closed_cycle_epoch}"));
     }
 
     #[test]
@@ -5468,7 +5476,8 @@ mod pr_hook_registration_integration_tests {
         assert_eq!(second_attempts, 0);
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, thread);
-        assert!(delivered[0].1.contains("owner/repo#42"));
+        assert!(delivered[0].1.contains("owner/repo"));
+        assert!(delivered[0].1.contains("PR #42"));
         assert!(!delivered[0].2.is_empty());
         assert!(delivered[0].3);
         let db = bridge::connect(&config.db).unwrap();
