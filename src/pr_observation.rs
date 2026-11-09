@@ -126,6 +126,8 @@ pub struct CandidateRecord {
     pub consumed_at_ms: Option<i64>,
     pub retry_count: u32,
     pub next_retry_at_ms: Option<i64>,
+    /// Lease token captured when this worker claimed the candidate.
+    pub work_claim_until_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,7 +353,12 @@ fn claim_candidates(
     tx.commit()?;
     ids.into_iter()
         .filter_map(|id| match candidate_record(db, id) {
-            Ok(Some(record)) => Some(Ok(record)),
+            Ok(Some(mut record)) => {
+                // Return the token this claimant wrote, even if another worker
+                // reclaims the row before the post-commit read completes.
+                record.work_claim_until_ms = Some(lease_until);
+                Some(Ok(record))
+            }
             Ok(None) => None,
             Err(error) => Some(Err(error)),
         })
@@ -456,6 +463,15 @@ pub fn record_pre_tool_use(
     )?;
     if inserted == 1 {
         let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE pr_hook_candidates SET state='ambiguous',
+             reason='multiple PreToolUse entries match session and input digest',
+             verified_json=NULL,work_claim_until_ms=NULL,updated_at_ms=?1
+             WHERE session_id=?2 AND turn_id=?3 AND tool_name=?4 AND input_digest=?5
+               AND exact_id_correlation=0 AND consumed_at_ms IS NULL
+               AND state IN ('pending','timeout','transport_error','inconclusive','verified')",
+            params![observed_at_ms, session_id, turn_id, tool_name, input_digest],
+        )?;
         tx.commit()?;
         return Ok(if initial_state == "pending" {
             PreRecord::Recorded { id }
@@ -494,6 +510,14 @@ pub fn record_pre_tool_use(
                 "UPDATE pr_hook_pre_observations SET state='ambiguous',
                  reason='same tool identity received different input digests' WHERE id=?1",
                 [id],
+            )?;
+            tx.execute(
+                "UPDATE pr_hook_candidates SET state='ambiguous',
+                 reason='correlated PreToolUse identity received conflicting input',
+                 verified_json=NULL,work_claim_until_ms=NULL,updated_at_ms=?1
+                 WHERE pre_id=?2 AND consumed_at_ms IS NULL
+                   AND state IN ('pending','timeout','transport_error','inconclusive','verified')",
+                params![observed_at_ms, id],
             )?;
             tx.commit()?;
             return Ok(PreRecord::Ambiguous {
@@ -701,20 +725,19 @@ fn resume_pending_candidate(
 pub fn retry_candidate(
     db: &mut Connection,
     candidate_id: i64,
+    expected_lease_until_ms: i64,
     transport: &dyn PullRequestGetTransport,
     timeout: Duration,
     max_pre_to_creation_ms: i64,
 ) -> Result<HandleResult> {
     initialize(db)?;
-    let lease_until = db
-        .query_row(
-            "SELECT work_claim_until_ms FROM pr_hook_candidates WHERE id=?1",
-            [candidate_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .flatten();
-    let Some(lease_until) = lease_until.filter(|until| *until > unix_now_ms()) else {
+    let lease_matches = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pr_hook_candidates
+             WHERE id=?1 AND work_claim_until_ms=?2 AND work_claim_until_ms>?3)",
+        params![candidate_id, expected_lease_until_ms, unix_now_ms()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !lease_matches {
         return Ok(candidate_status(db, candidate_id)?
             .map(|record| HandleResult::Candidate {
                 verified: record.verified.clone(),
@@ -728,7 +751,7 @@ pub fn retry_candidate(
     verify_persisted_candidate(
         db,
         candidate_id,
-        lease_until,
+        expected_lease_until_ms,
         state,
         transport,
         timeout,
@@ -877,6 +900,18 @@ fn verify_persisted_candidate(
         )?;
         return candidate_result(db, candidate_id, None);
     };
+    if pre.state != "linked" {
+        set_candidate_state(
+            db,
+            candidate_id,
+            CandidateState::Ambiguous,
+            (expected_state, expected_lease_until),
+            Some("correlated PreToolUse is not in linked state"),
+            None,
+            None,
+        )?;
+        return candidate_result(db, candidate_id, None);
+    }
     let repo = repository_from_pr_url(&candidate.url)
         .ok_or_else(|| anyhow!("persisted candidate URL has invalid repository"))?;
     let exact_call_and_result = exact_id_correlation
@@ -1067,6 +1102,7 @@ fn load_candidate_for_verify(db: &Connection, id: i64) -> Result<Option<StoredCa
 
 #[derive(Debug)]
 struct StoredPre {
+    state: String,
     observed_at_ms: i64,
     session_id: Option<String>,
     turn_id: Option<String>,
@@ -1082,22 +1118,23 @@ struct StoredPre {
 fn load_pre_observation(db: &Connection, id: i64) -> Result<Option<StoredPre>> {
     Ok(db
         .query_row(
-            "SELECT observed_at_ms,session_id,turn_id,tool_use_id,tool_name,input_digest,
+            "SELECT state,observed_at_ms,session_id,turn_id,tool_use_id,tool_name,input_digest,
                     repository,head_ref,base_ref,author_login
              FROM pr_hook_pre_observations WHERE id=?1",
             [id],
             |row| {
                 Ok(StoredPre {
-                    observed_at_ms: row.get(0)?,
-                    session_id: row.get(1)?,
-                    turn_id: row.get(2)?,
-                    tool_use_id: row.get(3)?,
-                    tool_name: row.get(4)?,
-                    input_digest: row.get(5)?,
-                    repository: row.get(6)?,
-                    head_ref: row.get(7)?,
-                    base_ref: row.get(8)?,
-                    author_login: row.get(9)?,
+                    state: row.get(0)?,
+                    observed_at_ms: row.get(1)?,
+                    session_id: row.get(2)?,
+                    turn_id: row.get(3)?,
+                    tool_use_id: row.get(4)?,
+                    tool_name: row.get(5)?,
+                    input_digest: row.get(6)?,
+                    repository: row.get(7)?,
+                    head_ref: row.get(8)?,
+                    base_ref: row.get(9)?,
+                    author_login: row.get(10)?,
                 })
             },
         )
@@ -1108,7 +1145,7 @@ fn candidate_record(db: &Connection, id: i64) -> Result<Option<CandidateRecord>>
     let row = db
         .query_row(
             "SELECT id,session_id,turn_id,tool_use_id,number,url,state,reason,get_status,verified_json,
-                    consumed_at_ms,retry_count,next_retry_at_ms
+                    consumed_at_ms,retry_count,next_retry_at_ms,work_claim_until_ms
              FROM pr_hook_candidates WHERE id=?1",
             [id],
             |row| {
@@ -1126,6 +1163,7 @@ fn candidate_record(db: &Connection, id: i64) -> Result<Option<CandidateRecord>>
                     row.get::<_, Option<i64>>(10)?,
                     row.get::<_, u32>(11)?,
                     row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
                 ))
             },
         )
@@ -1145,6 +1183,7 @@ fn candidate_record(db: &Connection, id: i64) -> Result<Option<CandidateRecord>>
             consumed_at_ms,
             retry_count,
             next_retry_at_ms,
+            work_claim_until_ms,
         )| {
             let number = u64::try_from(number).context("invalid stored PR number")?;
             Ok(CandidateRecord {
@@ -1164,6 +1203,7 @@ fn candidate_record(db: &Connection, id: i64) -> Result<Option<CandidateRecord>>
                 consumed_at_ms,
                 retry_count,
                 next_retry_at_ms,
+                work_claim_until_ms,
             })
         },
     )
@@ -2122,6 +2162,7 @@ mod tests {
         let HandleResult::Candidate { record, .. } = retry_candidate(
             &mut db,
             claimed[0].id,
+            claimed[0].work_claim_until_ms.unwrap(),
             &transport,
             Duration::from_secs(2),
             60_000,
@@ -2213,6 +2254,104 @@ mod tests {
         };
         assert_eq!(record.state, CandidateState::Ambiguous);
         assert!(verified.is_none());
+    }
+
+    #[test]
+    fn new_or_conflicting_pre_during_get_cannot_authorize_attribution() {
+        let command = "gh pr create --title same";
+        let mut control_db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut control_db,
+            &pre("control", "turn", "call", command),
+            1_735_787_045_500,
+            60_000,
+        )
+        .unwrap();
+        let control = handle_post_tool_use(
+            &mut control_db,
+            &post("control", "turn", Some("call"), command),
+            &fixture_transport(),
+            Duration::from_secs(3),
+            60_000,
+        )
+        .unwrap();
+        let HandleResult::Candidate {
+            record,
+            verified: Some(_),
+        } = control
+        else {
+            panic!("an unconflicted exact call should verify")
+        };
+        assert_eq!(record.state, CandidateState::Verified);
+
+        fn exercise(post_id: Option<&str>, extra_id: &str, extra_command: &str) {
+            struct BlockingTransport {
+                started: mpsc::Sender<()>,
+                release: mpsc::Receiver<()>,
+                response: GetPullRequestResponse,
+            }
+            impl PullRequestGetTransport for BlockingTransport {
+                fn get_pull_request(
+                    &self,
+                    _repository: &str,
+                    _number: u64,
+                    _timeout: Duration,
+                ) -> std::result::Result<GetPullRequestResponse, TransportFailure> {
+                    self.started.send(()).unwrap();
+                    self.release.recv().unwrap();
+                    Ok(self.response.clone())
+                }
+            }
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let command = "gh pr create --title same";
+            {
+                let mut db = Connection::open(file.path()).unwrap();
+                record_pre_tool_use(
+                    &mut db,
+                    &pre("s", "t", "call", command),
+                    1_735_787_045_500,
+                    60_000,
+                )
+                .unwrap();
+            }
+            let path = file.path().to_owned();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let event = post("s", "t", post_id, command);
+            let verifier = std::thread::spawn(move || {
+                let mut db = Connection::open(path).unwrap();
+                let transport = BlockingTransport {
+                    started: started_tx,
+                    release: release_rx,
+                    response: fixture_response(),
+                };
+                handle_post_tool_use(&mut db, &event, &transport, Duration::from_secs(3), 60_000)
+                    .unwrap()
+            });
+
+            started_rx.recv().unwrap();
+            let mut conflict_db = Connection::open(file.path()).unwrap();
+            record_pre_tool_use(
+                &mut conflict_db,
+                &pre("s", "t", extra_id, extra_command),
+                1_735_787_045_500,
+                60_000,
+            )
+            .unwrap();
+            release_tx.send(()).unwrap();
+
+            let HandleResult::Candidate { record, verified } = verifier.join().unwrap() else {
+                panic!("in-flight candidate should remain queryable")
+            };
+            assert_eq!(record.state, CandidateState::Ambiguous);
+            assert!(verified.is_none());
+        }
+
+        // A digest-only match becomes ambiguous when another matching call appears.
+        exercise(None, "other-call", "gh pr create --title same");
+        // Reuse of the exact call identity with changed input invalidates its candidate.
+        exercise(Some("call"), "call", "gh pr create --title changed");
     }
 
     #[test]
@@ -2583,8 +2722,15 @@ mod tests {
         );
 
         let retry = fixture_transport();
-        let result =
-            retry_candidate(&mut db, record.id, &retry, Duration::from_secs(3), 60_000).unwrap();
+        let result = retry_candidate(
+            &mut db,
+            claims[0].id,
+            claims[0].work_claim_until_ms.unwrap(),
+            &retry,
+            Duration::from_secs(3),
+            60_000,
+        )
+        .unwrap();
         let HandleResult::Candidate {
             record: retried, ..
         } = result
@@ -2596,6 +2742,123 @@ mod tests {
         assert_eq!(stored.state, CandidateState::Verified);
         assert_eq!(stored.retry_count, 1);
         assert!(stored.next_retry_at_ms.is_none());
+    }
+
+    #[test]
+    fn stale_retry_claim_cannot_adopt_a_new_workers_lease() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let command = TRUSTED_API_CREATE;
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call", command),
+            1_735_787_045_500,
+            60_000,
+        )
+        .unwrap();
+        let timeout = FixtureTransport {
+            response: Err(TransportFailure::Timeout),
+            calls: Cell::new(0),
+        };
+        let HandleResult::Candidate { record, .. } = handle_post_tool_use(
+            &mut db,
+            &post("s", "t", Some("call"), command),
+            &timeout,
+            Duration::from_millis(50),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("candidate should remain persisted")
+        };
+        let first = claim_due_retries(&mut db, record.next_retry_at_ms.unwrap(), 60_000, 1)
+            .unwrap()
+            .remove(0);
+        let second = claim_due_retries(&mut db, first.work_claim_until_ms.unwrap(), 60_000, 1)
+            .unwrap()
+            .remove(0);
+        let transport = fixture_transport();
+        let stale = retry_candidate(
+            &mut db,
+            first.id,
+            first.work_claim_until_ms.unwrap(),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        let HandleResult::Candidate {
+            record: stale_record,
+            ..
+        } = stale
+        else {
+            panic!("stale claim should preserve candidate")
+        };
+        assert_eq!(stale_record.state, CandidateState::Timeout);
+        assert_eq!(transport.calls.get(), 0);
+        assert_eq!(
+            candidate_status(&db, second.id)
+                .unwrap()
+                .unwrap()
+                .work_claim_until_ms,
+            second.work_claim_until_ms
+        );
+    }
+
+    #[test]
+    fn persisted_ambiguous_pre_blocks_retry_before_github_get() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let command = TRUSTED_API_CREATE;
+        let record = {
+            let mut db = Connection::open(file.path()).unwrap();
+            record_pre_tool_use(
+                &mut db,
+                &pre("s", "t", "call", command),
+                1_735_787_045_500,
+                60_000,
+            )
+            .unwrap();
+            let timeout = FixtureTransport {
+                response: Err(TransportFailure::Timeout),
+                calls: Cell::new(0),
+            };
+            let HandleResult::Candidate { record, .. } = handle_post_tool_use(
+                &mut db,
+                &post("s", "t", Some("call"), command),
+                &timeout,
+                Duration::from_millis(50),
+                60_000,
+            )
+            .unwrap() else {
+                panic!("candidate should remain persisted")
+            };
+            // Model a durable ambiguous Pre observation whose candidate-state
+            // update was interrupted before it could be committed.
+            db.execute(
+                "UPDATE pr_hook_pre_observations SET state='ambiguous' WHERE tool_use_id='call'",
+                [],
+            )
+            .unwrap();
+            record
+        };
+
+        let mut db = Connection::open(file.path()).unwrap();
+        let claim = claim_due_retries(&mut db, record.next_retry_at_ms.unwrap(), 60_000, 1)
+            .unwrap()
+            .remove(0);
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } = retry_candidate(
+            &mut db,
+            claim.id,
+            claim.work_claim_until_ms.unwrap(),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("candidate should remain queryable")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
+        assert_eq!(transport.calls.get(), 0);
     }
 
     #[test]

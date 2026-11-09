@@ -13,7 +13,8 @@
       {"source": "string", "name": "CODEX_WAKE_PAYLOAD"}
     ],
     "pass-environment-to-command": [
-      {"source": "header", "name": "X-GitHub-Event", "envname": "CODEX_WAKE_EVENT"}
+      {"source": "header", "name": "X-GitHub-Event", "envname": "CODEX_WAKE_EVENT"},
+      {"source": "header", "name": "X-Hub-Signature-256", "envname": "CODEX_WAKE_SIGNATURE"}
     ],
     "pass-file-to-command": [
       {"source": "entire-payload", "envname": "CODEX_WAKE_PAYLOAD"}

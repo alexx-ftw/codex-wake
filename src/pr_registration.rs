@@ -57,6 +57,12 @@ fn register_in(
             "prompt":"Hay un comentario nuevo o editado en la PR {{event.repo}}#{{event.pr}}. Revísalo en GitHub y atiéndelo dentro del alcance autorizado."
         }))?;
         let id = crate::rules::configure(db, input)?;
+        if let Some(registered_at_sec) = registered_at_sec {
+            db.execute(
+                "UPDATE rules SET updated=datetime(?1,'unixepoch') WHERE id=?2",
+                params![registered_at_sec, id],
+            )?;
+        }
         db.execute(
             "INSERT INTO automatic_pr_rules(repo,pr,thread,rule_id) VALUES(?1,?2,?3,?4)",
             params![repo, number, thread, id],
@@ -71,6 +77,9 @@ pub fn reconcile(db: &mut Connection, config: &crate::manager::Config, now: i64)
         crate::pr_observation::retry_candidate(
             db,
             candidate.id,
+            candidate
+                .work_claim_until_ms
+                .ok_or_else(|| anyhow::anyhow!("retry candidate has no claim lease"))?,
             &transport,
             std::time::Duration::from_secs(20),
             3_600_000,
@@ -106,32 +115,49 @@ fn register_claimed_candidate(
     initialize_registration(db)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let now = current_time_ms()?;
-    let eligible: bool = tx.query_row(
+    let claim_valid: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pr_hook_candidates
          WHERE id=?1 AND state='verified' AND consumed_at_ms IS NULL
            AND work_claim_until_ms=?2 AND work_claim_until_ms>?3)",
         params![candidate.id, claim_until, now],
         |row| row.get(0),
     )?;
-    if !eligible {
+    if !claim_valid {
         return Ok(false);
     }
-    let observed_at_ms: i64 = tx.query_row(
-        "SELECT created_at_ms FROM pr_hook_candidates WHERE id=?1",
+    let pre_linked: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM pr_hook_candidates c
+             JOIN pr_hook_pre_observations p ON p.id=c.pre_id
+             WHERE c.id=?1 AND p.state='linked'
+         )",
         [candidate.id],
         |row| row.get(0),
     )?;
-    register_in(
-        &tx,
-        &pr.repository,
-        &number,
-        &thread,
-        Some(observed_at_ms.div_euclid(1000)),
+    if !pre_linked {
+        tx.execute(
+            "UPDATE pr_hook_candidates SET state='ambiguous',
+             reason='correlated PreToolUse is not in linked state',verified_json=NULL,
+             work_claim_until_ms=NULL,updated_at_ms=?1
+             WHERE id=?2 AND state='verified' AND consumed_at_ms IS NULL
+               AND work_claim_until_ms=?3",
+            params![now, candidate.id, claim_until],
+        )?;
+        tx.commit()?;
+        return Ok(false);
+    }
+    let created_at_sec: i64 = tx.query_row(
+        "SELECT CAST(strftime('%s', ?1) AS INTEGER)",
+        [&pr.created_at],
+        |row| row.get(0),
     )?;
+    register_in(&tx, &pr.repository, &number, &thread, Some(created_at_sec))?;
     let consumed = tx.execute(
         "UPDATE pr_hook_candidates SET consumed_at_ms=?1,work_claim_until_ms=NULL,updated_at_ms=?1
          WHERE id=?2 AND state='verified' AND consumed_at_ms IS NULL
-           AND work_claim_until_ms=?3 AND work_claim_until_ms>?1",
+           AND work_claim_until_ms=?3 AND work_claim_until_ms>?1
+           AND EXISTS(SELECT 1 FROM pr_hook_pre_observations p
+                      WHERE p.id=pr_hook_candidates.pre_id AND p.state='linked')",
         params![current_time_ms()?, candidate.id, claim_until],
     )? == 1;
     if !consumed {
@@ -276,14 +302,9 @@ mod tests {
             60_000,
         )
         .unwrap();
-        let crate::pr_observation::HandleResult::Candidate { record, .. } = result else {
+        let crate::pr_observation::HandleResult::Candidate { .. } = result else {
             panic!("expected verified PR candidate");
         };
-        db.execute(
-            "UPDATE pr_hook_candidates SET created_at_ms=?1 WHERE id=?2",
-            params![observed_at_ms, record.id],
-        )
-        .unwrap();
 
         let claimed_at_ms = unix_now_ms();
         let claimed =
@@ -293,6 +314,38 @@ mod tests {
         assert!(register_claimed_candidate(&mut db, &claimed[0], claimed_at_ms + 60_000,).unwrap());
 
         let event_at = utc_timestamp(observed_at_ms + 10_000);
+        let eligible_rules: i64 = db
+            .query_row(
+                "SELECT count(*) FROM rules WHERE datetime(updated)<=datetime(?1)",
+                [&event_at],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            eligible_rules, 1,
+            "creation boundary must admit earlier comments"
+        );
+        let stored_boundary: i64 = db
+            .query_row(
+                "SELECT CAST(strftime('%s', r.updated) AS INTEGER)
+                 FROM automatic_pr_rules a JOIN rules r ON r.id=a.rule_id
+                 WHERE a.repo='owner/repo' AND a.pr='42' AND a.thread=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_boundary, (observed_at_ms + 1_000).div_euclid(1000));
+        register(&mut db, "owner/repo", "42", session).unwrap();
+        let preserved_boundary: i64 = db
+            .query_row(
+                "SELECT CAST(strftime('%s', r.updated) AS INTEGER)
+                 FROM automatic_pr_rules a JOIN rules r ON r.id=a.rule_id
+                 WHERE a.repo='owner/repo' AND a.pr='42' AND a.thread=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_boundary, stored_boundary);
         let notices = crate::polling::pr_notifications::record_event(
             &db,
             "review",
@@ -389,6 +442,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (0, 0, 0, None));
+    }
+
+    #[test]
+    fn persisted_ambiguous_pre_blocks_pending_registration() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let now = unix_now_ms();
+        let session = "11111111-1111-4111-8111-111111111111";
+        let command = "gh pr create --repo owner/repo --title verified";
+        let pre = serde_json::json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":session,
+            "turn_id":"turn-ambiguous-pre",
+            "tool_use_id":"call-ambiguous-pre",
+            "tool_name":"Bash",
+            "tool_input":{"command":command}
+        });
+        crate::pr_observation::record_pre_tool_use(&mut db, &pre, now, 60_000).unwrap();
+        let post = serde_json::json!({
+            "hook_event_name":"PostToolUse",
+            "session_id":session,
+            "turn_id":"turn-ambiguous-pre",
+            "tool_use_id":"call-ambiguous-pre",
+            "tool_name":"Bash",
+            "tool_input":{"command":command},
+            "tool_response":"https://github.com/owner/repo/pull/42"
+        });
+        let transport = FixtureTransport {
+            created_at: utc_timestamp(now),
+        };
+        let result = crate::pr_observation::handle_post_tool_use(
+            &mut db,
+            &post,
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        let crate::pr_observation::HandleResult::Candidate { record, .. } = result else {
+            panic!("expected verified candidate")
+        };
+        assert_eq!(
+            record.state,
+            crate::pr_observation::CandidateState::Verified
+        );
+        let claimed = crate::pr_observation::claim_verified_pending(&mut db, now, 60_000, 1)
+            .unwrap()
+            .remove(0);
+        db.execute(
+            "UPDATE pr_hook_pre_observations SET state='ambiguous'
+             WHERE tool_use_id='call-ambiguous-pre'",
+            [],
+        )
+        .unwrap();
+
+        assert!(!register_claimed_candidate(&mut db, &claimed, now + 60_000).unwrap());
+        let (candidate_state, verified, consumed, registrations): (
+            String,
+            Option<String>,
+            Option<i64>,
+            i64,
+        ) = db
+            .query_row(
+                "SELECT c.state,c.verified_json,c.consumed_at_ms,
+                        (SELECT count(*) FROM automatic_pr_rules)
+                 FROM pr_hook_candidates c WHERE c.id=?1",
+                [claimed.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(candidate_state, "ambiguous");
+        assert!(verified.is_none());
+        assert!(consumed.is_none());
+        assert_eq!(registrations, 0);
     }
 
     #[test]

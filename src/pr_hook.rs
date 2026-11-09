@@ -304,11 +304,9 @@ fn parse_mcp_candidate(event: &Value) -> Option<PrCandidate> {
         return None;
     }
 
-    let mut candidates = Vec::new();
-    if let Some(snapshot) = response.get("structuredContent")
-        && let Some(candidate) = parse_pr_snapshot(snapshot, expected_repo)
-    {
-        candidates.push(candidate);
+    let mut snapshots = Vec::new();
+    if let Some(snapshot) = response.get("structuredContent") {
+        snapshots.push(snapshot.clone());
     }
     if let Some(content) = response.get("content").and_then(Value::as_array) {
         for text in content.iter().filter_map(|item| {
@@ -316,21 +314,37 @@ fn parse_mcp_candidate(event: &Value) -> Option<PrCandidate> {
                 .then(|| item.get("text")?.as_str())
                 .flatten()
         }) {
-            if let Ok(snapshot) = serde_json::from_str::<Value>(text)
-                && let Some(candidate) = parse_pr_snapshot(&snapshot, expected_repo)
-            {
-                candidates.push(candidate);
+            if let Ok(snapshot) = serde_json::from_str::<Value>(text) {
+                snapshots.push(snapshot);
             }
         }
     }
+    let candidates: Vec<_> = snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.get("number").is_some()
+                || snapshot.get("html_url").is_some()
+                || snapshot.get("url").is_some()
+        })
+        .map(parse_pr_snapshot_identity)
+        .collect::<Option<Vec<_>>>()?;
     let first = candidates.first()?.clone();
     candidates
         .iter()
-        .all(|candidate| candidate == &first)
+        .all(|candidate| {
+            candidate == &first
+                && repository_from_url(&candidate.url)
+                    .is_some_and(|repo| same_repo(expected_repo, &repo))
+        })
         .then_some(first)
 }
 
 fn parse_pr_snapshot(snapshot: &Value, expected_repo: &str) -> Option<PrCandidate> {
+    let candidate = parse_pr_snapshot_identity(snapshot)?;
+    same_repo(expected_repo, &repository_from_url(&candidate.url)?).then_some(candidate)
+}
+
+fn parse_pr_snapshot_identity(snapshot: &Value) -> Option<PrCandidate> {
     let snapshot = snapshot.as_object()?;
     let number = snapshot.get("number")?.as_u64()?;
     let url = snapshot
@@ -338,8 +352,7 @@ fn parse_pr_snapshot(snapshot: &Value, expected_repo: &str) -> Option<PrCandidat
         .or_else(|| snapshot.get("url"))?
         .as_str()?;
     let candidate = parse_github_pr_url(url)?;
-    (candidate.number == number && same_repo(expected_repo, &repository_from_url(url)?))
-        .then_some(candidate)
+    (candidate.number == number).then_some(candidate)
 }
 
 fn parse_github_pr_url(url: &str) -> Option<PrCandidate> {
@@ -899,6 +912,18 @@ mod tests {
             "content": [{"type":"text","text":"{\"number\":43,\"html_url\":\"https://github.com/acme/widget/pull/43\"}"}]
         }));
         assert!(parse_pr_candidate(&conflict).is_none());
+
+        let inconsistent_secondary = mcp(json!({
+            "structuredContent": {"number":42,"html_url":url},
+            "content": [{"type":"text","text":"{\"number\":43,\"html_url\":\"https://github.com/acme/widget/pull/44\"}"}]
+        }));
+        assert!(parse_pr_candidate(&inconsistent_secondary).is_none());
+
+        let foreign_secondary = mcp(json!({
+            "structuredContent": {"number":42,"html_url":url},
+            "content": [{"type":"text","text":"{\"number\":42,\"html_url\":\"https://github.com/other/repo/pull/42\"}"}]
+        }));
+        assert!(parse_pr_candidate(&foreign_secondary).is_none());
 
         let prose = mcp(json!({
             "content": [{"type":"text","text":"Created PR: https://github.com/acme/widget/pull/42"}]

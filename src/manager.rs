@@ -178,6 +178,7 @@ pub(crate) fn source_digest() -> String {
     for source in [
         include_bytes!("main.rs").as_slice(),
         include_bytes!("manager.rs").as_slice(),
+        include_bytes!("lib.rs").as_slice(),
         include_bytes!("coordination_view.rs").as_slice(),
         include_bytes!("conditions.rs").as_slice(),
         include_bytes!("condition_alerts.rs").as_slice(),
@@ -192,6 +193,12 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("templates.rs").as_slice(),
         include_bytes!("execution.rs").as_slice(),
         include_bytes!("rules.rs").as_slice(),
+        include_bytes!("pr_ci.rs").as_slice(),
+        include_bytes!("pr_ci_runtime.rs").as_slice(),
+        include_bytes!("pr_notifications.rs").as_slice(),
+        include_bytes!("pr_hook.rs").as_slice(),
+        include_bytes!("pr_observation.rs").as_slice(),
+        include_bytes!("pr_registration.rs").as_slice(),
         include_bytes!("uninstall.rs").as_slice(),
         include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("observability.rs").as_slice(),
@@ -951,6 +958,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
         "delivery",
         "pr-ci",
         "pr-ci-delivery",
+        "native-wake-recovery",
         "pr-registration",
     ] {
         let poll_config = config.clone();
@@ -1033,6 +1041,68 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                     )
                                 },
                             )?;
+                        }
+                        "native-wake-recovery" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
+                                &db,
+                                now,
+                                |thread| {
+                                    let deadline =
+                                        std::time::Instant::now() + Duration::from_secs(15);
+                                    let remaining = || {
+                                        deadline
+                                            .checked_duration_since(std::time::Instant::now())
+                                            .filter(|timeout| !timeout.is_zero())
+                                            .context("Native wake recovery deadline expired")
+                                    };
+                                    let read = crate::goals::rpc_with_timeout(
+                                        &poll_config.codex,
+                                        "thread/read",
+                                        serde_json::json!({
+                                            "threadId": thread,
+                                            "includeTurns": false
+                                        }),
+                                        remaining()?,
+                                    )?;
+                                    let status = read
+                                        .pointer("/thread/status/type")
+                                        .and_then(serde_json::Value::as_str)
+                                        .context("Thread read response has no status")?;
+                                    match status {
+                                        "notLoaded" => {
+                                            crate::goals::rpc_with_timeout(
+                                                &poll_config.codex,
+                                                "thread/resume",
+                                                serde_json::json!({
+                                                    "threadId": thread,
+                                                    "excludeTurns": true
+                                                }),
+                                                remaining()?,
+                                            )?;
+                                            Ok(())
+                                        }
+                                        "idle" | "active" => Ok(()),
+                                        other => bail!(
+                                            "Cannot recover queued input for thread status {other}"
+                                        ),
+                                    }
+                                },
+                            )?;
+                            if recovered > 0 {
+                                crate::observability::emit(
+                                    "native_wake.recovery",
+                                    "ok",
+                                    "resumed",
+                                    None,
+                                    Duration::ZERO,
+                                    recovered as u64,
+                                );
+                            }
                         }
                         "pr-registration" => {
                             let now = i64::try_from(

@@ -29,12 +29,14 @@ mod uninstall;
 mod validation_obligations;
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, Mac};
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
     tool_router,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     env,
@@ -491,21 +493,105 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     Ok(db)
 }
 
+fn verify_webhook_signature(config: &manager::Config, raw: &[u8], signature: &str) -> Result<()> {
+    let signature = signature
+        .strip_prefix("sha256=")
+        .context("Webhook signature header must use sha256")?;
+    anyhow::ensure!(
+        signature.len() == 64 && signature.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid webhook signature encoding"
+    );
+    let supplied = (0..32)
+        .map(|index| u8::from_str_radix(&signature[index * 2..index * 2 + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let secret_path = config.config.join("webhook.secret");
+    let owner = fs::metadata("/proc/self")?.uid();
+    let directory = fs::symlink_metadata(&config.config)?;
+    anyhow::ensure!(
+        directory.is_dir()
+            && directory.uid() == owner
+            && directory.permissions().mode() & 0o077 == 0,
+        "Webhook secret directory is not private"
+    );
+    let metadata = fs::symlink_metadata(&secret_path)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.uid() == owner && metadata.permissions().mode() & 0o077 == 0,
+        "Webhook secret must be a private file owned by this user"
+    );
+    let secret = fs::read_to_string(secret_path)?.trim().to_owned();
+    anyhow::ensure!(!secret.is_empty(), "Webhook secret is empty");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+    mac.update(raw);
+    mac.verify_slice(&supplied)
+        .context("Webhook signature does not match payload")
+}
+
+fn capture_authenticated_pr_notification(
+    db: &rusqlite::Connection,
+    event: &str,
+    payload: &Value,
+) -> Result<usize> {
+    let is_supported = (event == "pull_request"
+        && matches!(payload["action"].as_str(), Some("closed" | "reopened")))
+        || (event == "pull_request_review" && payload["action"] == "submitted");
+    if is_supported {
+        polling::pr_notifications::accept_authenticated_webhook(db, event, payload)
+    } else {
+        Ok(0)
+    }
+}
+
 fn recover(config: &manager::Config) -> Result<usize> {
+    recover_with_queue(config, |thread, message, id, resume| {
+        execution::queue_with_identity(
+            &config.codex,
+            thread,
+            message,
+            id,
+            resume,
+            Duration::from_secs(120),
+        )
+    })
+}
+
+fn recover_with_queue(
+    config: &manager::Config,
+    mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
     let mut db = database(config)?;
-    Ok(
-        bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + dispatch_conditions(&db, &config.codex)?
-            + obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + obligations::dispatch_coordinator_alerts(
-                &mut db,
-                &config.codex,
-                Duration::from_secs(30),
-            )?
-            + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
-    )
+    polling::pr_notifications::initialize(&db)?;
+    codex_wake::pr_ci::initialize(&db)?;
+    let mut attempted = bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + dispatch_conditions(&db, &config.codex)?
+        + obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + obligations::dispatch_coordinator_alerts(
+            &mut db,
+            &config.codex,
+            Duration::from_secs(30),
+        )?
+        + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?;
+    attempted +=
+        polling::pr_notifications::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    attempted += codex_wake::pr_ci_runtime::dispatch(&mut db, now, |delivery, message| {
+        let run = delivery.run_id.to_string();
+        let attempt = delivery.attempt.to_string();
+        let key = delivery_evidence::source_fields_identity(
+            "github.workflow_run.completed",
+            &[&delivery.repo, &run, &attempt],
+        )?;
+        let evidence_db = bridge::connect(&config.db)?;
+        let (id, _) = delivery_evidence::begin(&evidence_db, &key, &delivery.thread, true)?;
+        queue(&delivery.thread, message, &id, true)
+    })?
+    .claimed;
+    Ok(attempted)
 }
 
 pub(crate) fn dispatch_conditions(
@@ -2772,9 +2858,18 @@ async fn run_command(
             let mut raw = Vec::new();
             reader.take(1024 * 1024 + 1).read_to_end(&mut raw)?;
             anyhow::ensure!(raw.len() <= 1024 * 1024, "Payload exceeds 1 MiB");
+            let (payload, authenticated_webhook) = match env::var("CODEX_WAKE_SIGNATURE") {
+                Ok(signature) => (verified_webhook_payload(&config, &raw, &signature)?, true),
+                Err(env::VarError::NotPresent) => (serde_json::from_slice(&raw)?, false),
+                Err(error) => return Err(error.into()),
+            };
             let db = database(&config)?;
-            let payload: Value = serde_json::from_slice(&raw)?;
             let matched_rules = rules::accept(&db, &event, &payload)?;
+            let automatic_pr_notifications = if authenticated_webhook {
+                capture_authenticated_pr_notification(&db, &event, &payload)?
+            } else {
+                0
+            };
             let result = if event == "workflow_run" {
                 json!(bridge::accept(&db, &payload)?)
             } else if matches!(
@@ -2789,7 +2884,10 @@ async fn run_command(
             if env::var("CODEX_WAKE_DEFER").as_deref() != Ok("1") {
                 recover(&config)?;
             }
-            println!("{}", json!({"result":result,"matched_rules":matched_rules}));
+            println!(
+                "{}",
+                json!({"result":result,"matched_rules":matched_rules,"automatic_pr_notifications":automatic_pr_notifications})
+            );
         }
         "status" | "subscriptions" | "recover" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
@@ -2812,6 +2910,119 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn webhook_signature_verification_binds_the_exact_raw_body() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config_dir = root.join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state: root.join("state"),
+            runtime: root.join("runtime"),
+            config: config_dir,
+            unit: root.join("unit"),
+            db: root.join("state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: true,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let secret = manager::load_secret(&config.config.join("webhook.secret")).unwrap();
+        let body = br#"{"action":"closed"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let signature = format!("sha256={:x}", mac.finalize().into_bytes());
+
+        assert!(verify_webhook_signature(&config, body, &signature).is_ok());
+        assert!(
+            verify_webhook_signature(&config, br#"{"action":"reopened"}"#, &signature).is_err()
+        );
+    }
+
+    #[test]
+    fn signed_reopened_webhook_uses_durable_cycle_and_deduplicates_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config_dir = root.join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state: root.join("state"),
+            runtime: root.join("runtime"),
+            config: config_dir,
+            unit: root.join("unit"),
+            db: root.join("state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: true,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let secret = manager::load_secret(&config.config.join("webhook.secret")).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        polling::pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread)
+            .unwrap();
+        let events = [
+            (
+                "closed",
+                json!({
+                    "action":"closed","number":7,
+                    "repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"merged":false,
+                        "closed_at":"2098-12-31T23:59:00Z"}
+                }),
+            ),
+            (
+                "reopened",
+                json!({
+                    "action":"reopened","number":7,
+                    "repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z"}
+                }),
+            ),
+        ];
+
+        for (action, payload) in &events {
+            let raw = serde_json::to_vec(payload).unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+            mac.update(&raw);
+            let signature = format!("sha256={:x}", mac.finalize().into_bytes());
+            verify_webhook_signature(&config, &raw, &signature).unwrap();
+            let parsed: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(
+                capture_authenticated_pr_notification(&db, "pull_request", &parsed).unwrap(),
+                1,
+                "signed {action} webhook should enqueue once"
+            );
+            if *action == "reopened" {
+                verify_webhook_signature(&config, &raw, &signature).unwrap();
+                let replay: Value = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    capture_authenticated_pr_notification(&db, "pull_request", &replay).unwrap(),
+                    0
+                );
+            }
+        }
+        let notices = polling::pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 2);
+        let reopened = notices
+            .iter()
+            .find(|notification| notification.event == "reopened")
+            .unwrap();
+        assert_eq!(reopened.event_key, "reopened:1");
+    }
 
     #[test]
     fn synthetic_turn_completion_and_stop_share_claim_only_with_a_common_turn_id() {
@@ -5172,6 +5383,66 @@ mod pr_hook_registration_integration_tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn recover_dispatches_pending_pr_ci_delivery_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state,
+            runtime: root.join("runtime"),
+            config: root.join("config"),
+            unit: root.join("unit"),
+            db: root.join("state/state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: false,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let db = database(&config).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',7,1,?1,'failure','{}')",
+            [thread],
+        )
+        .unwrap();
+        drop(db);
+
+        let mut delivered = Vec::new();
+        let first_attempts = recover_with_queue(&config, |thread, message, id, resume| {
+            delivered.push((thread.to_owned(), message.to_owned(), id.to_owned(), resume));
+            Ok(("queued".into(), None))
+        })
+        .unwrap();
+        let second_attempts = recover_with_queue(&config, |thread, message, id, resume| {
+            delivered.push((thread.to_owned(), message.to_owned(), id.to_owned(), resume));
+            Ok(("queued".into(), None))
+        })
+        .unwrap();
+
+        assert_eq!(first_attempts, 1);
+        assert_eq!(second_attempts, 0);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, thread);
+        assert!(delivered[0].1.contains("owner/repo#42"));
+        assert!(!delivered[0].2.is_empty());
+        assert!(delivered[0].3);
+        let db = bridge::connect(&config.db).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM pr_ci_deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "delivered");
     }
 }
 

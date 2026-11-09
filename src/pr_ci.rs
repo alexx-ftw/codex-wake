@@ -4,7 +4,7 @@
 //! transport, then delivers rows claimed by [`claim_deliveries`]. This state
 //! is independent of the exact-run `waits` table.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +17,7 @@ const MAX_BACKOFF_MS: i64 = 3_600_000;
 const RUNS_PER_PAGE: usize = 100;
 const MAX_RUN_PAGES: usize = 10;
 const MAX_RECORDED_ATTEMPT_GAP: i64 = 50;
+const DELIVERY_RETRY_DELAY_MS: i64 = 5_000;
 const TRACKERS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_trackers (
     repo TEXT NOT NULL, pull_number INTEGER NOT NULL, thread TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
@@ -116,6 +117,14 @@ pub fn initialize(db: &Connection) -> Result<()> {
         );",
     )?;
     db.execute_batch(DELIVERIES_SCHEMA)?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pr_ci_delivery_retry_after (
+            delivery_id INTEGER PRIMARY KEY,
+            available_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS pr_ci_delivery_retry_due
+            ON pr_ci_delivery_retry_after(available_at_ms,delivery_id);",
+    )?;
     db.execute_batch(CLOSED_TRACKERS_SCHEMA)?;
     db.execute_batch(REOPEN_EVENTS_SCHEMA)?;
     db.execute_batch(PR_OBSERVATIONS_SCHEMA)?;
@@ -587,11 +596,18 @@ where
         .filter(|sha| valid_sha(sha))
         .context("Invalid PR head SHA")?
         .to_ascii_lowercase();
-    let head_repo = pull
-        .pointer("/head/repo/full_name")
-        .and_then(Value::as_str)
-        .context("Fork source repository is unavailable")?;
-    ensure!(valid_repo(head_repo), "Invalid PR head repository");
+    match pull.pointer("/head/repo") {
+        Some(Value::Null) | None => {}
+        Some(Value::Object(head_repo)) => {
+            if let Some(full_name) = head_repo.get("full_name") {
+                if !full_name.is_null() {
+                    let full_name = full_name.as_str().context("Invalid PR head repository")?;
+                    ensure!(valid_repo(full_name), "Invalid PR head repository");
+                }
+            }
+        }
+        Some(_) => bail!("Invalid PR head repository"),
+    }
     if old_sha.is_none_or(|old| !same_sha(old, &sha)) {
         db.execute(
             "UPDATE pr_ci_trackers SET head_sha=?1 WHERE repo=?2 AND pull_number=?3",
@@ -908,9 +924,13 @@ pub fn claim_deliveries(
     )?;
     let ids = {
         let mut stmt = tx.prepare(
-            "SELECT id FROM pr_ci_deliveries WHERE state='pending' ORDER BY id LIMIT ?1",
+            "SELECT delivery.id FROM pr_ci_deliveries AS delivery
+             WHERE delivery.state='pending' AND NOT EXISTS(
+                 SELECT 1 FROM pr_ci_delivery_retry_after AS retry
+                 WHERE retry.delivery_id=delivery.id AND retry.available_at_ms>?1)
+             ORDER BY delivery.id LIMIT ?2",
         )?;
-        stmt.query_map([limit as i64], |row| row.get::<_, i64>(0))?
+        stmt.query_map(params![now_ms, limit as i64], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut deliveries = Vec::with_capacity(ids.len());
@@ -939,6 +959,10 @@ pub fn claim_deliveries(
         if changed != 1 {
             continue;
         }
+        tx.execute(
+            "DELETE FROM pr_ci_delivery_retry_after WHERE delivery_id=?1",
+            [id],
+        )?;
         deliveries.push(Delivery {
             id,
             thread: row.0,
@@ -967,13 +991,24 @@ pub fn ack_delivery(db: &Connection, id: i64) -> Result<bool> {
 }
 
 /// Return an unaccepted claim to the durable queue immediately.
-pub fn retry_delivery(db: &Connection, id: i64) -> Result<bool> {
+pub fn retry_delivery(db: &Connection, id: i64, now_ms: i64) -> Result<bool> {
     initialize(db)?;
-    Ok(db.execute(
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
         "UPDATE pr_ci_deliveries SET state='pending',lease_until_ms=NULL
          WHERE id=?1 AND state='claimed'",
         [id],
-    )? == 1)
+    )?;
+    if changed == 1 {
+        tx.execute(
+            "INSERT INTO pr_ci_delivery_retry_after(delivery_id,available_at_ms)
+             VALUES(?1,?2)
+             ON CONFLICT(delivery_id) DO UPDATE SET available_at_ms=excluded.available_at_ms",
+            params![id, now_ms.saturating_add(DELIVERY_RETRY_DELAY_MS)],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed == 1)
 }
 
 /// Keep a claimed delivery out of automatic retries when its send outcome is
@@ -1947,5 +1982,38 @@ mod tests {
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap();
         assert!((60_100..=60_100 + elapsed).contains(&next));
         assert_eq!(backoff, 120_000);
+    }
+
+    #[test]
+    fn missing_fork_repository_name_does_not_block_sha_verified_run_polling() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                let mut pr = pull(7, "open", SHA);
+                pr["head"]["repo"] = Value::Null;
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pr,
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":1,"workflow_runs":[run(7,SHA,95,1,"success")]}),
+                })
+            }
+        };
+
+        let report = poll(&db, 1_000, response).unwrap();
+        assert_eq!((report.errors.len(), report.queued), (0, 1));
+        let source_repo: Option<String> = db
+            .query_row(
+                "SELECT json_extract(source_json,'$.head_repository.full_name')
+                 FROM pr_ci_runs WHERE run_id=95",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_repo.as_deref(), Some(HEAD_REPO));
     }
 }
