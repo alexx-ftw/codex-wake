@@ -248,26 +248,11 @@ fn observe_pull_request_state_tx(
             "DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2",
             params![repo, number],
         )?;
-    } else {
-        let pending_runs: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pr_ci_runs
-             WHERE repo=?1 AND pull_number=?2 AND status!='completed')",
-            params![repo, number],
-            |row| row.get(0),
+        db.execute(
+            "UPDATE pr_ci_trackers SET updated_at_ms=?1
+             WHERE repo=?2 AND pull_number=?3 AND active=1",
+            params![observed_at_ms, repo, number],
         )?;
-        if !pending_runs {
-            db.execute(
-                "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
-                 SELECT repo,pull_number,thread FROM pr_ci_trackers
-                 WHERE repo=?1 AND pull_number=?2 AND active=1",
-                params![repo, number],
-            )?;
-            db.execute(
-                "UPDATE pr_ci_trackers SET active=0,error=NULL,updated_at_ms=?1
-                 WHERE repo=?2 AND pull_number=?3 AND active=1",
-                params![observed_at_ms, repo, number],
-            )?;
-        }
     }
     Ok(true)
 }
@@ -365,34 +350,65 @@ where
             number,
             &thread,
             old_sha.as_deref(),
-            expected_updated_at,
             &mut fetch,
         );
         let elapsed_ms = i64::try_from(poll_started.elapsed().as_millis()).unwrap_or(i64::MAX);
         let finished_ms = now_ms.saturating_add(elapsed_ms);
         match poll_result {
-            Ok((discovered, queued, unlinked)) => {
+            Ok((discovered, queued, unlinked, is_closed)) => {
                 report.discovered += discovered;
                 report.queued += queued;
                 report.unlinked_runs += unlinked;
-                db.execute(
-                    "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,error=NULL,
-                     updated_at_ms=?2 WHERE repo=?3 AND pull_number=?4 AND thread=?5 AND active=1",
-                    params![
-                        schedule_after_completion_ms(now_ms, elapsed_ms, POLL_MS),
-                        finished_ms,
-                        repo,
-                        number,
-                        thread
-                    ],
+                let tx = db.unchecked_transaction()?;
+                let tracker_current: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pr_ci_trackers
+                     WHERE repo=?1 AND pull_number=?2 AND thread=?3 AND active=1
+                       AND updated_at_ms=?4)",
+                    params![repo, number, thread, expected_updated_at],
+                    |row| row.get(0),
                 )?;
+                let pending_runs: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pr_ci_runs
+                     WHERE repo=?1 AND pull_number=?2 AND status!='completed')",
+                    params![repo, number],
+                    |row| row.get(0),
+                )?;
+                if tracker_current && is_closed && !pending_runs {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
+                         VALUES(?1,?2,?3)",
+                        params![repo, number, thread],
+                    )?;
+                    tx.execute(
+                        "UPDATE pr_ci_trackers SET active=0,error=NULL,updated_at_ms=?1
+                         WHERE repo=?2 AND pull_number=?3 AND thread=?4 AND active=1
+                           AND updated_at_ms=?5",
+                        params![finished_ms, repo, number, thread, expected_updated_at],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,error=NULL,
+                         updated_at_ms=?2 WHERE repo=?3 AND pull_number=?4 AND thread=?5
+                           AND active=1 AND updated_at_ms=?6",
+                        params![
+                            schedule_after_completion_ms(now_ms, elapsed_ms, POLL_MS),
+                            finished_ms,
+                            repo,
+                            number,
+                            thread,
+                            expected_updated_at
+                        ],
+                    )?;
+                }
+                tx.commit()?;
             }
             Err(_) => {
                 let delay = backoff.clamp(60_000, MAX_BACKOFF_MS);
                 let next = delay.saturating_mul(2).min(MAX_BACKOFF_MS);
                 db.execute(
                     "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=?2,error=?3,
-                     updated_at_ms=?4 WHERE repo=?5 AND pull_number=?6 AND thread=?7 AND active=1",
+                     updated_at_ms=?4 WHERE repo=?5 AND pull_number=?6 AND thread=?7
+                       AND active=1 AND updated_at_ms=?8",
                     params![
                         schedule_after_completion_ms(now_ms, elapsed_ms, delay),
                         next,
@@ -400,7 +416,8 @@ where
                         finished_ms,
                         repo,
                         number,
-                        thread
+                        thread,
+                        expected_updated_at
                     ],
                 )?;
                 report
@@ -425,9 +442,8 @@ fn poll_one<F>(
     number: i64,
     thread: &str,
     old_sha: Option<&str>,
-    expected_updated_at: i64,
     fetch: &mut F,
-) -> Result<(usize, usize, usize)>
+) -> Result<(usize, usize, usize, bool)>
 where
     F: FnMut(&str) -> Result<ApiResponse>,
 {
@@ -519,7 +535,7 @@ where
         |row| row.get(0),
     )?;
     if !still_active {
-        return Ok((0, 0, 0));
+        return Ok((0, 0, 0, false));
     }
     let mut discovered = 0;
     let mut queued = 0;
@@ -615,7 +631,7 @@ where
             process_run_attempt(db, now, identity, attempt_run, &mut discovered, &mut queued)?;
         }
     }
-    Ok((discovered, queued, unlinked))
+    Ok((discovered, queued, unlinked, pull["state"] == "closed"))
 }
 
 fn fetch_runs_for_sha<F>(repo: &str, sha: &str, fetch: &mut F) -> Result<Vec<Value>>
@@ -1352,6 +1368,7 @@ mod tests {
     fn closed_pr_remains_tracked_and_picks_up_ci_after_reopen() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 1).unwrap());
         let mut response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 return Ok(ApiResponse {
@@ -1381,7 +1398,7 @@ mod tests {
             }
         };
 
-        assert_eq!(poll(&db, 1, pending_response).unwrap().queued, 0);
+        assert_eq!(poll(&db, 2, pending_response).unwrap().queued, 0);
         assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
         let active_with_pending: i64 = db
             .query_row(
@@ -1394,7 +1411,7 @@ mod tests {
 
         db.execute("UPDATE pr_ci_trackers SET next_poll_ms=0", [])
             .unwrap();
-        assert_eq!(poll(&db, 2, &mut response).unwrap().queued, 1);
+        assert_eq!(poll(&db, 3, &mut response).unwrap().queued, 1);
         assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 20).unwrap());
         let (active_after_close, deliveries): (i64, i64) = db
             .query_row(
@@ -1443,6 +1460,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!((active, reopened_deliveries), (1, 1));
+    }
+
+    #[test]
+    fn closed_pr_is_paused_only_after_successful_ci_scan_discovers_runs() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        let mut pending = run(7, SHA, 88, 1, "success");
+        pending["status"] = json!("in_progress");
+        pending["conclusion"] = Value::Null;
+        let response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":1,"workflow_runs":[pending.clone()]}),
+                })
+            }
+        };
+
+        assert_eq!(poll(&db, 20, response).unwrap().queued, 0);
+        let (active, runs): (i64, i64) = db
+            .query_row(
+                "SELECT (SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7),
+                        (SELECT count(*) FROM pr_ci_runs WHERE run_id=88 AND status='in_progress')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, runs), (1, 1));
+    }
+
+    #[test]
+    fn old_poll_does_not_overwrite_immediate_reopen_schedule() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let mut reopened = false;
+        let response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                if !reopened {
+                    reopened = true;
+                    observe_pull_request_state_in(&db, "owner/project", "7", "open", 200)?;
+                }
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":0,"workflow_runs":[]}),
+                })
+            }
+        };
+
+        assert_eq!(poll(&db, 100, response).unwrap().checked, 1);
+        let (active, next_poll, updated): (i64, i64, i64) = db
+            .query_row(
+                "SELECT active,next_poll_ms,updated_at_ms FROM pr_ci_trackers
+                 WHERE repo='owner/project' AND pull_number=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((active, next_poll, updated), (1, 0, 200));
+    }
+
+    #[test]
+    fn unregister_after_auto_pause_stays_inactive_when_pr_reopens() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        let response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":0,"workflow_runs":[]}),
+                })
+            }
+        };
+        poll(&db, 20, response).unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        assert!(unregister(&db, "owner/project", "7", THREAD).unwrap());
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "open", 30).unwrap());
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
     }
 
     #[test]
