@@ -112,11 +112,13 @@ jq -Rsc '[
     ] as $rules | . as $message | [$rules[] | . as $rule | select($message | contains($rule[1])) | $rule[0]]'
 }
 diagnose() {
-  local state_json gate_json health_json codes phase matches expected actual unit_pid event_pid delivery_json
+  local state_json gate_json health_json codes phase matches expected actual unit_pid event_pid delivery_json process_state
   state_json=$(ctl show codex-wake.service -p LoadState -p ActiveState -p SubState -p MainPID -p Result -p ExecMainCode -p ExecMainStatus |
     jq -Rn '[inputs | split("=") | {(.[0]):.[1]}] | add') || state_json='{}'
   unit_pid=$(jq -r '.MainPID // "0"' <<< "$state_json")
   [[ $unit_pid =~ ^[0-9]+$ ]] || unit_pid=0
+  process_state=$(sed -n 's/^State:[[:space:]]*\([RSDZTtXI]\).*/\1/p' "/proc/$unit_pid/status" 2>/dev/null) || process_state=''
+  state_json=$(jq --arg state "$process_state" '. + {ProcessState:$state}' <<< "$state_json")
   event_pid=$unit_pid
   if [[ $event_pid == 0 ]]; then
     event_pid=$(sqlite3 -readonly "$state/telemetry.sqlite3" "SELECT pid FROM events WHERE operation='cli.receiver' ORDER BY at_ms DESC,rowid DESC LIMIT 1;" 2>/dev/null) || event_pid=0
@@ -289,13 +291,15 @@ if [[ $1 == --user && $2 == start ]]; then
 fi
 WRAPPER
 chmod 700 "$root/commands/systemctl"
-PATH="$root/commands:/usr/bin:/bin" "$root/third" ensure > /dev/null 2>&1 & upgrader=$!
-for ((i=0;i<300;i++)); do
+PATH="$root/commands:/usr/bin:/bin" "$root/third" ensure > /dev/null 2> "$root/upgrade-error" & upgrader=$!
+stopped=$upgrader
+for ((i=0;i<600;i++)); do
   [[ -f $root/coordinator-paused && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open || ":" || (receiver_pid IS NOT NULL) FROM wake_delivery_claim_gate') == 3:0:1 ]] && break
+  kill -0 "$upgrader"
   sleep .05
 done
 [[ -f $root/coordinator-paused && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open || ":" || (receiver_pid IS NOT NULL) FROM wake_delivery_claim_gate') == 3:0:1 ]]
-kill -KILL "$upgrader"; wait "$upgrader" 2>/dev/null || true; upgrader=
+kill -KILL "$upgrader"; wait "$upgrader" 2>/dev/null || true; upgrader=''; stopped=''
 journal_hash=$(sha256sum "$journal")
 if "$root/third" ensure > /dev/null 2>&1; then exit 1; fi
 [[ $journal_hash == "$(sha256sum "$journal")" && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open FROM wake_delivery_claim_gate') == 3:0 ]]
