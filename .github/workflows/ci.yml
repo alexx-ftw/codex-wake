@@ -25,11 +25,16 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: sleep 20
       - name: Obtain verified receiver for HTTP tests
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p .tools
-          curl --fail --location --max-time 60 --retry 3 --retry-all-errors --retry-max-time 90 --silent --show-error \
+          if ! curl --fail --location --max-time 60 --retry 3 --retry-all-errors --retry-max-time 90 --silent --show-error \
             --output .tools/webhook.tar.gz \
-            https://github.com/adnanh/webhook/releases/download/2.8.3/webhook-linux-amd64.tar.gz
+            https://github.com/adnanh/webhook/releases/download/2.8.3/webhook-linux-amd64.tar.gz; then
+            gh api -H 'Accept: application/octet-stream' \
+              repos/adnanh/webhook/releases/assets/355024982 > .tools/webhook.tar.gz
+          fi
           printf '%s  %s\n' \
             3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b \
             .tools/webhook.tar.gz | sha256sum --check
