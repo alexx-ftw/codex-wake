@@ -47,6 +47,11 @@ const PR_OBSERVATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_pr_observ
     observed_at_ms INTEGER NOT NULL,
     PRIMARY KEY(repo,pull_number)
 );";
+const TRACKER_GENERATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_tracker_generations (
+    repo TEXT NOT NULL, pull_number INTEGER NOT NULL, thread TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0, closed_sweep_generation INTEGER,
+    PRIMARY KEY(repo,pull_number,thread)
+);";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Delivery {
@@ -114,6 +119,12 @@ pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(CLOSED_TRACKERS_SCHEMA)?;
     db.execute_batch(REOPEN_EVENTS_SCHEMA)?;
     db.execute_batch(PR_OBSERVATIONS_SCHEMA)?;
+    db.execute_batch(TRACKER_GENERATIONS_SCHEMA)?;
+    db.execute(
+        "INSERT OR IGNORE INTO pr_ci_tracker_generations(repo,pull_number,thread)
+         SELECT repo,pull_number,thread FROM pr_ci_trackers",
+        [],
+    )?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS pr_ci_due ON pr_ci_trackers(active,next_poll_ms);
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_queue ON pr_ci_deliveries(state,id);
@@ -159,6 +170,17 @@ pub fn register_in(db: &Connection, repo: &str, number: &str, thread: &str) -> R
          WHERE repo=?1 AND pull_number=?2 AND thread=?3",
         params![repo, number, thread],
     )?;
+    db.execute(
+        "INSERT OR IGNORE INTO pr_ci_tracker_generations(repo,pull_number,thread)
+         VALUES(?1,?2,?3)",
+        params![repo, number, thread],
+    )?;
+    db.execute(
+        "UPDATE pr_ci_tracker_generations SET generation=generation+1,
+             closed_sweep_generation=NULL
+         WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+        params![repo, number, thread],
+    )?;
     Ok(inserted)
 }
 
@@ -179,15 +201,21 @@ pub fn unregister(db: &Connection, repo: &str, number: &str, thread: &str) -> Re
          WHERE repo=?1 AND pull_number=?2 AND thread=?3",
         params![repo, number, thread],
     )?;
+    tx.execute(
+        "UPDATE pr_ci_tracker_generations SET generation=generation+1,
+             closed_sweep_generation=NULL
+         WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+        params![repo, number, thread],
+    )?;
     tx.commit()?;
     Ok(changed != 0 || cleared_auto_close != 0)
 }
 
 /// Apply the latest validated PR state from the ordinary PR poller.
 /// `observed_at_ms` orders concurrent responses so a late stale `closed`
-/// snapshot cannot overwrite a newer `open` observation. Closed PRs stay
-/// active while any observed Actions run is nonterminal. A completed closed PR
-/// is paused with a marker that an explicit `unregister` removes.
+/// snapshot cannot overwrite a newer `open` observation. This PR-poller-owned
+/// reconciliation pauses a closed PR only after CI records a successful sweep
+/// for the current tracker generation and no observed run remains nonterminal.
 pub fn observe_pull_request_state_in(
     db: &Connection,
     repo: &str,
@@ -220,6 +248,13 @@ fn observe_pull_request_state_tx(
     state: &str,
     observed_at_ms: i64,
 ) -> Result<bool> {
+    let previous_state: Option<String> = db
+        .query_row(
+            "SELECT state FROM pr_ci_pr_observations WHERE repo=?1 AND pull_number=?2",
+            params![repo, number],
+            |row| row.get(0),
+        )
+        .optional()?;
     let observed = db.execute(
         "INSERT INTO pr_ci_pr_observations(repo,pull_number,state,observed_at_ms)
          VALUES(?1,?2,?3,?4)
@@ -231,13 +266,30 @@ fn observe_pull_request_state_tx(
         params![repo, number, state, observed_at_ms],
     )?;
     if observed == 0 {
-        return Ok(false);
+        let current_state: Option<String> = db
+            .query_row(
+                "SELECT state FROM pr_ci_pr_observations WHERE repo=?1 AND pull_number=?2",
+                params![repo, number],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_state.as_deref() != Some(state) {
+            return Ok(false);
+        }
+    }
+    if previous_state.as_deref() != Some(state) && observed != 0 {
+        db.execute(
+            "UPDATE pr_ci_tracker_generations SET generation=generation+1,
+                 closed_sweep_generation=NULL
+             WHERE repo=?1 AND pull_number=?2",
+            params![repo, number],
+        )?;
     }
     if state == "open" {
         db.execute(
             "UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,
                  error=NULL,updated_at_ms=?1
-             WHERE repo=?2 AND pull_number=?3 AND EXISTS(
+             WHERE repo=?2 AND pull_number=?3 AND active=0 AND EXISTS(
                  SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
                  WHERE closed.repo=pr_ci_trackers.repo
                    AND closed.pull_number=pr_ci_trackers.pull_number
@@ -248,13 +300,51 @@ fn observe_pull_request_state_tx(
             "DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2",
             params![repo, number],
         )?;
-        db.execute(
-            "UPDATE pr_ci_trackers SET updated_at_ms=?1
-             WHERE repo=?2 AND pull_number=?3 AND active=1",
-            params![observed_at_ms, repo, number],
+    } else {
+        let pending_runs: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pr_ci_runs
+             WHERE repo=?1 AND pull_number=?2 AND status!='completed')",
+            params![repo, number],
+            |row| row.get(0),
         )?;
+        if !pending_runs {
+            db.execute(
+                "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
+                 SELECT tracker.repo,tracker.pull_number,tracker.thread
+                 FROM pr_ci_trackers AS tracker
+                 JOIN pr_ci_tracker_generations AS generation
+                   USING(repo,pull_number,thread)
+                 WHERE tracker.repo=?1 AND tracker.pull_number=?2 AND tracker.active=1
+                   AND generation.closed_sweep_generation=generation.generation",
+                params![repo, number],
+            )?;
+            db.execute(
+                "UPDATE pr_ci_tracker_generations SET generation=generation+1,
+                     closed_sweep_generation=NULL
+                 WHERE repo=?1 AND pull_number=?2 AND EXISTS(
+                   SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+                   WHERE closed.repo=pr_ci_tracker_generations.repo
+                     AND closed.pull_number=pr_ci_tracker_generations.pull_number
+                     AND closed.thread=pr_ci_tracker_generations.thread)
+                   AND EXISTS(SELECT 1 FROM pr_ci_trackers AS tracker
+                     WHERE tracker.repo=pr_ci_tracker_generations.repo
+                       AND tracker.pull_number=pr_ci_tracker_generations.pull_number
+                       AND tracker.thread=pr_ci_tracker_generations.thread
+                       AND tracker.active=1)",
+                params![repo, number],
+            )?;
+            db.execute(
+                "UPDATE pr_ci_trackers SET active=0,error=NULL,updated_at_ms=?1
+                 WHERE repo=?2 AND pull_number=?3 AND active=1 AND EXISTS(
+                   SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+                   WHERE closed.repo=pr_ci_trackers.repo
+                     AND closed.pull_number=pr_ci_trackers.pull_number
+                     AND closed.thread=pr_ci_trackers.thread)",
+                params![observed_at_ms, repo, number],
+            )?;
+        }
     }
-    Ok(true)
+    Ok(observed != 0)
 }
 
 /// Consume a durable `reopened` notification by its ID after inserting it into
@@ -320,13 +410,14 @@ where
 {
     let poll_started = Instant::now();
     initialize(db)?;
-    let mut stmt = db.prepare(
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let mut stmt = tx.prepare(
         "UPDATE pr_ci_trackers SET next_poll_ms=?1
          WHERE repo=(SELECT repo FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
            AND pull_number=(SELECT pull_number FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
            AND thread=(SELECT thread FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
            AND active=1 AND next_poll_ms<=?2
-         RETURNING repo,pull_number,thread,head_sha,backoff_ms,updated_at_ms",
+         RETURNING repo,pull_number,thread,head_sha,backoff_ms",
     )?;
     let trackers = stmt
         .query_map(params![now_ms.saturating_add(POLL_MS), now_ms], |row| {
@@ -336,12 +427,23 @@ where
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut trackers_with_generation = Vec::with_capacity(trackers.len());
+    for (repo, number, thread, old_sha, backoff) in trackers {
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM pr_ci_tracker_generations
+             WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+            params![repo, number, thread],
+            |row| row.get(0),
+        )?;
+        trackers_with_generation.push((repo, number, thread, old_sha, backoff, generation));
+    }
+    tx.commit()?;
     let mut report = PollReport::default();
-    for (repo, number, thread, old_sha, backoff, expected_updated_at) in trackers {
+    for (repo, number, thread, old_sha, backoff, expected_generation) in trackers_with_generation {
         report.checked += 1;
         let poll_result = poll_one(
             db,
@@ -359,12 +461,19 @@ where
                 report.discovered += discovered;
                 report.queued += queued;
                 report.unlinked_runs += unlinked;
-                let tx = db.unchecked_transaction()?;
+                let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
                 let tracker_current: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pr_ci_trackers
-                     WHERE repo=?1 AND pull_number=?2 AND thread=?3 AND active=1
-                       AND updated_at_ms=?4)",
-                    params![repo, number, thread, expected_updated_at],
+                    "SELECT EXISTS(SELECT 1 FROM pr_ci_trackers AS tracker
+                     JOIN pr_ci_tracker_generations AS generation USING(repo,pull_number,thread)
+                     WHERE tracker.repo=?1 AND tracker.pull_number=?2 AND tracker.thread=?3
+                       AND tracker.active=1 AND generation.generation=?4)",
+                    params![repo, number, thread, expected_generation],
+                    |row| row.get(0),
+                )?;
+                let observed_closed: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pr_ci_pr_observations
+                     WHERE repo=?1 AND pull_number=?2 AND state='closed')",
+                    params![repo, number],
                     |row| row.get(0),
                 )?;
                 let pending_runs: bool = tx.query_row(
@@ -373,33 +482,31 @@ where
                     params![repo, number],
                     |row| row.get(0),
                 )?;
-                if tracker_current && is_closed && !pending_runs {
+                if tracker_current && is_closed && observed_closed && !pending_runs {
                     tx.execute(
-                        "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
-                         VALUES(?1,?2,?3)",
-                        params![repo, number, thread],
-                    )?;
-                    tx.execute(
-                        "UPDATE pr_ci_trackers SET active=0,error=NULL,updated_at_ms=?1
-                         WHERE repo=?2 AND pull_number=?3 AND thread=?4 AND active=1
-                           AND updated_at_ms=?5",
-                        params![finished_ms, repo, number, thread, expected_updated_at],
-                    )?;
-                } else {
-                    tx.execute(
-                        "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,error=NULL,
-                         updated_at_ms=?2 WHERE repo=?3 AND pull_number=?4 AND thread=?5
-                           AND active=1 AND updated_at_ms=?6",
-                        params![
-                            schedule_after_completion_ms(now_ms, elapsed_ms, POLL_MS),
-                            finished_ms,
-                            repo,
-                            number,
-                            thread,
-                            expected_updated_at
-                        ],
+                        "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=?1
+                         WHERE repo=?2 AND pull_number=?3 AND thread=?4 AND generation=?1",
+                        params![expected_generation, repo, number, thread],
                     )?;
                 }
+                tx.execute(
+                    "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,error=NULL,
+                     updated_at_ms=?2 WHERE repo=?3 AND pull_number=?4 AND thread=?5
+                       AND active=1 AND EXISTS(
+                         SELECT 1 FROM pr_ci_tracker_generations AS generation
+                         WHERE generation.repo=pr_ci_trackers.repo
+                           AND generation.pull_number=pr_ci_trackers.pull_number
+                           AND generation.thread=pr_ci_trackers.thread
+                           AND generation.generation=?6)",
+                    params![
+                        schedule_after_completion_ms(now_ms, elapsed_ms, POLL_MS),
+                        finished_ms,
+                        repo,
+                        number,
+                        thread,
+                        expected_generation
+                    ],
+                )?;
                 tx.commit()?;
             }
             Err(_) => {
@@ -408,7 +515,12 @@ where
                 db.execute(
                     "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=?2,error=?3,
                      updated_at_ms=?4 WHERE repo=?5 AND pull_number=?6 AND thread=?7
-                       AND active=1 AND updated_at_ms=?8",
+                       AND active=1 AND EXISTS(
+                         SELECT 1 FROM pr_ci_tracker_generations AS generation
+                         WHERE generation.repo=pr_ci_trackers.repo
+                           AND generation.pull_number=pr_ci_trackers.pull_number
+                           AND generation.thread=pr_ci_trackers.thread
+                           AND generation.generation=?8)",
                     params![
                         schedule_after_completion_ms(now_ms, elapsed_ms, delay),
                         next,
@@ -417,7 +529,7 @@ where
                         repo,
                         number,
                         thread,
-                        expected_updated_at
+                        expected_generation
                     ],
                 )?;
                 report
@@ -1500,11 +1612,19 @@ mod tests {
     fn old_poll_does_not_overwrite_immediate_reopen_schedule() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 100).unwrap());
+        db.execute(
+            "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation
+             WHERE repo='owner/project' AND pull_number=7",
+            [],
+        )
+        .unwrap();
         let mut reopened = false;
         let response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 if !reopened {
                     reopened = true;
+                    observe_pull_request_state_in(&db, "owner/project", "7", "closed", 200)?;
                     observe_pull_request_state_in(&db, "owner/project", "7", "open", 200)?;
                 }
                 Ok(ApiResponse {
@@ -1520,15 +1640,15 @@ mod tests {
         };
 
         assert_eq!(poll(&db, 100, response).unwrap().checked, 1);
-        let (active, next_poll, updated): (i64, i64, i64) = db
+        let (active, next_poll): (i64, i64) = db
             .query_row(
-                "SELECT active,next_poll_ms,updated_at_ms FROM pr_ci_trackers
+                "SELECT active,next_poll_ms FROM pr_ci_trackers
                  WHERE repo='owner/project' AND pull_number=7",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((active, next_poll, updated), (1, 0, 200));
+        assert_eq!((active, next_poll), (1, 0));
     }
 
     #[test]
@@ -1550,6 +1670,7 @@ mod tests {
             }
         };
         poll(&db, 20, response).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 21).unwrap());
         let active: i64 = db
             .query_row(
                 "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
