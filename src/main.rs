@@ -631,11 +631,60 @@ fn recover_with_queue(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis(),
     )?;
-    attempted +=
-        codex_wake::pr_ci_runtime::dispatch(&mut db, now, |dispatch_db, delivery, message| {
+    attempted += dispatch_ci_with_queue(&mut db, config, now, &mut queue)?.claimed;
+    Ok(attempted)
+}
+
+pub(crate) fn dispatch_ci_with_queue(
+    db: &mut rusqlite::Connection,
+    config: &manager::Config,
+    now: i64,
+    mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
+) -> Result<codex_wake::pr_ci_runtime::DispatchReport> {
+    let mut ci_lock = None;
+    let mut ci_intent = None;
+    let ci_report =
+        codex_wake::pr_ci_runtime::dispatch(db, now, |dispatch_db, delivery, message| {
             let key = ci_delivery_event_identity(delivery)?;
             let id = prepare_ci_delivery_identity(&config.db, &key, &delivery.thread)?;
-            let (state, reason) = queue(&delivery.thread, message, &id, true)?;
+            ci_lock = Some(
+                codex_wake::pr_ci_runtime::try_native_wake_lock(dispatch_db, &id)
+                    .map_err(codex_wake::pr_ci_runtime::before_send_failure)?
+                    .ok_or_else(|| {
+                        codex_wake::pr_ci_runtime::before_send_failure(anyhow::anyhow!(
+                            "Native delivery lock is busy"
+                        ))
+                    })?,
+            );
+            let token = codex_wake::pr_ci_runtime::begin_native_wake_intent(
+                dispatch_db,
+                &delivery.thread,
+                &id,
+                codex_wake::pr_ci_runtime::NativeWakeOrigin::Ci { id: delivery.id },
+                now.saturating_add(codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS),
+            )
+            .map_err(|error| {
+                if codex_wake::pr_ci_runtime::native_wake_intent_exists(&error) {
+                    error
+                } else {
+                    codex_wake::pr_ci_runtime::before_send_failure(error)
+                }
+            })?;
+            ci_intent = Some((delivery.thread.clone(), token.clone()));
+            let (state, reason) = match queue(&delivery.thread, message, &id, true) {
+                Err(error) if execution::before_send_retry_reason(&error).is_some() => {
+                    return Err(codex_wake::pr_ci_runtime::before_send_failure_with_intent(
+                        error, &token,
+                    ));
+                }
+                other => other?,
+            };
+            if state == "ready" {
+                return Err(codex_wake::pr_ci_runtime::before_send_failure_with_intent(
+                    anyhow::anyhow!("Native delivery was not sent"),
+                    &token,
+                ));
+            }
             if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
                 codex_wake::pr_ci_runtime::record_native_wake_recovery(
                     dispatch_db,
@@ -645,9 +694,14 @@ fn recover_with_queue(
                 )?;
             }
             Ok((state, reason))
-        })?
-        .claimed;
-    Ok(attempted)
+        })?;
+    if ci_report.accepted > 0
+        && let Some((thread, token)) = ci_intent
+    {
+        codex_wake::pr_ci_runtime::finish_native_wake_intent(db, &thread, &token)?;
+    }
+    drop(ci_lock);
+    Ok(ci_report)
 }
 
 pub(crate) fn dispatch_conditions(
@@ -5603,6 +5657,59 @@ mod pr_hook_registration_integration_tests {
         let ids: Value = serde_json::from_str(&recovery.1).unwrap();
         assert_eq!(ids["client_ids"], json!([delivered[0].2.as_str()]));
         assert_eq!(ids["unattributed"], false);
+        db.execute("DELETE FROM native_wake_recovery", []).unwrap();
+        db.execute("INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',8,1,?1,'failure','{}')", [thread]).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_ci_recovery BEFORE UPDATE ON native_wake_recovery
+            BEGIN SELECT RAISE(ABORT,'recovery unavailable'); END;",
+        )
+        .unwrap();
+        let mut second_id = None;
+        recover_with_queue(&config, |_, _, id, _| {
+            second_id = Some(id.to_owned());
+            Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+        })
+        .unwrap();
+        assert!(second_id.is_some());
+        let state: String = db
+            .query_row(
+                "SELECT state FROM pr_ci_deliveries WHERE run_id=8",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+        db.execute_batch("DROP TRIGGER fail_ci_recovery").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(
+            codex_wake::pr_ci_runtime::recover_native_wake_intents(
+                &db,
+                now + codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS + 1,
+                |target, ids| {
+                    assert_eq!(target, thread);
+                    assert_eq!(ids, &[second_id.clone().unwrap()]);
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM pr_ci_deliveries WHERE run_id=8",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "delivered");
+        assert_eq!(
+            recover_with_queue(&config, |_, _, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
     }
 
     #[test]

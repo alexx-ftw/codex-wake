@@ -1279,10 +1279,45 @@ fn dispatch_with_clock(
     let mut attempted = 0;
     let mut attempted_ids = HashSet::new();
     for _ in 0..BATCH {
-        let Some(notification) = claim_next(db, now(), &attempted_ids)? else {
+        let claim_time = now();
+        let Some(notification) = claim_next(db, claim_time, &attempted_ids)? else {
             break;
         };
         attempted_ids.insert(notification.id.clone());
+        let lock = codex_wake::pr_ci_runtime::try_native_wake_lock(db, &notification.id);
+        let Ok(Some(_lock)) = lock else {
+            release_before_send_at(
+                db,
+                &notification.id,
+                claim_time.saturating_add(BEFORE_SEND_RETRY_MS),
+            )?;
+            attempted += 1;
+            continue;
+        };
+        let intent = match codex_wake::pr_ci_runtime::begin_native_wake_intent(
+            db,
+            &notification.thread,
+            &notification.id,
+            codex_wake::pr_ci_runtime::NativeWakeOrigin::Pr {
+                id: notification.id.clone(),
+            },
+            claim_time.saturating_add(codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS),
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                if codex_wake::pr_ci_runtime::native_wake_intent_exists(&error) {
+                    mark_uncertain(db, &notification.id)?;
+                } else {
+                    release_before_send_at(
+                        db,
+                        &notification.id,
+                        now().saturating_add(BEFORE_SEND_RETRY_MS),
+                    )?;
+                }
+                attempted += 1;
+                continue;
+            }
+        };
         let message = format!(
             "Automatic GitHub PR notification: {}#{} {}. Review: https://github.com/{}/pull/{}",
             notification.repo,
@@ -1293,25 +1328,39 @@ fn dispatch_with_clock(
         );
         match queue(&notification.thread, &message, &notification.id, true) {
             Ok((state, reason)) if state == "queued" => {
+                let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
                 if let Some(reason @ "native_queue_resume_warning") = reason.as_deref() {
                     codex_wake::pr_ci_runtime::record_native_wake_recovery(
-                        db,
+                        &tx,
                         &notification.thread,
                         reason,
                         &notification.id,
                     )?;
                 }
                 ensure!(
-                    mark_queued(db, &notification.id)?,
+                    mark_queued(&tx, &notification.id)?,
                     "Lost notification claim after queue acceptance"
                 );
+                codex_wake::pr_ci_runtime::finish_native_wake_intent(
+                    &tx,
+                    &notification.thread,
+                    &intent,
+                )?;
+                tx.commit()?;
             }
             Err(error) if crate::execution::before_send_retry_reason(&error).is_some() => {
                 let retry_after = now().saturating_add(BEFORE_SEND_RETRY_MS);
+                let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
                 ensure!(
-                    release_before_send_at(db, &notification.id, retry_after)?,
+                    release_before_send_at(&tx, &notification.id, retry_after)?,
                     "Lost notification claim before send"
                 );
+                codex_wake::pr_ci_runtime::finish_native_wake_intent(
+                    &tx,
+                    &notification.thread,
+                    &intent,
+                )?;
+                tx.commit()?;
             }
             _ => {
                 ensure!(
@@ -2483,6 +2532,115 @@ mod tests {
             0
         );
         assert_eq!(resend_count, 0);
+    }
+
+    #[test]
+    fn accepted_notification_survives_failed_ack_without_resend() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            "2099-01-01T00:00:00Z",
+            "close-ack-failure",
+            &json!({"action":"closed"}),
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_queued BEFORE UPDATE OF state ON automatic_pr_notifications
+            WHEN NEW.state='queued' BEGIN SELECT RAISE(ABORT,'ack failed'); END;",
+        )
+        .unwrap();
+        let mut sent = Vec::new();
+        let result = dispatch_with_clock(
+            &mut db,
+            |_, _, id, _| {
+                sent.push(id.to_owned());
+                Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+            },
+            || 1_000,
+        );
+        assert!(result.is_err());
+        assert_eq!(sent.len(), 1);
+        db.execute_batch("DROP TRIGGER reject_queued").unwrap();
+        assert_eq!(
+            codex_wake::pr_ci_runtime::recover_native_wake_intents(
+                &db,
+                1_000 + codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS,
+                |destination, ids| {
+                    assert_eq!(destination, thread);
+                    assert_eq!(ids, sent.as_slice());
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id=?1",
+                [&sent[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "queued");
+        assert_eq!(
+            dispatch_with(&mut db, |_, _, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_intent_before_send_retries_without_sending() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            "2099-01-01T00:00:00Z",
+            "close-pre-intent",
+            &json!({"action":"closed"}),
+        )
+        .unwrap();
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            thread,
+            "native_queue_resume_warning",
+            "11111111-1111-4111-8111-111111111112",
+        )
+        .unwrap();
+        db.execute("DELETE FROM native_wake_recovery", []).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_intent BEFORE INSERT ON native_wake_recovery
+            BEGIN SELECT RAISE(ABORT,'db unavailable'); END;",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_with_clock(&mut db, |_, _, _, _| panic!("must not send"), || 1_000).unwrap(),
+            1
+        );
+        let (state, next): (String, i64) = db
+            .query_row(
+                "SELECT state,available_at_ms FROM automatic_pr_notifications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), next), ("pending", 6_000));
+        db.execute_batch("DROP TRIGGER reject_intent").unwrap();
+        assert_eq!(
+            dispatch_with_clock(&mut db, |_, _, _, _| Ok(("queued".into(), None)), || 6_000)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

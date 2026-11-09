@@ -1015,35 +1015,19 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                     .duration_since(std::time::UNIX_EPOCH)?
                                     .as_millis(),
                             )?;
-                            codex_wake::pr_ci_runtime::dispatch(
+                            crate::dispatch_ci_with_queue(
                                 &mut db,
+                                &poll_config,
                                 now,
-                                |dispatch_db, delivery, message| {
-                                    let key = crate::ci_delivery_event_identity(delivery)?;
-                                    let id = crate::prepare_ci_delivery_identity(
-                                        &poll_config.db,
-                                        &key,
-                                        &delivery.thread,
-                                    )?;
-                                    let (state, reason) = crate::execution::queue_with_identity(
+                                |thread, message, id, resume| {
+                                    crate::execution::queue_with_identity(
                                         &poll_config.codex,
-                                        &delivery.thread,
+                                        thread,
                                         message,
-                                        &id,
-                                        true,
+                                        id,
+                                        resume,
                                         Duration::from_secs(120),
-                                    )?;
-                                    if state == "queued"
-                                        && reason.as_deref() == Some("native_queue_resume_warning")
-                                    {
-                                        codex_wake::pr_ci_runtime::record_native_wake_recovery(
-                                            dispatch_db,
-                                            &delivery.thread,
-                                            "native_queue_resume_warning",
-                                            &id,
-                                        )?;
-                                    }
-                                    Ok((state, reason))
+                                    )
                                 },
                             )?;
                         }
@@ -1053,34 +1037,35 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                     .duration_since(std::time::UNIX_EPOCH)?
                                     .as_millis(),
                             )?;
-                            let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
-                                &db,
-                                now,
-                                |thread, accepted_ids| {
-                                    let deadline =
-                                        std::time::Instant::now() + Duration::from_secs(15);
-                                    let remaining = || {
-                                        deadline
-                                            .checked_duration_since(std::time::Instant::now())
-                                            .filter(|timeout| !timeout.is_zero())
-                                            .context("Native wake recovery deadline expired")
-                                    };
-                                    let accepted_ids = accepted_ids.iter().cloned().collect();
-                                    start_accepted_native_message(
-                                        &db,
-                                        thread,
-                                        &accepted_ids,
-                                        &mut |method, params| {
-                                            crate::goals::rpc_with_timeout(
-                                                &poll_config.codex,
-                                                method,
-                                                params,
-                                                remaining()?,
-                                            )
-                                        },
-                                    )
-                                },
-                            )?;
+                            let mut wake = |thread: &str, accepted_ids: &[String]| {
+                                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                                let remaining = || {
+                                    deadline
+                                        .checked_duration_since(std::time::Instant::now())
+                                        .filter(|timeout| !timeout.is_zero())
+                                        .context("Native wake recovery deadline expired")
+                                };
+                                let accepted_ids = accepted_ids.iter().cloned().collect();
+                                start_accepted_native_message(
+                                    &db,
+                                    thread,
+                                    &accepted_ids,
+                                    &mut |method, params| {
+                                        crate::goals::rpc_with_timeout(
+                                            &poll_config.codex,
+                                            method,
+                                            params,
+                                            remaining()?,
+                                        )
+                                    },
+                                )
+                            };
+                            let recovered = codex_wake::pr_ci_runtime::recover_native_wake_intents(
+                                &db, now, &mut wake,
+                            )?
+                                + codex_wake::pr_ci_runtime::recover_native_wake_retries(
+                                    &db, now, &mut wake,
+                                )?;
                             if recovered > 0 {
                                 crate::observability::emit(
                                     "native_wake.recovery",

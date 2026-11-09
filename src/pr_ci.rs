@@ -1220,21 +1220,29 @@ pub fn ack_delivery(db: &Connection, id: i64) -> Result<bool> {
 /// Return an unaccepted claim to the durable queue immediately.
 pub fn retry_delivery(db: &Connection, id: i64, now_ms: i64) -> Result<bool> {
     initialize(db)?;
+    if !db.is_autocommit() {
+        return retry_delivery_in(db, id, now_ms);
+    }
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-    let changed = tx.execute(
+    let changed = retry_delivery_in(&tx, id, now_ms)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn retry_delivery_in(db: &Connection, id: i64, now_ms: i64) -> Result<bool> {
+    let changed = db.execute(
         "UPDATE pr_ci_deliveries SET state='pending',lease_until_ms=NULL
          WHERE id=?1 AND state='claimed'",
         [id],
     )?;
     if changed == 1 {
-        tx.execute(
+        db.execute(
             "INSERT INTO pr_ci_delivery_retry_after(delivery_id,available_at_ms)
              VALUES(?1,?2)
              ON CONFLICT(delivery_id) DO UPDATE SET available_at_ms=excluded.available_at_ms",
             params![id, now_ms.saturating_add(DELIVERY_RETRY_DELAY_MS)],
         )?;
     }
-    tx.commit()?;
     Ok(changed == 1)
 }
 

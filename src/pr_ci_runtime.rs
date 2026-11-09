@@ -25,29 +25,125 @@ const WAKE_RETRY_BATCH: i64 = 1;
 const WAKE_RETRY_MAX_MS: i64 = 900_000;
 /// Longer than Wake's normal delivery command timeout; expiry means uncertain.
 const DELIVERY_LEASE: Duration = Duration::from_secs(180);
+/// The lease exceeds the bounded queue RPC; the kernel lock also fences a
+/// suspended writer whose RPC outlives that deadline.
+pub const NATIVE_WAKE_INTENT_LEASE_MS: i64 = 180_000;
+
+/// Acquire one of a fixed set of database-local locks. Locks are never unlinked:
+/// removing a held lock could allow a second process to lock a different inode.
+pub fn try_native_wake_lock(db: &Connection, client_id: &str) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let id = uuid::Uuid::parse_str(client_id)?;
+    let path = match db.path() {
+        Some(path) if !path.is_empty() => {
+            let mut path = std::fs::canonicalize(path)?.into_os_string();
+            path.push(format!(".native-wake-lock-{:02x}", id.as_bytes()[0] % 32));
+            PathBuf::from(path)
+        }
+        _ => std::env::temp_dir().join(format!(
+            "codex-wake-memory-lock-{}-{}-{:02x}",
+            std::process::id(),
+            memory_lock_namespace(db)?,
+            id.as_bytes()[0] % 32
+        )),
+    };
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    Ok(Some(lock))
+}
+
+fn memory_lock_namespace(db: &Connection) -> Result<String> {
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let namespace = memory_lock_namespace(&tx)?;
+        tx.commit()?;
+        return Ok(namespace);
+    }
+    db.execute_batch("CREATE TABLE IF NOT EXISTS pr_ci_schema_migrations(name TEXT PRIMARY KEY)")?;
+    let existing: Option<String> = db.query_row(
+        "SELECT name FROM pr_ci_schema_migrations WHERE name LIKE 'memory_lock_namespace:%' LIMIT 1",
+        [], |row| row.get(0),
+    ).optional()?;
+    let name = match existing {
+        Some(name) => name,
+        None => {
+            let name = format!("memory_lock_namespace:{}", uuid::Uuid::new_v4());
+            db.execute(
+                "INSERT INTO pr_ci_schema_migrations(name) VALUES(?1)",
+                [&name],
+            )?;
+            name
+        }
+    };
+    let namespace = name
+        .strip_prefix("memory_lock_namespace:")
+        .context("Invalid memory lock namespace")?;
+    Ok(uuid::Uuid::parse_str(namespace)?.to_string())
+}
 
 #[derive(Debug)]
-struct BeforeSendFailure(anyhow::Error);
+struct BeforeSendFailure {
+    error: anyhow::Error,
+    intent_token: Option<String>,
+}
+
+#[derive(Debug)]
+struct ExistingNativeWakeIntent;
+
+impl fmt::Display for ExistingNativeWakeIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("A previous native delivery remains uncertain")
+    }
+}
+impl Error for ExistingNativeWakeIntent {}
+
+pub fn native_wake_intent_exists(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ExistingNativeWakeIntent>().is_some()
+}
 
 impl fmt::Display for BeforeSendFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
             "Delivery preparation failed before queue submission: {}",
-            self.0
+            self.error
         )
     }
 }
 
 impl Error for BeforeSendFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.0.as_ref())
+        Some(self.error.as_ref())
     }
 }
 
 /// Mark an error from delivery preparation that occurs before any queue request.
 pub fn before_send_failure(error: anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(BeforeSendFailure(error))
+    anyhow::Error::new(BeforeSendFailure {
+        error,
+        intent_token: None,
+    })
+}
+
+pub fn before_send_failure_with_intent(error: anyhow::Error, token: &str) -> anyhow::Error {
+    anyhow::Error::new(BeforeSendFailure {
+        error,
+        intent_token: Some(token.to_owned()),
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -63,6 +159,33 @@ struct NativeWakeIds {
     client_ids: Vec<String>,
     unattributed: bool,
     generation: String,
+    #[serde(default)]
+    intents: Vec<NativeWakeIntent>,
+}
+
+/// Exact origin of a native queue request whose acceptance may be uncertain.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind")]
+pub enum NativeWakeOrigin {
+    Pr {
+        id: String,
+    },
+    Ci {
+        id: i64,
+    },
+    Rule {
+        rule_id: String,
+        event_header: String,
+        comment_id: String,
+    },
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct NativeWakeIntent {
+    client_id: String,
+    token: String,
+    lease_until_ms: i64,
+    origin: NativeWakeOrigin,
 }
 
 fn native_wake_ids(raw: Option<&str>) -> Result<NativeWakeIds> {
@@ -82,7 +205,98 @@ fn native_wake_ids(raw: Option<&str>) -> Result<NativeWakeIds> {
             "Invalid stored native recovery message identity"
         );
     }
+    for intent in &ids.intents {
+        ensure!(
+            uuid::Uuid::parse_str(&intent.client_id)?.to_string() == intent.client_id,
+            "Invalid pending native message identity"
+        );
+        uuid::Uuid::parse_str(&intent.token)?;
+    }
     Ok(ids)
+}
+
+/// Persist the intent before invoking the queue. Recovery may inspect it only
+/// after its lease; absence from the queue is never evidence of rejection.
+pub fn begin_native_wake_intent(
+    db: &Connection,
+    thread: &str,
+    client_id: &str,
+    origin: NativeWakeOrigin,
+    lease_until_ms: i64,
+) -> Result<String> {
+    let thread = uuid::Uuid::parse_str(thread)?.to_string();
+    let client_id = uuid::Uuid::parse_str(client_id)?.to_string();
+    initialize_native_wake_recovery(db)?;
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let token = begin_native_wake_intent(&tx, &thread, &client_id, origin, lease_until_ms)?;
+        tx.commit()?;
+        return Ok(token);
+    }
+    let raw: Option<Option<String>> = db
+        .query_row(
+            "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+            [&thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut ids = match raw {
+        Some(raw) => native_wake_ids(raw.as_deref())?,
+        None => NativeWakeIds::default(),
+    };
+    if ids
+        .intents
+        .iter()
+        .any(|intent| intent.client_id == client_id)
+    {
+        return Err(ExistingNativeWakeIntent.into());
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    ids.intents.push(NativeWakeIntent {
+        client_id,
+        token: token.clone(),
+        lease_until_ms,
+        origin,
+    });
+    ids.generation = uuid::Uuid::new_v4().to_string();
+    let raw = serde_json::to_string(&ids)?;
+    db.execute("INSERT INTO native_wake_recovery(thread,reason,next_attempt_ms,backoff_ms,revision,client_ids_json)
+        VALUES(?1,'native_queue_resume_warning',?2,1000,1,?3)
+        ON CONFLICT(thread) DO UPDATE SET next_attempt_ms=min(next_attempt_ms,excluded.next_attempt_ms),
+          revision=revision+1,client_ids_json=excluded.client_ids_json",
+        rusqlite::params![thread, lease_until_ms, raw])?;
+    Ok(token)
+}
+
+/// Remove a completed or definitively unsent intent using its original token.
+pub fn finish_native_wake_intent(db: &Connection, thread: &str, token: &str) -> Result<()> {
+    initialize_native_wake_recovery(db)?;
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        finish_native_wake_intent(&tx, thread, token)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    let raw: Option<Option<String>> = db
+        .query_row(
+            "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+            [thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let mut ids = native_wake_ids(raw.as_deref())?;
+    ids.intents.retain(|intent| intent.token != token);
+    if ids.intents.is_empty() && ids.client_ids.is_empty() && !ids.unattributed {
+        db.execute("DELETE FROM native_wake_recovery WHERE thread=?1", [thread])?;
+    } else {
+        ids.generation = uuid::Uuid::new_v4().to_string();
+        db.execute("UPDATE native_wake_recovery SET client_ids_json=?2,revision=revision+1 WHERE thread=?1",
+            rusqlite::params![thread, serde_json::to_string(&ids)?])?;
+    }
+    Ok(())
 }
 
 /// Persist the exact accepted message identity, never its input. Multiple warnings
@@ -180,10 +394,10 @@ where
     let due = {
         let mut statement = tx.prepare(
             "SELECT thread,client_ids_json,revision,backoff_ms FROM native_wake_recovery
-             WHERE next_attempt_ms<=?1 ORDER BY next_attempt_ms,thread LIMIT ?2",
+             WHERE next_attempt_ms<=?1 ORDER BY next_attempt_ms,thread",
         )?;
         statement
-            .query_map([now_ms, WAKE_RETRY_BATCH], |row| {
+            .query_map([now_ms], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -192,6 +406,21 @@ where
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|row| match native_wake_ids(row.1.as_deref()) {
+                Ok(ids)
+                    if ids
+                        .client_ids
+                        .iter()
+                        .any(|id| !ids.intents.iter().any(|intent| &intent.client_id == id)) =>
+                {
+                    Some(Ok(row))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .take(WAKE_RETRY_BATCH as usize)
+            .collect::<Result<Vec<_>>>()?
     };
     for (thread, _, revision, backoff) in &due {
         tx.execute(
@@ -209,17 +438,175 @@ where
 
     let mut recovered = 0;
     for (thread, raw, revision, _) in due {
-        let ids = native_wake_ids(raw.as_deref())?;
-        if !ids.client_ids.is_empty() && wake(&thread, &ids.client_ids).is_ok() && !ids.unattributed
-        {
-            recovered += db.execute(
-                "DELETE FROM native_wake_recovery
-                 WHERE thread=?1 AND revision=?2 AND client_ids_json=?3",
-                rusqlite::params![thread, revision, raw],
-            )?;
+        let mut ids = native_wake_ids(raw.as_deref())?;
+        let eligible: Vec<String> = ids
+            .client_ids
+            .iter()
+            .filter(|id| !ids.intents.iter().any(|intent| &intent.client_id == *id))
+            .cloned()
+            .collect();
+        if !eligible.is_empty() && wake(&thread, &eligible).is_ok() {
+            ids.client_ids.retain(|id| !eligible.contains(id));
+            if ids.client_ids.is_empty() && ids.intents.is_empty() && !ids.unattributed {
+                let changed = db.execute(
+                    "DELETE FROM native_wake_recovery WHERE thread=?1 AND revision=?2 AND client_ids_json=?3",
+                    rusqlite::params![thread, revision, raw],
+                )?;
+                if !ids.unattributed {
+                    recovered += changed;
+                }
+            } else {
+                ids.generation = uuid::Uuid::new_v4().to_string();
+                let changed = db.execute(
+                    "UPDATE native_wake_recovery SET client_ids_json=?4,revision=revision+1
+                     WHERE thread=?1 AND revision=?2 AND client_ids_json=?3",
+                    rusqlite::params![thread, revision, raw, serde_json::to_string(&ids)?],
+                )?;
+                if !ids.unattributed {
+                    recovered += changed;
+                }
+            }
         }
     }
     Ok(recovered)
+}
+
+/// Reconcile expired pre-send intents using exact queue or execution evidence.
+/// A missing identity is never treated as a rejection and is not resent.
+pub fn recover_native_wake_intents<F>(db: &Connection, now_ms: i64, mut wake: F) -> Result<usize>
+where
+    F: FnMut(&str, &[String]) -> Result<()>,
+{
+    initialize_native_wake_recovery(db)?;
+    let rows: Vec<(String, Option<String>)> = db.prepare(
+        "SELECT thread,client_ids_json FROM native_wake_recovery ORDER BY next_attempt_ms,thread"
+    )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    let mut due = Vec::new();
+    for (thread, raw) in rows {
+        let ids = native_wake_ids(raw.as_deref())?;
+        due.extend(
+            ids.intents
+                .into_iter()
+                .filter(|intent| intent.lease_until_ms <= now_ms)
+                .map(|intent| (thread.clone(), intent)),
+        );
+    }
+    due.sort_by_key(|(_, intent)| intent.lease_until_ms);
+    for (thread, intent) in due.into_iter().take(2) {
+        let Some(_lock) = try_native_wake_lock(db, &intent.client_id)? else {
+            defer_native_wake_intent(db, &thread, &intent.token, now_ms.saturating_add(1_000))?;
+            continue;
+        };
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let current: Option<Option<String>> = tx
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [&thread],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            tx.commit()?;
+            continue;
+        };
+        let mut ids = native_wake_ids(current.as_deref())?;
+        let Some(entry) = ids
+            .intents
+            .iter_mut()
+            .find(|entry| entry.token == intent.token && entry.lease_until_ms <= now_ms)
+        else {
+            tx.commit()?;
+            continue;
+        };
+        let claimed_until = now_ms.saturating_add(NATIVE_WAKE_INTENT_LEASE_MS);
+        entry.lease_until_ms = claimed_until;
+        ids.generation = uuid::Uuid::new_v4().to_string();
+        tx.execute("UPDATE native_wake_recovery SET client_ids_json=?2,revision=revision+1 WHERE thread=?1",
+            rusqlite::params![thread, serde_json::to_string(&ids)?])?;
+        tx.commit()?;
+        if wake(&thread, std::slice::from_ref(&intent.client_id)).is_err() {
+            continue;
+        }
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        let current: Option<Option<String>> = tx
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [&thread],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            tx.commit()?;
+            continue;
+        };
+        let mut ids = native_wake_ids(current.as_deref())?;
+        if !ids
+            .intents
+            .iter()
+            .any(|entry| entry.token == intent.token && entry.lease_until_ms == claimed_until)
+        {
+            tx.commit()?;
+            continue;
+        }
+        let reconciled = match &intent.origin {
+            NativeWakeOrigin::Pr { id } => {
+                tx.execute("UPDATE automatic_pr_notifications SET state='queued' WHERE id=?1 AND thread=?2 AND state IN ('pending','sending','needs_attention')", rusqlite::params![id,thread])? != 0
+                    || tx.query_row("SELECT EXISTS(SELECT 1 FROM automatic_pr_notifications WHERE id=?1 AND thread=?2 AND state='queued')", rusqlite::params![id,thread], |row| row.get(0))?
+            }
+            NativeWakeOrigin::Ci { id } => {
+                tx.execute("UPDATE pr_ci_deliveries SET state='delivered',lease_until_ms=NULL WHERE id=?1 AND thread=?2 AND state IN ('pending','claimed','needs_attention')", rusqlite::params![id,thread])? != 0
+                    || tx.query_row("SELECT EXISTS(SELECT 1 FROM pr_ci_deliveries WHERE id=?1 AND thread=?2 AND state='delivered')", rusqlite::params![id,thread], |row| row.get(0))?
+            }
+            NativeWakeOrigin::Rule {
+                rule_id,
+                event_header,
+                comment_id,
+            } => {
+                tx.execute("UPDATE rule_deliveries SET state='queued',reason=NULL,updated=CURRENT_TIMESTAMP WHERE rule_id=?1 AND event_header=?2 AND comment_id=?3 AND thread_id=?4 AND state IN ('ready','creating','needs_attention')", rusqlite::params![rule_id,event_header,comment_id,thread])? != 0
+                    || tx.query_row("SELECT EXISTS(SELECT 1 FROM rule_deliveries WHERE rule_id=?1 AND event_header=?2 AND comment_id=?3 AND thread_id=?4 AND state='queued')", rusqlite::params![rule_id,event_header,comment_id,thread], |row| row.get(0))?
+            }
+        };
+        if !reconciled {
+            tx.commit()?;
+            continue;
+        }
+        ids.intents.retain(|entry| entry.token != intent.token);
+        if ids.intents.is_empty() && ids.client_ids.is_empty() && !ids.unattributed {
+            tx.execute(
+                "DELETE FROM native_wake_recovery WHERE thread=?1",
+                [&thread],
+            )?;
+        } else {
+            ids.generation = uuid::Uuid::new_v4().to_string();
+            tx.execute("UPDATE native_wake_recovery SET client_ids_json=?2,revision=revision+1 WHERE thread=?1",
+                rusqlite::params![thread, serde_json::to_string(&ids)?])?;
+        }
+        tx.commit()?;
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+fn defer_native_wake_intent(db: &Connection, thread: &str, token: &str, until: i64) -> Result<()> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let raw: Option<Option<String>> = tx
+        .query_row(
+            "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+            [thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(raw) = raw {
+        let mut ids = native_wake_ids(raw.as_deref())?;
+        if let Some(intent) = ids.intents.iter_mut().find(|intent| intent.token == token) {
+            intent.lease_until_ms = intent.lease_until_ms.max(until);
+            ids.generation = uuid::Uuid::new_v4().to_string();
+            tx.execute("UPDATE native_wake_recovery SET client_ids_json=?2,revision=revision+1 WHERE thread=?1",
+                rusqlite::params![thread, serde_json::to_string(&ids)?])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn initialize_native_wake_recovery(db: &Connection) -> Result<()> {
@@ -279,7 +666,7 @@ fn gh_response_filter(route: &str) -> Result<&'static str> {
         "Invalid repository path"
     );
     let filter = if endpoint.starts_with("pulls/") {
-        ". as $pr | {number, state, base:{repo:{full_name:$pr.base.repo.full_name}}, head:{sha:$pr.head.sha, repo:{full_name:$pr.head.repo.full_name}}}"
+        ". as $pr | {number, state, closed_at, base:{repo:{full_name:$pr.base.repo.full_name}}, head:{sha:$pr.head.sha, repo:{full_name:$pr.head.repo.full_name}}}"
     } else if endpoint.starts_with("actions/runs?") {
         ". as $r | {total_count:$r.total_count, workflow_runs:[$r.workflow_runs[] | {id, run_attempt, head_sha, event, status, conclusion, head_repository:(.head_repository | if . == null then null else {id,name,full_name,html_url} end), pull_requests:[.pull_requests[]? | {id, number, url, html_url, title, head:{sha:.head.sha, ref:.head.ref, repo:(.head.repo | if . == null then null else {id,name,url} end)}}]}]}"
     } else if endpoint.starts_with("actions/runs/") && endpoint.contains("/attempts/") {
@@ -544,14 +931,18 @@ where
                 }
             }
             Ok((state, _)) if state == "ready" => {
-                if pr_ci::retry_delivery(db, delivery.id, now())? {
+                if retry_ci_before_send(db, &delivery, now(), None)? {
                     report.retried_before_send += 1;
                 } else {
                     report.uncertain += 1;
                 }
             }
             Err(error) if known_before_send_failure(&error) => {
-                if pr_ci::retry_delivery(db, delivery.id, now())? {
+                let token = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<BeforeSendFailure>())
+                    .and_then(|failure| failure.intent_token.as_deref());
+                if retry_ci_before_send(db, &delivery, now(), token)? {
                     report.retried_before_send += 1;
                 } else {
                     report.uncertain += 1;
@@ -564,6 +955,36 @@ where
         }
     }
     Ok(report)
+}
+
+fn retry_ci_before_send(
+    db: &Connection,
+    delivery: &Delivery,
+    now: i64,
+    token: Option<&str>,
+) -> Result<bool> {
+    initialize_native_wake_recovery(db)?;
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let changed = pr_ci::retry_delivery(&tx, delivery.id, now)?;
+    let raw: Option<Option<String>> = tx
+        .query_row(
+            "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+            [&delivery.thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if changed && let Some(raw) = raw {
+        let ids = native_wake_ids(raw.as_deref())?;
+        for intent in ids.intents {
+            if token == Some(intent.token.as_str())
+                && matches!(intent.origin, NativeWakeOrigin::Ci { id } if id == delivery.id)
+            {
+                finish_native_wake_intent(&tx, &delivery.thread, &intent.token)?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(changed)
 }
 
 fn known_before_send_failure(error: &anyhow::Error) -> bool {
@@ -618,6 +1039,318 @@ mod tests {
     use rusqlite::params;
 
     #[test]
+    fn intent_waits_for_writer_and_requires_exact_evidence() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE automatic_pr_notifications(id TEXT PRIMARY KEY,thread TEXT,state TEXT);
+            INSERT INTO automatic_pr_notifications VALUES('11111111-1111-4111-8111-111111111112',
+            '11111111-1111-4111-8111-111111111111','sending');",
+        )
+        .unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = "11111111-1111-4111-8111-111111111112";
+        let lock = try_native_wake_lock(&db, id).unwrap().unwrap();
+        begin_native_wake_intent(&db, thread, id, NativeWakeOrigin::Pr { id: id.into() }, 100)
+            .unwrap();
+        assert_eq!(
+            recover_native_wake_intents(&db, 101, |_, _| panic!("writer still owns lock")).unwrap(),
+            0
+        );
+        drop(lock);
+        assert_eq!(
+            recover_native_wake_intents(&db, 101, |_, _| anyhow::bail!("identity absent")).unwrap(),
+            0
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "sending");
+        assert_eq!(
+            recover_native_wake_intents(
+                &db,
+                101 + NATIVE_WAKE_INTENT_LEASE_MS,
+                |destination, ids| {
+                    assert_eq!(destination, thread);
+                    assert_eq!(ids, &[id.to_owned()]);
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "queued");
+    }
+
+    #[test]
+    fn memory_locks_are_per_database_and_shared_across_connections() {
+        let first = Connection::open_in_memory().unwrap();
+        let second = Connection::open_in_memory().unwrap();
+        let id = "11111111-1111-4111-8111-111111111112";
+        let first_lock = try_native_wake_lock(&first, id).unwrap().unwrap();
+        let second_lock = try_native_wake_lock(&second, id).unwrap().unwrap();
+        assert!(try_native_wake_lock(&first, id).unwrap().is_none());
+        drop((first_lock, second_lock));
+        let uri = format!("file:{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI;
+        let shared_a = Connection::open_with_flags(&uri, flags).unwrap();
+        let shared_b = Connection::open_with_flags(&uri, flags).unwrap();
+        let lock = try_native_wake_lock(&shared_a, id).unwrap().unwrap();
+        assert!(try_native_wake_lock(&shared_b, id).unwrap().is_none());
+        drop(lock);
+        assert!(try_native_wake_lock(&shared_b, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn before_send_retry_cannot_clear_a_previous_uncertain_intent() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::pr_ci::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = "11111111-1111-4111-8111-111111111112";
+        db.execute("INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+            VALUES('owner/repo',7,'sha',1,1,?1,'success','{}')", [thread]).unwrap();
+        let delivery = crate::pr_ci::claim_deliveries(&mut db, 1, 1, Duration::from_secs(180))
+            .unwrap()
+            .remove(0);
+        let token = begin_native_wake_intent(
+            &db,
+            thread,
+            id,
+            NativeWakeOrigin::Ci { id: delivery.id },
+            100,
+        )
+        .unwrap();
+        assert!(retry_ci_before_send(&db, &delivery, 2, None).unwrap());
+        let raw: String = db
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_wake_ids(Some(&raw)).unwrap().intents[0].token, token);
+    }
+
+    #[test]
+    fn ci_retry_and_own_intent_cleanup_are_atomic() {
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::pr_ci::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let id = "11111111-1111-4111-8111-111111111112";
+        db.execute("INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+            VALUES('owner/repo',7,'sha',1,1,?1,'success','{}')", [thread]).unwrap();
+        let delivery = crate::pr_ci::claim_deliveries(&mut db, 1, 1, Duration::from_secs(180))
+            .unwrap()
+            .remove(0);
+        let token = begin_native_wake_intent(
+            &db,
+            thread,
+            id,
+            NativeWakeOrigin::Ci { id: delivery.id },
+            100,
+        )
+        .unwrap();
+        db.execute_batch("CREATE TRIGGER fail_finish BEFORE DELETE ON native_wake_recovery BEGIN SELECT RAISE(ABORT,'db error'); END;").unwrap();
+        assert!(retry_ci_before_send(&db, &delivery, 2, Some(&token)).is_err());
+        let state: String = db
+            .query_row(
+                "SELECT state FROM pr_ci_deliveries WHERE id=?1",
+                [delivery.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "claimed");
+        db.execute_batch("DROP TRIGGER fail_finish").unwrap();
+        assert!(retry_ci_before_send(&db, &delivery, 3, Some(&token)).unwrap());
+        let (state, remaining): (String, i64) = db.query_row("SELECT state,(SELECT count(*) FROM native_wake_recovery) FROM pr_ci_deliveries WHERE id=?1", [delivery.id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!((state.as_str(), remaining), ("pending", 0));
+    }
+
+    #[test]
+    fn uncertain_intent_does_not_block_another_accepted_message() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let uncertain = "11111111-1111-4111-8111-111111111112";
+        let accepted = "11111111-1111-4111-8111-111111111113";
+        begin_native_wake_intent(
+            &db,
+            thread,
+            uncertain,
+            NativeWakeOrigin::Pr {
+                id: uncertain.into(),
+            },
+            500,
+        )
+        .unwrap();
+        record_native_wake_recovery(&db, thread, "native_queue_resume_warning", accepted).unwrap();
+        assert_eq!(
+            recover_native_wake_retries(&db, 1, |target, ids| {
+                assert_eq!(target, thread);
+                assert_eq!(ids, &[accepted.to_owned()]);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        let raw: String = db
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining = native_wake_ids(Some(&raw)).unwrap();
+        assert!(remaining.client_ids.is_empty());
+        assert_eq!(remaining.intents.len(), 1);
+        assert_eq!(remaining.intents[0].client_id, uncertain);
+    }
+
+    #[test]
+    fn missing_intent_does_not_block_another_recovery() {
+        for same_thread in [true, false] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch("CREATE TABLE automatic_pr_notifications(id TEXT PRIMARY KEY,thread TEXT,state TEXT)").unwrap();
+            let first = "11111111-1111-4111-8111-111111111111";
+            let second = if same_thread {
+                first
+            } else {
+                "22222222-2222-4222-8222-222222222222"
+            };
+            let absent = "11111111-1111-4111-8111-111111111112";
+            let accepted = "22222222-2222-4222-8222-222222222223";
+            for (thread, id) in [(first, absent), (second, accepted)] {
+                db.execute(
+                    "INSERT INTO automatic_pr_notifications VALUES(?1,?2,'sending')",
+                    params![id, thread],
+                )
+                .unwrap();
+                begin_native_wake_intent(
+                    &db,
+                    thread,
+                    id,
+                    NativeWakeOrigin::Pr { id: id.into() },
+                    1,
+                )
+                .unwrap();
+            }
+            let mut checked = Vec::new();
+            assert_eq!(
+                recover_native_wake_intents(&db, 2, |_, ids| {
+                    checked.push(ids[0].clone());
+                    if ids[0] == absent {
+                        anyhow::bail!("not found")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap(),
+                1
+            );
+            assert_eq!(checked, vec![absent, accepted]);
+            let states: Vec<String> = db
+                .prepare("SELECT state FROM automatic_pr_notifications ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(states, vec!["sending", "queued"]);
+        }
+    }
+
+    #[test]
+    fn locked_intents_do_not_starve_a_third_destination() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE automatic_pr_notifications(id TEXT PRIMARY KEY,thread TEXT,state TEXT)",
+        )
+        .unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let ids = [
+            "11111111-1111-4111-8111-111111111112",
+            "22222222-2222-4222-8222-222222222223",
+            "33333333-3333-4333-8333-333333333334",
+        ];
+        for id in ids {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications VALUES(?1,?2,'sending')",
+                params![id, thread],
+            )
+            .unwrap();
+            begin_native_wake_intent(&db, thread, id, NativeWakeOrigin::Pr { id: id.into() }, 1)
+                .unwrap();
+        }
+        let first = try_native_wake_lock(&db, ids[0]).unwrap().unwrap();
+        let second = try_native_wake_lock(&db, ids[1]).unwrap().unwrap();
+        assert_eq!(
+            recover_native_wake_intents(&db, 2, |_, _| panic!("locks held")).unwrap(),
+            0
+        );
+        assert_eq!(
+            recover_native_wake_intents(&db, 1_002, |_, found| {
+                assert_eq!(found, &[ids[2]]);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        drop((first, second));
+    }
+
+    #[test]
+    fn unattributed_recovery_does_not_starve_other_threads() {
+        let db = Connection::open_in_memory().unwrap();
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let id1 = "11111111-1111-4111-8111-111111111112";
+        let id2 = "22222222-2222-4222-8222-222222222223";
+        record_unattributed_native_wake_recovery(&db, first, "native_queue_resume_warning")
+            .unwrap();
+        record_native_wake_recovery(&db, first, "native_queue_resume_warning", id1).unwrap();
+        record_native_wake_recovery(&db, second, "native_queue_resume_warning", id2).unwrap();
+        assert_eq!(
+            recover_native_wake_retries(&db, 1, |thread, ids| {
+                assert_eq!(thread, first);
+                assert_eq!(ids, &[id1]);
+                Ok(())
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            recover_native_wake_retries(&db, 2, |thread, ids| {
+                assert_eq!(thread, second);
+                assert_eq!(ids, &[id2]);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        let raw: String = db
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [first],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining = native_wake_ids(Some(&raw)).unwrap();
+        assert!(remaining.unattributed);
+        assert!(remaining.client_ids.is_empty());
+    }
+
+    #[test]
     fn github_response_filter_uses_endpoint_after_owner_and_repository() {
         for (ordinary, named_pulls) in [
             ("/repos/acme/widget/pulls/7", "/repos/pulls/pulls/pulls/7"),
@@ -641,6 +1374,52 @@ mod tests {
             gh_response_filter("/repos/acme/pulls/pulls/7").unwrap(),
             gh_response_filter("/repos/acme/pulls/actions/runs?per_page=100").unwrap()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh_pull_filter_preserves_close_identity_for_ci_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("gh");
+        std::fs::write(&wrapper, r##"#!/bin/sh
+case "$4" in
+  */pulls/7) case "$3" in *closed_at*) ;; *) exit 2;; esac
+    printf '%s' '{"number":7,"state":"closed","closed_at":"2026-01-01T00:00:00Z","base":{"repo":{"full_name":"owner/project"}},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"full_name":"owner/project"}}}' ;;
+  *) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+esac
+"##).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::pr_ci::register(
+            &mut db,
+            "owner/project",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let snapshot = gh_api_with_timeout(
+            &wrapper,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .body;
+        crate::pr_ci::observe_pull_request_snapshot_in(&db, "owner/project", "7", &snapshot, 1)
+            .unwrap();
+        let report = crate::pr_ci::poll(&db, 2, |route| {
+            gh_api_with_timeout(&wrapper, route, Duration::from_secs(5))
+        })
+        .unwrap();
+        assert!(report.errors.is_empty());
+        let certificate: Option<i64> = db
+            .query_row(
+                "SELECT closed_sweep_generation FROM pr_ci_tracker_generations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(certificate.is_some());
     }
 
     fn database() -> Connection {
@@ -1085,7 +1864,7 @@ mod tests {
             .unwrap();
         let ids = native_wake_ids(Some(&raw)).unwrap();
         assert!(ids.unattributed);
-        assert_eq!(ids.client_ids, vec![id]);
+        assert!(ids.client_ids.is_empty());
     }
 
     #[test]

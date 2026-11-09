@@ -469,6 +469,8 @@ fn dispatch_with_identity(
         let mut may_retry = false;
         let mut delivery_thread = None;
         let mut delivery_client_id = None;
+        let mut delivery_lock = None;
+        let mut delivery_intent = None;
         let result = (|| -> Result<(String, Option<String>)> {
             let mut input: RuleInput = serde_json::from_str(&raw)?;
             validate(&mut input)?;
@@ -590,6 +592,36 @@ fn dispatch_with_identity(
             );
             stage = "goal_or_delivery_outcome_unknown";
             may_retry = input.goal_objective.is_none();
+            if let Some((_, client_id)) = identity.as_ref() {
+                delivery_lock = Some(
+                    codex_wake::pr_ci_runtime::try_native_wake_lock(db, client_id)
+                        .map_err(|_| crate::execution::TargetUnavailableBeforeSend)?
+                        .ok_or(crate::execution::TargetUnavailableBeforeSend)?,
+                );
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64;
+                let token = codex_wake::pr_ci_runtime::begin_native_wake_intent(
+                    db,
+                    &thread,
+                    client_id,
+                    codex_wake::pr_ci_runtime::NativeWakeOrigin::Rule {
+                        rule_id: rule_id.clone(),
+                        event_header: header.clone(),
+                        comment_id: comment_id.clone(),
+                    },
+                    now.saturating_add(codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS),
+                )
+                .map_err(|error| {
+                    if codex_wake::pr_ci_runtime::native_wake_intent_exists(&error) {
+                        error
+                    } else {
+                        crate::execution::TargetUnavailableBeforeSend.into()
+                    }
+                })?;
+                delivery_intent = Some(token);
+            }
             finish(
                 &thread,
                 &input,
@@ -626,11 +658,11 @@ fn dispatch_with_identity(
                 Some(format!("{stage}: {error}").chars().take(1024).collect()),
             ),
         };
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
             let thread = delivery_thread
                 .as_deref()
                 .context("Accepted rule delivery has no target thread")?;
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if let Some(client_id) = delivery_client_id.as_deref() {
                 codex_wake::pr_ci_runtime::record_native_wake_recovery(
                     &tx,
@@ -645,14 +677,16 @@ fn dispatch_with_identity(
                     "native_queue_resume_warning",
                 )?;
             }
-            ensure!(
-                tx.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5 AND state='creating'",params![state,reason,rule_id,header,comment_id])? == 1,
-                "Rule delivery claim was lost before wake recovery was recorded"
-            );
-            tx.commit()?;
-        } else {
-            db.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5",params![state,reason,rule_id,header,comment_id])?;
         }
+        ensure!(tx.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5 AND state='creating'",params![state,reason,rule_id,header,comment_id])? == 1, "Rule delivery claim was lost");
+        if (state == "queued" || state == "ready")
+            && let (Some(thread), Some(token)) =
+                (delivery_thread.as_deref(), delivery_intent.as_deref())
+        {
+            codex_wake::pr_ci_runtime::finish_native_wake_intent(&tx, thread, token)?;
+        }
+        tx.commit()?;
+        drop(delivery_lock);
         span.finish(
             match state.as_str() {
                 "queued" => "queued",
@@ -1013,6 +1047,77 @@ mod tests {
         let stored_ids: Value = serde_json::from_str(&raw_ids).unwrap();
         assert_eq!(stored_ids["client_ids"], json!([expected_client_id]));
         assert_eq!(stored_ids["unattributed"], false);
+    }
+
+    #[test]
+    fn accepted_rule_survives_failed_recovery_write_without_resend() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        rule.model = Some("test-model".into());
+        rule.reasoning_effort = Some("medium".into());
+        configure(&db, rule).unwrap();
+        accept(&db, "issue_comment", &payload()).unwrap();
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            THREAD,
+            "native_queue_resume_warning",
+            "11111111-1111-4111-8111-111111111112",
+        )
+        .unwrap();
+        db.execute("DELETE FROM native_wake_recovery", []).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_recovery BEFORE UPDATE ON native_wake_recovery
+            BEGIN SELECT RAISE(ABORT,'recovery unavailable'); END;",
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut sent = Vec::new();
+        let result = dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut |_, _| unreachable!(),
+            &mut |_, _, _, _, id| {
+                sent.push(id.unwrap().to_owned());
+                Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(sent.len(), 1);
+        db.execute_batch("DROP TRIGGER fail_recovery").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(
+            codex_wake::pr_ci_runtime::recover_native_wake_intents(
+                &db,
+                now + codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS + 1,
+                |thread, ids| {
+                    assert_eq!(thread, THREAD);
+                    assert_eq!(ids, sent.as_slice());
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row("SELECT state FROM rule_deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "queued");
+        assert_eq!(
+            dispatch_with_identity(
+                &mut db,
+                directory.path(),
+                &mut |_, _| unreachable!(),
+                &mut |_, _, _, _, _| panic!("must not resend"),
+                &mut |_| Ok(())
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
