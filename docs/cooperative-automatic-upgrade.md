@@ -98,3 +98,15 @@ samples. The ignored `legacy_schema_race` test deterministically demonstrates
 this with the pinned published binary, a private Unix controller and a SQLite
 lock: the rejected updater exits without changes; schema additions occur only
 after releasing the legacy writer. CI executes this regression explicitly.
+
+Preparation is renewed every five seconds while admission stays closed, after
+checking the controller again. The hosted fixture delays the start command
+completion by 18 seconds, requires preparation samples spanning at least 15
+seconds, then checks that the retained stable request was accepted by the
+native controller queue after activation and a repeat returns the same result.
+Queue acceptance is not model execution or human consumption.
+
+Health queries use the same hashed invocation subject as `observability::emit`.
+A subprocess regression writes through that actual telemetry path and runs the
+real health query, including a later failed heartbeat. Generation units preserve
+the configured environment; only their executable and working directory change.

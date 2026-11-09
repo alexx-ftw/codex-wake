@@ -301,7 +301,7 @@ if [[ $handoff_mode != 0 ]]; then
     || {
       if [[ $handoff_mode == 2 ]]; then
         diagnostic=$(as_qual_user cat "$qual_root/upgrade-failure" 2>/dev/null || true)
-        if [[ $diagnostic =~ ^stage=(legacy|legacy_identity|legacy_binary|legacy_schema|legacy_journal|bootstrap|descendant|closure|drain|activation|interruption)\ line=[0-9]+\ status=[0-9]+\ class=(other|manager_query|missing_file|installation|configuration)$ ]]; then
+        if [[ $diagnostic =~ ^stage=(legacy|legacy_identity|legacy_binary|legacy_schema|legacy_journal|bootstrap|descendant|closure|drain|activation|interruption)\ line=[0-9]+\ status=[0-9]+\ class=(other|manager_query|missing_file|installation|configuration|missing_marker|unit_contract|cgroup|controller|deadline)$ ]]; then
           printf 'upgrade qualification: %s\n' "$diagnostic" >&2
         fi
       fi
@@ -314,7 +314,7 @@ if [[ $handoff_mode != 0 ]]; then
     || fail 'isolated controller did not remain ready after handoff'
   handoff_done=1
   if [[ $handoff_mode == 2 ]]; then
-    printf '%s\n' '{"cooperative_upgrade_qualification_passed":true,"legacy_alpha2_untouched":true,"descendant_drain_verified":true,"concurrent_updates_serialized":true,"interrupted_transition_not_retried":true,"uncertain_send_preserved":true}' > "$output.upgrade"
+    printf '%s\n' '{"cooperative_upgrade_qualification_passed":true,"legacy_alpha2_untouched":true,"descendant_drain_verified":true,"concurrent_updates_serialized":true,"interrupted_transition_not_retried":true,"uncertain_send_preserved":true,"prepared_renewal_over_15_seconds_verified":true,"retained_fixture_input_queued_after_activation":true}' > "$output.upgrade"
   fi
 fi
 stage=receiver_start

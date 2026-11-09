@@ -443,7 +443,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn quote(value: &str) -> Result<String> {
+pub(crate) fn quote(value: &str) -> Result<String> {
     ensure!(
         !value.chars().any(|c| c.is_control()),
         "Invalid control character in service configuration"

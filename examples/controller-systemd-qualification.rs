@@ -59,6 +59,21 @@ fn run() -> Result<()> {
             let _ = ready(Path::new(native), Path::new(socket))?;
             Ok(())
         }
+        (Some("create-thread"), [native, socket]) => {
+            let (mut ws, _) = ready(Path::new(native), Path::new(socket))?;
+            ws.send(Message::Text(
+                json!({"id":3,"method":"thread/start","params":{}})
+                    .to_string()
+                    .into(),
+            ))?;
+            let result = response(&mut ws, 3)?;
+            let id = result
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .context("missing fixture thread")?;
+            println!("{}", uuid::Uuid::parse_str(id)?);
+            Ok(())
+        }
         (Some("cleanup-lock"), [socket, lock]) => {
             let uid = unsafe { libc::geteuid() };
             let daemon = PathBuf::from(format!("/tmp/codex-daemon-{uid}"));

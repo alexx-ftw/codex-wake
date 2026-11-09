@@ -83,13 +83,17 @@ fn save(config: &Config, phase: &str, spec: &Spec, activation: Option<Activation
     Ok(())
 }
 fn unit(config: &Config, spec: &Spec) -> Result<String> {
-    let mut generation = config.clone();
-    generation.runtime = spec
+    let executable =
+        |path: &std::path::Path| manager::quote(path.to_str().context("Invalid executable path")?);
+    let directory = spec
         .executable
         .parent()
-        .context("Missing generation directory")?
-        .into();
-    Ok(manager::unit(&generation)?
+        .context("Missing generation directory")?;
+    Ok(manager::unit(config)?
+        .replace(&format!("ExecStart=:{} receiver\n",executable(&config.runtime.join("codex-wake"))?),
+            &format!("ExecStart=:{} receiver\n",executable(&spec.executable)?))
+        .replace(&format!("WorkingDirectory={}\n",config.runtime.to_str().context("Invalid runtime path")?.replace('%',"%%")),
+            &format!("WorkingDirectory={}\n",directory.to_str().context("Invalid generation path")?.replace('%',"%%")))
         .replace("Type=simple\n", "Type=exec\nRemainAfterExit=yes\nKillMode=control-group\n")
         .replace("Restart=on-failure\n", "Restart=no\n")
         .replace("[Service]\n", &format!("[Service]\nEnvironment=CODEX_WAKE_COOPERATIVE_RECEIVER=1\nEnvironment=CODEX_WAKE_RECEIVER_LIFECYCLE=1\nEnvironment=CODEX_WAKE_GATE_OWNER={}\nEnvironment=CODEX_WAKE_GATE_GENERATION={}\n", spec.owner, spec.generation)))
@@ -556,7 +560,7 @@ fn fresh_health(
     operation: &str,
     now: i64,
 ) -> Result<()> {
-    let (at, outcome): (i64,String) = db.query_row("SELECT at_ms,outcome FROM events WHERE pid=?1 AND subject=?2 AND operation=?3 ORDER BY at_ms DESC,rowid DESC LIMIT 1",params![pid,invocation,operation],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let (at, outcome): (i64,String) = db.query_row("SELECT at_ms,outcome FROM events WHERE pid=?1 AND subject=?2 AND operation=?3 ORDER BY at_ms DESC,rowid DESC LIMIT 1",params![pid,crate::telemetry::subject(invocation),operation],|r|Ok((r.get(0)?,r.get(1)?)))?;
     ensure!(
         outcome == "ok" && at <= now && now - at <= 15_000,
         "Receiver health is stale or failed"
@@ -616,20 +620,25 @@ fn activate(
 // A bound successor cannot start workers until the coordinator publishes a verified activation.
 pub(crate) fn await_activation(config: &Config) -> Result<()> {
     let invocation = env::var("INVOCATION_ID")?;
-    ensure!(
-        crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}))?["data"].is_array(),
-        "Controller preparation failed"
-    );
-    crate::observability::emit(
-        "receiver.prepared",
-        "ok",
-        "",
-        Some(&invocation),
-        Duration::ZERO,
-        1,
-    );
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut prepared = Instant::now() - Duration::from_secs(5);
     loop {
+        if prepared.elapsed() >= Duration::from_secs(5) {
+            ensure!(
+                crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}))?["data"]
+                    .is_array(),
+                "Controller preparation failed"
+            );
+            crate::observability::emit(
+                "receiver.prepared",
+                "ok",
+                "",
+                Some(&invocation),
+                Duration::ZERO,
+                1,
+            );
+            prepared = Instant::now();
+        }
         let db = crate::bridge::open_existing_owned(&config.db)?;
         if crate::bridge::claims_open(&db)? {
             let record = read_record(config)?;
@@ -674,6 +683,69 @@ pub(crate) fn status(config: &Config) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn health_reads_the_actual_observability_encoding() {
+        const CASE: &str = "upgrade::tests::health_reads_the_actual_observability_encoding";
+        if env::var_os("WAKE_HEALTH_TEST_CHILD").is_none() {
+            let output = manager::run(
+                std::process::Command::new(env::current_exe().unwrap())
+                    .args(["--exact", CASE])
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("WAKE_HEALTH_TEST_CHILD", "1"),
+                Duration::from_secs(15),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        manager::private_dir(root.path()).unwrap();
+        let path = root.path().join("telemetry.sqlite3");
+        crate::telemetry::initialize(&path).unwrap();
+        crate::observability::configure(path.clone());
+        let inv = "11111111111111111111111111111111";
+        crate::observability::emit("receiver.prepared", "ok", "", Some(inv), Duration::ZERO, 1);
+        let db = Connection::open(&path).unwrap();
+        let stored: String = db
+            .query_row(
+                "SELECT subject FROM events WHERE operation='receiver.prepared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(stored, inv);
+        assert!(fresh_health(&db, std::process::id(), inv, "receiver.prepared", now_ms()).is_ok());
+        assert!(
+            fresh_health(
+                &db,
+                std::process::id(),
+                "22222222222222222222222222222222",
+                "receiver.prepared",
+                now_ms()
+            )
+            .is_err()
+        );
+        crate::observability::emit("receiver.heartbeat", "ok", "", Some(inv), Duration::ZERO, 1);
+        assert!(fresh_health(&db, std::process::id(), inv, "receiver.heartbeat", now_ms()).is_ok());
+        crate::observability::emit(
+            "receiver.heartbeat",
+            "error",
+            "fixture",
+            Some(inv),
+            Duration::ZERO,
+            1,
+        );
+        assert!(
+            fresh_health(&db, std::process::id(), inv, "receiver.heartbeat", now_ms()).is_err()
+        );
+    }
+
+    #[test]
     fn missing_or_mismatched_activation_journal_never_opens_a_prepared_binding() {
         let root = tempfile::tempdir().unwrap();
         let config = Config {
@@ -698,6 +770,17 @@ mod tests {
             binary: "fixture".into(),
             unit: "fixture".into(),
         };
+        let original = manager::unit(&config).unwrap();
+        let generated = unit(&config, &spec).unwrap();
+        for line in original
+            .lines()
+            .filter(|line| line.starts_with("Environment="))
+        {
+            assert!(
+                generated.lines().any(|candidate| candidate == line),
+                "effective environment changed: {line}"
+            );
+        }
         let mut db = Connection::open_in_memory().unwrap();
         crate::bridge::control_claim_gate(&mut db, "init", &spec.owner, None, None).unwrap();
         crate::bridge::control_claim_gate(&mut db, "arm", &spec.owner, Some(1), None).unwrap();
@@ -741,7 +824,7 @@ mod tests {
         let add = |at, outcome, inv, op| {
             db.execute(
                 "INSERT INTO events VALUES(?1,?2,123,?3,?4)",
-                params![at, outcome, inv, op],
+                params![at, outcome, crate::telemetry::subject(inv), op],
             )
             .unwrap();
         };

@@ -18,11 +18,18 @@ upgrader='' contender='' helper='' stopped=''
 stage=legacy
 failure() {
   local status=$1 line=$2 class=other
-  if [[ -f $root/legacy-error ]]; then
-    if grep -qF 'systemctl show' "$root/legacy-error"; then class=manager_query; fi
-    if grep -qF 'No such file' "$root/legacy-error"; then class=missing_file; fi
-    if grep -qF 'uninstalled' "$root/legacy-error"; then class=installation; fi
-    if grep -qF 'configuration' "$root/legacy-error"; then class=configuration; fi
+  local error="$root/upgrade-error"
+  if [[ $stage == legacy* ]]; then error="$root/legacy-error"; fi
+  if [[ -f $error ]]; then
+    if grep -qF 'systemctl show' "$error"; then class=manager_query; fi
+    if grep -qF 'No such file' "$error"; then class=missing_file; fi
+    if grep -qF 'uninstalled' "$error"; then class=installation; fi
+    if grep -qF 'configuration' "$error"; then class=configuration; fi
+    if grep -qF 'no rows' "$error"; then class=missing_marker; fi
+    if grep -qF 'unit' "$error"; then class=unit_contract; fi
+    if grep -qF 'cgroup' "$error"; then class=cgroup; fi
+    if grep -qF 'Controller' "$error"; then class=controller; fi
+    if grep -qF 'deadline' "$error"; then class=deadline; fi
   fi
   printf 'stage=%s line=%s status=%s class=%s\n' "$stage" "$line" "$status" "$class" > "$root/upgrade-failure"
 }
@@ -80,12 +87,13 @@ stage=bootstrap
 # Distinct ELF files of one supported protocol; no claim about historical cooperative releases.
 cp -- "$wake" "$root/old"
 printf '\ncooperative-previous-generation\n' >> "$root/old"
-"$root/old" ensure > "$root/first"
+"$root/old" ensure > "$root/first" 2> "$root/upgrade-error"
 jq -e '.local_ready == true and .generation == 1' "$root/first" >/dev/null
 old_pid=$(ctl show codex-wake.service -p MainPID --value)
 old_invocation=$(ctl show codex-wake.service -p InvocationID --value)
 old_group=$(ctl show codex-wake.service -p ControlGroup --value)
 old_owner=$(jq -r .spec.owner "$journal")
+delivery_thread=$("$root/probe" create-thread "$codex" "$socket")
 controller=$(ctl show wake-qualification-controller.service -p MainPID -p InvocationID)
 secret=$HOME/preserved-secret
 printf fixture-secret > "$secret"
@@ -97,7 +105,14 @@ sleep 120 & helper=$!
 printf '%s\n' "$helper" > "/sys/fs/cgroup$old_group/cgroup.procs"
 kill -STOP "$old_pid"; stopped=$old_pid
 stage=closure
-CODEX_WAKE_CODEX=/usr/bin/false "$wake" --codex "$codex" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
+mkdir "$root/delayed"
+cat > "$root/delayed/systemctl" <<'DELAY'
+#!/bin/bash
+/usr/bin/systemctl "$@" || exit $?
+if [[ $1 == --user && $2 == start ]]; then sleep 18; fi
+DELAY
+chmod 700 "$root/delayed/systemctl"
+PATH="$root/delayed:/usr/bin:/bin" CODEX_WAKE_CODEX=/usr/bin/false "$wake" --codex "$codex" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
 for ((i=0;i<300;i++)); do
   [[ $(sqlite3 -readonly "$db" 'SELECT is_open FROM wake_delivery_claim_gate') == 0 ]] && break
   kill -0 "$upgrader"
@@ -108,7 +123,8 @@ done
 if "$wake" cooperative-gate transfer --owner "$old_owner" --generation 1 --next-owner bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb >/dev/null 2>&1; then exit 1; fi
 "$wake" ensure > "$root/contender-result" 2> "$root/contender-error" & contender=$!
 # A stable producer may retain input while closed; it cannot dispatch it.
-printf '%s' '{"thread":"11111111-1111-4111-8111-111111111111","message_template":"fixture","request_id":"22222222-2222-4222-8222-222222222222"}' | "$wake" queue-direct > "$root/retained"
+payload=$(jq -nc --arg thread "$delivery_thread" '{thread:$thread,message_template:"fixture",request_id:"22222222-2222-4222-8222-222222222222"}')
+printf '%s' "$payload" | "$wake" queue-direct > "$root/retained"
 jq -e '.state == "pending"' "$root/retained" >/dev/null
 kill -CONT "$old_pid"; stopped=
 stage=drain
@@ -126,6 +142,13 @@ stage=activation
 wait "$upgrader"; upgrader=
 wait "$contender"; contender=
 for file in second contender-result; do jq -e '.local_ready == true and .generation == 2' "$root/$file" >/dev/null; done
+new_pid=$(ctl show codex-wake.service -p MainPID --value)
+prepared_span=$(sqlite3 -readonly "$state/telemetry.sqlite3" "SELECT max(at_ms)-min(at_ms) FROM events WHERE pid=$new_pid AND operation='receiver.prepared' AND outcome='ok';")
+[[ $prepared_span =~ ^[0-9]+$ && $prepared_span -ge 15000 ]]
+# The retained input reaches the native controller only after activation and is not sent again.
+printf '%s' "$payload" | "$wake" queue-direct > "$root/delivered"
+jq -e '.state == "queued" and .replayed == true and .reason == "accepted"' "$root/delivered" >/dev/null
+[[ $(sqlite3 -readonly "$db" "SELECT count(*) FROM cooperative_direct_pending WHERE request_id='22222222-2222-4222-8222-222222222222';") == 0 ]]
 [[ $(ctl show codex-wake.service -p InvocationID --value) != "$old_invocation" ]]
 [[ $(ctl show codex-wake.service -p MainPID --value) != "$old_pid" ]]
 [[ $(sqlite3 -readonly "$db" 'SELECT state FROM waits WHERE run_id=9') == sending ]]
