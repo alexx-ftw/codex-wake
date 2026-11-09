@@ -5,7 +5,8 @@ set -Eeuo pipefail
 root=${HOME%/h}
 wake=$1 codex=$2 socket=$3
 [[ $wake == "$root/wake" && $codex == "$root/codex" && $socket == "$root/socket" && -x $root/legacy ]] || exit 1
-export TMPDIR="$root/t" XDG_STATE_HOME="$HOME/s" XDG_DATA_HOME="$HOME/d" XDG_CONFIG_HOME="$HOME/f" XDG_CACHE_HOME="$HOME/a"
+# Unit files must use the search path of the independently started user manager.
+export TMPDIR="$root/t" XDG_STATE_HOME="$HOME/s" XDG_DATA_HOME="$HOME/d" XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/a"
 export CODEX_WAKE_CODEX="$codex" CODEX_WAKE_GH=/usr/bin/false CODEX_WAKE_ENABLE_WEBHOOKS=0 CODEX_WAKE_RPC_SOCKET="$socket"
 ctl() { /usr/bin/systemctl --user "$@"; }
 state=$XDG_STATE_HOME/codex-wake
@@ -15,7 +16,17 @@ runtime=$XDG_DATA_HOME/codex-wake/runtime
 journal=$state/cooperative-upgrade.json
 upgrader='' contender='' helper='' stopped=''
 stage=legacy
-trap 'printf "stage=%s line=%s status=%s\n" "$stage" "$LINENO" "$?" > "$root/upgrade-failure"' ERR
+failure() {
+  local status=$1 line=$2 class=other
+  if [[ -f $root/legacy-error ]]; then
+    if grep -qF 'systemctl show' "$root/legacy-error"; then class=manager_query; fi
+    if grep -qF 'No such file' "$root/legacy-error"; then class=missing_file; fi
+    if grep -qF 'uninstalled' "$root/legacy-error"; then class=installation; fi
+    if grep -qF 'configuration' "$root/legacy-error"; then class=configuration; fi
+  fi
+  printf 'stage=%s line=%s status=%s class=%s\n' "$stage" "$line" "$status" "$class" > "$root/upgrade-failure"
+}
+trap 'failure "$?" "$LINENO"' ERR
 cleanup_upgrade() {
   local rc=$?
   trap - EXIT
@@ -28,7 +39,7 @@ cleanup_upgrade() {
 }
 trap cleanup_upgrade EXIT
 # A real released alpha.2 remains active, with the same binary, invocation and DB.
-"$root/legacy" ensure > "$root/legacy-result"
+"$root/legacy" ensure > "$root/legacy-result" 2> "$root/legacy-error"
 legacy_id=$(ctl show codex-wake.service -p MainPID -p InvocationID)
 legacy_binary=$(sha256sum "$runtime/codex-wake")
 legacy_schema=$(sqlite3 -readonly "$db" '.schema')

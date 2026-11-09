@@ -674,6 +674,67 @@ pub(crate) fn status(config: &Config) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn missing_or_mismatched_activation_journal_never_opens_a_prepared_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            state: root.path().into(),
+            runtime: root.path().join("runtime"),
+            config: root.path().join("config"),
+            unit: root.path().join("unit"),
+            db: root.path().join("db"),
+            codex: PathBuf::from("/effective/cli/override"),
+            gh: PathBuf::from("/bin/false"),
+            webhooks_enabled: false,
+            codex_home: root.path().join("codex"),
+            rpc_socket: root.path().join("external.sock"),
+            cache: root.path().join("cache"),
+            plugin_base: None,
+        };
+        let spec = Spec {
+            protocol: PROTOCOL,
+            owner: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            generation: 1,
+            executable: root.path().join("wake"),
+            binary: "fixture".into(),
+            unit: "fixture".into(),
+        };
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::bridge::control_claim_gate(&mut db, "init", &spec.owner, None, None).unwrap();
+        crate::bridge::control_claim_gate(&mut db, "arm", &spec.owner, Some(1), None).unwrap();
+        crate::bridge::bind_receiver_gate(&mut db, &spec.owner, 1).unwrap();
+        crate::bridge::control_claim_gate(&mut db, "close", &spec.owner, Some(1), None).unwrap();
+        let a = Activation {
+            invocation: "11111111111111111111111111111111".into(),
+            pid: 123,
+            start: 1,
+        };
+        let peer = Controller {
+            pid: 456,
+            start: 1,
+            device: 1,
+            inode: 1,
+            socket_device: 1,
+            socket_inode: 1,
+            group: "/outside".into(),
+        };
+        // Each interleaving must fail before querying any real manager or controller.
+        assert!(activate(&config, &spec, &a, &peer, &mut db).is_err());
+        save(&config, "pending", &spec, None).unwrap();
+        assert!(activate(&config, &spec, &a, &peer, &mut db).is_err());
+        let mut other = a.clone();
+        other.start += 1;
+        save(&config, "ready", &spec, Some(other)).unwrap();
+        assert!(activate(&config, &spec, &a, &peer, &mut db).is_err());
+        assert!(
+            !db.query_row("SELECT is_open FROM wake_delivery_claim_gate", [], |r| r
+                .get::<_, bool>(
+                0
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn health_requires_fresh_success_from_this_invocation_without_later_errors() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE events(at_ms INTEGER,outcome TEXT,pid INTEGER,subject TEXT,operation TEXT)").unwrap();
