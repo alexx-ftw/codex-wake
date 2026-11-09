@@ -41,10 +41,33 @@ trap cleanup_upgrade EXIT
 # A real released alpha.2 remains active, with the same binary, invocation and DB.
 "$root/legacy" ensure > "$root/legacy-result" 2> "$root/legacy-error"
 legacy_id=$(ctl show codex-wake.service -p MainPID -p InvocationID)
+legacy_pid=$(ctl show codex-wake.service -p MainPID --value)
+# Freeze only the fixture before its baseline: its own worker migrations are unrelated to ensure.
+[[ $legacy_pid =~ ^[1-9][0-9]*$ ]]
+for ((i=0;i<100;i++)); do [[ -f $db ]] && break; sleep .05; done
+[[ -f $db ]]
+stopped=$legacy_pid
+# Acquire the writer lock first so SIGSTOP cannot strand an exclusive schema transaction.
+sqlite3 -batch "$db" <<SQL
+.bail on
+.timeout 10000
+BEGIN IMMEDIATE;
+.shell /bin/kill -STOP $legacy_pid
+COMMIT;
+SQL
+grep -q '^State:.*T' "/proc/$legacy_pid/status"
 legacy_binary=$(sha256sum "$runtime/codex-wake")
 legacy_schema=$(sqlite3 -readonly "$db" '.schema')
 if CODEX_WAKE_COOPERATIVE_RECEIVER=1 "$wake" ensure > /dev/null 2>&1; then exit 1; fi
-[[ $legacy_id == "$(ctl show codex-wake.service -p MainPID -p InvocationID)" && $legacy_binary == "$(sha256sum "$runtime/codex-wake")" && $legacy_schema == "$(sqlite3 -readonly "$db" '.schema')" && ! -e $journal ]]
+stage=legacy_identity
+[[ $legacy_id == "$(ctl show codex-wake.service -p MainPID -p InvocationID)" ]]
+stage=legacy_binary
+[[ $legacy_binary == "$(sha256sum "$runtime/codex-wake")" ]]
+stage=legacy_schema
+[[ $legacy_schema == "$(sqlite3 -readonly "$db" '.schema')" ]]
+stage=legacy_journal
+[[ ! -e $journal ]]
+kill -CONT "$legacy_pid"; stopped=
 # Retire only this fixture's legacy installation before creating a fresh cooperative cohort.
 ctl stop codex-wake.service
 rm -- "$unit"

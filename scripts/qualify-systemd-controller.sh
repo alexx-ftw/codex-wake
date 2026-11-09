@@ -301,7 +301,7 @@ if [[ $handoff_mode != 0 ]]; then
     || {
       if [[ $handoff_mode == 2 ]]; then
         diagnostic=$(as_qual_user cat "$qual_root/upgrade-failure" 2>/dev/null || true)
-        if [[ $diagnostic =~ ^stage=(legacy|bootstrap|descendant|closure|drain|activation|interruption)\ line=[0-9]+\ status=[0-9]+\ class=(other|manager_query|missing_file|installation|configuration)$ ]]; then
+        if [[ $diagnostic =~ ^stage=(legacy|legacy_identity|legacy_binary|legacy_schema|legacy_journal|bootstrap|descendant|closure|drain|activation|interruption)\ line=[0-9]+\ status=[0-9]+\ class=(other|manager_query|missing_file|installation|configuration)$ ]]; then
           printf 'upgrade qualification: %s\n' "$diagnostic" >&2
         fi
       fi

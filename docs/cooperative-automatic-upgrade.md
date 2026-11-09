@@ -90,3 +90,11 @@ socket test and systemd lifecycle tests must not be described as that proof.
 The freshness tests cover old successful heartbeats, PID reuse across invocations,
 a newer heartbeat failure, and a worker error after a successful heartbeat.
 A socket-preflight regression checks that a healthy generation is not closed.
+
+The alpha.2 guard fixture pauses only its own test receiver before taking the
+schema baseline, then resumes it after checking the rejected update. Otherwise
+alpha.2 worker initialization can independently change that schema between
+samples. The ignored `legacy_schema_race` test deterministically demonstrates
+this with the pinned published binary, a private Unix controller and a SQLite
+lock: the rejected updater exits without changes; schema additions occur only
+after releasing the legacy writer. CI executes this regression explicitly.

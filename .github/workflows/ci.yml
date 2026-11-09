@@ -206,6 +206,11 @@ jobs:
             --pattern 'codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' --dir "$RUNNER_TEMP/upgrade-legacy"
           echo '98c3fd2c436ee5dd7a53d0839c0e53d2148e2923859875aefa69bf7a8932a1a7  codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' | (cd "$RUNNER_TEMP/upgrade-legacy" && sha256sum --check)
           tar -xzf "$RUNNER_TEMP/upgrade-legacy/codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/upgrade-legacy"
+      - name: Reproduce independent alpha.2 schema initialization
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        env:
+          WAKE_LEGACY_BINARY: ${{ runner.temp }}/upgrade-legacy/codex-wake-0.2.0-alpha.2/bin/codex-wake
+        run: cargo test --locked --test legacy_schema_race -- --ignored --nocapture
       - name: Qualify independent units under a temporary user
         env:
           WAKE_QUALIFY_HANDOFF: ${{ (github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification') && '2' || inputs.probe == 'cooperative-handoff-qualification' && '1' || '0' }}
