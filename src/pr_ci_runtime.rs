@@ -7,13 +7,13 @@ use crate::pr_ci::{self, ApiResponse, Delivery, PollReport};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::Connection;
 use serde_json::Value;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::{error::Error, fmt, io::Read};
 
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
 const GH_OUTPUT_LIMIT: u64 = 1_048_576;
@@ -25,6 +25,30 @@ const WAKE_RETRY_BATCH: i64 = 1;
 const WAKE_RETRY_MAX_MS: i64 = 900_000;
 /// Longer than Wake's normal delivery command timeout; expiry means uncertain.
 const DELIVERY_LEASE: Duration = Duration::from_secs(180);
+
+#[derive(Debug)]
+struct BeforeSendFailure(anyhow::Error);
+
+impl fmt::Display for BeforeSendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Delivery preparation failed before queue submission: {}",
+            self.0
+        )
+    }
+}
+
+impl Error for BeforeSendFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Mark an error from delivery preparation that occurs before any queue request.
+pub fn before_send_failure(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(BeforeSendFailure(error))
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DispatchReport {
@@ -419,13 +443,13 @@ where
 }
 
 fn known_before_send_failure(error: &anyhow::Error) -> bool {
-    // These typed markers belong to the host binary; match their unique display text here.
     error.chain().any(|cause| {
-        matches!(
-            cause.to_string().as_str(),
-            "Target unavailable during preparation; input was not sent"
-                | "Target thread has an active writer; input was not sent"
-        )
+        cause.downcast_ref::<BeforeSendFailure>().is_some()
+            || matches!(
+                cause.to_string().as_str(),
+                "Target unavailable during preparation; input was not sent"
+                    | "Target thread has an active writer; input was not sent"
+            )
     })
 }
 
@@ -579,6 +603,16 @@ mod tests {
                 1
             );
         }
+
+        let mut evidence_db = database();
+        let report = dispatch(&mut evidence_db, 2_000, |_, _| {
+            Err(before_send_failure(anyhow::anyhow!(
+                "could not open delivery evidence database"
+            )))
+        })
+        .unwrap();
+        assert_eq!((report.retried_before_send, report.uncertain), (1, 0));
+        assert_eq!(pr_ci::uncertain_deliveries(&evidence_db).unwrap().len(), 0);
 
         let mut uncertain_db = database();
         let report = dispatch(&mut uncertain_db, 3_000, |_, _| {

@@ -1025,12 +1025,10 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                         "github.workflow_run.completed",
                                         &[&delivery.repo, &run, &attempt],
                                     )?;
-                                    let evidence_db = crate::bridge::connect(&poll_config.db)?;
-                                    let (id, _) = crate::delivery_evidence::begin(
-                                        &evidence_db,
+                                    let id = crate::prepare_ci_delivery_identity(
+                                        &poll_config.db,
                                         &key,
                                         &delivery.thread,
-                                        true,
                                     )?;
                                     crate::execution::queue_with_identity(
                                         &poll_config.codex,
@@ -1628,6 +1626,7 @@ fn accepted_native_message_ids(db: &rusqlite::Connection, thread: &str) -> Resul
     crate::polling::pr_notifications::initialize(db)?;
     crate::delivery_evidence::initialize(db)?;
     codex_wake::pr_ci::initialize(db)?;
+    crate::rules::initialize(db)?;
 
     let mut ids = HashSet::new();
     let mut statement = db.prepare(
@@ -1662,6 +1661,28 @@ fn accepted_native_message_ids(db: &rusqlite::Connection, thread: &str) -> Resul
         )?;
         ids.insert(crate::delivery_evidence::client_user_message_id(
             &event, thread,
+        )?);
+    }
+
+    let mut statement = db.prepare(
+        "SELECT rule_id,source_event_key FROM rule_deliveries
+         WHERE thread_id=?1 AND state='queued'
+           AND reason='native_queue_resume_warning'
+           AND event_identity_verified=1 AND source_event_key IS NOT NULL",
+    )?;
+    let rule_deliveries = statement
+        .query_map([thread], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (rule_id, event_key) in rule_deliveries {
+        let delivery_key = crate::delivery_evidence::source_fields_identity(
+            "codex-wake/rule-delivery/v1",
+            &[&rule_id, &event_key],
+        )?;
+        ids.insert(crate::delivery_evidence::client_user_message_id(
+            &delivery_key,
+            thread,
         )?);
     }
     Ok(ids)
@@ -1805,11 +1826,12 @@ mod tests {
     }
 
     #[test]
-    fn native_wake_recovery_resolves_durable_ids_from_both_accepted_outboxes() {
+    fn native_wake_recovery_resolves_durable_ids_from_accepted_deliveries() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         crate::polling::pr_notifications::initialize(&db).unwrap();
         codex_wake::pr_ci::initialize(&db).unwrap();
         crate::delivery_evidence::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
         let notification_id = "22222222-2222-4222-8222-222222222222";
         db.execute(
             "INSERT INTO automatic_pr_notifications
@@ -1825,6 +1847,17 @@ mod tests {
             rusqlite::params!["a".repeat(40), RECOVERY_THREAD],
         )
         .unwrap();
+        let rule_id = "rule-with-accepted-comment";
+        let source_event_key = "github-comment-event-key";
+        db.execute("INSERT INTO rules(id,input) VALUES(?1,'{}')", [rule_id])
+            .unwrap();
+        db.execute(
+            "INSERT INTO rule_deliveries
+             (rule_id,event_header,comment_id,source,source_event_key,event_identity_verified,state,thread_id,reason)
+             VALUES(?1,'issue_comment','77','{}',?2,1,'queued',?3,'native_queue_resume_warning')",
+            rusqlite::params![rule_id, source_event_key, RECOVERY_THREAD],
+        )
+        .unwrap();
 
         let ids = accepted_native_message_ids(&db, RECOVERY_THREAD).unwrap();
         let run = "123";
@@ -1834,11 +1867,20 @@ mod tests {
             &["owner/repo", run, attempt],
         )
         .unwrap();
-        assert_eq!(ids.len(), 2);
+        let rule_delivery_key = crate::delivery_evidence::source_fields_identity(
+            "codex-wake/rule-delivery/v1",
+            &[rule_id, source_event_key],
+        )
+        .unwrap();
+        let rule_client_id =
+            crate::delivery_evidence::client_user_message_id(&rule_delivery_key, RECOVERY_THREAD)
+                .unwrap();
+        assert_eq!(ids.len(), 3);
         assert!(ids.contains(notification_id));
         assert!(ids.contains(
             &crate::delivery_evidence::client_user_message_id(&event, RECOVERY_THREAD).unwrap()
         ));
+        assert!(ids.contains(&rule_client_id));
     }
 
     #[test]

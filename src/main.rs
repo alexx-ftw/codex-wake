@@ -43,7 +43,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -573,6 +573,18 @@ fn recover(config: &manager::Config) -> Result<usize> {
     })
 }
 
+pub(crate) fn prepare_ci_delivery_identity(
+    db_path: &Path,
+    event_key: &str,
+    thread: &str,
+) -> Result<String> {
+    let evidence_db =
+        bridge::connect(db_path).map_err(codex_wake::pr_ci_runtime::before_send_failure)?;
+    let (id, _) = delivery_evidence::begin(&evidence_db, event_key, thread, true)
+        .map_err(codex_wake::pr_ci_runtime::before_send_failure)?;
+    Ok(id)
+}
+
 fn recover_with_queue(
     config: &manager::Config,
     mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
@@ -605,8 +617,7 @@ fn recover_with_queue(
             "github.workflow_run.completed",
             &[&delivery.repo, &run, &attempt],
         )?;
-        let evidence_db = bridge::connect(&config.db)?;
-        let (id, _) = delivery_evidence::begin(&evidence_db, &key, &delivery.thread, true)?;
+        let id = prepare_ci_delivery_identity(&config.db, &key, &delivery.thread)?;
         queue(&delivery.thread, message, &id, true)
     })?
     .claimed;
@@ -5485,6 +5496,62 @@ mod pr_hook_registration_integration_tests {
             .query_row("SELECT state FROM pr_ci_deliveries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(state, "delivered");
+    }
+
+    #[test]
+    fn recover_retries_pr_ci_when_evidence_cannot_be_prepared_before_queueing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state,
+            runtime: root.join("runtime"),
+            config: root.join("config"),
+            unit: root.join("unit"),
+            db: root.join("state/state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: false,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let db = database(&config).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',8,1,'not-a-thread-uuid','failure','{}')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        assert_eq!(
+            recover_with_queue(&config, |_, _, _, _| panic!(
+                "evidence preparation failed before the queue call"
+            ))
+            .unwrap(),
+            1
+        );
+
+        let db = bridge::connect(&config.db).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM pr_ci_deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
+        let retry_after: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_delivery_retry_after",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_after, 1);
     }
 }
 

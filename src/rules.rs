@@ -467,6 +467,7 @@ fn dispatch_with_identity(
         let span = crate::observability::Span::new("dispatch.rule", Some(&subject));
         let mut stage = "invalid_configuration";
         let mut may_retry = false;
+        let mut delivery_thread = None;
         let result = (|| -> Result<(String, Option<String>)> {
             let mut input: RuleInput = serde_json::from_str(&raw)?;
             validate(&mut input)?;
@@ -548,6 +549,7 @@ fn dispatch_with_identity(
                 )?
                 .to_string()
             };
+            delivery_thread = Some(thread.clone());
             db.execute("UPDATE rule_deliveries SET thread_id=?1,updated=CURRENT_TIMESTAMP WHERE rule_id=?2 AND event_header=?3 AND comment_id=?4", params![thread,rule_id,header,comment_id])?;
             crate::observability::emit(
                 "delivery.target",
@@ -622,7 +624,24 @@ fn dispatch_with_identity(
                 Some(format!("{stage}: {error}").chars().take(1024).collect()),
             ),
         };
-        db.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5",params![state,reason,rule_id,header,comment_id])?;
+        if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
+            let thread = delivery_thread
+                .as_deref()
+                .context("Accepted rule delivery has no target thread")?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                &tx,
+                thread,
+                "native_queue_resume_warning",
+            )?;
+            ensure!(
+                tx.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5 AND state='creating'",params![state,reason,rule_id,header,comment_id])? == 1,
+                "Rule delivery claim was lost before wake recovery was recorded"
+            );
+            tx.commit()?;
+        } else {
+            db.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5",params![state,reason,rule_id,header,comment_id])?;
+        }
         span.finish(
             match state.as_str() {
                 "queued" => "queued",
@@ -920,6 +939,66 @@ mod tests {
         assert_eq!(starts, 1);
         assert_eq!(attempts, 2);
         assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
+    }
+
+    #[test]
+    fn accepted_comment_resume_warning_records_native_wake_recovery() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        rule.model = Some("gpt-6.1-sol".into());
+        rule.reasoning_effort = Some("medium".into());
+        let rule_id = configure(&db, rule).unwrap();
+        let source = payload();
+        assert_eq!(accept(&db, "issue_comment", &source).unwrap(), 1);
+        let source_event_key =
+            crate::delivery_evidence::github_comment_event_identity("issue_comment", &source)
+                .unwrap()
+                .unwrap();
+        let delivery_key = crate::delivery_evidence::source_fields_identity(
+            "codex-wake/rule-delivery/v1",
+            &[&rule_id, &source_event_key],
+        )
+        .unwrap();
+        let expected_client_id =
+            crate::delivery_evidence::client_user_message_id(&delivery_key, THREAD).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut actual_client_id = None;
+
+        dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut |_, _| unreachable!(),
+            &mut |thread, _, _, event_key, client_id| {
+                assert_eq!(thread, THREAD);
+                assert_eq!(event_key, Some(delivery_key.as_str()));
+                actual_client_id = client_id.map(str::to_owned);
+                Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            actual_client_id.as_deref(),
+            Some(expected_client_id.as_str())
+        );
+        let (state, reason): (String, Option<String>) = db
+            .query_row("SELECT state,reason FROM rule_deliveries", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(state, "queued");
+        assert_eq!(reason.as_deref(), Some("native_queue_resume_warning"));
+        let (thread, recovery_reason): (String, String) = db
+            .query_row(
+                "SELECT thread,reason FROM native_wake_recovery",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(thread, THREAD);
+        assert_eq!(recovery_reason, "native_queue_resume_warning");
     }
 
     #[test]
