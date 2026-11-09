@@ -198,6 +198,15 @@ where
                 )?;
             }
         }
+        let timeline_floor = if cached_prior_state.as_deref() == Some("closed") {
+            Some(
+                pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)
+                    .map_err(|_| Failure::new("database"))?
+                    .ok_or_else(|| Failure::new("invalid_response"))?,
+            )
+        } else {
+            None
+        };
         let reopened_at = std::cell::RefCell::new(None::<Vec<ReopenedTimelineEvent>>);
         let timeline_calls = std::cell::Cell::new(0_u64);
         let repo_for_timeline = resource.repo.clone();
@@ -211,10 +220,13 @@ where
                 && serde_json::from_slice::<Value>(&response.body)
                     .is_ok_and(|pull| pull["state"] == "open")
             {
+                let floor_sec = timeline_floor.ok_or_else(|| Failure::new("invalid_response"))?;
                 let (events, calls) = fetch_reopened_timeline(
+                    db,
                     &mut fetch,
                     &repo_for_timeline,
                     &number_for_timeline,
+                    floor_sec,
                     &timeline_calls,
                 )?;
                 reopened_at.replace(Some(events));
@@ -2234,15 +2246,18 @@ impl HttpResponse {
     }
 }
 
+#[derive(Clone)]
 struct ReopenedTimelineEvent {
     event_at: String,
     event_id: String,
 }
 
 fn fetch_reopened_timeline<F>(
+    db: &Connection,
     fetch: &mut F,
     repo: &str,
     number: &str,
+    floor_sec: i64,
     calls: &std::cell::Cell<u64>,
 ) -> std::result::Result<(Vec<ReopenedTimelineEvent>, u64), Failure>
 where
@@ -2265,21 +2280,35 @@ where
     }
     let mut reopened = Vec::new();
     loop {
-        reopened.extend(
-            serde_json::from_slice::<Value>(&page.body)
-                .ok()
-                .and_then(|events| events.as_array().cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|event| event["event"] == "reopened")
-                .filter_map(|event| {
-                    Some(ReopenedTimelineEvent {
-                        event_at: event["created_at"].as_str()?.to_owned(),
-                        event_id: event["id"].as_i64()?.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>(),
-        );
+        let page_events = serde_json::from_slice::<Value>(&page.body)
+            .ok()
+            .and_then(|events| events.as_array().cloned())
+            .ok_or_else(|| Failure::new("invalid_response"))?;
+        let mut reached_floor = false;
+        for event in page_events {
+            let event_at = event["created_at"]
+                .as_str()
+                .ok_or_else(|| Failure::new("invalid_response"))?;
+            let event_at_sec = pr_notifications::timestamp_second(db, event_at)
+                .map_err(|_| Failure::new("invalid_response"))?;
+            reached_floor |= event_at_sec <= floor_sec;
+            if event["event"] == "reopened" && event_at_sec >= floor_sec {
+                reopened.push(ReopenedTimelineEvent {
+                    event_at: event_at.to_owned(),
+                    event_id: event["id"]
+                        .as_i64()
+                        .ok_or_else(|| Failure::new("invalid_response"))?
+                        .to_string(),
+                });
+            }
+        }
+        if reached_floor {
+            if reopened.is_empty() {
+                return Err(Failure::new("invalid_response"));
+            }
+            reopened.sort_by(|left, right| left.event_at.cmp(&right.event_at));
+            return Ok((reopened, calls.get()));
+        }
         let Some(previous) = page_link_route(&page, "prev") else {
             if reopened.is_empty() {
                 return Err(Failure::new("invalid_response"));
@@ -3636,11 +3665,14 @@ mod tests {
 
     #[test]
     fn reopened_timeline_collects_events_from_previous_pages() {
+        let db = Connection::open_in_memory().unwrap();
         let first_page = "/repos/owner/repo/issues/7/timeline?per_page=100&page=1";
         let last_page = "/repos/owner/repo/issues/7/timeline?per_page=100&page=2";
+        let floor = pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap();
         let calls = std::cell::Cell::new(0);
         let mut requested = Vec::new();
         let (events, _) = fetch_reopened_timeline(
+            &db,
             &mut |route, _| {
                 requested.push(route.to_owned());
                 let (body, link) = match route {
@@ -3666,6 +3698,7 @@ mod tests {
             },
             "owner/repo",
             "7",
+            floor,
             &calls,
         )
         .unwrap();
@@ -3673,7 +3706,56 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_id, "7001");
         assert_eq!(events[1].event_id, "7002");
-        assert_eq!(requested, [first_page, last_page, first_page]);
+        assert_eq!(
+            requested,
+            vec![
+                first_page.to_owned(),
+                last_page.to_owned(),
+                first_page.to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn reopened_timeline_stops_after_reaching_the_known_close_floor() {
+        let db = Connection::open_in_memory().unwrap();
+        let first_page = "/repos/owner/repo/issues/7/timeline?per_page=100&page=1";
+        let last_page = "/repos/owner/repo/issues/7/timeline?per_page=100&page=2";
+        let floor = pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let mut requested = Vec::new();
+        let (events, _) = fetch_reopened_timeline(
+            &db,
+            &mut |route, _| {
+                requested.push(route.to_owned());
+                let (body, link) = match route {
+                    route if route == first_page => (
+                        json!([]),
+                        format!("<https://api.github.com{last_page}>; rel=\"last\""),
+                    ),
+                    route if route == last_page => (
+                        json!([
+                            {"id":7001,"event":"reopened","created_at":"2099-01-01T00:00:00Z"},
+                            {"id":6999,"event":"closed","created_at":"2098-12-31T23:59:00Z"}
+                        ]),
+                        format!("<https://api.github.com{first_page}>; rel=\"prev\""),
+                    ),
+                    _ => panic!("unexpected timeline route: {route}"),
+                };
+                let mut response = response(body, false);
+                response.headers.insert("link".into(), link);
+                Ok(response)
+            },
+            "owner/repo",
+            "7",
+            floor,
+            &calls,
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "7001");
+        assert_eq!(requested, vec![first_page.to_owned(), last_page.to_owned()]);
     }
 
     #[test]

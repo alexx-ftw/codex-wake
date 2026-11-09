@@ -249,7 +249,8 @@ fn real_webhook_passes_delivery_id_and_exact_request_bytes_to_command() {
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let db = temp.path().join("state.sqlite3");
     let codex = temp.path().join("unused-codex");
-    let capture = temp.path().join("received-body");
+    let capture = temp.path().join("codex-calls");
+    let delivery_capture = temp.path().join("codex-calls.delivery");
     let recorder = temp.path().join("record-webhook-input");
     fs::write(
         &recorder,
@@ -277,10 +278,7 @@ fn real_webhook_passes_delivery_id_and_exact_request_bytes_to_command() {
         200
     );
     assert_eq!(fs::read(capture).unwrap(), body);
-    assert_eq!(
-        fs::read_to_string(temp.path().join("received-body.delivery")).unwrap(),
-        delivery_id
-    );
+    assert_eq!(fs::read_to_string(delivery_capture).unwrap(), delivery_id);
 }
 
 #[test]
