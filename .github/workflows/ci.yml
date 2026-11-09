@@ -125,7 +125,9 @@ jobs:
         run: bash tests/qualify-systemd-controller.sh
       - name: Check handoff status regressions
         if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification' }}
-        run: bash tests/qualify-cooperative-handoff.sh
+        run: |
+          bash tests/qualify-cooperative-handoff.sh
+          bash tests/qualify-cooperative-upgrade.sh
       - name: Build test receiver and qualification probe
         run: |
           cargo test --locked --jobs "$(nproc)" --example controller-systemd-qualification
@@ -233,5 +235,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: controller-systemd-qualification
-          path: ${{ runner.temp }}/controller-systemd-qualification.json
+          path: |
+            ${{ runner.temp }}/controller-systemd-qualification.json
+            ${{ runner.temp }}/controller-systemd-qualification.json.upgrade-diagnostic.json
           if-no-files-found: ignore

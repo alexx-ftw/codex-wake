@@ -9,6 +9,7 @@ wake=$1 codex=$2 socket=$3
 export TMPDIR="$root/t" XDG_STATE_HOME="$HOME/s" XDG_DATA_HOME="$HOME/d" XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/a"
 export CODEX_WAKE_CODEX="$codex" CODEX_WAKE_GH=/usr/bin/false CODEX_WAKE_ENABLE_WEBHOOKS=0 CODEX_WAKE_RPC_SOCKET="$socket"
 ctl() { /usr/bin/systemctl --user "$@"; }
+receiver_journal() { /usr/bin/journalctl --user -u codex-wake.service -n 40 --no-pager -o cat; }
 state=$XDG_STATE_HOME/codex-wake
 db=$state/state.sqlite3
 unit=$XDG_CONFIG_HOME/systemd/user/codex-wake.service
@@ -18,6 +19,7 @@ upgrader='' contender='' helper='' stopped=''
 stage=legacy
 failure() {
   local status=$1 line=$2 class=other
+  trap - ERR
   local error="$root/upgrade-error"
   if [[ $stage == legacy* ]]; then error="$root/legacy-error"; fi
   if [[ -f $error ]]; then
@@ -32,6 +34,50 @@ failure() {
     if grep -qF 'deadline' "$error"; then class=deadline; fi
   fi
   printf 'stage=%s line=%s status=%s class=%s\n' "$stage" "$line" "$status" "$class" > "$root/upgrade-failure"
+  diagnose "$status" "$line" "$class" || true
+}
+receiver_error_codes() {
+jq -Rsc '[
+      ["unit_contract","Cooperative unit contract changed"],
+      ["unit_override","Unverified cooperative unit"],
+      ["unit_file","Cooperative unit file changed"],
+      ["not_running","Cooperative receiver is not running"],
+      ["cgroup","Receiver process/cgroup mismatch"],
+      ["executable","Receiver executable identity changed"],
+      ["invocation","Receiver invocation is not this process"],
+      ["controller_group","Controller shares receiver cgroup"],
+      ["bind_changed","Receiver gate closed state or ownership changed"],
+      ["binding_record","Receiver has not bound its lifecycle generation"],
+      ["stale_health","Receiver health is stale or failed"],
+      ["later_error","Receiver reported an error after its health marker"],
+      ["activation_journal","Receiver activation journal mismatch"],
+      ["preparation","Controller preparation failed"],
+      ["missing_rows","returned no rows"],
+      ["missing_table","no such table"],
+      ["locked","database is locked"]
+    ] as $rules | . as $message | [$rules[] | . as $rule | select($message | contains($rule[1])) | $rule[0]]'
+}
+diagnose() {
+  local state_json gate_json health_json codes phase matches expected actual unit_pid
+  state_json=$(ctl show codex-wake.service -p LoadState -p ActiveState -p SubState -p MainPID -p Result -p ExecMainCode -p ExecMainStatus |
+    jq -Rn '[inputs | split("=") | {(.[0]):.[1]}] | add') || state_json='{}'
+  unit_pid=$(jq -r '.MainPID // "0"' <<< "$state_json")
+  [[ $unit_pid =~ ^[0-9]+$ ]] || unit_pid=0
+  gate_json=$(sqlite3 -readonly "$db" "SELECT json_object('open',is_open,'generation',generation,'bound',receiver_pid IS NOT NULL,'pid_matches_unit',receiver_pid=$unit_pid,'start_present',receiver_start IS NOT NULL,'lifecycle_present',receiver_lifecycle IS NOT NULL,'owner_matches_lifecycle',owner=json_extract(receiver_lifecycle,'$.owner'),'generation_matches_lifecycle',generation=json_extract(receiver_lifecycle,'$.generation')) FROM wake_delivery_claim_gate WHERE id=1;" 2>/dev/null) || gate_json='{}'
+  health_json=$(sqlite3 -readonly "$state/telemetry.sqlite3" "SELECT json_group_array(json_object('operation',operation,'outcome',outcome,'count',n,'latest_ms',latest)) FROM (SELECT operation,outcome,count(*) n,max(at_ms) latest FROM events WHERE pid=$unit_pid AND operation IN ('receiver.prepared','receiver.heartbeat','receiver.start','receiver.dispatch','receiver.worker','cli.receiver') GROUP BY operation,outcome);" 2>/dev/null) || health_json='[]'
+  # Only fixed codes leave this private fixture; never export error strings or journal messages.
+  codes=$({ cat "$root/upgrade-error" 2>/dev/null || true; receiver_journal 2>/dev/null || true; } |
+    receiver_error_codes) || codes='[]'
+  [[ -n $gate_json ]] || gate_json='{}'
+  [[ -n $health_json ]] || health_json='[]'
+  phase=$(jq -r '.phase | select(. == "ready" or . == "pending")' "$journal" 2>/dev/null) || phase=unknown
+  expected=$(jq -r .spec.unit "$journal" 2>/dev/null) || expected=missing
+  actual=$(sha256sum "$unit" 2>/dev/null | cut -d' ' -f1) || actual=absent
+  matches=false; [[ $expected == "$actual" ]] && matches=true
+  jq -n --arg stage "$stage" --arg phase "$phase" --arg class "$3" --argjson line "$2" --argjson status "$1" \
+    --argjson service "$state_json" --argjson gate "$gate_json" --argjson health "$health_json" \
+    --argjson codes "$codes" --argjson unit_matches "$matches" \
+    '{stage:$stage,line:$line,status:$status,error_class:$class,journal_phase:$phase,service:$service,gate:$gate,health:$health,error_codes:$codes,unit_matches_journal:$unit_matches}' > "$root/upgrade-diagnostic.json"
 }
 trap 'failure "$?" "$LINENO"' ERR
 cleanup_upgrade() {

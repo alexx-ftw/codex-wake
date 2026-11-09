@@ -304,6 +304,9 @@ if [[ $handoff_mode != 0 ]]; then
         if [[ $diagnostic =~ ^stage=(legacy|legacy_identity|legacy_binary|legacy_schema|legacy_journal|bootstrap|descendant|closure|drain|activation|interruption)\ line=[0-9]+\ status=[0-9]+\ class=(other|manager_query|missing_file|installation|configuration|missing_marker|unit_contract|cgroup|controller|deadline)$ ]]; then
           printf 'upgrade qualification: %s\n' "$diagnostic" >&2
         fi
+        if as_qual_user jq -ce '{stage,line,status,error_class,journal_phase,service,gate,health,error_codes,unit_matches_journal}' "$qual_root/upgrade-diagnostic.json" > "$output.upgrade-diagnostic.json" 2>/dev/null; then
+          cat "$output.upgrade-diagnostic.json" >&2
+        fi
       fi
       fail 'cooperative handoff qualification failed'
     }
