@@ -661,7 +661,6 @@ pub(crate) fn record_reopened_event_in(
     source_kind: &str,
     event_at: &str,
     source_id: &str,
-    source: &Value,
 ) -> Result<Option<(String, Vec<Notification>)>> {
     ensure!(
         matches!(source_kind, "webhook" | "poll"),
@@ -746,10 +745,9 @@ pub(crate) fn record_reopened_event(
     pr: &str,
     source_kind: &str,
     event_at: &str,
-    source: &Value,
 ) -> Result<usize> {
     let source_id = format!("unidentified:{}", Uuid::new_v4());
-    record_reopened_event_with_id(db, repo, pr, source_kind, event_at, &source_id, source)
+    record_reopened_event_with_id(db, repo, pr, source_kind, event_at, &source_id)
 }
 
 pub(crate) fn record_reopened_event_with_id(
@@ -759,19 +757,18 @@ pub(crate) fn record_reopened_event_with_id(
     source_kind: &str,
     event_at: &str,
     source_id: &str,
-    source: &Value,
 ) -> Result<usize> {
     initialize(db)?;
     if db.is_autocommit() {
         let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
         let notifications =
-            record_reopened_event_in(&tx, repo, pr, source_kind, event_at, source_id, source)?
+            record_reopened_event_in(&tx, repo, pr, source_kind, event_at, source_id)?
                 .map_or(0, |(_, notifications)| notifications.len());
         tx.commit()?;
         Ok(notifications)
     } else {
         Ok(
-            record_reopened_event_in(db, repo, pr, source_kind, event_at, source_id, source)?
+            record_reopened_event_in(db, repo, pr, source_kind, event_at, source_id)?
                 .map_or(0, |(_, notifications)| notifications.len()),
         )
     }
@@ -948,10 +945,10 @@ fn accept_authenticated_webhook_inner(
                 if let Some(delivery_id) = delivery_id {
                     let source_id = format!("webhook:{delivery_id}");
                     return record_reopened_event_with_id(
-                        db, repo, &pr, "webhook", event_at, &source_id, payload,
+                        db, repo, &pr, "webhook", event_at, &source_id,
                     );
                 }
-                return record_reopened_event(db, repo, &pr, "webhook", event_at, payload);
+                return record_reopened_event(db, repo, &pr, "webhook", event_at);
             }
             if action != "closed" {
                 return Ok(0);
@@ -1657,7 +1654,6 @@ mod tests {
                 "7",
                 "poll",
                 "2099-01-01T00:00:20Z",
-                &json!({"action":"reopened"}),
             )
             .unwrap(),
             1

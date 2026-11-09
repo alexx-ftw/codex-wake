@@ -379,7 +379,6 @@ where
                             .borrow()
                             .clone()
                             .ok_or_else(|| Failure::new("invalid_response"))?;
-                        let event = full("reopened", Value::Null);
                         let tx = rusqlite::Transaction::new_unchecked(
                             db,
                             rusqlite::TransactionBehavior::Immediate,
@@ -393,7 +392,6 @@ where
                                 "poll",
                                 &timeline_event.event_at,
                                 &format!("timeline:{}", timeline_event.event_id),
-                                &event,
                             )
                             .map_err(|_| Failure::new("database"))?;
                             let Some((event_key, _)) = cycle else {
