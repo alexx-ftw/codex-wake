@@ -2861,6 +2861,7 @@ fn apply_timeline_lifecycle_events(
         tx.commit().map_err(|_| Failure::new("database"))?;
         return Ok(0);
     }
+    pr_notifications::initialize(&tx).map_err(|_| Failure::new("database"))?;
     let mut accepted = 0;
     // Stage all close identities before classification, so equal-second closes
     // remain ambiguous even when they occur later in the same batch.
@@ -5310,6 +5311,14 @@ mod tests {
     #[test]
     fn equal_second_timeline_closes_stay_pending_at_merge() {
         let db = db();
+        let journal_exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='automatic_pr_event_journal')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            !journal_exists,
+            "timeline application must initialize its own journal"
+        );
         let at = "2099-01-01T00:00:30Z";
         let events = [1, 2]
             .into_iter()
