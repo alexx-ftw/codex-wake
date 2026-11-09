@@ -594,6 +594,18 @@ pub(crate) fn prepare_ci_delivery_identity(
     Ok(id)
 }
 
+pub(crate) fn ci_delivery_event_identity(delivery: &codex_wake::pr_ci::Delivery) -> Result<String> {
+    delivery_evidence::source_fields_identity(
+        "github.pr_ci.workflow_run.completed",
+        &[
+            &delivery.repo,
+            &delivery.pull_request.to_string(),
+            &delivery.run_id.to_string(),
+            &delivery.attempt.to_string(),
+        ],
+    )
+}
+
 fn recover_with_queue(
     config: &manager::Config,
     mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
@@ -621,12 +633,7 @@ fn recover_with_queue(
     )?;
     attempted +=
         codex_wake::pr_ci_runtime::dispatch(&mut db, now, |dispatch_db, delivery, message| {
-            let run = delivery.run_id.to_string();
-            let attempt = delivery.attempt.to_string();
-            let key = delivery_evidence::source_fields_identity(
-                "github.workflow_run.completed",
-                &[&delivery.repo, &run, &attempt],
-            )?;
+            let key = ci_delivery_event_identity(delivery)?;
             let id = prepare_ci_delivery_identity(&config.db, &key, &delivery.thread)?;
             let (state, reason) = queue(&delivery.thread, message, &id, true)?;
             if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
@@ -2972,6 +2979,38 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn ci_delivery_identity_distinguishes_pull_requests_sharing_a_run() {
+        let mut delivery = codex_wake::pr_ci::Delivery {
+            id: 1,
+            thread: "11111111-1111-4111-8111-111111111111".into(),
+            repo: "owner/repo".into(),
+            pull_request: 7,
+            sha: "a".repeat(40),
+            run_id: 42,
+            attempt: 1,
+            conclusion: "success".into(),
+            source: json!({}),
+        };
+        let first = ci_delivery_event_identity(&delivery).unwrap();
+        let ordinary = delivery_evidence::source_fields_identity(
+            "github.workflow_run.completed",
+            &["owner/repo", "42", "1"],
+        )
+        .unwrap();
+        assert_ne!(first, ordinary);
+        assert_eq!(
+            delivery_evidence::client_user_message_id(&first, &delivery.thread).unwrap(),
+            delivery_evidence::client_user_message_id(
+                &ci_delivery_event_identity(&delivery).unwrap(),
+                &delivery.thread,
+            )
+            .unwrap()
+        );
+        delivery.pull_request = 8;
+        assert_ne!(first, ci_delivery_event_identity(&delivery).unwrap());
+    }
 
     #[test]
     fn webhook_signature_verification_binds_the_exact_raw_body() {

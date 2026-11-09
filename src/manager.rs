@@ -1019,12 +1019,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                 &mut db,
                                 now,
                                 |dispatch_db, delivery, message| {
-                                    let run = delivery.run_id.to_string();
-                                    let attempt = delivery.attempt.to_string();
-                                    let key = crate::delivery_evidence::source_fields_identity(
-                                        "github.workflow_run.completed",
-                                        &[&delivery.repo, &run, &attempt],
-                                    )?;
+                                    let key = crate::ci_delivery_event_identity(delivery)?;
                                     let id = crate::prepare_ci_delivery_identity(
                                         &poll_config.db,
                                         &key,
@@ -1881,8 +1876,8 @@ mod tests {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         codex_wake::pr_ci::initialize(&db).unwrap();
         let event = crate::delivery_evidence::source_fields_identity(
-            "github.workflow_run.completed",
-            &["owner/repo", "124", "1"],
+            "github.pr_ci.workflow_run.completed",
+            &["owner/repo", "42", "124", "1"],
         )
         .unwrap();
         let current_id =

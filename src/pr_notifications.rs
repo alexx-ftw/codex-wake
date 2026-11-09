@@ -1146,7 +1146,7 @@ pub(crate) fn pending(db: &Connection) -> Result<Vec<Notification>> {
     initialize(db)?;
     let mut statement = db.prepare(
         "SELECT id,kind,repo,pr,thread,event,event_key,source,state
-         FROM automatic_pr_notifications WHERE state='pending' ORDER BY created_at,id",
+         FROM automatic_pr_notifications WHERE state='pending' ORDER BY created_at,rowid",
     )?;
     statement
         .query_map([], |row| {
@@ -1345,7 +1345,7 @@ fn claim_next(
     };
     let sql = format!(
             "SELECT id,kind,repo,pr,thread,event,event_key,source FROM automatic_pr_notifications
-             WHERE state='pending' AND available_at_ms<=?1{exclusion} ORDER BY created_at,id LIMIT 1"
+             WHERE state='pending' AND available_at_ms<=?1{exclusion} ORDER BY created_at,rowid LIMIT 1"
         );
     let mut values = Vec::with_capacity(excluded_ids.len() + 1);
     values.push(rusqlite::types::Value::Integer(now_ms));
@@ -1394,6 +1394,65 @@ fn claim_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_second_notifications_keep_insertion_order() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for (id, event) in [("z", "closed"), ("a", "reopened")] {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                 (id,kind,repo,pr,thread,event,event_key,source,created_at)
+                 VALUES(?1,'pull_request','owner/repo','7','thread',?2,?2,'{}','2025-01-01 00:00:00')",
+                params![id, event],
+            )
+            .unwrap();
+        }
+        assert_eq!(pending(&db).unwrap()[0].event, "closed");
+        assert_eq!(
+            claim_next(&db, 0, &HashSet::new()).unwrap().unwrap().event,
+            "closed"
+        );
+    }
+
+    #[test]
+    fn late_registration_dispatches_journal_in_event_order() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for (event, key, time) in [
+            ("closed", "close-1", 1_735_689_601_i64),
+            ("reopened", "reopen-1", 1_735_689_602),
+            ("closed", "close-2", 1_735_689_603),
+        ] {
+            db.execute(
+                "INSERT INTO automatic_pr_event_journal
+                 (kind,repo,pr,event,event_key,event_at_sec,event_at,source)
+                 VALUES('pull_request','owner/repo','7',?1,?2,?3,'2025-01-01T00:00:00Z','{}')",
+                params![event, key, time],
+            )
+            .unwrap();
+        }
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            1_735_689_600,
+        )
+        .unwrap();
+        for (key, id) in [("close-1", "z"), ("reopen-1", "y"), ("close-2", "x")] {
+            db.execute(
+                "UPDATE automatic_pr_notifications SET id=?2,created_at='2025-01-01 00:00:00' WHERE event_key=?1",
+                params![key, id],
+            )
+            .unwrap();
+        }
+        for expected in ["closed", "reopened", "closed"] {
+            let notice = claim_next(&db, 0, &HashSet::new()).unwrap().unwrap();
+            assert_eq!(notice.event, expected);
+        }
+    }
     use serde_json::json;
 
     fn reopen_key(db: &Connection, closed_at: &str) -> String {

@@ -721,13 +721,95 @@ where
         let number = &resource.resource;
         let route = format!("/repos/{}/pulls/{number}/reviews", resource.repo);
         let repo = resource.repo.clone();
-        let outcome = poll_endpoint(
+        let earliest_listener: Option<i64> = db.query_row(
+            "SELECT MIN(registered_at_sec) FROM automatic_pr_notification_listeners
+             WHERE kind='review' AND repo=?1 COLLATE NOCASE AND pr=?2",
+            params![repo, number],
+            |row| row.get(0),
+        )?;
+        let recovered = std::cell::RefCell::new(BTreeMap::<String, String>::new());
+        let review_page = std::cell::Cell::new(0_usize);
+        let timeline_calls = std::cell::Cell::new(0_u64);
+        let recovery_route = format!("{route}/dismissal-recovery");
+        let recovery_due =
+            state(db, &recovery_route, 0)?.is_none_or(|saved| saved.next_poll <= now);
+        let recovery_error = std::cell::RefCell::new(None::<Failure>);
+        let mut review_fetch = |requested: &str, etag: Option<&str>| {
+            let response = fetch(requested, etag)?;
+            let page = review_page.get() + 1;
+            review_page.set(page);
+            let Some(earliest_listener) = earliest_listener else {
+                return Ok(response);
+            };
+            if !matches!(response.status, 200 | 304) {
+                return Ok(response);
+            }
+            let body = if response.status == 304 {
+                state(db, &route, page)
+                    .map_err(|_| Failure::new("database"))?
+                    .and_then(|saved| saved.body)
+            } else {
+                std::str::from_utf8(&response.body).ok().map(str::to_owned)
+            };
+            let Some(reviews) = body
+                .as_deref()
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .and_then(|value| value.as_array().cloned())
+            else {
+                return Ok(response);
+            };
+            let mut unresolved = BTreeMap::new();
+            let mut floor = None::<i64>;
+            for review in reviews
+                .iter()
+                .filter(|review| review["state"] == "DISMISSED")
+            {
+                let (Some(id), Some(submitted)) =
+                    (positive_id(&review["id"]), review["submitted_at"].as_str())
+                else {
+                    continue;
+                };
+                let submitted_sec = pr_notifications::timestamp_second(db, submitted)
+                    .map_err(|_| Failure::new("invalid_response"))?;
+                if submitted_sec < earliest_listener {
+                    continue;
+                }
+                if let Some(normalized) =
+                    known_automatic_review_state(db, &repo, number, &id, submitted)?
+                {
+                    recovered.borrow_mut().insert(id, normalized.to_owned());
+                    continue;
+                }
+                floor = Some(floor.map_or(submitted_sec, |old| old.min(submitted_sec)));
+                unresolved.insert(id, submitted_sec);
+            }
+            let can_recover = recovery_error.borrow().is_none();
+            if let Some(floor) = floor
+                && recovery_due
+                && can_recover
+            {
+                match fetch_review_dismissal_states(
+                    db,
+                    &mut fetch,
+                    &repo,
+                    number,
+                    floor,
+                    &unresolved,
+                    &timeline_calls,
+                ) {
+                    Ok(states) => recovered.borrow_mut().extend(states),
+                    Err(error) => *recovery_error.borrow_mut() = Some(error),
+                }
+            }
+            Ok(response)
+        };
+        let mut outcome = poll_endpoint(
             db,
             &route,
             PAGE_LIMIT,
             now,
-            &mut fetch,
-            move |db, cursor, items, _| {
+            &mut review_fetch,
+            |db, cursor, items, _| {
                 let previous: BTreeMap<String, String> = decode_cursor(cursor)?;
                 let baseline = review_baseline(&previous);
                 let mut seen = previous;
@@ -745,10 +827,15 @@ where
                     let version = format!("{submitted}|{state}");
                     let is_new_version = seen.get(&id) != Some(&version);
                     seen.insert(id.clone(), version);
+                    let recovered_state = recovered.borrow().get(&id).cloned();
                     let normalized = match state {
                         "APPROVED" => "approved",
                         "CHANGES_REQUESTED" => "changes_requested",
                         "COMMENTED" => "commented",
+                        "DISMISSED" => match recovered_state.as_deref() {
+                            Some(state) => state,
+                            None => continue,
+                        },
                         _ => continue,
                     };
                     let condition_events = if normalized == "commented" {
@@ -760,7 +847,7 @@ where
                     review["state"] = json!(normalized);
                     let event = json!({"action":"submitted","pull_request":{"number":number.parse::<i64>().unwrap_or(0)},
                     "review":review,"repository":{"full_name":repo}});
-                    if is_new_version {
+                    if is_new_version && state != "DISMISSED" {
                         for condition_event in condition_events {
                             observations.push(ConditionObservation {
                                 resource: number.clone(),
@@ -795,14 +882,8 @@ where
                         _ => "submitted",
                     };
                     let identity = [&id, submitted];
-                    let event_key = stable_source_key(
-                        "review",
-                        &repo.to_ascii_lowercase(),
-                        number,
-                        notification_event,
-                        normalized,
-                        &identity,
-                    );
+                    let event_key =
+                        automatic_review_event_key(&repo, number, &identity, normalized);
                     // Automatic destinations have their own registration-time boundary and
                     // idempotency key, so a shared endpoint cursor must not hide this event.
                     pr_notifications::record_event(
@@ -840,6 +921,16 @@ where
                 ))
             },
         )?;
+        outcome.calls = outcome.calls.saturating_add(timeline_calls.get());
+        if let Some(error) = recovery_error.into_inner() {
+            record_failure(db, &recovery_route, 0, now, &error, 0)?;
+            report.record_error(error.category);
+        } else if timeline_calls.get() > 0 {
+            db.execute(
+                "DELETE FROM github_poll_state WHERE endpoint=?1 AND page=0",
+                [&recovery_route],
+            )?;
+        }
         report.record(outcome);
     }
 
@@ -2798,6 +2889,166 @@ fn timeline_event_timestamp(event: &Value) -> Option<&str> {
         | "committed" => event["created_at"].as_str(),
         _ => None,
     }
+}
+
+fn automatic_review_event_key(repo: &str, pr: &str, identity: &[&str], state: &str) -> String {
+    let event = match state {
+        "approved" | "changes_requested" => state,
+        _ => "submitted",
+    };
+    stable_source_key(
+        "review",
+        &repo.to_ascii_lowercase(),
+        pr,
+        event,
+        state,
+        identity,
+    )
+}
+
+fn known_automatic_review_state(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+    id: &str,
+    submitted: &str,
+) -> std::result::Result<Option<&'static str>, Failure> {
+    let mut known = None;
+    for state in ["approved", "changes_requested", "commented"] {
+        let key = automatic_review_event_key(repo, pr, &[id, submitted], state);
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+                 WHERE kind='review' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event_key=?3)",
+                params![repo, pr, key],
+                |row| row.get(0),
+            )
+            .map_err(|_| Failure::new("database"))?;
+        if exists {
+            if known.is_some() {
+                return Ok(None);
+            }
+            known = Some(state);
+        }
+    }
+    Ok(known)
+}
+
+fn fetch_review_dismissal_states<F>(
+    db: &Connection,
+    fetch: &mut F,
+    repo: &str,
+    pr: &str,
+    floor_sec: i64,
+    review_ids: &BTreeMap<String, i64>,
+    calls: &std::cell::Cell<u64>,
+) -> std::result::Result<BTreeMap<String, String>, Failure>
+where
+    F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
+{
+    let first_route = format!("/repos/{repo}/issues/{pr}/timeline?per_page=100&page=1");
+    calls.set(calls.get().saturating_add(1));
+    let first = fetch(&first_route, None)?;
+    if first.status != 200 {
+        return Err(first.failure());
+    }
+    let last = page_link_route(&first, "last");
+    let reverse = last.is_some() || page_link_route(&first, "next").is_none();
+    let mut route = last.unwrap_or_else(|| first_route.clone());
+    let mut visited = BTreeSet::from([route.clone()]);
+    let mut page = first;
+    if route != first_route {
+        calls.set(calls.get().saturating_add(1));
+        page = fetch(&route, None)?;
+        if page.status != 200 {
+            return Err(page.failure());
+        }
+    }
+    let mut states = BTreeMap::<String, Option<String>>::new();
+    loop {
+        if page.body.len() >= MAX_OUTPUT {
+            return Err(Failure::new("output_limit"));
+        }
+        let events: Vec<Value> =
+            serde_json::from_slice(&page.body).map_err(|_| Failure::new("invalid_response"))?;
+        let mut reached_floor = false;
+        for event in events {
+            let dismissed = event["event"] == "review_dismissed";
+            let timestamp = if dismissed {
+                event["created_at"].as_str()
+            } else {
+                timeline_event_timestamp(&event)
+            };
+            if let Some(timestamp) = timestamp
+                && let Ok(second) = pr_notifications::timestamp_second(db, timestamp)
+            {
+                reached_floor |= second < floor_sec;
+            }
+            if !dismissed {
+                continue;
+            }
+            let review_id = event
+                .pointer("/dismissed_review/review_id")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .filter(|id| positive_text(id))
+                        .map(str::to_owned)
+                        .or_else(|| positive_id(value))
+                });
+            let Some(id) = review_id.filter(|id| review_ids.contains_key(id)) else {
+                continue;
+            };
+            let at = timestamp.ok_or_else(|| Failure::new("invalid_response"))?;
+            let dismissed_sec = pr_notifications::timestamp_second(db, at)
+                .map_err(|_| Failure::new("invalid_response"))?;
+            if dismissed_sec < review_ids[&id] {
+                continue;
+            }
+            let state = event["dismissed_review"]["state"]
+                .as_str()
+                .map(str::to_ascii_lowercase);
+            let Some(state) = state.filter(|state| {
+                matches!(
+                    state.as_str(),
+                    "approved" | "changes_requested" | "commented"
+                )
+            }) else {
+                states.insert(id, None);
+                continue;
+            };
+            match states.entry(id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(state));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().as_deref() != Some(state.as_str()) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+        if reverse && reached_floor {
+            break;
+        }
+        let relation = if reverse { "prev" } else { "next" };
+        let Some(next) = page_link_route(&page, relation) else {
+            break;
+        };
+        if !visited.insert(next.clone()) {
+            return Err(Failure::new("invalid_response"));
+        }
+        route = next;
+        calls.set(calls.get().saturating_add(1));
+        page = fetch(&route, None)?;
+        if page.status != 200 {
+            return Err(page.failure());
+        }
+    }
+    Ok(states
+        .into_iter()
+        .filter_map(|(id, state)| state.map(|state| (id, state)))
+        .collect())
 }
 
 fn page_link_route(response: &HttpResponse, relation: &str) -> Option<String> {
@@ -7408,21 +7659,205 @@ mod tests {
             pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
         )
         .unwrap();
-        let report = tick_with(&db, 1, |route, _| {
-            assert_eq!(
-                route,
-                "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1"
-            );
-            Ok(response(
+        let report = tick_with(&db, 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(response(
                 json!([{
                     "id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:00:00Z"
                 }]),
                 false,
-            ))
+            )),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
         })
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
         assert!(pr_notifications::pending(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dismissed_before_first_poll_recovers_original_review_once() {
+        for webhook_first in [false, true] {
+            let db = db();
+            let thread = "11111111-1111-4111-8111-111111111111";
+            pr_notifications::register_in_since(
+                &db,
+                "review",
+                "owner/repo",
+                "7",
+                thread,
+                pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+            )
+            .unwrap();
+            let subscription = subscribe(&db, "review", "7", "approved");
+            let submitted = "2026-01-02T00:00:00Z";
+            let webhook = json!({"action":"submitted",
+                "repository":{"full_name":"owner/repo"},"pull_request":{"number":7},
+                "review":{"id":31,"state":"APPROVED","submitted_at":submitted}});
+            if webhook_first {
+                assert_eq!(
+                    pr_notifications::accept_authenticated_webhook(
+                        &db,
+                        "pull_request_review",
+                        &webhook,
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            let mut timeline_calls = 0;
+            let report = tick_with(&db, 1, |route, _| match route {
+                "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(response(
+                    json!([{"id":31,"state":"DISMISSED","submitted_at":submitted}]),
+                    false,
+                )),
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                    timeline_calls += 1;
+                    Ok(response(
+                        json!([{"event":"review_dismissed",
+                        "created_at":"2026-01-02T00:01:00Z",
+                        "dismissed_review":{"review_id":"31","state":"approved"}}]),
+                        false,
+                    ))
+                }
+                _ => panic!("unexpected route {route}"),
+            })
+            .unwrap();
+            assert_eq!(report["errors"], json!({}), "{report}");
+            assert_eq!(timeline_calls, usize::from(!webhook_first));
+            assert_eq!(registration_state(&db, &subscription), "waiting");
+            let notices = pr_notifications::pending(&db).unwrap();
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].event, "approved");
+            assert_eq!(
+                notices[0].event_key,
+                automatic_review_event_key("owner/repo", "7", &["31", submitted], "approved",)
+            );
+            assert_eq!(
+                pr_notifications::accept_authenticated_webhook(
+                    &db,
+                    "pull_request_review",
+                    &webhook
+                )
+                .unwrap(),
+                0
+            );
+            let second = tick_with(&db, INTERVAL_MS + 1, |route, _| match route {
+                "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                }),
+                _ => panic!("known dismissal must not rescan timeline: {route}"),
+            })
+            .unwrap();
+            assert_eq!(second["errors"], json!({}), "{second}");
+            assert_eq!(pr_notifications::pending(&db).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn dismissed_review_timeline_failure_does_not_block_other_reviews() {
+        let db = db();
+        pr_notifications::register_in_since(
+            &db,
+            "review",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let subscription = subscribe(&db, "review", "7", "approved");
+        let review = json!([
+            {"id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:00:00Z"},
+            {"id":32,"state":"APPROVED","submitted_at":"2026-01-02T00:02:00Z"}
+        ]);
+        let first = tick_with(&db, 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => {
+                Ok(response(review.clone(), false))
+            }
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(HttpResponse {
+                status: 503,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"]["server_error"], json!(1));
+        let saved = state(&db, "/repos/owner/repo/pulls/7/reviews", 1)
+            .unwrap()
+            .unwrap();
+        assert!(saved.cursor.is_some());
+        assert_eq!(registration_state(&db, &subscription), "ready");
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 1);
+
+        let retried = tick_with(&db, INTERVAL_MS + 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([{"event":"review_dismissed","created_at":"2026-01-02T00:01:00Z",
+                    "dismissed_review":{"review_id":"31","state":"approved"}}]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(retried["errors"], json!({}), "{retried}");
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dismissal_timeline_checks_previous_page_on_equal_second() {
+        let db = db();
+        let floor = pr_notifications::timestamp_second(&db, "2026-01-02T00:00:00Z").unwrap();
+        let ids = BTreeMap::from([("31".to_owned(), floor)]);
+        let calls = std::cell::Cell::new(0);
+        let first = "/repos/owner/repo/issues/7/timeline?per_page=100&page=1";
+        let last = "/repos/owner/repo/issues/7/timeline?per_page=100&page=2";
+        let mut requests = Vec::new();
+        let states = fetch_review_dismissal_states(
+            &db,
+            &mut |route, _| {
+                requests.push(route.to_owned());
+                let (body, link) = if route == first && requests.len() == 1 {
+                    (
+                        json!([]),
+                        format!("<https://api.github.com{last}>; rel=\"last\""),
+                    )
+                } else if route == last {
+                    (
+                        json!([{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z"}]),
+                        format!("<https://api.github.com{first}>; rel=\"prev\""),
+                    )
+                } else {
+                    assert_eq!(route, first);
+                    (
+                        json!([{"event":"review_dismissed","created_at":"2026-01-02T00:00:00Z",
+                        "dismissed_review":{"review_id":"31","state":"approved"}}]),
+                        String::new(),
+                    )
+                };
+                let mut result = response(body, false);
+                if !link.is_empty() {
+                    result.headers.insert("link".into(), link);
+                }
+                Ok(result)
+            },
+            "owner/repo",
+            "7",
+            floor,
+            &ids,
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(states.get("31").map(String::as_str), Some("approved"));
+        assert_eq!(requests, vec![first, last, first]);
     }
 
     #[test]
