@@ -3528,6 +3528,142 @@ printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s' "$body"
         assert!(!second.to_string().contains("private-payload"));
     }
 
+    #[tokio::test]
+    async fn attention_tool_pages_over_real_mcp_transport() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn send(writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>, message: Value) {
+            writer
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        async fn receive(
+            reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+            id: i64,
+        ) -> Value {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        reader.read_line(&mut line).await.unwrap(),
+                        0,
+                        "MCP transport closed"
+                    );
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    if message["id"] == id {
+                        return message;
+                    }
+                }
+            })
+            .await
+            .expect("MCP response timed out")
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        polling::pr_notifications::initialize(&db).unwrap();
+        for index in 0..51 {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state,created_at)
+                VALUES(?1,'pull_request','owner/repo','7','thread','closed',?1,
+                '{\"secret\":\"private-payload\"}','needs_attention','2000-01-01 00:00:00')",
+                [format!("id-{index:02}")],
+            )
+            .unwrap();
+        }
+        let snapshot_sql = "SELECT json_group_array(json_array(id,kind,repo,pr,thread,event,event_key,source,state,available_at_ms,created_at)) FROM (SELECT * FROM automatic_pr_notifications ORDER BY id)";
+        let before: String = db.query_row(snapshot_sql, [], |row| row.get(0)).unwrap();
+        drop(db);
+        let db_path = config.db.clone();
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let server = tokio::spawn(async move {
+            WakeTools { config }
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut reader = BufReader::new(reader);
+        send(&mut writer, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await;
+        assert!(receive(&mut reader, 1).await.get("error").is_none());
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await;
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .await;
+        let list = receive(&mut reader, 2).await;
+        assert!(
+            list["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "get_pr_notification_attention")
+        );
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"get_pr_notification_attention","arguments":{}}}),
+        )
+        .await;
+        let first_reply = receive(&mut reader, 3).await;
+        assert!(first_reply.get("error").is_none());
+        assert_ne!(first_reply["result"]["isError"], true);
+        let first = &first_reply["result"]["structuredContent"];
+        assert_eq!(first["items"].as_array().unwrap().len(), 50);
+        for (index, item) in first["items"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                item["queue_identity"].as_str().unwrap(),
+                format!("id-{index:02}")
+            );
+        }
+        assert_eq!(first["has_more"], true);
+        let cursor = first["next_cursor"].as_str().unwrap();
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+            "name":"get_pr_notification_attention","arguments":{"cursor":cursor}}}),
+        )
+        .await;
+        let second_reply = receive(&mut reader, 4).await;
+        assert!(second_reply.get("error").is_none());
+        assert_ne!(second_reply["result"]["isError"], true);
+        let second = &second_reply["result"]["structuredContent"];
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["queue_identity"], "id-50");
+        assert_eq!(second["has_more"], false);
+        assert!(second["next_cursor"].is_null());
+        assert!(!first_reply.to_string().contains("private-payload"));
+        assert!(!second_reply.to_string().contains("private-payload"));
+        drop(writer);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let db = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let after: String = db.query_row(snapshot_sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(after, before);
+    }
+
     #[test]
     fn simulate_rule_tool_does_not_open_the_service_database() {
         let temp = tempfile::tempdir().unwrap();
