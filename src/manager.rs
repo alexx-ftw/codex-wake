@@ -13,6 +13,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -704,6 +705,10 @@ pub fn status(config: &Config) -> Result<Value> {
 }
 
 pub fn ensure_receiver(config: &Config) -> Result<Value> {
+    ensure!(
+        !cooperative_receiver_enabled()?,
+        "Cooperative receiver is only available for direct experiments"
+    );
     require_installed(config)?;
     let _guard = lock(config)?;
     require_installed(config)?;
@@ -869,8 +874,166 @@ fn remove_stale_socket_in(path: &Path, temp: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cooperative_receiver_enabled() -> Result<bool> {
+    match env::var("CODEX_WAKE_COOPERATIVE_RECEIVER") {
+        Err(env::VarError::NotPresent) => Ok(false),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) if value == "1" => Ok(true),
+        _ => bail!("CODEX_WAKE_COOPERATIVE_RECEIVER must be 0 or 1"),
+    }
+}
+
+// Linearize each new cycle against closing the cooperative gate. The body of
+// a previously admitted cycle may still run and capture new events.
+fn receiver_cycle_allowed(config: &Config) -> Result<bool> {
+    let mut db = crate::bridge::connect(&config.db)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let allowed = crate::bridge::claims_open(&tx)?;
+    tx.commit()?;
+    Ok(allowed)
+}
+
+fn receiver_start_cycle(config: &Config, cooperative: bool, stop: &Mutex<bool>) -> Result<bool> {
+    let mut stopped = stop.lock().unwrap_or_else(|error| error.into_inner());
+    if *stopped {
+        return Ok(false);
+    }
+    if cooperative {
+        match receiver_cycle_allowed(config) {
+            Ok(true) => (),
+            Ok(false) => {
+                *stopped = true;
+                return Ok(false);
+            }
+            Err(error) => {
+                *stopped = true;
+                return Err(error);
+            }
+        }
+    }
+    Ok(true)
+}
+
+// Standby is opt-in and performs no work until a coordinator opens the gate
+// and sends a byte over the inherited stdin pipe. EOF is a failed handoff.
+fn receiver_standby(config: &Config) -> Result<()> {
+    let owner = env::var("CODEX_WAKE_GATE_OWNER").context("Missing gate owner")?;
+    let parsed = uuid::Uuid::parse_str(&owner).context("Invalid gate owner")?;
+    ensure!(
+        !parsed.is_nil() && parsed.to_string() == owner,
+        "Invalid gate owner"
+    );
+    let generation = env::var("CODEX_WAKE_GATE_GENERATION")?
+        .parse::<i64>()
+        .context("Invalid gate generation")?;
+    ensure!(generation > 0, "Invalid gate generation");
+    let mut db = crate::bridge::connect(&config.db)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (open, current, current_generation): (bool, String, i64) = tx.query_row(
+        "SELECT is_open,owner,generation FROM wake_delivery_claim_gate WHERE id=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    ensure!(
+        !open && current == owner && current_generation == generation,
+        "Standby requires the closed gate and matching owner and generation"
+    );
+    tx.commit()?;
+    std::io::stdout().write_all(b"receiver-standby-ready-v1\n")?;
+    std::io::stdout().flush()?;
+    let mut signal = [0];
+    std::io::stdin()
+        .read_exact(&mut signal)
+        .context("Standby control pipe closed")?;
+    ensure!(signal[0] == b'G', "Invalid standby activation");
+    let mut db = crate::bridge::connect(&config.db)?;
+    crate::bridge::bind_receiver_gate(&mut db, &owner, generation)?;
+    Ok(())
+}
+
+fn wait_receiver_workers(workers: Vec<thread::JoinHandle<Result<()>>>) -> Result<()> {
+    let mut failed = false;
+    for worker in workers {
+        match worker.join() {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => {
+                failed = true;
+                crate::observability::emit(
+                    "receiver.worker",
+                    "error",
+                    crate::observability::error_class(&error),
+                    None,
+                    Duration::ZERO,
+                    1,
+                );
+            }
+            Err(_) => {
+                failed = true;
+                crate::observability::emit(
+                    "receiver.worker",
+                    "error",
+                    "worker_panicked",
+                    None,
+                    Duration::ZERO,
+                    1,
+                );
+            }
+        }
+    }
+    ensure!(!failed, "Receiver worker failed while stopping");
+    Ok(())
+}
+
+fn spawn_receiver_worker(
+    workers: &mut Vec<thread::JoinHandle<Result<()>>>,
+    stop: &Mutex<bool>,
+    run: impl FnOnce() -> Result<()> + Send + 'static,
+) -> Result<()> {
+    match thread::Builder::new().spawn(run) {
+        Ok(worker) => {
+            workers.push(worker);
+            Ok(())
+        }
+        Err(error) => {
+            *stop.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            let result = wait_receiver_workers(std::mem::take(workers));
+            if result.is_err() {
+                return Err(error).context("Start receiver worker; an existing worker also failed");
+            }
+            Err(error).context("Start receiver worker")
+        }
+    }
+}
+
 pub fn run_receiver(config: &Config) -> Result<()> {
     require_installed(config)?;
+    let cooperative = cooperative_receiver_enabled()?;
+    let standby = match env::var("CODEX_WAKE_RECEIVER_STANDBY") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => bail!("CODEX_WAKE_RECEIVER_STANDBY must be 1 or unset"),
+    };
+    ensure!(
+        !standby || cooperative,
+        "Standby requires cooperative receiver mode"
+    );
+    if cooperative {
+        ensure!(
+            config.rpc_socket != config.state.join("app-server.sock") && !config.webhooks_enabled,
+            "Cooperative receiver requires an external controller and externally managed webhook"
+        );
+        ensure!(
+            env::var_os("CODEX_WAKE_GATE_OWNER").is_some()
+                && env::var_os("CODEX_WAKE_GATE_GENERATION").is_some(),
+            "Cooperative receiver requires a gate owner and generation"
+        );
+        if !standby {
+            ensure!(
+                receiver_cycle_allowed(config)?,
+                "Cooperative receiver gate is closed or ownership is invalid"
+            );
+        }
+    }
     let root = env::current_exe()?
         .parent()
         .context("Executable has no directory")?
@@ -942,13 +1105,22 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     {
         crate::observability::capture(pipe, "webhook");
     }
+    if standby {
+        receiver_standby(config)?;
+    }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
+    let stop = Arc::new(Mutex::new(false));
+    let mut workers = Vec::new();
     for source in ["github", "external", "native", "delivery"] {
         let poll_config = config.clone();
-        thread::spawn(move || {
+        let worker_stop = stop.clone();
+        spawn_receiver_worker(&mut workers, &stop, move || {
             let mut history_scans = std::collections::HashMap::new();
             loop {
+                if !receiver_start_cycle(&poll_config, cooperative, &worker_stop)? {
+                    return Ok(());
+                }
                 let result = (|| -> Result<()> {
                     let mut db = crate::bridge::connect(&poll_config.db)?;
                     crate::subscriptions::initialize(&db)?;
@@ -989,13 +1161,17 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                     1
                 }));
             }
-        });
+        })?;
     }
     let config = config.clone();
-    thread::spawn(move || {
+    let worker_stop = stop.clone();
+    spawn_receiver_worker(&mut workers, &stop, move || {
         let mut heartbeat = Instant::now() - Duration::from_secs(60);
         let mut obligations_initialized = false;
         loop {
+            if !receiver_start_cycle(&config, cooperative, &worker_stop)? {
+                return Ok(());
+            }
             let result = (|| -> Result<()> {
                 let mut db = crate::bridge::connect(&config.db)?;
                 crate::subscriptions::initialize(&db)?;
@@ -1014,6 +1190,16 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                     obligations_initialized = true;
                 }
                 crate::process_interrupts(&config, &db)?;
+                if let Err(error) = crate::dispatch_direct_pending(&mut db, &config.codex) {
+                    crate::observability::emit(
+                        "receiver.direct",
+                        "error",
+                        crate::observability::error_class(&error),
+                        None,
+                        Duration::ZERO,
+                        1,
+                    );
+                }
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::conditions::initialize(&db)?;
@@ -1069,8 +1255,24 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             }
             thread::sleep(Duration::from_secs(1));
         }
-    });
+    })?;
     loop {
+        if cooperative
+            && (*stop.lock().unwrap_or_else(|error| error.into_inner())
+                || workers.iter().any(thread::JoinHandle::is_finished))
+        {
+            *stop.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wait_receiver_workers(workers)?;
+            crate::observability::emit(
+                "receiver.drain",
+                "ok",
+                "cycles_finished_outcomes_not_verified",
+                None,
+                Duration::ZERO,
+                1,
+            );
+            return Ok(());
+        }
         if let Some(controller) = &mut controller
             && let Some(status) = controller.0.try_wait()?
         {
@@ -1494,6 +1696,52 @@ pub fn remove_service(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_admission_error_latches_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_path_buf();
+        let config = Config {
+            state: path.clone(),
+            runtime: path.clone(),
+            config: path.clone(),
+            unit: path.clone(),
+            db: path.clone(),
+            codex: path.clone(),
+            gh: path.clone(),
+            webhooks_enabled: false,
+            codex_home: path.clone(),
+            rpc_socket: path.clone(),
+            cache: path,
+            plugin_base: None,
+        };
+        let stop = Mutex::new(false);
+        assert!(receiver_start_cycle(&config, true, &stop).is_err());
+        assert!(!receiver_start_cycle(&config, false, &stop).unwrap());
+    }
+
+    #[test]
+    fn receiver_worker_failure_still_waits_for_active_worker() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let active = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        started_rx.recv().unwrap();
+        let failed = thread::spawn(|| -> Result<()> { bail!("test failure") });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            done_tx
+                .send(wait_receiver_workers(vec![failed, active]).is_err())
+                .unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(200)).is_err());
+        release_tx.send(()).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        waiter.join().unwrap();
+    }
 
     #[test]
     fn funnel_cleanup_removes_only_unchanged_owned_path() {

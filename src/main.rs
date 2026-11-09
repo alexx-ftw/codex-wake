@@ -30,8 +30,10 @@ use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
     tool_router,
 };
-use serde::Deserialize;
+use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env,
@@ -396,6 +398,8 @@ struct CreateGoalInput {
     message_template: Option<String>,
     source: Option<Value>,
     execution: Option<execution::ExecutionOptions>,
+    /// Stable UUID for cooperative execution; retain it before sending.
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -408,6 +412,8 @@ struct EditGoalInput {
     message_template: Option<String>,
     source: Option<Value>,
     execution: Option<execution::ExecutionOptions>,
+    /// Stable UUID for cooperative execution; retain it before sending.
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -417,6 +423,8 @@ struct ResumeGoalInput {
     message_template: Option<String>,
     source: Option<Value>,
     execution: Option<execution::ExecutionOptions>,
+    /// Stable UUID for cooperative execution; retain it before sending.
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -434,6 +442,548 @@ struct QueueInput {
     #[serde(default)]
     steer: bool,
     execution: Option<execution::ExecutionOptions>,
+    /// Stable UUID for an opt-in cooperative direct queue operation.
+    request_id: Option<String>,
+}
+
+// Invalid persisted fields cannot prove that a sender exited. In particular,
+// compare boot IDs only after checking their canonical kernel representation.
+fn valid_direct_sender_identity(sender: &conditions::SenderIdentity) -> bool {
+    let boot = uuid::Uuid::parse_str(&sender.boot).ok();
+    let namespace = sender
+        .namespace
+        .strip_prefix("pid:[")
+        .and_then(|s| s.strip_suffix(']'));
+    sender.pid > 0
+        && i32::try_from(sender.pid).is_ok()
+        && sender.start >= 0
+        && boot.is_some_and(|value| !value.is_nil() && value.to_string() == sender.boot)
+        && namespace.is_some_and(|value| {
+            !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+                && value.parse::<u64>().is_ok_and(|id| id > 0)
+        })
+}
+
+fn direct_client_id(db: &rusqlite::Connection, request_id: &str, thread: &str) -> Result<String> {
+    // A namespace belongs to the database, not to the caller or receiver process.
+    // Create it once under the writer transaction; a missing row later is an error.
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cooperative_direct_queue_meta')", [], |r| r.get(0))?;
+    if !exists {
+        db.execute_batch("CREATE TABLE cooperative_direct_queue_meta (id INTEGER PRIMARY KEY CHECK(id=1), namespace TEXT NOT NULL)")?;
+        db.execute(
+            "INSERT INTO cooperative_direct_queue_meta(id,namespace) VALUES(1,?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+    }
+    let namespace: String = db.query_row(
+        "SELECT namespace FROM cooperative_direct_queue_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let namespace = uuid::Uuid::parse_str(&namespace)
+        .context("Invalid direct queue database namespace")?
+        .to_string();
+    delivery_evidence::client_user_message_id(
+        &format!("codex-wake/direct-queue/v2/{namespace}/{request_id}"),
+        thread,
+    )
+}
+
+// A caller may repeat the same request ID to read its recorded result. A
+// claimed operation is never resent, even if its external outcome is unknown.
+fn queue_cooperative_with(
+    db: &mut rusqlite::Connection,
+    request_id: &str,
+    thread: &str,
+    message: &str,
+    resume: bool,
+    options: Option<&execution::ExecutionOptions>,
+    send: impl FnOnce(&str) -> Result<(String, Option<String>)>,
+) -> Result<Value> {
+    let bytes = serde_json::to_vec(
+        &json!({"thread":thread,"message":message,"resume":resume,"execution":options}),
+    )?;
+    queue_cooperative_serialized_with(db, request_id, thread, bytes, send)
+}
+
+fn queue_cooperative_serialized_with(
+    db: &mut rusqlite::Connection,
+    request_id: &str,
+    thread: &str,
+    bytes: Vec<u8>,
+    send: impl FnOnce(&str) -> Result<(String, Option<String>)>,
+) -> Result<Value> {
+    let request_id = uuid::Uuid::parse_str(request_id)?.to_string();
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS cooperative_direct_queue (
+        request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('sending','queued','needs_attention')),
+        reason TEXT, sender_pid INTEGER, sender_start INTEGER, sender_boot TEXT, sender_namespace TEXT
+    )")?;
+    let columns = {
+        let mut statement = tx.prepare("PRAGMA table_info(cooperative_direct_queue)")?;
+        statement
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (column, kind) in [
+        ("sender_pid", "INTEGER"),
+        ("sender_start", "INTEGER"),
+        ("sender_boot", "TEXT"),
+        ("sender_namespace", "TEXT"),
+        ("goal_progress", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            tx.execute_batch(&format!(
+                "ALTER TABLE cooperative_direct_queue ADD COLUMN {column} {kind}"
+            ))?;
+        }
+    }
+    type ExistingDirectQueue = (
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let existing: Option<ExistingDirectQueue> = tx.query_row(
+        "SELECT request_digest,state,reason,sender_pid,sender_start,sender_boot,sender_namespace,goal_progress FROM cooperative_direct_queue WHERE request_id=?1",
+        [&request_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+    ).optional()?;
+    if let Some((prior_digest, mut state, mut reason, pid, start, boot, namespace, progress)) =
+        existing
+    {
+        anyhow::ensure!(
+            prior_digest == digest,
+            "Request ID already belongs to a different queue operation"
+        );
+        if state == "sending"
+            && let (Some(pid), Some(start), Some(boot), Some(namespace)) =
+                (pid, start, boot, namespace)
+            && {
+                let sender = conditions::SenderIdentity {
+                    pid,
+                    start,
+                    boot,
+                    namespace,
+                };
+                valid_direct_sender_identity(&sender) && conditions::sender_confirmed_gone(&sender)
+            }
+        {
+            tx.execute("UPDATE cooperative_direct_queue SET state='needs_attention',reason='sender_exit_outcome_unconfirmed' WHERE request_id=?1 AND state='sending'", [&request_id])?;
+            state = "needs_attention".into();
+            reason = Some("sender_exit_outcome_unconfirmed".into());
+        }
+        let progress: Option<Value> = progress
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        tx.commit()?;
+        let mut result = json!({"request_id":request_id,"state":state,"reason":reason.unwrap_or_else(|| "outcome_unconfirmed".into()),"replayed":true,"turn_execution_verified":false});
+        if let Some(progress) = progress {
+            result["goal_progress"] = progress;
+        }
+        return Ok(result);
+    }
+    let has_pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cooperative_direct_pending')", [], |row| row.get(0))?;
+    if has_pending {
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT request_digest FROM cooperative_direct_pending WHERE request_id=?1",
+                [&request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                previous == digest,
+                "Request ID already belongs to a different queue operation"
+            );
+            tx.commit()?;
+            return Ok(
+                json!({"request_id":request_id,"state":"pending","reason":"retained_for_receiver","replayed":true,"turn_execution_verified":false}),
+            );
+        }
+    }
+    if let Some(allowed) = bridge::producer_enqueue_allowed(&tx)? {
+        anyhow::ensure!(
+            allowed,
+            "Stale cooperative owner or generation; retain and retry this request ID"
+        );
+        // Persist the database namespace with the first accepted request, so a
+        // snapshot before the first dispatch retains the same native identity.
+        let _ = direct_client_id(&tx, &request_id, thread)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS cooperative_direct_pending (request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, payload TEXT NOT NULL)")?;
+        tx.execute("INSERT INTO cooperative_direct_pending(request_id,request_digest,payload) VALUES(?1,?2,?3)", params![request_id, digest, String::from_utf8(bytes)?])?;
+        tx.commit()?;
+        return Ok(
+            json!({"request_id":request_id,"state":"pending","reason":"retained_for_receiver","replayed":false,"turn_execution_verified":false}),
+        );
+    }
+    anyhow::ensure!(
+        bridge::claims_open(&tx)?,
+        "Cooperative admission is closed; retain and retry this request ID"
+    );
+    let client_id = direct_client_id(&tx, &request_id, thread)?;
+    let sender = conditions::current_sender_identity()?;
+    tx.execute("INSERT INTO cooperative_direct_queue(request_id,request_digest,state,sender_pid,sender_start,sender_boot,sender_namespace) VALUES(?1,?2,'sending',?3,?4,?5,?6)", params![request_id,digest,sender.pid,sender.start,sender.boot,sender.namespace])?;
+    tx.commit()?;
+    let (state, reason) = match send(&client_id) {
+        Ok((state, Some(reason)))
+            if state == "queued" && reason == "native_queue_resume_warning" =>
+        {
+            ("queued", "native_queue_resume_warning")
+        }
+        Ok((state, _)) if state == "queued" => ("queued", "accepted"),
+        _ => ("needs_attention", "outcome_unconfirmed"),
+    };
+    anyhow::ensure!(db.execute("UPDATE cooperative_direct_queue SET state=?2,reason=?3 WHERE request_id=?1 AND state='sending'", params![request_id,state,reason])? == 1, "Direct queue result could not be recorded");
+    Ok(
+        json!({"request_id":request_id,"state":state,"reason":reason,"replayed":false,"turn_execution_verified":false}),
+    )
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PendingGoalAction {
+    Create,
+    Edit,
+    Resume,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingGoal {
+    action: PendingGoalAction,
+    objective: Option<String>,
+    token_budget: Option<i64>,
+    message_template: Option<String>,
+    source: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDirectRequest {
+    thread: String,
+    message: String,
+    resume: bool,
+    execution: Option<execution::ExecutionOptions>,
+    #[serde(default)]
+    steer: bool,
+    #[serde(default)]
+    goal: Option<PendingGoal>,
+}
+
+const DIRECT_PENDING_BATCH: usize = 1;
+
+// Claim under the same writer lock as the gate check. Retain the payload for
+// uncertain outcomes; a claimed request is never replayed automatically.
+fn dispatch_direct_pending_with(
+    db: &mut rusqlite::Connection,
+    mut send: impl FnMut(
+        &mut rusqlite::Connection,
+        &str,
+        &PendingDirectRequest,
+        &str,
+    ) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cooperative_direct_pending')", [], |row| row.get(0))?;
+    if !exists {
+        return Ok(0);
+    }
+    let mut count = 0;
+    while count < DIRECT_PENDING_BATCH {
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if bridge::bound_enqueue_allowed(&tx)? != Some(true) || !bridge::claims_open(&tx)? {
+            tx.commit()?;
+            return Ok(count);
+        }
+        let has_goal_progress: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('cooperative_direct_queue') WHERE name='goal_progress')", [], |r| r.get(0))?;
+        if !has_goal_progress {
+            tx.execute_batch("ALTER TABLE cooperative_direct_queue ADD COLUMN goal_progress TEXT")?;
+        }
+        let pending: Option<(String, String, String)> = tx.query_row(
+            "SELECT p.request_id,p.request_digest,p.payload FROM cooperative_direct_pending p WHERE NOT EXISTS (SELECT 1 FROM cooperative_direct_queue q WHERE q.request_id=p.request_id) ORDER BY p.rowid LIMIT 1", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((request_id, digest, payload)) = pending else {
+            tx.commit()?;
+            return Ok(count);
+        };
+        anyhow::ensure!(
+            format!("{:x}", Sha256::digest(payload.as_bytes())) == digest,
+            "Pending direct request integrity check failed"
+        );
+        let request: PendingDirectRequest = serde_json::from_str(&payload)?;
+        anyhow::ensure!(
+            !(request.steer && request.goal.is_some()),
+            "Invalid pending operation kind"
+        );
+        if request.steer {
+            steer::enqueue_with_id(&tx, &request.thread, &request.message, &request_id)?;
+            tx.execute("INSERT INTO cooperative_direct_queue(request_id,request_digest,state,reason) VALUES(?1,?2,'queued','awaiting_destination_hook')", params![request_id, digest])?;
+            anyhow::ensure!(
+                tx.execute(
+                    "DELETE FROM cooperative_direct_pending WHERE request_id=?1",
+                    [&request_id]
+                )? == 1,
+                "Direct queue payload disappeared"
+            );
+            tx.commit()?;
+            count += 1;
+            continue;
+        }
+        let client_id = direct_client_id(&tx, &request_id, &request.thread)?;
+        let sender = conditions::current_sender_identity()?;
+        tx.execute("INSERT INTO cooperative_direct_queue(request_id,request_digest,state,sender_pid,sender_start,sender_boot,sender_namespace) VALUES(?1,?2,'sending',?3,?4,?5,?6)", params![request_id,digest,sender.pid,sender.start,sender.boot,sender.namespace])?;
+        tx.commit()?;
+        let (state, reason) = match send(db, &request_id, &request, &client_id) {
+            Ok((state, Some(reason)))
+                if state == "queued"
+                    && request.goal.is_some()
+                    && matches!(
+                        reason.as_str(),
+                        "goal_applied" | "goal_applied_input_queued"
+                    ) =>
+            {
+                (
+                    "queued",
+                    if reason == "goal_applied" {
+                        "goal_applied"
+                    } else {
+                        "goal_applied_input_queued"
+                    },
+                )
+            }
+            Ok((state, Some(reason)))
+                if state == "queued" && reason == "native_queue_resume_warning" =>
+            {
+                ("queued", "native_queue_resume_warning")
+            }
+            Ok((state, _)) if state == "queued" => ("queued", "accepted"),
+            _ => ("needs_attention", "outcome_unconfirmed"),
+        };
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        anyhow::ensure!(tx.execute("UPDATE cooperative_direct_queue SET state=?2,reason=?3 WHERE request_id=?1 AND state='sending'", params![request_id,state,reason])? == 1, "Direct queue result could not be recorded");
+        if state == "queued" {
+            anyhow::ensure!(
+                tx.execute(
+                    "DELETE FROM cooperative_direct_pending WHERE request_id=?1",
+                    [&request_id]
+                )? == 1,
+                "Direct queue payload disappeared"
+            );
+        }
+        tx.commit()?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn dispatch_direct_pending(
+    db: &mut rusqlite::Connection,
+    codex: &std::path::Path,
+) -> Result<usize> {
+    dispatch_direct_pending_with(db, |db, request_id, request, client_id| {
+        if let Some(goal) = &request.goal {
+            return dispatch_pending_goal(db, request_id, codex, request, goal, client_id);
+        }
+        match &request.execution {
+            Some(options) => execution::deliver_with_identity_observed(
+                codex,
+                &request.thread,
+                &request.message,
+                options,
+                client_id,
+            )
+            .map(|(state, reason, _)| (state, reason)),
+            None => execution::queue_with_identity(
+                codex,
+                &request.thread,
+                &request.message,
+                client_id,
+                request.resume,
+                Duration::from_secs(120),
+            ),
+        }
+    })
+}
+
+fn dispatch_pending_goal(
+    db: &rusqlite::Connection,
+    request_id: &str,
+    codex: &std::path::Path,
+    request: &PendingDirectRequest,
+    pending: &PendingGoal,
+    client_id: &str,
+) -> Result<(String, Option<String>)> {
+    let mut progress = json!({"phase":"preparing"});
+    let save = |progress: &Value| -> Result<()> {
+        anyhow::ensure!(db.execute("UPDATE cooperative_direct_queue SET goal_progress=?2 WHERE request_id=?1 AND state='sending'", params![request_id, progress.to_string()])? == 1, "Goal progress could not be recorded");
+        Ok(())
+    };
+    if let Some(options) = &request.execution {
+        progress["phase"] = json!("preset_started");
+        save(&progress)?;
+        execution::prepare(codex, &request.thread, options)?;
+        progress["phase"] = json!("preset_confirmed");
+        progress["preset_confirmed"] = json!(true);
+        save(&progress)?;
+    }
+    progress["phase"] = json!("goal_started");
+    save(&progress)?;
+    let goal = match pending.action {
+        PendingGoalAction::Create => goals::create(
+            codex,
+            &request.thread,
+            pending
+                .objective
+                .as_deref()
+                .context("Missing goal objective")?,
+            pending.token_budget,
+        )?,
+        PendingGoalAction::Edit => goals::edit(
+            codex,
+            &request.thread,
+            pending.objective.as_deref(),
+            pending.token_budget,
+        )?,
+        PendingGoalAction::Resume => goals::resume(codex, &request.thread)?,
+    };
+    progress["phase"] = json!("goal_confirmed");
+    progress["confirmed_goal"] = goal.clone();
+    save(&progress)?;
+    if let Some(template) = &pending.message_template {
+        let message = templates::render(
+            template,
+            &json!({"source":pending.source.as_ref().unwrap_or(&Value::Null),"target":{"thread":request.thread},"goal":goal}),
+        )?;
+        progress["phase"] = json!("queue_started");
+        progress["rendered_message"] = json!(message);
+        save(&progress)?;
+        let (state, _) = execution::queue_with_identity(
+            codex,
+            &request.thread,
+            &message,
+            client_id,
+            false,
+            Duration::from_secs(120),
+        )?;
+        anyhow::ensure!(state == "queued", "Goal input outcome unconfirmed");
+        progress["phase"] = json!("queue_confirmed");
+        save(&progress)?;
+        Ok((state, Some("goal_applied_input_queued".into())))
+    } else {
+        Ok(("queued".into(), Some("goal_applied".into())))
+    }
+}
+
+fn bound_mode_state(config: &manager::Config) -> Result<Option<bool>> {
+    if !config.db.try_exists()? {
+        return Ok(None);
+    }
+    if std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_some() {
+        let db = bridge::open_existing_owned(&config.db)?;
+        anyhow::ensure!(
+            bridge::producer_enqueue_allowed(&db)? == Some(true),
+            "Invalid cooperative producer"
+        );
+        return Ok(Some(true));
+    }
+    let db = bridge::connect(&config.db)?;
+    bridge::producer_enqueue_allowed(&db)
+}
+
+fn queue_direct(
+    config: &manager::Config,
+    request_id: &str,
+    thread: &str,
+    message: &str,
+    resume: bool,
+    options: Option<&execution::ExecutionOptions>,
+) -> Result<Value> {
+    anyhow::ensure!(
+        options.is_none() || resume,
+        "Configured model and reasoning effort require resume=true"
+    );
+    if std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_some() {
+        let db = bridge::open_existing_owned(&config.db)?;
+        anyhow::ensure!(
+            bridge::producer_enqueue_allowed(&db)? == Some(true),
+            "Invalid cooperative producer"
+        );
+    }
+    let mut db = database(config)?;
+    queue_cooperative_with(
+        &mut db,
+        request_id,
+        thread,
+        message,
+        resume,
+        options,
+        |client_id| match options {
+            Some(options) => execution::deliver_with_identity_observed(
+                &config.codex,
+                thread,
+                message,
+                options,
+                client_id,
+            )
+            .map(|(state, reason, _)| (state, reason)),
+            None => execution::queue_with_identity(
+                &config.codex,
+                thread,
+                message,
+                client_id,
+                resume,
+                Duration::from_secs(120),
+            ),
+        },
+    )
+}
+
+fn retain_bound_goal(
+    config: &manager::Config,
+    thread: &str,
+    request_id: Option<&str>,
+    goal: PendingGoal,
+    execution: Option<&execution::ExecutionOptions>,
+) -> Result<Value> {
+    let thread = uuid::Uuid::parse_str(thread)?.to_string();
+    if let Some(template) = &goal.message_template {
+        templates::validate(template)?;
+    }
+    if let Some(objective) = &goal.objective {
+        goals::validate_objective(objective)?;
+    }
+    goals::validate_budget(goal.token_budget)?;
+    if matches!(goal.action, PendingGoalAction::Create) {
+        anyhow::ensure!(goal.objective.is_some(), "Missing goal objective");
+    }
+    if matches!(goal.action, PendingGoalAction::Edit) {
+        anyhow::ensure!(
+            goal.objective.is_some() || goal.token_budget.is_some(),
+            "Provide an objective or token budget to edit"
+        );
+    }
+    let generated = request_id.is_none();
+    let id = request_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let bytes = serde_json::to_vec(
+        &json!({"thread":thread,"message":"","resume":false,"execution":execution,"goal":goal}),
+    )?;
+    let mut db = database(config)?;
+    let mut result = queue_cooperative_serialized_with(&mut db, &id, &thread, bytes, |_| {
+        anyhow::bail!("Goal retention requires an armed gate")
+    })?;
+    result["request_id_generated"] = json!(generated);
+    result["retry_safe_if_response_lost"] = json!(!generated);
+    Ok(result)
 }
 
 fn goal_input_result(
@@ -828,6 +1378,7 @@ fn notify_coordinator(
     payload: &Value,
     deferred: bool,
 ) -> Result<Option<(String, String)>> {
+    bridge::initialize_claim_gate(db)?;
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
     let turn = payload["turn_id"].as_str().filter(|turn| !turn.is_empty());
     if let Some(turn) = turn {
@@ -920,7 +1471,7 @@ fn notify_coordinator(
         );
         return Ok(Some((coordinator, "needs_attention".into())));
     }
-    if deferred {
+    if deferred || !bridge::claims_open(&tx)? {
         anyhow::ensure!(tx.execute(
             "UPDATE coordinator_alerts SET state='ready',reason=?2,sender_pid=NULL,sender_start=NULL WHERE id=?1 AND state='sending'",
             rusqlite::params![id, obligations::COORDINATOR_ALERT_READY_REASON],
@@ -1644,7 +2195,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Render and queue input for a thread. resume wakes it. steer delivers via its next tool/stop hook without waking or changing its model; incompatible with resume/execution.",
+        description = "Render and queue input for a thread. resume wakes it. Optional request_id is a stable UUID for cooperative delivery; repeat the same request to inspect its result without resending. Process-bound mode returns pending for locally retained input; a generated ID cannot make a lost response retry-safe. steer delivers via its next tool/stop hook without waking or changing its model; incompatible with resume/execution.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn queue_thread(&self, Parameters(input): Parameters<QueueInput>) -> CallToolResult {
@@ -1659,7 +2210,80 @@ impl WakeTools {
                     !input.resume && input.execution.is_none(),
                     "Steer cannot resume or change execution presets"
                 );
-                return steer::enqueue(&database(&self.config)?, &thread, &message);
+                steer::validate_input(&thread, &message)?;
+                return match bound_mode_state(&self.config)? {
+                    Some(bound) if bound || input.request_id.is_some() => {
+                        let generated = input.request_id.is_none();
+                        let id = input
+                            .request_id
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        let bytes = serde_json::to_vec(
+                            &json!({"thread":thread,"message":message,"resume":false,"execution":null,"steer":true}),
+                        )?;
+                        let mut db = database(&self.config)?;
+                        let mut result = queue_cooperative_serialized_with(
+                            &mut db,
+                            &id,
+                            &thread,
+                            bytes,
+                            |_| anyhow::bail!("Steer requires an armed gate"),
+                        )?;
+                        result["steer_id"] = result["request_id"].clone();
+                        result["request_id_generated"] = json!(generated);
+                        result["retry_safe_if_response_lost"] = json!(!generated);
+                        Ok(result)
+                    }
+                    Some(_) => anyhow::bail!("Stale cooperative owner or generation"),
+                    None => {
+                        anyhow::ensure!(
+                            std::env::var_os("CODEX_WAKE_GATE_OWNER").is_none()
+                                && std::env::var_os("CODEX_WAKE_GATE_GENERATION").is_none()
+                                && std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_none(),
+                            "Cooperative steer requires an armed gate"
+                        );
+                        anyhow::ensure!(
+                            input.request_id.is_none(),
+                            "Cooperative request IDs are not supported for unbound steer"
+                        );
+                        steer::enqueue(&database(&self.config)?, &thread, &message)
+                    }
+                };
+            }
+            if let Some(request_id) = input.request_id.as_deref() {
+                let mut result = queue_direct(
+                    &self.config,
+                    request_id,
+                    &thread,
+                    &message,
+                    input.resume,
+                    input.execution.as_ref(),
+                )?;
+                result["request_id_generated"] = json!(false);
+                result["retry_safe_if_response_lost"] = json!(true);
+                return Ok(result);
+            }
+            match bound_mode_state(&self.config)? {
+                Some(true) => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let mut result = queue_direct(
+                        &self.config,
+                        &id,
+                        &thread,
+                        &message,
+                        input.resume,
+                        input.execution.as_ref(),
+                    )?;
+                    result["request_id_generated"] = json!(true);
+                    result["retry_safe_if_response_lost"] = json!(false);
+                    return Ok(result);
+                }
+                Some(_) => anyhow::bail!("Stale cooperative owner or generation"),
+                None => anyhow::ensure!(
+                    std::env::var_os("CODEX_WAKE_GATE_OWNER").is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_GENERATION").is_none()
+                        && std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_none(),
+                    "Cooperative direct queue requires an armed gate"
+                ),
             }
             let (state, reason) = execution::deliver(
                 &self.config.codex,
@@ -1682,11 +2306,36 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Create an authorized goal; fails if one exists. Codex may continue automatically. Optional presets apply first; input is queued. Omit unrequested budgets.",
+        description = "Create an authorized goal; fails if one exists. In cooperative mode pending confirms storage only, not goal mutation or input. Supply a stable request_id before retrying. Omit unrequested budgets.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn create_goal(&self, Parameters(input): Parameters<CreateGoalInput>) -> CallToolResult {
         tool_result((|| {
+            match bound_mode_state(&self.config)? {
+                Some(bound) if bound || input.request_id.is_some() => {
+                    return retain_bound_goal(
+                        &self.config,
+                        &input.thread,
+                        input.request_id.as_deref(),
+                        PendingGoal {
+                            action: PendingGoalAction::Create,
+                            objective: Some(input.objective),
+                            token_budget: input.token_budget,
+                            message_template: input.message_template,
+                            source: input.source,
+                        },
+                        input.execution.as_ref(),
+                    );
+                }
+                Some(_) => anyhow::bail!("Stale cooperative owner or generation"),
+                None => anyhow::ensure!(
+                    input.request_id.is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_OWNER").is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_GENERATION").is_none()
+                        && std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_none(),
+                    "Cooperative goal execution requires an armed gate"
+                ),
+            }
             if let Some(template) = &input.message_template {
                 templates::validate(template)?;
             }
@@ -1710,11 +2359,36 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Edit a saved goal; Codex may continue active goals automatically. Optional presets apply first; input is queued. Omitted fields stay unchanged; Codex controls usage accounting.",
+        description = "Edit a saved goal. In cooperative mode pending confirms storage only, not goal mutation or input. Supply a stable request_id before retrying. Omitted fields stay unchanged.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn edit_goal(&self, Parameters(input): Parameters<EditGoalInput>) -> CallToolResult {
         tool_result((|| {
+            match bound_mode_state(&self.config)? {
+                Some(bound) if bound || input.request_id.is_some() => {
+                    return retain_bound_goal(
+                        &self.config,
+                        &input.thread,
+                        input.request_id.as_deref(),
+                        PendingGoal {
+                            action: PendingGoalAction::Edit,
+                            objective: input.objective,
+                            token_budget: input.token_budget,
+                            message_template: input.message_template,
+                            source: input.source,
+                        },
+                        input.execution.as_ref(),
+                    );
+                }
+                Some(_) => anyhow::bail!("Stale cooperative owner or generation"),
+                None => anyhow::ensure!(
+                    input.request_id.is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_OWNER").is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_GENERATION").is_none()
+                        && std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_none(),
+                    "Cooperative goal execution requires an armed gate"
+                ),
+            }
             if let Some(template) = &input.message_template {
                 templates::validate(template)?;
             }
@@ -1738,11 +2412,36 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Activate an authorized saved goal. Optional input is queued; Codex controls continuation. Presets apply before activation.",
+        description = "Activate an authorized saved goal. In cooperative mode pending confirms storage only, not activation or input. Supply a stable request_id before retrying.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn resume_goal(&self, Parameters(input): Parameters<ResumeGoalInput>) -> CallToolResult {
         tool_result((|| {
+            match bound_mode_state(&self.config)? {
+                Some(bound) if bound || input.request_id.is_some() => {
+                    return retain_bound_goal(
+                        &self.config,
+                        &input.thread,
+                        input.request_id.as_deref(),
+                        PendingGoal {
+                            action: PendingGoalAction::Resume,
+                            objective: None,
+                            token_budget: None,
+                            message_template: input.message_template,
+                            source: input.source,
+                        },
+                        input.execution.as_ref(),
+                    );
+                }
+                Some(_) => anyhow::bail!("Stale cooperative owner or generation"),
+                None => anyhow::ensure!(
+                    input.request_id.is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_OWNER").is_none()
+                        && std::env::var_os("CODEX_WAKE_GATE_GENERATION").is_none()
+                        && std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_none(),
+                    "Cooperative goal execution requires an armed gate"
+                ),
+            }
             if let Some(template) = &input.message_template {
                 templates::validate(template)?;
             }
@@ -2434,11 +3133,14 @@ async fn main() -> Result<()> {
     }
     anyhow::ensure!(
         !args.is_empty(),
-        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|poll|register|subscribe|cancel-subscription|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
+        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|poll|register|subscribe|cancel-subscription|publish|handle|hook|status|subscriptions|recover|queue-direct|remove-service|smoke-live|smoke-github"
     );
     let command = args.remove(0);
     // Cleanup must never recreate state after removing the plugin.
-    if command != "cleanup-uninstalled" && command != "diagnostics" {
+    if command != "cleanup-uninstalled"
+        && command != "diagnostics"
+        && !(command == "cooperative-gate" && args.first().is_some_and(|value| value == "producer"))
+    {
         observability::configure(config.state.join("telemetry.sqlite3"));
     }
     let operation = match command.as_str() {
@@ -2446,6 +3148,8 @@ async fn main() -> Result<()> {
         "ensure" => "cli.ensure",
         "record-funnel" => "cli.record_funnel",
         "receiver" => "cli.receiver",
+        "cooperative-gate" => "cli.cooperative_gate",
+        "queue-direct" => "cli.queue_direct",
         "poll" => "cli.poll",
         "register" => "cli.register",
         "subscribe" => "cli.subscribe",
@@ -2480,6 +3184,75 @@ async fn run_command(
     mut args: Vec<String>,
 ) -> Result<()> {
     match command.as_str() {
+        "cooperative-gate" => {
+            anyhow::ensure!(!args.is_empty(), "Missing cooperative gate action");
+            let action = args.remove(0);
+            let owner = required(&mut args, "--owner")?;
+            let generation = option(&mut args, "--generation")?
+                .map(|value| value.parse::<i64>())
+                .transpose()?;
+            let next_owner = option(&mut args, "--next-owner")?;
+            let producer = option(&mut args, "--producer-id")?;
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            if action == "producer" {
+                anyhow::ensure!(next_owner.is_none(), "Unexpected next owner");
+                manager::require_installed(&config)?;
+                let mut db = bridge::open_existing_owned(&config.db)?;
+                println!(
+                    "{}",
+                    bridge::configure_producer(
+                        &mut db,
+                        &owner,
+                        generation.context("Missing generation")?,
+                        producer.as_deref().context("Missing producer identity")?
+                    )?
+                );
+                return Ok(());
+            }
+            anyhow::ensure!(producer.is_none(), "Unexpected producer identity");
+            let mut db = database(&config)?;
+            println!(
+                "{}",
+                bridge::control_claim_gate(
+                    &mut db,
+                    &action,
+                    &owner,
+                    generation,
+                    next_owner.as_deref()
+                )?
+            );
+        }
+        "queue-direct" => {
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            let mut raw = Vec::new();
+            io::stdin().take(1024 * 1024 + 1).read_to_end(&mut raw)?;
+            anyhow::ensure!(raw.len() <= 1024 * 1024, "Direct queue input exceeds 1 MiB");
+            let input: QueueInput = serde_json::from_slice(&raw)?;
+            anyhow::ensure!(
+                !input.steer,
+                "Cooperative request IDs are not supported for steer"
+            );
+            let generated = input.request_id.is_none();
+            let request_id = input
+                .request_id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let thread = uuid::Uuid::parse_str(&input.thread)?.to_string();
+            let message = templates::render(
+                &input.message_template,
+                &json!({"source":input.source.unwrap_or(Value::Null),"target":{"thread":thread}}),
+            )?;
+            let mut result = queue_direct(
+                &config,
+                &request_id,
+                &thread,
+                &message,
+                input.resume,
+                input.execution.as_ref(),
+            )?;
+            result["request_id_generated"] = json!(generated);
+            result["retry_safe_if_response_lost"] = json!(!generated);
+            println!("{result}");
+        }
         "record-funnel" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
             println!("{}", manager::record_funnel(&config)?);
@@ -2512,7 +3285,19 @@ async fn run_command(
         }
         "mcp" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
-            manager::ensure_receiver(&config)?;
+            match bound_mode_state(&config)? {
+                None => {
+                    anyhow::ensure!(
+                        std::env::var_os("CODEX_WAKE_GATE_OWNER").is_none()
+                            && std::env::var_os("CODEX_WAKE_GATE_GENERATION").is_none()
+                            && std::env::var_os("CODEX_WAKE_PRODUCER_ID").is_none(),
+                        "Cooperative MCP requires an armed receiver gate"
+                    );
+                    manager::ensure_receiver(&config)?;
+                }
+                Some(true) => (),
+                Some(false) => anyhow::bail!("Stale cooperative owner or generation"),
+            }
             let _client = manager::register_client(&config)?;
             let service = WakeTools { config }.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
@@ -4687,6 +5472,1600 @@ mod hook_output_tests {
     }
 
     #[test]
+    fn bound_goal_and_steer_dispatch_preserves_uncertain_result() {
+        use std::{
+            os::unix::net::UnixListener,
+            process::{Command, Stdio},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            thread,
+        };
+        use wait_timeout::ChildExt;
+        const PHASE: &str = "WAKE_BOUND_GOAL_DISPATCH_TEST";
+        const OWNER: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const THREAD: &str = "11111111-1111-4111-8111-111111111111";
+        if std::env::var_os(PHASE).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "hook_output_tests::bound_goal_and_steer_dispatch_preserves_uncertain_result",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", temp.path())
+                .env("CODEX_HOME", temp.path().join("codex"))
+                .env("XDG_STATE_HOME", temp.path().join("state-root"))
+                .env("CODEX_WAKE_DB", temp.path().join("state/db.sqlite3"))
+                .env("CODEX_WAKE_RPC_SOCKET", temp.path().join("app.sock"))
+                .env("CODEX_WAKE_CODEX", "/bin/false")
+                .env("CODEX_WAKE_GATE_OWNER", OWNER)
+                .env("CODEX_WAKE_GATE_GENERATION", "1")
+                .env(PHASE, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            let mut child = child.spawn().unwrap();
+            let status = child.wait_timeout(Duration::from_secs(45)).unwrap();
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            assert!(
+                status.is_some_and(|s| s.success()),
+                "isolated dispatch test failed or timed out"
+            );
+            return;
+        }
+        let socket = PathBuf::from(std::env::var_os("CODEX_WAKE_RPC_SOCKET").unwrap());
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let fixture_db = PathBuf::from(std::env::var_os("CODEX_WAKE_DB").unwrap());
+        let server = thread::spawn(move || {
+            use tungstenite::Message;
+            let mut goal = Value::Null;
+            let mut queue_calls = 0;
+            let mut set_calls = 0;
+            let mut fail_get = false;
+            while !finished.load(Ordering::SeqCst) {
+                let (stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                ws.send(Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                let _ = ws.read().unwrap();
+                let request: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "thread/goal/get" if fail_get => {
+                        drop(ws);
+                        fail_get = false;
+                        continue;
+                    }
+                    "thread/goal/get" => json!({"goal":goal}),
+                    "thread/goal/set" => {
+                        set_calls += 1;
+                        if set_calls == 4 {
+                            fail_get = true;
+                        }
+                        if goal.is_null() {
+                            goal = json!({"status":"paused"});
+                        }
+                        if let Some(objective) = request["params"].get("objective") {
+                            goal["objective"] = objective.clone();
+                        }
+                        if let Some(status) = request["params"].get("status") {
+                            goal["status"] = status.clone();
+                        }
+                        json!({})
+                    }
+                    "thread/queue/add" => {
+                        queue_calls += 1;
+                        if queue_calls == 3 {
+                            assert_eq!(request["params"]["input"][0]["text"], "goal=second");
+                            let db = rusqlite::Connection::open(&fixture_db).unwrap();
+                            let saved: String = db.query_row("SELECT goal_progress FROM cooperative_direct_queue WHERE request_id=?1", ["44444444-4444-4444-8444-444444444444"], |r| r.get(0)).unwrap();
+                            let saved: Value = serde_json::from_str(&saved).unwrap();
+                            assert_eq!(saved["phase"], "queue_started");
+                            assert_eq!(saved["confirmed_goal"]["objective"], "second");
+                            assert_eq!(saved["rendered_message"], "goal=second");
+                            drop(ws);
+                            continue;
+                        }
+                        json!({"queuedSubmission":{"id":"fixture"}})
+                    }
+                    method => panic!("unexpected fixture method {method}"),
+                };
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+            (queue_calls, set_calls, goal)
+        });
+        let config = manager::Config::from_env().unwrap();
+        let mut db = database(&config).unwrap();
+        bridge::control_claim_gate(&mut db, "init", OWNER, None, None).unwrap();
+        bridge::control_claim_gate(&mut db, "arm", OWNER, Some(1), None).unwrap();
+        let tools = WakeTools { config };
+        let ids = [
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+            "44444444-4444-4444-8444-444444444444",
+            "55555555-5555-4555-8555-555555555555",
+            "66666666-6666-4666-8666-666666666666",
+        ];
+        let create = json!({"thread":THREAD,"objective":"first","message_template":"input","request_id":ids[0]});
+        let edit = json!({"thread":THREAD,"objective":"second","message_template":"input","request_id":ids[1]});
+        let resume = json!({"thread":THREAD,"message_template":"goal={{goal.objective}}","request_id":ids[2]});
+        let uncertain_get = json!({"thread":THREAD,"objective":"third","message_template":"input","request_id":ids[3]});
+        let steer =
+            json!({"thread":THREAD,"message_template":"steer","steer":true,"request_id":ids[4]});
+        let results = [
+            tools.create_goal(Parameters(serde_json::from_value(create).unwrap())),
+            tools.edit_goal(Parameters(serde_json::from_value(edit).unwrap())),
+            tools.resume_goal(Parameters(serde_json::from_value(resume.clone()).unwrap())),
+            tools.edit_goal(Parameters(
+                serde_json::from_value(uncertain_get.clone()).unwrap(),
+            )),
+            tools.queue_thread(Parameters(serde_json::from_value(steer).unwrap())),
+        ];
+        for result in results {
+            assert_eq!(result.structured_content.unwrap()["state"], "pending");
+        }
+        // Pending rows accepted by the previous build lack the progress column.
+        db.execute_batch("ALTER TABLE cooperative_direct_queue DROP COLUMN goal_progress")
+            .unwrap();
+        assert_eq!(
+            dispatch_direct_pending(&mut db, &tools.config.codex).unwrap(),
+            0
+        );
+        bridge::bind_receiver_gate(&mut db, OWNER, 1).unwrap();
+        for _ in 0..5 {
+            assert_eq!(
+                dispatch_direct_pending(&mut db, &tools.config.codex).unwrap(),
+                1
+            );
+        }
+        for (id, state, reason) in [
+            (ids[0], "queued", "goal_applied_input_queued"),
+            (ids[1], "queued", "goal_applied_input_queued"),
+            (ids[2], "needs_attention", "outcome_unconfirmed"),
+            (ids[3], "needs_attention", "outcome_unconfirmed"),
+            (ids[4], "queued", "awaiting_destination_hook"),
+        ] {
+            let actual: (String, String) = db
+                .query_row(
+                    "SELECT state,reason FROM cooperative_direct_queue WHERE request_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(actual, (state.into(), reason.into()));
+        }
+        let retained: i64 = db
+            .query_row(
+                "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                [ids[2]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 1);
+        let steer_state: String = db
+            .query_row("SELECT state FROM steers WHERE id=?1", [ids[4]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(steer_state, "pending");
+        let replay = tools
+            .resume_goal(Parameters(serde_json::from_value(resume).unwrap()))
+            .structured_content
+            .unwrap();
+        assert_eq!(replay["state"], "needs_attention");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["goal_progress"]["phase"], "queue_started");
+        assert_eq!(
+            replay["goal_progress"]["confirmed_goal"]["objective"],
+            "second"
+        );
+        assert_eq!(replay["goal_progress"]["rendered_message"], "goal=second");
+        assert_eq!(
+            dispatch_direct_pending(&mut db, &tools.config.codex).unwrap(),
+            0
+        );
+        let replay_get = tools
+            .edit_goal(Parameters(serde_json::from_value(uncertain_get).unwrap()))
+            .structured_content
+            .unwrap();
+        assert_eq!(replay_get["state"], "needs_attention");
+        assert_eq!(replay_get["replayed"], true);
+        assert_eq!(replay_get["goal_progress"]["phase"], "goal_started");
+        assert!(replay_get["goal_progress"].get("confirmed_goal").is_none());
+        let retained_get: i64 = db
+            .query_row(
+                "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                [ids[3]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_get, 1);
+        done.store(true, Ordering::SeqCst);
+        let (queue_calls, set_calls, goal) = server.join().unwrap();
+        assert_eq!(queue_calls, 3);
+        assert_eq!(set_calls, 4);
+        assert_eq!(goal["objective"], "third");
+    }
+
+    #[test]
+    fn bound_direct_persists_across_close_transfer_and_uncertainty() {
+        use std::{
+            process::{Command, Stdio},
+            sync::mpsc,
+            thread,
+        };
+        use wait_timeout::ChildExt;
+        thread_local! {
+            static BUSY: std::cell::RefCell<Option<(mpsc::Sender<&'static str>, &'static str)>> = const { std::cell::RefCell::new(None) };
+        }
+        fn report_busy(count: i32) -> bool {
+            BUSY.with(|slot| {
+                if let Some((sender, tag)) = &*slot.borrow() {
+                    let _ = sender.send(*tag);
+                }
+            });
+            thread::sleep(Duration::from_millis(5));
+            count < 2000
+        }
+        fn child_succeeded(child: &mut std::process::Child, timeout: Duration) -> bool {
+            match child.wait_timeout(timeout).unwrap() {
+                Some(status) => status.success(),
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    false
+                }
+            }
+        }
+        const PHASE: &str = "WAKE_BOUND_DIRECT_TEST_PHASE";
+        const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const FIRST: &str = "11111111-1111-4111-8111-111111111111";
+        const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+        const THIRD: &str = "33333333-3333-4333-8333-333333333333";
+        const FOURTH: &str = "55555555-5555-4555-8555-555555555555";
+        const THREAD: &str = "44444444-4444-4444-8444-444444444444";
+        let phase = std::env::var(PHASE).ok();
+        if let Some(phase) = phase {
+            let root = PathBuf::from(std::env::var_os("WAKE_BOUND_DIRECT_TEST_ROOT").unwrap());
+            let path = root.join("state/state.sqlite3");
+            let mut db = bridge::connect(&path).unwrap();
+            if phase == "first" {
+                bridge::control_claim_gate(&mut db, "init", A, None, None).unwrap();
+                bridge::control_claim_gate(&mut db, "arm", A, Some(1), None).unwrap();
+                let mut config = manager::Config::from_env().unwrap();
+                config.db = path.clone();
+                config.state = root.join("state");
+                config.plugin_base = None;
+                let tools = WakeTools { config };
+                let input = |id: &str, message: &str| {
+                    serde_json::from_value::<QueueInput>(json!({
+                        "thread":THREAD,"message_template":message,"request_id":id
+                    }))
+                    .unwrap()
+                };
+                let first = tools.queue_thread(Parameters(input(FIRST, "fixture-one")));
+                assert_ne!(first.is_error, Some(true));
+                assert_eq!(first.structured_content.unwrap()["state"], "pending");
+                let replay = tools
+                    .queue_thread(Parameters(input(FIRST, "fixture-one")))
+                    .structured_content
+                    .unwrap();
+                assert_eq!(replay["replayed"], true);
+                assert_eq!(replay["state"], "pending");
+                assert_eq!(
+                    tools
+                        .queue_thread(Parameters(input(FIRST, "different")))
+                        .is_error,
+                    Some(true)
+                );
+                crate::uninstall::validate_external_database(&path).unwrap();
+                let namespace: String = db
+                    .query_row(
+                        "SELECT namespace FROM cooperative_direct_queue_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("namespace missing after acceptance");
+                let expected_id = delivery_evidence::client_user_message_id(
+                    &format!("codex-wake/direct-queue/v2/{namespace}/{FIRST}"),
+                    THREAD,
+                )
+                .unwrap();
+                let snapshot_path = path.parent().unwrap().join("snapshot.sqlite3");
+                db.execute("VACUUM INTO ?1", [snapshot_path.to_str().unwrap()])
+                    .unwrap();
+                std::fs::set_permissions(
+                    &snapshot_path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )
+                .unwrap();
+                let mut snapshot = bridge::connect(&snapshot_path).unwrap();
+                bridge::bind_receiver_gate(&mut snapshot, A, 1).unwrap();
+                assert_eq!(
+                    dispatch_direct_pending_with(&mut snapshot, |_, _, _, id| {
+                        assert_eq!(id, expected_id);
+                        Ok(("queued".into(), None))
+                    })
+                    .unwrap(),
+                    1
+                );
+                drop(snapshot);
+                let original_pending: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                        [FIRST],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(original_pending, 1);
+                bridge::bind_receiver_gate(&mut db, A, 1).unwrap();
+                db.execute_batch("CREATE TRIGGER fail_bound_claim BEFORE INSERT ON cooperative_direct_queue BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+                assert!(
+                    dispatch_direct_pending_with(&mut db, |_, _, _, _| panic!(
+                        "claim failed but sent"
+                    ))
+                    .is_err()
+                );
+                db.execute_batch("DROP TRIGGER fail_bound_claim").unwrap();
+                let retained: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                        [FIRST],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, 1);
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let worker_path = path.clone();
+                let worker = thread::spawn(move || {
+                    let mut db = bridge::connect(&worker_path).unwrap();
+                    dispatch_direct_pending_with(&mut db, |_, _, request, _| {
+                        assert_eq!(request.message, "fixture-one");
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Err(anyhow::anyhow!("injected ambiguous result"))
+                    })
+                    .unwrap()
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let mut closer_db = bridge::connect(&path).unwrap();
+                let mut producer_db = bridge::connect(&path).unwrap();
+                closer_db.busy_handler(Some(report_busy)).unwrap();
+                producer_db.busy_handler(Some(report_busy)).unwrap();
+                db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                let (busy_tx, busy_rx) = mpsc::channel();
+                let close_tx = busy_tx.clone();
+                let closer = thread::spawn(move || {
+                    BUSY.with(|slot| *slot.borrow_mut() = Some((close_tx, "close")));
+                    bridge::control_claim_gate(&mut closer_db, "close", A, Some(1), None).unwrap()
+                });
+                let producer = thread::spawn(move || {
+                    BUSY.with(|slot| *slot.borrow_mut() = Some((busy_tx, "enqueue")));
+                    queue_cooperative_with(
+                        &mut producer_db,
+                        SECOND,
+                        THREAD,
+                        "fixture-two",
+                        false,
+                        None,
+                        |_| panic!("producer sent directly"),
+                    )
+                    .unwrap()
+                });
+                let mut seen = std::collections::HashSet::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while seen.len() < 2 {
+                    seen.insert(
+                        busy_rx
+                            .recv_timeout(
+                                deadline.saturating_duration_since(std::time::Instant::now()),
+                            )
+                            .unwrap(),
+                    );
+                }
+                assert!(seen.contains("close") && seen.contains("enqueue"));
+                db.execute_batch("COMMIT").unwrap();
+                assert_eq!(closer.join().unwrap()["open"], false);
+                assert_eq!(producer.join().unwrap()["state"], "pending");
+                let second = tools.queue_thread(Parameters(input(SECOND, "fixture-two")));
+                assert_ne!(second.is_error, Some(true));
+                let second = second.structured_content.unwrap();
+                assert_eq!(second["state"], "pending");
+                assert_eq!(second["replayed"], true);
+                release_tx.send(()).unwrap();
+                assert_eq!(worker.join().unwrap(), 1);
+                assert_eq!(
+                    dispatch_direct_pending_with(&mut db, |_, _, _, _| panic!(
+                        "closed gate dispatched"
+                    ))
+                    .unwrap(),
+                    0
+                );
+                let replay = tools
+                    .queue_thread(Parameters(input(FIRST, "fixture-one")))
+                    .structured_content
+                    .unwrap();
+                assert_eq!(replay["state"], "needs_attention");
+                assert_eq!(replay["replayed"], true);
+                let retained: String = db
+                    .query_row(
+                        "SELECT payload FROM cooperative_direct_pending WHERE request_id=?1",
+                        [FIRST],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(retained.contains("fixture-one"));
+                drop(db);
+                let mut db = bridge::connect(&path).unwrap();
+                let pending: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                        [SECOND],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(pending, 1);
+                bridge::control_claim_gate(&mut db, "transfer", A, Some(1), Some(B)).unwrap();
+                drop(db);
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "hook_output_tests::bound_direct_persists_across_close_transfer_and_uncertainty"])
+                    .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &root)
+                    .env("CODEX_HOME", root.join("codex")).env("XDG_STATE_HOME", root.join("state-root"))
+                    .env("CODEX_WAKE_DB", &path).env("CODEX_WAKE_CODEX", "/bin/false").env("CODEX_WAKE_GH", "/bin/false")
+                    .env(PHASE, "second").env("WAKE_BOUND_DIRECT_TEST_ROOT", &root)
+                    .env("CODEX_WAKE_GATE_OWNER", B).env("CODEX_WAKE_GATE_GENERATION", "2")
+                    .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap();
+                assert!(
+                    child_succeeded(&mut child, Duration::from_secs(20)),
+                    "second owner failed or timed out"
+                );
+                let mut db = bridge::connect(&path).unwrap();
+                for (id, message) in [(THIRD, "fixture-three"), (FOURTH, "fixture-four")] {
+                    let result =
+                        queue_cooperative_with(&mut db, id, THREAD, message, false, None, |_| {
+                            panic!("uncertain request resent")
+                        })
+                        .unwrap();
+                    assert_eq!(result["state"], "needs_attention");
+                    assert_eq!(result["replayed"], true);
+                }
+            } else {
+                assert_eq!(phase, "second");
+                bridge::bind_receiver_gate(&mut db, B, 2).unwrap();
+                let mut calls = 0;
+                assert_eq!(
+                    dispatch_direct_pending_with(&mut db, |_, _, request, _| {
+                        assert_eq!(request.message, "fixture-two");
+                        calls += 1;
+                        Ok(("queued".into(), None))
+                    })
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(calls, 1);
+                let retained: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                        [SECOND],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, 0);
+                let replay = queue_cooperative_with(
+                    &mut db,
+                    SECOND,
+                    THREAD,
+                    "fixture-two",
+                    false,
+                    None,
+                    |_| panic!("duplicate sent"),
+                )
+                .unwrap();
+                assert_eq!(replay["state"], "queued");
+                assert_eq!(replay["replayed"], true);
+                // Two simultaneous producers of the same stable ID persist
+                // exactly one request, even before a receiver claims it.
+                let shared = std::sync::Arc::new(std::sync::Barrier::new(3));
+                let race_id = uuid::Uuid::new_v4().to_string();
+                let mut producers = Vec::new();
+                for _ in 0..2 {
+                    let path = path.clone();
+                    let barrier = shared.clone();
+                    let id = race_id.clone();
+                    producers.push(thread::spawn(move || {
+                        let mut db = bridge::connect(&path).unwrap();
+                        barrier.wait();
+                        queue_cooperative_with(
+                            &mut db,
+                            &id,
+                            THREAD,
+                            "same-request",
+                            false,
+                            None,
+                            |_| panic!("producer sent directly"),
+                        )
+                        .unwrap()
+                    }));
+                }
+                shared.wait();
+                let outcomes: Vec<Value> =
+                    producers.into_iter().map(|p| p.join().unwrap()).collect();
+                assert_eq!(
+                    outcomes
+                        .iter()
+                        .filter(|result| result["replayed"].as_bool() == Some(false))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    outcomes
+                        .iter()
+                        .filter(|result| result["replayed"].as_bool() == Some(true))
+                        .count(),
+                    1
+                );
+                let rows: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                        [&race_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rows, 1);
+                // More pending direct work than one batch must leave a chance
+                // for the next real bridge dispatcher in the receiver cycle.
+                for _ in 0..DIRECT_PENDING_BATCH {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    assert_eq!(
+                        queue_cooperative_with(
+                            &mut db,
+                            &id,
+                            THREAD,
+                            "batch",
+                            false,
+                            None,
+                            |_| panic!("pending sent directly")
+                        )
+                        .unwrap()["state"],
+                        "pending"
+                    );
+                }
+                let mut batch_calls = 0;
+                assert_eq!(
+                    dispatch_direct_pending_with(&mut db, |_, _, _, _| {
+                        batch_calls += 1;
+                        Ok(("queued".into(), None))
+                    })
+                    .unwrap(),
+                    DIRECT_PENDING_BATCH
+                );
+                assert_eq!(batch_calls, DIRECT_PENDING_BATCH);
+                let remaining: i64 = db.query_row("SELECT count(*) FROM cooperative_direct_pending p WHERE NOT EXISTS (SELECT 1 FROM cooperative_direct_queue q WHERE q.request_id=p.request_id)", [], |r| r.get(0)).unwrap();
+                assert_eq!(remaining, 1);
+                db.execute("INSERT INTO waits(repo,run_id,attempt,thread,sha,state,conclusion) VALUES('fixture/repo',77,1,?1,?2,'ready','success')", params![THREAD,"a".repeat(40)]).unwrap();
+                assert_eq!(
+                    bridge::dispatch(
+                        &mut db,
+                        std::path::Path::new("/bin/false"),
+                        Duration::from_millis(100)
+                    )
+                    .unwrap(),
+                    1
+                );
+                let other: (String, Option<String>) = db
+                    .query_row("SELECT state,reason FROM waits WHERE run_id=77", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .unwrap();
+                assert!(other.0 != "ready" || other.1.is_some());
+                assert_eq!(
+                    dispatch_direct_pending_with(&mut db, |_, _, _, _| Ok(("queued".into(), None)))
+                        .unwrap(),
+                    1
+                );
+                let pending = queue_cooperative_with(
+                    &mut db,
+                    THIRD,
+                    THREAD,
+                    "fixture-three",
+                    false,
+                    None,
+                    |_| panic!("not queued"),
+                )
+                .unwrap();
+                assert_eq!(pending["state"], "pending");
+                let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = dispatch_direct_pending_with(
+                        &mut db,
+                        |_, _, _, _| -> Result<(String, Option<String>)> {
+                            panic!("injected interruption")
+                        },
+                    );
+                }));
+                assert!(interrupted.is_err());
+                let sending: String = db
+                    .query_row(
+                        "SELECT state FROM cooperative_direct_queue WHERE request_id=?1",
+                        [THIRD],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(sending, "sending");
+                assert_eq!(
+                    queue_cooperative_with(
+                        &mut db,
+                        FOURTH,
+                        THREAD,
+                        "fixture-four",
+                        false,
+                        None,
+                        |_| panic!("not queued")
+                    )
+                    .unwrap()["state"],
+                    "pending"
+                );
+                db.execute_batch("CREATE TRIGGER fail_bound_result BEFORE UPDATE ON cooperative_direct_queue BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
+                let mut sent = 0;
+                assert!(
+                    dispatch_direct_pending_with(&mut db, |_, _, _, _| {
+                        sent += 1;
+                        Ok(("queued".into(), None))
+                    })
+                    .is_err()
+                );
+                assert_eq!(sent, 1);
+                db.execute_batch("DROP TRIGGER fail_bound_result").unwrap();
+                let result = queue_cooperative_with(
+                    &mut db,
+                    FOURTH,
+                    THREAD,
+                    "fixture-four",
+                    false,
+                    None,
+                    |_| panic!("result write failure resent request"),
+                )
+                .unwrap();
+                assert_eq!(result["state"], "sending");
+                for id in [THIRD, FOURTH] {
+                    let retained: i64 = db
+                        .query_row(
+                            "SELECT count(*) FROM cooperative_direct_pending WHERE request_id=?1",
+                            [id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(retained, 1);
+                }
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hook_output_tests::bound_direct_persists_across_close_transfer_and_uncertainty",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("CODEX_HOME", root.path().join("codex"))
+            .env("XDG_STATE_HOME", root.path().join("state-root"))
+            .env("CODEX_WAKE_DB", root.path().join("state/state.sqlite3"))
+            .env("CODEX_WAKE_CODEX", "/bin/false")
+            .env("CODEX_WAKE_GH", "/bin/false")
+            .env(PHASE, "first")
+            .env("WAKE_BOUND_DIRECT_TEST_ROOT", root.path())
+            .env("CODEX_WAKE_GATE_OWNER", A)
+            .env("CODEX_WAKE_GATE_GENERATION", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        assert!(
+            child_succeeded(&mut child, Duration::from_secs(30)),
+            "first owner failed or timed out"
+        );
+    }
+
+    #[test]
+    fn review_direct_queue_result_write_failure_does_not_resend() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        db.execute("UPDATE wake_delivery_claim_gate SET is_open=0", [])
+            .unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        assert!(
+            queue_cooperative_with(
+                &mut db,
+                request,
+                thread,
+                "message",
+                false,
+                None,
+                |_| panic!("closed")
+            )
+            .is_err()
+        );
+        db.execute_batch("CREATE TABLE cooperative_direct_queue(request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, state TEXT NOT NULL, reason TEXT)").unwrap();
+        db.execute_batch("UPDATE wake_delivery_claim_gate SET is_open=1; CREATE TRIGGER fail_direct_result BEFORE UPDATE ON cooperative_direct_queue BEGIN SELECT RAISE(FAIL,'injected result write failure'); END;").unwrap();
+        let mut sends = 0;
+        assert!(
+            queue_cooperative_with(&mut db, request, thread, "message", false, None, |_| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .is_err()
+        );
+        db.execute_batch("DROP TRIGGER fail_direct_result").unwrap();
+        let retry =
+            queue_cooperative_with(&mut db, request, thread, "message", false, None, |_| {
+                panic!("result-write failure caused resend")
+            })
+            .unwrap();
+        assert_eq!(sends, 1);
+        assert_eq!(retry["state"], "sending");
+        assert_eq!(retry["reason"], "outcome_unconfirmed");
+    }
+
+    #[test]
+    fn review_direct_queue_simultaneous_first_claims_send_once() {
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        drop(db);
+        let barrier = Arc::new(Barrier::new(3));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (path, barrier, sends) = (path.clone(), barrier.clone(), sends.clone());
+                std::thread::spawn(move || {
+                    let mut db = rusqlite::Connection::open(path).unwrap();
+                    db.busy_timeout(Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    queue_cooperative_with(
+                        &mut db,
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "11111111-1111-4111-8111-111111111111",
+                        "message",
+                        false,
+                        None,
+                        |_| {
+                            sends.fetch_add(1, Ordering::SeqCst);
+                            Ok(("queued".into(), None))
+                        },
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(results.iter().filter(|r| r["replayed"] == false).count(), 1);
+        assert_eq!(results.iter().filter(|r| r["replayed"] == true).count(), 1);
+    }
+
+    #[test]
+    fn review_direct_queue_distinct_first_requests_share_stable_namespace() {
+        use std::sync::{Arc, Barrier};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        drop(db);
+        let barrier = Arc::new(Barrier::new(3));
+        let requests = [
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ];
+        let workers: Vec<_> = requests
+            .into_iter()
+            .map(|request| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let mut db = rusqlite::Connection::open(path).unwrap();
+                    db.busy_timeout(Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    let mut native_id = String::new();
+                    queue_cooperative_with(
+                        &mut db,
+                        request,
+                        "11111111-1111-4111-8111-111111111111",
+                        "message",
+                        false,
+                        None,
+                        |id| {
+                            native_id = id.to_owned();
+                            Ok(("queued".into(), None))
+                        },
+                    )
+                    .unwrap();
+                    (request, native_id)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let namespace: String = db
+            .query_row(
+                "SELECT namespace FROM cooperative_direct_queue_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM cooperative_direct_queue_meta",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        for (request, native_id) in results {
+            assert_eq!(
+                native_id,
+                delivery_evidence::client_user_message_id(
+                    &format!("codex-wake/direct-queue/v2/{namespace}/{request}"),
+                    "11111111-1111-4111-8111-111111111111"
+                )
+                .unwrap()
+            );
+        }
+        drop(db);
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        let request = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        queue_cooperative_with(
+            &mut db,
+            request,
+            "11111111-1111-4111-8111-111111111111",
+            "message",
+            false,
+            None,
+            |id| {
+                assert_eq!(
+                    id,
+                    delivery_evidence::client_user_message_id(
+                        &format!("codex-wake/direct-queue/v2/{namespace}/{request}"),
+                        "11111111-1111-4111-8111-111111111111"
+                    )
+                    .unwrap()
+                );
+                Ok(("queued".into(), None))
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn review_direct_queue_claim_write_failure_rolls_back_namespace() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        db.execute("UPDATE wake_delivery_claim_gate SET is_open=0", [])
+            .unwrap();
+        assert!(
+            queue_cooperative_with(
+                &mut db,
+                request,
+                thread,
+                "message",
+                false,
+                None,
+                |_| panic!("closed")
+            )
+            .is_err()
+        );
+        db.execute_batch("CREATE TABLE cooperative_direct_queue(request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, state TEXT NOT NULL, reason TEXT)").unwrap();
+        db.execute_batch("UPDATE wake_delivery_claim_gate SET is_open=1; CREATE TRIGGER fail_direct_claim BEFORE INSERT ON cooperative_direct_queue BEGIN SELECT RAISE(FAIL,'injected claim write failure'); END;").unwrap();
+        assert!(
+            queue_cooperative_with(
+                &mut db,
+                request,
+                thread,
+                "message",
+                false,
+                None,
+                |_| panic!("failed claim sent")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM cooperative_direct_queue", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cooperative_direct_queue_meta')", [], |r| r.get::<_, bool>(0)).unwrap());
+        db.execute_batch("DROP TRIGGER fail_direct_claim").unwrap();
+        let mut sends = 0;
+        let result =
+            queue_cooperative_with(&mut db, request, thread, "message", false, None, |_| {
+                sends += 1;
+                Ok(("queued".into(), None))
+            })
+            .unwrap();
+        assert_eq!(sends, 1);
+        assert_eq!(result["state"], "queued");
+    }
+
+    #[test]
+    fn cooperative_direct_queue_retains_unknown_and_rejects_conflicting_retry() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert!(
+            queue_cooperative_with(
+                &mut db,
+                request,
+                thread,
+                "private payload",
+                false,
+                None,
+                |_| panic!("closed gate sent")
+            )
+            .is_err()
+        );
+        let count: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='cooperative_direct_queue'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let first = queue_cooperative_with(
+            &mut db,
+            request,
+            thread,
+            "private payload",
+            false,
+            None,
+            |_| anyhow::bail!("sensitive upstream output"),
+        )
+        .unwrap();
+        assert_eq!(first["state"], "needs_attention");
+        assert_eq!(first["reason"], "outcome_unconfirmed");
+        let again = queue_cooperative_with(
+            &mut db,
+            request,
+            thread,
+            "private payload",
+            false,
+            None,
+            |_| panic!("uncertain request resent"),
+        )
+        .unwrap();
+        assert_eq!(again["state"], "needs_attention");
+        assert_eq!(again["replayed"], true);
+        assert!(
+            queue_cooperative_with(
+                &mut db,
+                request,
+                thread,
+                "different",
+                false,
+                None,
+                |_| panic!("conflicting request sent")
+            )
+            .is_err()
+        );
+        let stored: (String, Option<String>) = db
+            .query_row(
+                "SELECT request_digest,reason FROM cooperative_direct_queue WHERE request_id=?1",
+                [request],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(!format!("{stored:?}").contains("private payload"));
+        assert!(!format!("{stored:?}").contains("sensitive upstream output"));
+    }
+
+    #[test]
+    fn cooperative_direct_queue_interruption_remains_unconfirmed() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                    panic!("injected interruption after claim")
+                });
+        }));
+        assert!(interrupted.is_err());
+        let result =
+            queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                panic!("interrupted request resent")
+            })
+            .unwrap();
+        assert_eq!(result["state"], "sending");
+        assert_eq!(result["reason"], "outcome_unconfirmed");
+        assert_eq!(result["replayed"], true);
+    }
+
+    #[test]
+    fn cooperative_direct_queue_namespaces_are_per_database_and_persistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.sqlite3");
+        let second_path = dir.path().join("second.sqlite3");
+        let mut first = rusqlite::Connection::open(&first_path).unwrap();
+        let mut second = rusqlite::Connection::open(&second_path).unwrap();
+        bridge::initialize_claim_gate(&first).unwrap();
+        bridge::initialize_claim_gate(&second).unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let mut first_id = String::new();
+        let mut second_id = String::new();
+        queue_cooperative_with(&mut first, request, thread, "one", false, None, |id| {
+            first_id = id.into();
+            Ok(("queued".into(), None))
+        })
+        .unwrap();
+        queue_cooperative_with(
+            &mut second,
+            request,
+            thread,
+            "different",
+            false,
+            None,
+            |id| {
+                second_id = id.into();
+                Ok(("queued".into(), None))
+            },
+        )
+        .unwrap();
+        assert_ne!(first_id, second_id);
+        let namespace: String = first
+            .query_row(
+                "SELECT namespace FROM cooperative_direct_queue_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(first);
+        let mut first = rusqlite::Connection::open(&first_path).unwrap();
+        let replay =
+            queue_cooperative_with(&mut first, request, thread, "one", false, None, |_| {
+                panic!("reopened request resent")
+            })
+            .unwrap();
+        assert_eq!(replay["replayed"], true);
+        let reopened: String = first
+            .query_row(
+                "SELECT namespace FROM cooperative_direct_queue_meta WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(namespace, reopened);
+        first
+            .execute("DELETE FROM cooperative_direct_queue_meta", [])
+            .unwrap();
+        assert!(
+            queue_cooperative_with(
+                &mut first,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                thread,
+                "new",
+                false,
+                None,
+                |_| panic!("missing namespace sent")
+            )
+            .is_err()
+        );
+        let count: i64 = first
+            .query_row("SELECT count(*) FROM cooperative_direct_queue", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cooperative_direct_queue_dead_sender_stays_uncertain_without_retry() {
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "WAKE_DIRECT_SENDER_EXIT_DB";
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let mut db = rusqlite::Connection::open(path).unwrap();
+            bridge::initialize_claim_gate(&db).unwrap();
+            let _ =
+                queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                    // Model the sender dying after claiming and before saving a result.
+                    std::process::exit(42)
+                });
+            panic!("child unexpectedly returned");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hook_output_tests::cooperative_direct_queue_dead_sender_stays_uncertain_without_retry"])
+            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", dir.path()).env(CHILD, &path)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert_eq!(status.code(), Some(42));
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        let result =
+            queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                panic!("dead sender replayed")
+            })
+            .unwrap();
+        assert_eq!(result["state"], "needs_attention");
+        assert_eq!(result["reason"], "sender_exit_outcome_unconfirmed");
+        assert_eq!(result["replayed"], true);
+        let result =
+            queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                panic!("uncertain result replayed")
+            })
+            .unwrap();
+        assert_eq!(result["state"], "needs_attention");
+    }
+
+    #[test]
+    fn cooperative_direct_queue_missing_sender_identity_stays_sending() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                    panic!("interrupt")
+                });
+        }));
+        db.execute(
+            "UPDATE cooperative_direct_queue SET sender_namespace=sender_namespace || '-other'",
+            [],
+        )
+        .unwrap();
+        let mismatch =
+            queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                panic!("mismatched namespace replayed")
+            })
+            .unwrap();
+        assert_eq!(mismatch["state"], "sending");
+        db.execute("UPDATE cooperative_direct_queue SET sender_pid=NULL,sender_start=NULL,sender_boot=NULL,sender_namespace=NULL", []).unwrap();
+        let result =
+            queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                panic!("unverifiable sender replayed")
+            })
+            .unwrap();
+        assert_eq!(result["state"], "sending");
+        assert_eq!(result["reason"], "outcome_unconfirmed");
+    }
+
+    #[test]
+    fn cooperative_direct_queue_old_record_remains_unconfirmed_after_migration() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        db.execute_batch("CREATE TABLE cooperative_direct_queue(request_id TEXT PRIMARY KEY,request_digest TEXT NOT NULL,state TEXT NOT NULL,reason TEXT)").unwrap();
+        let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(
+                    &json!({"thread":thread,"message":"private","resume":false,"execution":null})
+                )
+                .unwrap()
+            )
+        );
+        db.execute("INSERT INTO cooperative_direct_queue(request_id,request_digest,state) VALUES(?1,?2,'sending')", params![request,digest]).unwrap();
+        let result =
+            queue_cooperative_with(&mut db, request, thread, "private", false, None, |_| {
+                panic!("old unknown request resent")
+            })
+            .unwrap();
+        assert_eq!(result["state"], "sending");
+        assert_eq!(result["reason"], "outcome_unconfirmed");
+        let sender: Option<i64> = db
+            .query_row("SELECT sender_pid FROM cooperative_direct_queue", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(sender.is_none());
+    }
+
+    #[test]
+    fn review_direct_sender_reuse_boot_and_incomplete_matrix() {
+        let cases = [
+            ("", "sending"),
+            ("sender_start=sender_start+1", "needs_attention"),
+            (
+                "sender_boot='00000000-0000-4000-8000-000000000000'",
+                "needs_attention",
+            ),
+            (
+                "sender_namespace=sender_namespace || '-different'",
+                "sending",
+            ),
+            ("sender_pid=NULL", "sending"),
+            ("sender_start=NULL", "sending"),
+            ("sender_boot=NULL", "sending"),
+            ("sender_namespace=NULL", "sending"),
+        ];
+        for (mutation, expected) in cases {
+            let mut db = rusqlite::Connection::open_in_memory().unwrap();
+            bridge::initialize_claim_gate(&db).unwrap();
+            let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let thread = "11111111-1111-4111-8111-111111111111";
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = queue_cooperative_with(
+                        &mut db,
+                        request,
+                        thread,
+                        "message",
+                        false,
+                        None,
+                        |_| panic!("injected interruption"),
+                    );
+                }))
+                .is_err()
+            );
+            if !mutation.is_empty() {
+                db.execute(
+                    &format!("UPDATE cooperative_direct_queue SET {mutation}"),
+                    [],
+                )
+                .unwrap();
+            }
+            let replay =
+                queue_cooperative_with(&mut db, request, thread, "message", false, None, |_| {
+                    panic!("sender classification resent")
+                })
+                .unwrap();
+            assert_eq!(replay["state"], expected, "{mutation}");
+            assert!(replay["replayed"].as_bool().unwrap());
+        }
+    }
+
+    #[test]
+    fn cooperative_direct_queue_invalid_sender_metadata_stays_unconfirmed() {
+        for mutation in [
+            "sender_boot=''",
+            "sender_start=-1",
+            "sender_pid=-1",
+            "sender_boot='not-a-uuid'",
+            "sender_namespace='pid:[invalid]'",
+        ] {
+            let mut db = rusqlite::Connection::open_in_memory().unwrap();
+            bridge::initialize_claim_gate(&db).unwrap();
+            let request = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+            let thread = "11111111-1111-4111-8111-111111111111";
+            let live = conditions::current_sender_identity().unwrap();
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = queue_cooperative_with(
+                        &mut db,
+                        request,
+                        thread,
+                        "message",
+                        false,
+                        None,
+                        |_| panic!("injected interruption"),
+                    );
+                }))
+                .is_err()
+            );
+            db.execute(
+                &format!("UPDATE cooperative_direct_queue SET {mutation}"),
+                [],
+            )
+            .unwrap();
+            let result =
+                queue_cooperative_with(&mut db, request, thread, "message", false, None, |_| {
+                    panic!("invalid metadata resent")
+                })
+                .unwrap();
+            let still_live = conditions::current_sender_identity().unwrap();
+            assert_eq!((still_live.pid, still_live.start), (live.pid, live.start));
+            assert_eq!(result["state"], "sending", "{mutation}");
+            assert_eq!(result["reason"], "outcome_unconfirmed");
+        }
+    }
+
+    #[test]
+    fn cooperative_direct_queue_joins_concurrent_retry_without_resending() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        db.busy_timeout(Duration::from_secs(5)).unwrap();
+        bridge::initialize_claim_gate(&db).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let mut db = rusqlite::Connection::open(worker_path).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            queue_cooperative_with(
+                &mut db,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "11111111-1111-4111-8111-111111111111",
+                "message",
+                false,
+                None,
+                |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(("queued".into(), Some("native_queue_accepted".into())))
+                },
+            )
+            .unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let during = queue_cooperative_with(
+            &mut db,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "11111111-1111-4111-8111-111111111111",
+            "message",
+            false,
+            None,
+            |_| panic!("concurrent retry resent"),
+        )
+        .unwrap();
+        assert_eq!(during["state"], "sending");
+        assert_eq!(during["reason"], "outcome_unconfirmed");
+        assert!(
+            queue_cooperative_with(
+                &mut db,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "11111111-1111-4111-8111-111111111111",
+                "new",
+                false,
+                None,
+                |_| panic!("closed gate sent")
+            )
+            .is_err()
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap()["state"], "queued");
+        let after = queue_cooperative_with(
+            &mut db,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "11111111-1111-4111-8111-111111111111",
+            "message",
+            false,
+            None,
+            |_| panic!("completed request resent"),
+        )
+        .unwrap();
+        assert_eq!(after["state"], "queued");
+        assert_eq!(after["replayed"], true);
+    }
+
+    #[test]
+    fn cooperative_mcp_queue_returns_persistent_unknown_without_socket() {
+        use std::process::{Command, Stdio};
+        use wait_timeout::ChildExt;
+        const CHILD: &str = "WAKE_NO_SOCKET_TEST_HOME";
+        let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let root = tempfile::tempdir().unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "hook_output_tests::cooperative_mcp_queue_returns_persistent_unknown_without_socket", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", root.path())
+                .env("CODEX_HOME", root.path().join("codex")).env("XDG_STATE_HOME", root.path())
+                .env(CHILD, root.path()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+            let status = child.wait_timeout(Duration::from_secs(15)).unwrap();
+            if status.is_none() {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                status.is_some() && output.status.success(),
+                "isolated test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        assert!(std::env::var_os("CODEX_WAKE_RPC_SOCKET").is_none());
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = root.join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = root.join("missing-codex");
+        let tools = WakeTools { config };
+        let args = || {
+            serde_json::from_value::<QueueInput>(json!({"thread":"11111111-1111-4111-8111-111111111111","message_template":"private","request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})).unwrap()
+        };
+        let first = tools.queue_thread(Parameters(args()));
+        assert_ne!(first.is_error, Some(true));
+        assert_eq!(
+            first.structured_content.unwrap()["state"],
+            "needs_attention"
+        );
+        let second = tools.queue_thread(Parameters(args()));
+        assert_ne!(second.is_error, Some(true));
+        let result = second.structured_content.unwrap();
+        assert_eq!(result["state"], "needs_attention");
+        assert_eq!(result["replayed"], true);
+    }
+
+    #[test]
+    fn cooperative_mcp_queue_lost_rpc_response_is_never_resent() {
+        use std::{
+            os::unix::net::UnixListener,
+            process::{Command, Stdio},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            thread,
+            time::Instant,
+        };
+        use wait_timeout::ChildExt;
+        const CHILD: &str = "WAKE_DIRECT_QUEUE_TEST_HOME";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let mut config = manager::Config::from_env().unwrap();
+            config.plugin_base = None;
+            config.state = root.join("state");
+            config.db = config.state.join("state.sqlite3");
+            config.codex = root.join("must-not-execute");
+            let tools = WakeTools { config };
+            let args = || {
+                serde_json::from_value::<QueueInput>(json!({"thread":"11111111-1111-4111-8111-111111111111","message_template":"private","request_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})).unwrap()
+            };
+            let first = tools.queue_thread(Parameters(args()));
+            assert_ne!(first.is_error, Some(true));
+            assert_eq!(
+                first.structured_content.unwrap()["state"],
+                "needs_attention"
+            );
+            let again = tools.queue_thread(Parameters(args()));
+            assert_ne!(again.is_error, Some(true));
+            let result = again.structured_content.unwrap();
+            assert_eq!(result["state"], "needs_attention");
+            assert_eq!(result["replayed"], true);
+            uninstall::validate_external_database(&tools.config.db).unwrap();
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("rpc.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (calls, done) = (count.clone(), stop.clone());
+        let db_path = root.path().join("state/state.sqlite3");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                ws.read().unwrap();
+                let request: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "thread/queue/add");
+                let db = rusqlite::Connection::open(&db_path).unwrap();
+                let namespace: String = db
+                    .query_row(
+                        "SELECT namespace FROM cooperative_direct_queue_meta WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let expected_id = delivery_evidence::client_user_message_id(
+                    &format!("codex-wake/direct-queue/v2/{namespace}/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                    "11111111-1111-4111-8111-111111111111",
+                ).unwrap();
+                assert_eq!(request["params"]["clientUserMessageId"], expected_id);
+                calls.fetch_add(1, Ordering::SeqCst);
+                // The server may have accepted the input; drop before responding.
+                drop(ws);
+            }
+        });
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hook_output_tests::cooperative_mcp_queue_lost_rpc_response_is_never_resent",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path())
+            .env("CODEX_HOME", root.path().join("codex"))
+            .env("CODEX_WAKE_RPC_SOCKET", &socket)
+            .env(CHILD, root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = child.wait_timeout(Duration::from_secs(15)).unwrap();
+        if status.is_none() {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert!(
+            status.is_some() && output.status.success(),
+            "isolated MCP test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "uncertain input was resent"
+        );
+    }
+
+    #[test]
     fn queue_steer_renders_input_without_resuming_or_changing_presets() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = manager::Config::from_env().unwrap();
@@ -4919,6 +7298,43 @@ mod hook_output_tests {
             .unwrap();
         assert!(!blocked.success());
         assert_eq!(process_interrupts(&config, &db).unwrap(), 0);
+    }
+
+    #[test]
+    fn claim_gate_retains_stop_coordinator_alert_without_sending() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.codex = temp.path().join("missing-codex");
+        let db = database(&config).unwrap();
+        let source = "11111111-1111-4111-8111-111111111111";
+        let coordinator = "22222222-2222-4222-8222-222222222222";
+        obligations::register_coordinator(&db, source, coordinator).unwrap();
+        db.execute("INSERT INTO obligations(id,thread,kind,repo,resource,outcome,description) VALUES('fixture',?1,'artifact','repo','release','available','Pending')", [source]).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let event = json!({"hook_event_name":"Stop","session_id":source,"turn_id":"turn-1"});
+        assert_eq!(
+            notify_coordinator(&config, &db, source, &event, false).unwrap(),
+            Some((coordinator.into(), "ready".into()))
+        );
+        let (state, reason): (String, String) = db
+            .query_row("SELECT state,reason FROM coordinator_alerts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(state, "ready");
+        assert_eq!(reason, obligations::COORDINATOR_ALERT_READY_REASON);
+        assert!(
+            notify_coordinator(&config, &db, source, &event, false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

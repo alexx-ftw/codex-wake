@@ -19,8 +19,12 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     );
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    validate_owned_database(&db)
+}
+
+pub(crate) fn validate_owned_database(db: &rusqlite::Connection) -> Result<()> {
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts','wake_delivery_claim_gate','cooperative_direct_queue','cooperative_direct_queue_meta','cooperative_direct_pending')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -426,6 +430,112 @@ mod tests {
             remove_external_database(&path).unwrap();
             assert!(!path.exists());
         }
+    }
+
+    #[test]
+    fn claim_gate_is_allowed_only_after_database_ownership_is_established() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = temp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&foreign).unwrap();
+        db.execute_batch("CREATE TABLE wake_delivery_claim_gate(id INTEGER PRIMARY KEY, is_open INTEGER NOT NULL); INSERT INTO wake_delivery_claim_gate VALUES(1,0);").unwrap();
+        drop(db);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(crate::bridge::connect(&foreign).unwrap());
+        let db = rusqlite::Connection::open(&foreign).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        let open: bool = db
+            .query_row(
+                "SELECT is_open FROM wake_delivery_claim_gate WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(id, 0);
+        assert!(!open);
+        drop(db);
+        assert!(remove_external_database(&foreign).is_err());
+        assert!(foreign.exists());
+
+        let owned = temp.path().join("owned.sqlite");
+        drop(crate::bridge::connect(&owned).unwrap());
+        validate_external_database(&owned).unwrap();
+        remove_external_database(&owned).unwrap();
+        assert!(!owned.exists());
+    }
+
+    #[test]
+    fn cooperative_direct_queue_table_never_identifies_foreign_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE cooperative_direct_queue(request_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, state TEXT NOT NULL, reason TEXT)").unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(crate::bridge::connect(&path).unwrap());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn direct_queue_namespace_does_not_identify_foreign_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE cooperative_direct_queue_meta(id INTEGER PRIMARY KEY,namespace TEXT)",
+        )
+        .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(crate::bridge::connect(&path).unwrap());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn direct_pending_is_allowed_for_owned_but_does_not_identify_foreign_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let schema = "CREATE TABLE cooperative_direct_pending(request_id TEXT PRIMARY KEY,request_digest TEXT NOT NULL,payload TEXT NOT NULL)";
+        let foreign = temp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&foreign).unwrap();
+        db.execute_batch(schema).unwrap();
+        drop(db);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(crate::bridge::connect(&foreign).unwrap());
+        let db = rusqlite::Connection::open(&foreign).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        drop(db);
+        assert!(validate_external_database(&foreign).is_err());
+        let owned = temp.path().join("owned.sqlite");
+        let db = crate::bridge::connect(&owned).unwrap();
+        db.execute_batch(schema).unwrap();
+        drop(db);
+        validate_external_database(&owned).unwrap();
     }
 
     #[test]
