@@ -987,6 +987,35 @@ mod tests {
     }
 
     #[test]
+    fn connect_does_not_adopt_unmarked_process_watches_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE process_watches (owner_data TEXT); INSERT INTO process_watches VALUES ('preserve');")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let db = connect(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        let preserved: String = db
+            .query_row("SELECT owner_data FROM process_watches", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preserved, "preserve");
+        drop(db);
+        assert!(crate::uninstall::remove_external_database(&path).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
     fn connect_does_not_adopt_unmarked_circular_tables() {
         for table in [
             "circular_waits",
