@@ -70,7 +70,17 @@ pub fn connect(path: &Path) -> Result<Connection> {
     let migration = (|| -> Result<()> {
         let application_id: i32 =
             db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-        let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
+        let unsafe_unmarked_schema: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('view','trigger')
+             OR (type='table' AND name LIKE 'sqlite_%' AND lower(substr(name,1,7))!='sqlite_'))",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            application_id != 0 || !unsafe_unmarked_schema,
+            "Unmarked database contains unrelated schema; refusing to modify it"
+        );
+        let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND lower(substr(name,1,7))!='sqlite_' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','observers','native_observers','steers','delivery_evidence','user_message_observations')", [], |row| row.get(0))?;
         if application_id == 0 && unrelated == 0 {
             db.pragma_update(None, "application_id", crate::uninstall::DATABASE_ID)?;
         }
@@ -964,6 +974,98 @@ mod tests {
         assert!(
             register_with_template(&db, "owner/repo", 123, 1, THREAD, SHA, None, Some(&changed),)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn connect_refuses_unmarked_database_with_sqlite_like_foreign_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sqliteXpersonal(value TEXT); INSERT INTO sqliteXpersonal VALUES('keep');",
+        )
+        .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(connect(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(
+            db.query_row("SELECT value FROM sqliteXpersonal", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
+        let waits: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='waits')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!waits);
+    }
+
+    #[test]
+    fn connect_refuses_unmarked_database_with_foreign_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("state.sqlite3");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE VIEW personal_view AS SELECT 'keep' AS value")
+            .unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(connect(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(
+            db.query_row("SELECT value FROM personal_view", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
+        let waits: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='waits')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!waits);
+        db.execute_batch("DROP VIEW personal_view; CREATE TABLE waits(value TEXT); INSERT INTO waits VALUES('keep');
+            CREATE TRIGGER personal_trigger AFTER INSERT ON waits BEGIN SELECT 1; END;").unwrap();
+        drop(db);
+        assert!(connect(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        let id: i32 = db
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, 0);
+        let columns: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('waits')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1);
+        assert_eq!(
+            db.query_row("SELECT value FROM waits", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "keep"
         );
     }
 

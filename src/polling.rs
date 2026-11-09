@@ -5729,6 +5729,113 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_closed_timeline_retries_after_restart_with_unchanged_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+        )
+        .unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        crate::conditions::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let at = "2099-01-01T00:00:30Z";
+        let snapshot = json!({"number":7,"state":"closed","merged":false,"closed_at":at,
+            "merged_at":null,"updated_at":at,"head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let closes = json!([{"id":1,"event":"closed","created_at":at},
+            {"id":3,"event":"closed","created_at":at}]);
+        let first = tick_with(&db, 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    closes.clone()
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}));
+        let pending_count = |db: &Connection, event: &str| -> i64 {
+            db.query_row(
+                "SELECT count(*) FROM automatic_pr_event_journal WHERE event=?1",
+                [event],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(pending_count(&db, "pending_timeline_closed"), 2);
+        let middle = tick_with(&db, INTERVAL_MS + 1, |route, _| {
+            assert!(
+                !route.contains("/timeline"),
+                "unchanged evidence must respect backoff"
+            );
+            Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            })
+        })
+        .unwrap();
+        assert_eq!(middle["errors"], json!({}));
+        drop(db);
+        let db = Connection::open(&path).unwrap();
+        let mut scanned = false;
+        let retry = tick_with(&db, 2 * INTERVAL_MS + 1, |route, _| {
+            if route.contains("/timeline") {
+                scanned = true;
+                Ok(response(
+                    json!([{"id":1,"event":"closed","created_at":at},
+                    {"id":2,"event":"reopened","created_at":at},
+                    {"id":3,"event":"closed","created_at":at}]),
+                    false,
+                ))
+            } else {
+                Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            }
+        })
+        .unwrap();
+        assert_eq!(retry["errors"], json!({}));
+        assert!(
+            scanned,
+            "unchanged snapshot cannot prove the timeline complete"
+        );
+        assert_eq!(pending_count(&db, "pending_timeline_closed"), 2);
+        let reopens: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_pending_reopens WHERE source_kind='poll'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reopens, 1);
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.event == "closed")
+                .count(),
+            1
+        );
+        assert!(!notices.iter().any(|notice| notice.event == "reopened"));
+    }
+
+    #[test]
     fn changed_snapshot_retries_pending_close_before_backoff_expires() {
         let db = db();
         let thread = "11111111-1111-4111-8111-111111111111";

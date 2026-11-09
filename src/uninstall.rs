@@ -21,8 +21,14 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','automatic_pr_rules','automatic_pr_notification_listeners','automatic_pr_notifications','automatic_pr_lifecycle','automatic_pr_pending_reopens','automatic_pr_closed_cycles','automatic_pr_event_journal','pr_ci_trackers','pr_ci_runs','pr_ci_deliveries','pr_ci_auto_closed_trackers','pr_ci_reopen_events','pr_ci_pr_observations','pr_ci_tracker_generations','pr_ci_delivery_retry_after','pr_ci_schema_migrations','pr_hook_pre_observations','pr_hook_candidates','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','native_wake_recovery','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts')", [], |row| row.get(0))?;
+    let unrelated_schema: i64 = db.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type IN ('view','trigger')
+         OR (type='table' AND name LIKE 'sqlite_%' AND lower(substr(name,1,7))!='sqlite_')",
+        [],
+        |row| row.get(0),
+    )?;
     ensure!(
-        id == DATABASE_ID && unrelated == 0,
+        id == DATABASE_ID && unrelated == 0 && unrelated_schema == 0,
         "Database ownership could not be verified; unrelated data was preserved"
     );
     Ok(())
@@ -207,6 +213,50 @@ mod tests {
         remove_external_database(&path).unwrap();
         assert!(!path.exists());
         remove_external_database(&path).unwrap();
+    }
+
+    #[test]
+    fn external_cleanup_preserves_foreign_views_and_triggers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(value TEXT); INSERT INTO waits VALUES('keep');
+            CREATE VIEW personal_view AS SELECT value FROM waits;",
+        )
+        .unwrap();
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT value FROM personal_view", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
+        db.execute_batch("DROP VIEW personal_view; CREATE TRIGGER personal_trigger AFTER INSERT ON waits BEGIN SELECT 1; END;").unwrap();
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='personal_trigger')", [], |row| row.get(0)).unwrap();
+        assert!(exists);
+        assert_eq!(
+            db.query_row("SELECT value FROM waits", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
+        db.execute_batch("DROP TRIGGER personal_trigger; CREATE TABLE sqliteXpersonal(value TEXT); INSERT INTO sqliteXpersonal VALUES('keep');").unwrap();
+        drop(db);
+        assert!(remove_external_database(&path).is_err());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT value FROM sqliteXpersonal", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
     }
 
     #[test]

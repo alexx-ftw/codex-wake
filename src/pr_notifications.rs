@@ -97,6 +97,32 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             timeline_scanned INTEGER NOT NULL DEFAULT 0 CHECK(timeline_scanned IN (0,1)),
             UNIQUE(repo,pr,source_kind,source_id));",
     )?;
+    for (table, column, migration) in [
+        (
+            "automatic_pr_notifications",
+            "available_at_ms",
+            "ALTER TABLE automatic_pr_notifications ADD COLUMN available_at_ms INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "automatic_pr_pending_reopens",
+            "timeline_scanned",
+            "ALTER TABLE automatic_pr_pending_reopens ADD COLUMN timeline_scanned INTEGER NOT NULL DEFAULT 0 CHECK(timeline_scanned IN (0,1))",
+        ),
+    ] {
+        let has_column = || -> Result<bool> {
+            let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(names.iter().any(|name| name == column))
+        };
+        if !has_column()?
+            && let Err(error) = db.execute_batch(migration)
+            && !has_column()?
+        {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
@@ -1699,6 +1725,44 @@ fn claim_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_notification_columns_are_added_without_losing_rows() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO automatic_pr_notifications
+             (id,kind,repo,pr,thread,event,event_key,source,state)
+             VALUES('existing','pull_request','owner/repo','7','thread','closed','key','{}','needs_attention');
+             INSERT INTO automatic_pr_pending_reopens
+             (repo,pr,source_kind,source_id,event_at_sec,event_at,source)
+             VALUES('owner/repo','7','webhook','source',1,'1970-01-01T00:00:01Z','{}');
+             ALTER TABLE automatic_pr_notifications DROP COLUMN available_at_ms;
+             ALTER TABLE automatic_pr_pending_reopens DROP COLUMN timeline_scanned;",
+        )
+        .unwrap();
+        initialize(&db).unwrap();
+        let notification: (String, String, i64) = db
+            .query_row(
+                "SELECT id,state,available_at_ms FROM automatic_pr_notifications",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let reopen: (String, i64) = db
+            .query_row(
+                "SELECT source_id,timeline_scanned FROM automatic_pr_pending_reopens",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            notification,
+            ("existing".into(), "needs_attention".into(), 0)
+        );
+        assert_eq!(reopen, ("source".into(), 0));
+        initialize(&db).unwrap();
+    }
 
     #[test]
     fn same_second_notifications_keep_insertion_order() {
