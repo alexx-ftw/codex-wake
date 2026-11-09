@@ -283,7 +283,7 @@ where
     for resource in &targets.pull_requests {
         let number: i64 = resource.resource.parse().unwrap_or(0);
         let route = format!("/repos/{}/pulls/{}", resource.repo, resource.resource);
-        let automatic_generation = poll_generation(db, &automatic_pr_generation_key(resource))?;
+        let automatic_generation = std::cell::Cell::new(0_i64);
         let validated = &mut validated_prs;
         let cached = state(db, &route, 0)?;
         let cached_cursor: Value = cached
@@ -323,6 +323,15 @@ where
         }
         let (mut timeline_floor, pending_reopen_needs_close) =
             pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)?;
+        let pending_close_floor: Option<i64> = db.query_row(
+            "SELECT MIN(event_at_sec) FROM automatic_pr_event_journal
+             WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='pending_timeline_closed'",
+            params![resource.repo, resource.resource], |row| row.get(0),
+        )?;
+        timeline_floor = [timeline_floor, pending_close_floor]
+            .into_iter()
+            .flatten()
+            .min();
         let ci_needs_timeline: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pr_ci_tracker_generations AS generation
              JOIN pr_ci_trackers AS tracker USING(repo,pull_number,thread)
@@ -379,6 +388,7 @@ where
         let timeline_retry_due = timeline_due
             && timeline_floor.is_some()
             && (ci_needs_timeline
+                || pending_close_floor.is_some()
                 || timeline_has_error
                 || pending_reopen_needs_close
                 || timeline_checkpoint.is_none()
@@ -386,11 +396,14 @@ where
         let lifecycle_events = std::cell::RefCell::new(None::<TimelineLifecycleBatch>);
         let timeline_error = std::cell::Cell::new(None::<&'static str>);
         let timeline_calls = std::cell::Cell::new(0_u64);
-        let pr_observed_open = std::cell::Cell::new(false);
         let repo_for_timeline = resource.repo.clone();
         let number_for_timeline = resource.resource.clone();
         let route_for_timeline = route.clone();
         let mut pr_fetch = |requested: &str, etag: Option<&str>| {
+            automatic_generation.set(
+                poll_generation(db, &automatic_pr_generation_key(resource))
+                    .map_err(|_| Failure::new("database"))?,
+            );
             let mut response = fetch(requested, etag)?;
             if requested == route_for_timeline
                 && response.status == 304
@@ -416,29 +429,18 @@ where
             {
                 let pull: Value = serde_json::from_slice(&response.body)
                     .map_err(|_| Failure::new("invalid_response"))?;
-                if pull["state"] == "closed" {
-                    let closed_at = if pull["merged"] == true {
-                        pull["merged_at"].as_str()
-                    } else {
-                        pull["closed_at"].as_str()
-                    }
-                    .ok_or_else(|| Failure::new("invalid_response"))?;
-                    pr_notifications::ensure_closed_cycle(
-                        db,
-                        &repo_for_timeline,
-                        &number_for_timeline,
-                        closed_at,
-                    )
-                    .map_err(|_| Failure::new("database"))?;
-                }
                 let updated_at = pull["updated_at"]
                     .as_str()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
                 let needs_scan = (ci_needs_timeline && pull["state"] == "closed")
+                    || pending_close_floor.is_some()
                     || pending_reopen_needs_close
                     || timeline_has_error
                     || timeline_checkpoint.as_deref() != Some(updated_at);
-                if timeline_due && needs_scan {
+                let changed_pending_snapshot = pending_close_floor.is_some()
+                    && !timeline_has_error
+                    && timeline_checkpoint.as_deref() != Some(updated_at);
+                if (timeline_due || changed_pending_snapshot) && needs_scan {
                     match fetch_reopened_timeline(
                         db,
                         &mut fetch,
@@ -451,6 +453,9 @@ where
                         Ok((events, _)) => {
                             lifecycle_events.replace(Some(TimelineLifecycleBatch {
                                 events,
+                                snapshot: pull.clone(),
+                                canonical_generation: None,
+                                canonical_current: true,
                                 updated_at: updated_at.to_owned(),
                                 route: timeline_route.clone(),
                                 calls: timeline_calls.get() as i64,
@@ -489,6 +494,15 @@ where
                 if !valid_pr(pr, number) {
                     return Err(Failure::new("invalid_response"));
                 }
+                let automatic_key = automatic_pr_generation_key(resource);
+                let canonical_current = poll_generation(db, &automatic_key)
+                    .map_err(|_| Failure::new("database"))?
+                    == automatic_generation.get();
+                if let Some(batch) = lifecycle_events.borrow_mut().as_mut() {
+                    batch.canonical_generation =
+                        Some((automatic_key, automatic_generation.get().saturating_add(1)));
+                    batch.canonical_current = canonical_current;
+                }
                 let observed_state = pr["state"]
                     .as_str()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
@@ -516,18 +530,19 @@ where
                 {
                     ci_snapshot["closed_at"] = Value::Null;
                 }
-                codex_wake::pr_ci::observe_pull_request_snapshot_with_ambiguity_in(
-                    db,
-                    &resource.repo,
-                    &resource.resource,
-                    &ci_snapshot,
-                    now,
-                    ambiguous_cycle,
-                    lifecycle_events.borrow().is_some(),
-                )
-                .map_err(|_| Failure::new("database"))?;
-                if observed_state == "open" {
-                    pr_observed_open.set(true);
+                if canonical_current {
+                    codex_wake::pr_ci::observe_pull_request_snapshot_with_ambiguity_in(
+                        db,
+                        &resource.repo,
+                        &resource.resource,
+                        &ci_snapshot,
+                        now,
+                        ambiguous_cycle,
+                        lifecycle_events.borrow().is_some(),
+                    )
+                    .map_err(|_| Failure::new("database"))?;
+                }
+                if canonical_current && observed_state == "open" {
                     consume_durable_reopen_notifications(
                         db,
                         &resource.repo,
@@ -639,16 +654,26 @@ where
                         &resource.resource,
                         None,
                     )? as u64;
-                    pr_notifications::record_closed_event(
-                        db,
-                        &resource.repo,
-                        &resource.resource,
-                        event_name,
-                        event_time,
-                        &event_key,
-                        &event,
-                    )
-                    .map_err(|_| Failure::new("database"))?;
+                    if canonical_current && lifecycle_events.borrow().is_none() {
+                        pr_notifications::record_closed_event(
+                            db,
+                            &resource.repo,
+                            &resource.resource,
+                            event_name,
+                            event_time,
+                            &event_key,
+                            &event,
+                        )
+                        .map_err(|_| Failure::new("database"))?;
+                    } else if canonical_current {
+                        pr_notifications::ensure_closed_cycle(
+                            db,
+                            &resource.repo,
+                            &resource.resource,
+                            event_time,
+                        )
+                        .map_err(|_| Failure::new("database"))?;
+                    }
                 } else {
                     if head_changed {
                         if let Some(cursor) = event_cursor.as_ref() {
@@ -709,7 +734,7 @@ where
                         )? as u64;
                     }
                 }
-                record_automatic_pr_changes(db, resource, pr, &old, automatic_generation)?;
+                record_automatic_pr_changes(db, resource, pr, &old, automatic_generation.get())?;
                 accepted += observe_conditions(
                     db,
                     "pull_request",
@@ -730,6 +755,7 @@ where
             },
         )?;
         if outcome.error.is_none()
+            && !outcome.skipped
             && let Some(batch) = lifecycle_events.borrow().as_ref()
         {
             match apply_timeline_lifecycle_events(
@@ -741,15 +767,6 @@ where
             ) {
                 Ok(accepted) => {
                     outcome.accepted = outcome.accepted.saturating_add(accepted as u64);
-                    if pr_observed_open.get() {
-                        consume_durable_reopen_notifications(
-                            db,
-                            &resource.repo,
-                            &resource.resource,
-                            now,
-                        )
-                        .map_err(|_| anyhow::anyhow!("could not consume reopened PR notices"))?;
-                    }
                 }
                 Err(error) => {
                     record_failure(db, &timeline_route, 0, now, &error, timeline_calls.get())?;
@@ -2719,10 +2736,110 @@ struct TimelineLifecycleEvent {
 
 struct TimelineLifecycleBatch {
     events: Vec<TimelineLifecycleEvent>,
+    snapshot: Value,
+    canonical_generation: Option<(String, i64)>,
+    canonical_current: bool,
     updated_at: String,
     route: String,
     calls: i64,
     pending_reopen_watermark: i64,
+}
+
+type PendingTimelineClose = (String, i64, String, String);
+
+fn reconcile_timeline_closes(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+    snapshot: &Value,
+    events: &[TimelineLifecycleEvent],
+    through_second: i64,
+) -> std::result::Result<usize, Failure> {
+    let pending: Vec<PendingTimelineClose> = db.prepare(
+        "SELECT event_key,event_at_sec,event_at,source FROM automatic_pr_event_journal
+         WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='pending_timeline_closed'
+         ORDER BY event_at_sec,event_key",
+    ).map_err(|_| Failure::new("database"))?
+        .query_map(params![repo,pr], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))
+        .map_err(|_| Failure::new("database"))?
+        .collect::<rusqlite::Result<_>>().map_err(|_| Failure::new("database"))?;
+    let snapshot_close = if snapshot["state"] == "closed" {
+        snapshot["closed_at"]
+            .as_str()
+            .and_then(|at| pr_notifications::timestamp_second(db, at).ok())
+    } else {
+        None
+    };
+    let mut reopens: Vec<i64> = events
+        .iter()
+        .filter(|event| event.event == "reopened")
+        .map(|event| {
+            pr_notifications::timestamp_second(db, &event.event_at)
+                .map_err(|_| Failure::new("invalid_response"))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let stored_reopens: Vec<i64> = db
+        .prepare(
+            "SELECT event_at_sec FROM automatic_pr_event_journal
+        WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='reopened'",
+        )
+        .map_err(|_| Failure::new("database"))?
+        .query_map(params![repo, pr], |row| row.get(0))
+        .map_err(|_| Failure::new("database"))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|_| Failure::new("database"))?;
+    reopens.extend(stored_reopens);
+    let mut accepted = 0;
+    for (key, second, event_at, source) in &pending {
+        if *second > through_second {
+            continue;
+        }
+        let ambiguous =
+            pending.iter().filter(|item| item.1 == *second).count() > 1 || reopens.contains(second);
+        if ambiguous {
+            continue;
+        }
+        let later_reopen = reopens.iter().any(|reopened| reopened > second);
+        let prior_close = snapshot_close.is_some_and(|latest| latest > *second);
+        let current_close = snapshot_close == Some(*second);
+        let merged = snapshot["merged"].as_bool();
+        let existing_close: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+             WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='closed' AND event_at_sec=?3)",
+            params![repo,pr,second], |row| row.get(0),
+        ).map_err(|_| Failure::new("database"))?;
+        if current_close && merged == Some(true) && !later_reopen && !existing_close {
+            // A unique timeline close at the final merged snapshot's closed_at
+            // is the merge's close, not another user-visible event.
+        } else if prior_close || later_reopen || (current_close && merged == Some(false)) {
+            let source: Value =
+                serde_json::from_str(source).map_err(|_| Failure::new("invalid_response"))?;
+            accepted += pr_notifications::record_closed_event_in(
+                db,
+                repo,
+                pr,
+                "closed",
+                event_at,
+                &stable_source_key(
+                    "pull_request",
+                    &repo.to_ascii_lowercase(),
+                    pr,
+                    "closed",
+                    "",
+                    &[event_at],
+                ),
+                &source,
+            )
+            .map_err(|_| Failure::new("database"))?
+            .len();
+        } else {
+            continue;
+        }
+        db.execute("DELETE FROM automatic_pr_event_journal WHERE kind='pull_request'
+            AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='pending_timeline_closed' AND event_key=?3",
+            params![repo,pr,key]).map_err(|_| Failure::new("database"))?;
+    }
+    Ok(accepted)
 }
 
 fn apply_timeline_lifecycle_events(
@@ -2734,29 +2851,57 @@ fn apply_timeline_lifecycle_events(
 ) -> std::result::Result<usize, Failure> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| Failure::new("database"))?;
+    if !batch.canonical_current {
+        tx.commit().map_err(|_| Failure::new("database"))?;
+        return Ok(0);
+    }
+    if let Some((route, expected)) = batch.canonical_generation.as_ref()
+        && poll_generation(&tx, route).map_err(|_| Failure::new("database"))? != *expected
+    {
+        tx.commit().map_err(|_| Failure::new("database"))?;
+        return Ok(0);
+    }
     let mut accepted = 0;
-    for event in &batch.events {
-        if event.event == "closed" {
-            accepted += pr_notifications::record_closed_event_in(
-                &tx,
-                repo,
+    // Stage all close identities before classification, so equal-second closes
+    // remain ambiguous even when they occur later in the same batch.
+    for event in batch.events.iter().filter(|event| event.event == "closed") {
+        let at = pr_notifications::timestamp_second(&tx, &event.event_at)
+            .map_err(|_| Failure::new("invalid_response"))?;
+        let key = format!("pending-timeline-closed:{}", event.event_id);
+        tx.execute(
+            "INSERT OR IGNORE INTO automatic_pr_event_journal
+                 (kind,repo,pr,event,event_key,event_at_sec,event_at,source)
+                 VALUES('pull_request',?1,?2,'pending_timeline_closed',?3,?4,?5,?6)",
+            params![
+                repo.to_ascii_lowercase(),
                 pr,
-                "closed",
-                &event.event_at,
-                &stable_source_key(
-                    "pull_request",
-                    &repo.to_ascii_lowercase(),
-                    pr,
-                    "closed",
-                    "",
-                    &[&event.event_at],
-                ),
-                &event.source,
-            )
-            .map_err(|_| Failure::new("database"))?
-            .len();
+                key,
+                at,
+                event.event_at,
+                serde_json::to_string(&event.source)
+                    .map_err(|_| Failure::new("invalid_response"))?
+            ],
+        )
+        .map_err(|_| Failure::new("database"))?;
+    }
+    for event in &batch.events {
+        let at = pr_notifications::timestamp_second(&tx, &event.event_at)
+            .map_err(|_| Failure::new("invalid_response"))?;
+        if event.event == "closed" {
+            pr_notifications::ensure_closed_cycle_in(&tx, repo, pr, at)
+                .map_err(|_| Failure::new("database"))?;
+            accepted +=
+                reconcile_timeline_closes(&tx, repo, pr, &batch.snapshot, &batch.events, at)?;
             continue;
         }
+        accepted += reconcile_timeline_closes(
+            &tx,
+            repo,
+            pr,
+            &batch.snapshot,
+            &batch.events,
+            at.saturating_sub(1),
+        )?;
         let cycle = pr_notifications::record_reopened_event_in(
             &tx,
             repo,
@@ -2771,6 +2916,43 @@ fn apply_timeline_lifecycle_events(
         };
         accepted += notifications.len();
     }
+    accepted += reconcile_timeline_closes(&tx, repo, pr, &batch.snapshot, &batch.events, i64::MAX)?;
+    if batch.snapshot["state"] == "open" {
+        consume_durable_reopen_notifications(&tx, repo, pr, now)
+            .map_err(|_| Failure::new("database"))?;
+    }
+    if batch.snapshot["state"] == "closed"
+        && let Some(merged) = batch.snapshot["merged"].as_bool()
+        && let Some(event_at) = if merged {
+            batch.snapshot["merged_at"].as_str()
+        } else {
+            batch.snapshot["closed_at"].as_str()
+        }
+    {
+        let event_name = if merged { "merged" } else { "closed" };
+        let mut pull = batch.snapshot.clone();
+        pull["updated_at"] = json!(event_at);
+        let source = json!({"action":"closed","number":pr.parse::<i64>().unwrap_or(0),
+            "pull_request":pull,"repository":{"full_name":repo}});
+        accepted += pr_notifications::record_closed_event_in(
+            &tx,
+            repo,
+            pr,
+            event_name,
+            event_at,
+            &stable_source_key(
+                "pull_request",
+                &repo.to_ascii_lowercase(),
+                pr,
+                event_name,
+                "",
+                &[event_at],
+            ),
+            &source,
+        )
+        .map_err(|_| Failure::new("database"))?
+        .len();
+    }
     pr_notifications::mark_pending_reopens_timeline_scanned_in(
         &tx,
         repo,
@@ -2778,6 +2960,18 @@ fn apply_timeline_lifecycle_events(
         batch.pending_reopen_watermark,
     )
     .map_err(|_| Failure::new("database"))?;
+    let has_pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+        WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='pending_timeline_closed')",
+        params![repo,pr], |row| row.get(0)).map_err(|_| Failure::new("database"))?;
+    let delay = if has_pending {
+        state(&tx, &batch.route, 0)
+            .map_err(|_| Failure::new("database"))?
+            .map_or(INTERVAL_MS, |saved| saved.backoff.max(INTERVAL_MS))
+            .saturating_mul(2)
+            .min(MAX_BACKOFF_MS)
+    } else {
+        INTERVAL_MS
+    };
     tx.execute(
         "INSERT INTO github_poll_state
          (endpoint,page,cursor,next_poll_ms,backoff_ms,last_success_ms,error_category,calls)
@@ -2789,8 +2983,8 @@ fn apply_timeline_lifecycle_events(
         params![
             batch.route,
             Some(json!({"updated_at":batch.updated_at}).to_string()),
-            now + INTERVAL_MS,
-            INTERVAL_MS,
+            now.saturating_add(delay),
+            delay,
             now,
             batch.calls
         ],
@@ -5036,6 +5230,481 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn merge_timeline_close_reconciles_in_either_order_and_preserves_older_close() {
+        for merge_first in [false, true] {
+            let db = db();
+            let thread = "11111111-1111-4111-8111-111111111111";
+            pr_notifications::register_in_since(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                thread,
+                pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+            )
+            .unwrap();
+            let event = |id: i64, kind: &'static str, at: &str| TimelineLifecycleEvent {
+                event: kind,
+                event_at: at.into(),
+                event_id: id.to_string(),
+                source: json!({"id":id,"event":kind,"created_at":at}),
+            };
+            let old = "2099-01-01T00:00:10Z";
+            let reopened = "2099-01-01T00:00:20Z";
+            let final_close = "2099-01-01T00:00:30Z";
+            let merge = json!({"action":"closed","repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":true,"closed_at":final_close,"merged_at":final_close}});
+            let make_batch = |snapshot, events| TimelineLifecycleBatch {
+                snapshot,
+                events,
+                canonical_generation: None,
+                canonical_current: true,
+                updated_at: final_close.into(),
+                route: "timeline/test".into(),
+                calls: 1,
+                pending_reopen_watermark: 0,
+            };
+            if merge_first {
+                pr_notifications::accept_authenticated_webhook(&db, "pull_request", &merge)
+                    .unwrap();
+            } else {
+                let open = make_batch(
+                    json!({"state":"open","merged":false}),
+                    vec![event(3, "closed", final_close)],
+                );
+                apply_timeline_lifecycle_events(&db, "owner/repo", "7", &open, 1).unwrap();
+                assert!(
+                    pr_notifications::pending(&db).unwrap().is_empty(),
+                    "unclassified close must remain pending"
+                );
+                pr_notifications::accept_authenticated_webhook(&db, "pull_request", &merge)
+                    .unwrap();
+            }
+            let batch = make_batch(
+                json!({"state":"closed","merged":true,"closed_at":final_close}),
+                vec![
+                    event(1, "closed", old),
+                    event(2, "reopened", reopened),
+                    event(3, "closed", final_close),
+                ],
+            );
+            apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 2).unwrap();
+            apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 3).unwrap();
+            let notices = pr_notifications::pending(&db).unwrap();
+            assert_eq!(
+                notices.iter().filter(|item| item.event == "closed").count(),
+                1
+            );
+            assert_eq!(
+                notices.iter().filter(|item| item.event == "merged").count(),
+                1
+            );
+            let remaining: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed'", [], |row| row.get(0)).unwrap();
+            assert_eq!(remaining, 0);
+        }
+    }
+
+    #[test]
+    fn equal_second_timeline_closes_stay_pending_at_merge() {
+        let db = db();
+        let at = "2099-01-01T00:00:30Z";
+        let events = [1, 2]
+            .into_iter()
+            .map(|id| TimelineLifecycleEvent {
+                event: "closed",
+                event_at: at.into(),
+                event_id: id.to_string(),
+                source: json!({"event":"closed","id":id,"created_at":at}),
+            })
+            .collect();
+        let batch = TimelineLifecycleBatch {
+            events,
+            snapshot: json!({"state":"closed","merged":true,"closed_at":at}),
+            canonical_generation: None,
+            canonical_current: true,
+            updated_at: at.into(),
+            route: "timeline/tie".into(),
+            calls: 1,
+            pending_reopen_watermark: 0,
+        };
+        apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 1).unwrap();
+        let remaining: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed'", [], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 2);
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeline_close_reopen_and_merge_are_enqueued_in_event_order() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let event = |id: i64, kind: &'static str, at: &str| TimelineLifecycleEvent {
+            event: kind,
+            event_at: at.into(),
+            event_id: id.to_string(),
+            source: json!({"id":id,"event":kind,"created_at":at}),
+        };
+        let merge_at = "2099-01-01T00:00:30Z";
+        let batch = TimelineLifecycleBatch {
+            events: vec![
+                event(1, "closed", "2099-01-01T00:00:10Z"),
+                event(2, "reopened", "2099-01-01T00:00:20Z"),
+                event(3, "closed", merge_at),
+            ],
+            snapshot: json!({"state":"closed","merged":true,"closed_at":merge_at,"merged_at":merge_at}),
+            canonical_generation: None,
+            canonical_current: true,
+            updated_at: merge_at.into(),
+            route: "timeline/order".into(),
+            calls: 1,
+            pending_reopen_watermark: 0,
+        };
+        apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 1).unwrap();
+        let events: Vec<String> = pr_notifications::pending(&db)
+            .unwrap()
+            .into_iter()
+            .map(|notice| notice.event)
+            .collect();
+        assert_eq!(events, vec!["closed", "reopened", "merged"]);
+    }
+
+    #[test]
+    fn stale_timeline_does_not_overwrite_newer_poll_or_checkpoint() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let make_snapshot = |at: &str| {
+            json!({"number":7,"state":"closed","merged":true,
+            "closed_at":at,"merged_at":at,"updated_at":at,
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}})
+        };
+        let old = make_snapshot("2099-01-01T00:00:10Z");
+        let new = make_snapshot("2099-01-01T00:00:20Z");
+        let mut interleaved = false;
+        let outer = tick_with(&db, 1, |route, _| {
+            if route.contains("/timeline") {
+                if !interleaved {
+                    interleaved = true;
+                    let inner = tick_with(&db, 2, |route, _| Ok(response(if route.contains("/timeline") {
+                        json!([{"id":2,"event":"closed","created_at":"2099-01-01T00:00:20Z"}])
+                    } else { new.clone() }, false))).unwrap();
+                    assert_eq!(inner["errors"], json!({}), "{inner}");
+                }
+                Ok(response(json!([{"id":1,"event":"closed","created_at":"2099-01-01T00:00:10Z"}]), false))
+            } else { Ok(response(old.clone(), false)) }
+        }).unwrap();
+        assert_eq!(outer["errors"], json!({}), "{outer}");
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].event, "merged");
+        assert_eq!(
+            notices[0].source["pull_request"]["merged_at"],
+            "2099-01-01T00:00:20Z"
+        );
+        let saved = state(&db, "/repos/owner/repo/issues/7/timeline", 0)
+            .unwrap()
+            .unwrap();
+        let cursor: Value = serde_json::from_str(saved.cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(cursor["updated_at"], "2099-01-01T00:00:20Z");
+        let old_pending: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed' AND event_at='2099-01-01T00:00:10Z'", [], |row| row.get(0)).unwrap();
+        assert_eq!(old_pending, 0);
+        let stale = TimelineLifecycleBatch {
+            events: vec![TimelineLifecycleEvent {
+                event: "closed",
+                event_at: "2099-01-01T00:00:10Z".into(),
+                event_id: "1".into(),
+                source: json!({}),
+            }],
+            snapshot: old,
+            canonical_generation: Some(("__automatic_pr_changes__/owner/repo/7".into(), 0)),
+            canonical_current: true,
+            updated_at: "2099-01-01T00:00:10Z".into(),
+            route: "/repos/owner/repo/issues/7/timeline".into(),
+            calls: 1,
+            pending_reopen_watermark: 0,
+        };
+        assert_eq!(
+            apply_timeline_lifecycle_events(&db, "owner/repo", "7", &stale, 3).unwrap(),
+            0
+        );
+        let saved = state(&db, "/repos/owner/repo/issues/7/timeline", 0)
+            .unwrap()
+            .unwrap();
+        let cursor: Value = serde_json::from_str(saved.cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(cursor["updated_at"], "2099-01-01T00:00:20Z");
+    }
+
+    #[test]
+    fn stale_open_timeline_does_not_consume_reopen_after_newer_close() {
+        let mut db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        pr_notifications::record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "reopened",
+            "2099-01-01T00:00:10Z",
+            "reopened:stale",
+            &json!({"action":"reopened"}),
+        )
+        .unwrap();
+        let closed = json!({"state":"closed","closed_at":"2099-01-01T00:00:20Z","head":{"sha":"a".repeat(40)}});
+        codex_wake::pr_ci::observe_pull_request_snapshot_with_ambiguity_in(
+            &db,
+            "owner/repo",
+            "7",
+            &closed,
+            200,
+            false,
+            false,
+        )
+        .unwrap();
+        db.execute("INSERT INTO github_poll_generation(endpoint,generation) VALUES('/repos/owner/repo/pulls/7',2)", []).unwrap();
+        db.execute("INSERT INTO github_poll_generation(endpoint,generation) VALUES('__automatic_pr_changes__/owner/repo/7',2)", []).unwrap();
+        let stale = TimelineLifecycleBatch {
+            events: vec![],
+            snapshot: json!({"state":"open"}),
+            canonical_generation: Some(("__automatic_pr_changes__/owner/repo/7".into(), 1)),
+            canonical_current: true,
+            updated_at: "2099-01-01T00:00:10Z".into(),
+            route: "/repos/owner/repo/issues/7/timeline".into(),
+            calls: 1,
+            pending_reopen_watermark: 0,
+        };
+        assert_eq!(
+            apply_timeline_lifecycle_events(&db, "owner/repo", "7", &stale, 100).unwrap(),
+            0
+        );
+        let (state, consumed): (String, i64) = db.query_row("SELECT state,(SELECT count(*) FROM pr_ci_reopen_events) FROM pr_ci_pr_observations WHERE repo='owner/repo' AND pull_number=7", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((state.as_str(), consumed), ("closed", 0));
+    }
+
+    #[test]
+    fn stale_case_variant_cannot_reopen_ci_or_consume_evidence() {
+        let mut db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        pr_notifications::record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "reopened",
+            "2099-01-01T00:00:10Z",
+            "reopened:case-stale",
+            &json!({"action":"reopened"}),
+        )
+        .unwrap();
+        let open = json!({"number":7,"state":"open","merged":false,"closed_at":null,"merged_at":null,
+            "updated_at":"2099-01-01T00:00:10Z","head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let closed = json!({"number":7,"state":"closed","merged":false,"closed_at":"2099-01-01T00:00:20Z","merged_at":null,
+            "updated_at":"2099-01-01T00:00:20Z","head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let mut interleaved = false;
+        let report = tick_with(&db, 100, |route, _| {
+            if route.contains("/timeline") {
+                if !interleaved {
+                    interleaved = true;
+                    let upper = Resource {
+                        repo: "Owner/Repo".into(),
+                        resource: "7".into(),
+                    };
+                    let mut fetch = |_: &str, _: Option<&str>| Ok(response(closed.clone(), false));
+                    let fast = poll_endpoint(
+                        &db,
+                        "/repos/Owner/Repo/pulls/7",
+                        0,
+                        100,
+                        &mut fetch,
+                        |db, _, items, _| {
+                            codex_wake::pr_ci::observe_pull_request_snapshot_with_ambiguity_in(
+                                db,
+                                "owner/repo",
+                                "7",
+                                &items[0],
+                                100,
+                                false,
+                                false,
+                            )
+                            .map_err(|_| Failure::new("database"))?;
+                            record_automatic_pr_changes(db, &upper, &items[0], &Value::Null, 0)?;
+                            Ok((None, 0))
+                        },
+                    )
+                    .unwrap();
+                    assert!(fast.error.is_none());
+                }
+                Ok(response(json!([]), false))
+            } else {
+                Ok(response(open.clone(), false))
+            }
+        })
+        .unwrap();
+        assert!(interleaved);
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let (state, consumed): (String, i64) = db.query_row("SELECT state,(SELECT count(*) FROM pr_ci_reopen_events) FROM pr_ci_pr_observations WHERE repo='owner/repo' AND pull_number=7", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((state.as_str(), consumed), ("closed", 0));
+    }
+
+    #[test]
+    fn pending_timeline_close_reconciles_when_merge_snapshot_arrives() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let at = "2099-01-01T00:00:30Z";
+        let mut snapshot = json!({"number":7,"state":"open","merged":false,"closed_at":null,
+            "merged_at":null,"updated_at":at,"head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let timeline = json!([{"id":91,"event":"closed","created_at":at}]);
+        let first = tick_with(&db, 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    timeline.clone()
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}), "{first}");
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+        let count: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        let middle = tick_with(&db, INTERVAL_MS + 1, |route, _| {
+            assert!(
+                !route.contains("/timeline"),
+                "unchanged pending evidence must back off"
+            );
+            Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            })
+        })
+        .unwrap();
+        assert_eq!(middle["errors"], json!({}), "{middle}");
+        snapshot["state"] = json!("closed");
+        snapshot["merged"] = json!(true);
+        snapshot["closed_at"] = json!(at);
+        snapshot["merged_at"] = json!(at);
+        let second = tick_with(&db, INTERVAL_MS * 2 + 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    timeline.clone()
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].event, "merged");
+        let count: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn changed_snapshot_retries_pending_close_before_backoff_expires() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let at = "2099-01-01T00:00:30Z";
+        let mut snapshot = json!({"number":7,"state":"open","merged":false,"closed_at":null,
+            "merged_at":null,"updated_at":at,"head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let timeline = json!([{"id":91,"event":"closed","created_at":at}]);
+        tick_with(&db, 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    timeline.clone()
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        snapshot["state"] = json!("closed");
+        snapshot["merged"] = json!(true);
+        snapshot["closed_at"] = json!(at);
+        snapshot["merged_at"] = json!(at);
+        snapshot["updated_at"] = json!("2099-01-01T00:00:31Z");
+        let mut scanned = false;
+        let second = tick_with(&db, INTERVAL_MS + 1, |route, _| {
+            Ok(response(
+                if route.contains("/timeline") {
+                    scanned = true;
+                    timeline.clone()
+                } else {
+                    snapshot.clone()
+                },
+                false,
+            ))
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+        assert!(scanned);
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].event, "merged");
+        let pending: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed'", [], |row| row.get(0)).unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[test]
