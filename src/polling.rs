@@ -313,12 +313,13 @@ where
                 body["closed_at"].as_str()
             };
             if let Some(closed_at) = closed_at {
-                pr_notifications::ensure_closed_cycle(
+                report.accepted += pr_notifications::ensure_closed_cycle(
                     db,
                     &resource.repo,
                     &resource.resource,
                     closed_at,
-                )?;
+                )?
+                .len() as u64;
             }
         }
         let (mut timeline_floor, pending_reopen_needs_close) =
@@ -655,7 +656,7 @@ where
                         None,
                     )? as u64;
                     if canonical_current && lifecycle_events.borrow().is_none() {
-                        pr_notifications::record_closed_event(
+                        accepted += pr_notifications::record_closed_event(
                             db,
                             &resource.repo,
                             &resource.resource,
@@ -664,15 +665,17 @@ where
                             &event_key,
                             &event,
                         )
-                        .map_err(|_| Failure::new("database"))?;
+                        .map_err(|_| Failure::new("database"))?
+                        .len() as u64;
                     } else if canonical_current {
-                        pr_notifications::ensure_closed_cycle(
+                        accepted += pr_notifications::ensure_closed_cycle(
                             db,
                             &resource.repo,
                             &resource.resource,
                             event_time,
                         )
-                        .map_err(|_| Failure::new("database"))?;
+                        .map_err(|_| Failure::new("database"))?
+                        .len() as u64;
                     }
                 } else {
                     if head_changed {
@@ -2899,8 +2902,9 @@ fn apply_timeline_lifecycle_events(
         let at = pr_notifications::timestamp_second(&tx, &event.event_at)
             .map_err(|_| Failure::new("invalid_response"))?;
         if event.event == "closed" {
-            pr_notifications::ensure_closed_cycle_in(&tx, repo, pr, at)
-                .map_err(|_| Failure::new("database"))?;
+            accepted += pr_notifications::ensure_closed_cycle_in(&tx, repo, pr, at)
+                .map_err(|_| Failure::new("database"))?
+                .len();
             accepted +=
                 reconcile_timeline_closes(&tx, repo, pr, &batch.snapshot, &batch.events, at)?;
             continue;
@@ -2913,7 +2917,7 @@ fn apply_timeline_lifecycle_events(
             &batch.events,
             at.saturating_sub(1),
         )?;
-        let cycle = pr_notifications::record_reopened_event_in(
+        let notifications = pr_notifications::record_reopened_event_in(
             &tx,
             repo,
             pr,
@@ -2922,9 +2926,6 @@ fn apply_timeline_lifecycle_events(
             &format!("timeline:{}", event.event_id),
         )
         .map_err(|_| Failure::new("database"))?;
-        let Some((_, notifications)) = cycle else {
-            continue;
-        };
         accepted += notifications.len();
     }
     accepted += reconcile_timeline_closes(&tx, repo, pr, &batch.snapshot, &batch.events, i64::MAX)?;
@@ -5316,6 +5317,62 @@ mod tests {
             let remaining: i64 = db.query_row("SELECT count(*) FROM automatic_pr_event_journal WHERE event='pending_timeline_closed'", [], |row| row.get(0)).unwrap();
             assert_eq!(remaining, 0);
         }
+    }
+
+    #[test]
+    fn timeline_counts_notifications_reconciled_by_an_older_close() {
+        let db = db();
+        for thread in [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ] {
+            pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        }
+        let c2 = "2099-01-01T00:00:30Z";
+        let close = json!({"action":"closed","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false,"closed_at":c2}});
+        assert_eq!(
+            pr_notifications::accept_authenticated_webhook(&db, "pull_request", &close).unwrap(),
+            2
+        );
+        assert_eq!(
+            pr_notifications::record_reopened_event_with_id(
+                &db,
+                "owner/repo",
+                "7",
+                "poll",
+                "2099-01-01T00:00:20Z",
+                "timeline:20"
+            )
+            .unwrap(),
+            0
+        );
+        let c1 = "2099-01-01T00:00:10Z";
+        let batch = TimelineLifecycleBatch {
+            events: vec![TimelineLifecycleEvent {
+                event: "closed",
+                event_at: c1.into(),
+                event_id: "10".into(),
+                source: json!({"action":"closed","number":7,"repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"closed_at":c1,"merged":false}}),
+            }],
+            snapshot: json!({"state":"closed","merged":false,"closed_at":c2,"number":7}),
+            canonical_generation: None,
+            canonical_current: true,
+            updated_at: c2.into(),
+            route: "timeline/count".into(),
+            calls: 1,
+            pending_reopen_watermark: 0,
+        };
+        assert_eq!(
+            apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 1).unwrap(),
+            4
+        );
+        assert_eq!(
+            apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 2).unwrap(),
+            0
+        );
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 6);
     }
 
     #[test]

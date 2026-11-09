@@ -630,8 +630,8 @@ pub(crate) fn record_closed_event_in(
     initialize(db)?;
     let repo = repo.to_ascii_lowercase();
     let event_at_sec = timestamp_second(db, event_at)?;
-    ensure_closed_cycle_in(db, &repo, pr, event_at_sec)?;
-    let notifications = record_event_in(
+    let mut notifications = ensure_closed_cycle_in(db, &repo, pr, event_at_sec)?;
+    notifications.extend(record_event_in(
         db,
         "pull_request",
         &repo,
@@ -640,7 +640,7 @@ pub(crate) fn record_closed_event_in(
         event_at,
         event_key,
         source,
-    )?;
+    )?);
     Ok(notifications)
 }
 
@@ -649,17 +649,17 @@ pub(crate) fn ensure_closed_cycle(
     repo: &str,
     pr: &str,
     closed_at: &str,
-) -> Result<()> {
+) -> Result<Vec<Notification>> {
     initialize(db)?;
     let closed_at_sec = timestamp_second(db, closed_at)?;
     if db.is_autocommit() {
         let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-        ensure_closed_cycle_in(&tx, repo, pr, closed_at_sec)?;
+        let notifications = ensure_closed_cycle_in(&tx, repo, pr, closed_at_sec)?;
         tx.commit()?;
+        Ok(notifications)
     } else {
-        ensure_closed_cycle_in(db, repo, pr, closed_at_sec)?;
+        ensure_closed_cycle_in(db, repo, pr, closed_at_sec)
     }
-    Ok(())
 }
 
 pub(crate) fn ensure_closed_cycle_in(
@@ -667,7 +667,7 @@ pub(crate) fn ensure_closed_cycle_in(
     repo: &str,
     pr: &str,
     closed_at_sec: i64,
-) -> Result<()> {
+) -> Result<Vec<Notification>> {
     let repo = repo.to_ascii_lowercase();
     let inserted = db.execute(
         "INSERT OR IGNORE INTO automatic_pr_closed_cycles(repo,pr,closed_at_sec)
@@ -695,8 +695,7 @@ pub(crate) fn ensure_closed_cycle_in(
     if let Some((_, _, known_closed_at, _)) = current.as_ref()
         && closed_at_sec < *known_closed_at
     {
-        reconcile_pending_reopens_in(db, &repo, pr)?;
-        return Ok(());
+        return reconcile_pending_reopens_in(db, &repo, pr);
     }
     let (epoch, begin_cycle) = match current.as_ref() {
         None => (1, true),
@@ -731,11 +730,14 @@ pub(crate) fn ensure_closed_cycle_in(
             )?;
         }
     }
-    reconcile_pending_reopens_in(db, &repo, pr)?;
-    Ok(())
+    reconcile_pending_reopens_in(db, &repo, pr)
 }
 
-fn reconcile_pending_reopens_in(db: &Connection, repo: &str, pr: &str) -> Result<()> {
+fn reconcile_pending_reopens_in(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+) -> Result<Vec<Notification>> {
     let closed_at: Vec<i64> = {
         let mut statement = db.prepare(
             "SELECT closed_at_sec FROM automatic_pr_closed_cycles
@@ -745,10 +747,17 @@ fn reconcile_pending_reopens_in(db: &Connection, repo: &str, pr: &str) -> Result
             .query_map(params![repo, pr], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
+    let mut notifications = Vec::new();
     for pair in closed_at.windows(2) {
-        resolve_pending_reopen_interval_in(db, repo, pr, pair[0], Some(pair[1]))?;
+        notifications.extend(resolve_pending_reopen_interval_in(
+            db,
+            repo,
+            pr,
+            pair[0],
+            Some(pair[1]),
+        )?);
     }
-    Ok(())
+    Ok(notifications)
 }
 
 pub(crate) fn record_reopened_event_in(
@@ -758,7 +767,7 @@ pub(crate) fn record_reopened_event_in(
     source_kind: &str,
     event_at: &str,
     source_id: &str,
-) -> Result<Option<(String, Vec<Notification>)>> {
+) -> Result<Vec<Notification>> {
     ensure!(
         matches!(source_kind, "webhook" | "poll"),
         "Invalid PR reopen source"
@@ -797,8 +806,7 @@ pub(crate) fn record_reopened_event_in(
             event_at_sec,
             event_at,
         )?;
-        reconcile_pending_reopens_in(db, &repo, pr)?;
-        return Ok(None);
+        return reconcile_pending_reopens_in(db, &repo, pr);
     };
     let same_cycle = if source_kind == "webhook" && current.state == "reopened" {
         current.webhook_reopen_source_id.as_deref() == Some(source_id)
@@ -826,8 +834,7 @@ pub(crate) fn record_reopened_event_in(
             event_at_sec,
             event_at,
         )?;
-        reconcile_pending_reopens_in(db, &repo, pr)?;
-        return Ok(None);
+        return reconcile_pending_reopens_in(db, &repo, pr);
     }
 
     let event_key = format!("reopened:{}", current.closed_at_sec);
@@ -880,7 +887,7 @@ pub(crate) fn record_reopened_event_in(
             )?;
         }
     }
-    Ok(Some((event_key, notifications)))
+    Ok(notifications)
 }
 
 #[cfg(test)]
@@ -907,15 +914,11 @@ pub(crate) fn record_reopened_event_with_id(
     if db.is_autocommit() {
         let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
         let notifications =
-            record_reopened_event_in(&tx, repo, pr, source_kind, event_at, source_id)?
-                .map_or(0, |(_, notifications)| notifications.len());
+            record_reopened_event_in(&tx, repo, pr, source_kind, event_at, source_id)?.len();
         tx.commit()?;
         Ok(notifications)
     } else {
-        Ok(
-            record_reopened_event_in(db, repo, pr, source_kind, event_at, source_id)?
-                .map_or(0, |(_, notifications)| notifications.len()),
-        )
+        Ok(record_reopened_event_in(db, repo, pr, source_kind, event_at, source_id)?.len())
     }
 }
 
@@ -962,7 +965,7 @@ fn resolve_pending_reopen_interval_in(
     pr: &str,
     after_sec: i64,
     closed_at_sec: Option<i64>,
-) -> Result<()> {
+) -> Result<Vec<Notification>> {
     // A single timeline event identifies this interval. Retain webhook evidence unless
     // it can be paired using the existing exact-second rule.
     let mut candidates: Vec<PendingReopen> = {
@@ -1004,11 +1007,11 @@ fn resolve_pending_reopen_interval_in(
         .filter(|candidate| candidate.source_kind == "poll")
         .collect();
     let [candidate] = polls.as_slice() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let source = minimal_reopen_source(repo, pr, &candidate.event_at);
     let event_key = format!("reopened:{after_sec}");
-    record_event_in(
+    let notifications = record_event_in(
         db,
         "pull_request",
         repo,
@@ -1043,7 +1046,7 @@ fn resolve_pending_reopen_interval_in(
             params![repo, pr, webhook_id],
         )?;
     }
-    Ok(())
+    Ok(notifications)
 }
 
 pub(crate) fn mark_pending_reopens_timeline_scanned_in(
@@ -2569,6 +2572,76 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(unresolved, 1, "unmatched webhook identity remains pending");
+        }
+    }
+
+    #[test]
+    fn reconciliation_counts_only_new_notifications_for_every_listener() {
+        for reopen_last in [false, true] {
+            let db = Connection::open_in_memory().unwrap();
+            for thread in [
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ] {
+                register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+            }
+            let close = |at: &str| {
+                json!({"action":"closed","number":7,
+                "repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":false,"closed_at":at}})
+            };
+            let c1 = close("2099-01-01T00:00:10Z");
+            let c2 = close("2099-01-01T00:00:30Z");
+            assert_eq!(
+                accept_authenticated_webhook(&db, "pull_request", &c2).unwrap(),
+                2
+            );
+            let reopen = || {
+                record_reopened_event_with_id(
+                    &db,
+                    "owner/repo",
+                    "7",
+                    "poll",
+                    "2099-01-01T00:00:20Z",
+                    "timeline:20",
+                )
+                .unwrap()
+            };
+            if reopen_last {
+                assert_eq!(
+                    accept_authenticated_webhook(&db, "pull_request", &c1).unwrap(),
+                    2
+                );
+                assert_eq!(reopen(), 2);
+            } else {
+                assert_eq!(reopen(), 0);
+                db.execute_batch(
+                    "CREATE TRIGGER fail_close_count BEFORE INSERT ON automatic_pr_notifications
+                    WHEN NEW.event='closed' BEGIN SELECT RAISE(ABORT,'stop'); END;",
+                )
+                .unwrap();
+                assert!(accept_authenticated_webhook(&db, "pull_request", &c1).is_err());
+                assert_eq!(pending(&db).unwrap().len(), 2);
+                db.execute_batch("DROP TRIGGER fail_close_count").unwrap();
+                assert_eq!(
+                    accept_authenticated_webhook(&db, "pull_request", &c1).unwrap(),
+                    4
+                );
+            }
+            assert_eq!(
+                accept_authenticated_webhook(&db, "pull_request", &c1).unwrap(),
+                0
+            );
+            assert_eq!(reopen(), 0);
+            let notices = pending(&db).unwrap();
+            assert_eq!(notices.len(), 6);
+            assert_eq!(
+                notices
+                    .iter()
+                    .filter(|notice| notice.event == "reopened")
+                    .count(),
+                2
+            );
         }
     }
 
