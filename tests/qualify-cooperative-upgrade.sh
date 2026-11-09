@@ -11,7 +11,8 @@ printf 'upgrade diagnostics classify known causes without exposing raw errors\n'
 # Exercise the actual report with private SQLite files and fake data sources.
 eval "$(sed -n '/^diagnose() {/,/^}/p' "$root/scripts/qualify-cooperative-upgrade.sh")"
 scratch=$(mktemp -d)
-trap 'rm -rf -- "$scratch"' EXIT
+child=
+trap 'if [[ -n $child ]]; then kill -CONT "$child" 2>/dev/null || true; kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; fi; rm -rf -- "$scratch"' EXIT
 # shellcheck disable=SC2034
 root=$scratch state=$scratch stage=bootstrap
 # shellcheck disable=SC2034
@@ -32,3 +33,36 @@ diagnose 1 90 other
 jq -e '.stage == "bootstrap" and .gate.bound == 1 and .gate.pid_matches_unit == 1 and .unit_matches_journal == true and .error_codes == ["binding_record"] and (.health | length == 1)' "$scratch/upgrade-diagnostic.json" >/dev/null
 if rg -q 'PRIVATE_TEST_TOKEN|private/home' "$scratch/upgrade-diagnostic.json"; then exit 1; fi
 printf 'upgrade report preserves useful state and excludes private strings\n'
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+eval "$(sed -n '/^freeze_receiver() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
+touch "$state/telemetry-pending.lock"
+for lock in "$state/telemetry.sqlite3" "$state/telemetry-pending.lock"; do
+  rm -f "$scratch/locked"
+  bash -c 'exec 9<"$1"; flock -x 9; touch "$2"; sleep .3; flock -u 9; exec sleep 30' sh "$lock" "$scratch/locked" & child=$!
+  for ((i=0;i<100;i++)); do [[ -f $scratch/locked ]] && break; sleep .01; done
+  [[ -f $scratch/locked ]]
+  freeze_receiver "$child"
+  flock -n "$lock" true
+  kill -CONT "$child"
+  kill "$child"
+  wait "$child" 2>/dev/null || true
+  child=
+done
+printf 'freezing waits for telemetry writers and leaves both locks available\n'
+eval "$(sed -n '/^wait_cgroup_empty() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
+mkdir "$scratch/group"
+printf 'populated 1\n' > "$scratch/group/cgroup.events"
+# shellcheck disable=SC2329
+sleep() { :; }
+if wait_cgroup_empty "$scratch/group"; then exit 1; fi
+unset -f sleep
+printf 'populated 0\n' > "$scratch/group/cgroup.events"
+wait_cgroup_empty "$scratch/group"
+rm "$scratch/group/cgroup.events"
+if wait_cgroup_empty "$scratch/group"; then exit 1; fi
+rmdir "$scratch/group"
+wait_cgroup_empty "$scratch/group"
+ln -s "$scratch" "$scratch/group"
+if wait_cgroup_empty "$scratch/group"; then exit 1; fi
+if wait_cgroup_empty "$scratch/missing/group"; then exit 1; fi
+printf 'drain requires an empty or removed cgroup with an observable parent\n'

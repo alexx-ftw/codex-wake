@@ -14,6 +14,17 @@ freeze_receiver() {
   local pid=$1
   [[ $pid =~ ^[1-9][0-9]*$ ]]
   stopped=$pid
+  (
+  # A stopped telemetry writer must not strand the next CLI on its pending-file lock.
+  local telemetry_fd pending_fd
+  if [[ -f $state/telemetry.sqlite3 ]]; then
+    exec {telemetry_fd}<"$state/telemetry.sqlite3"
+    flock -x -w 10 "$telemetry_fd"
+  fi
+  if [[ -f $state/telemetry-pending.lock ]]; then
+    exec {pending_fd}<"$state/telemetry-pending.lock"
+    flock -x -w 10 "$pending_fd"
+  fi
   # Exclude writers before stopping all receiver threads, then release the unchanged transaction.
   sqlite3 -batch "$db" <<SQL
 .bail on
@@ -22,7 +33,19 @@ BEGIN IMMEDIATE;
 .shell /bin/kill -STOP $pid
 COMMIT;
 SQL
+  )
   grep -q '^State:.*T' "/proc/$pid/status"
+}
+wait_cgroup_empty() {
+  local dir=$1 i
+  [[ -d ${dir%/*} && ! -L $dir ]] || return 1
+  for ((i=0;i<100;i++)); do
+    if [[ ! -e $dir && ! -L $dir ]]; then return 0; fi
+    [[ -d $dir && ! -L $dir && -r $dir/cgroup.events && ! -L $dir/cgroup.events ]] || return 1
+    if grep -qx 'populated 0' "$dir/cgroup.events"; then return 0; fi
+    sleep .1
+  done
+  return 1
 }
 state=$XDG_STATE_HOME/codex-wake
 db=$state/state.sqlite3
@@ -227,7 +250,16 @@ done
 [[ $(sqlite3 -readonly "$db" 'SELECT is_open || ":" || owner || ":" || generation FROM wake_delivery_claim_gate') == "0:$old_owner:1" ]]
 kill -0 "$upgrader"
 grep -qx 'populated 1' "/sys/fs/cgroup$old_group/cgroup.events"
-kill "$helper"; wait "$helper" 2>/dev/null || true; helper=
+# Hold replacement so it cannot recreate the cgroup before the drain is observed.
+stopped=$upgrader
+kill -STOP "$upgrader"
+grep -q '^State:.*T' "/proc/$upgrader/status"
+kill "$helper"
+wait_cgroup_empty "/sys/fs/cgroup$old_group"
+helper=
+[[ $(ctl show codex-wake.service -p InvocationID --value) == "$old_invocation" ]]
+[[ $(sqlite3 -readonly "$db" 'SELECT is_open || ":" || owner || ":" || generation FROM wake_delivery_claim_gate') == "0:$old_owner:1" ]]
+kill -CONT "$upgrader"; stopped=
 stage=activation
 wait "$upgrader"; upgrader=
 wait "$contender"; contender=
