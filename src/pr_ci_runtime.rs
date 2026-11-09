@@ -264,8 +264,6 @@ fn terminate_process_group(child: &mut std::process::Child) {
 
 #[cfg(unix)]
 fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
     let descriptor = pipe.as_raw_fd();
     // SAFETY: fcntl reads/updates flags on the live child pipe descriptor.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
