@@ -204,53 +204,102 @@ where
             "/repos/{}/issues/{}/timeline",
             resource.repo, resource.resource
         );
-        let timeline_due = state(db, &timeline_route, 0)?
+        let timeline_state = state(db, &timeline_route, 0)?;
+        let timeline_due = timeline_state
+            .as_ref()
             .is_none_or(|timeline_state| timeline_state.next_poll <= now);
-        let lifecycle_events = std::cell::RefCell::new(None::<Vec<TimelineLifecycleEvent>>);
-        let timeline_failed = std::cell::Cell::new(false);
+        let timeline_has_error: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM github_poll_state
+             WHERE endpoint=?1 AND page=0 AND error_category IS NOT NULL)",
+            [&timeline_route],
+            |row| row.get(0),
+        )?;
+        let timeline_cursor: Value = timeline_state
+            .as_ref()
+            .and_then(|saved| saved.cursor.as_deref())
+            .and_then(|cursor| serde_json::from_str::<Value>(cursor).ok())
+            .unwrap_or(Value::Null);
+        let timeline_checkpoint = timeline_cursor["updated_at"].as_str().map(str::to_owned);
+        let cached_updated_at = cached
+            .as_ref()
+            .and_then(|saved| saved.body.as_deref())
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .and_then(|pull| pull["updated_at"].as_str().map(str::to_owned));
+        let timeline_retry_due = timeline_due
+            && timeline_floor.is_some()
+            && (timeline_has_error
+                || pending_reopen_needs_close
+                || timeline_checkpoint.is_none()
+                || timeline_checkpoint.as_deref() != cached_updated_at.as_deref());
+        let lifecycle_events = std::cell::RefCell::new(None::<TimelineLifecycleBatch>);
+        let timeline_error = std::cell::Cell::new(None::<&'static str>);
         let timeline_calls = std::cell::Cell::new(0_u64);
         let repo_for_timeline = resource.repo.clone();
         let number_for_timeline = resource.resource.clone();
         let route_for_timeline = route.clone();
         let mut pr_fetch = |requested: &str, etag: Option<&str>| {
-            let response = fetch(
-                requested,
-                if requested == route_for_timeline && timeline_floor.is_some() {
-                    None
-                } else {
-                    etag
-                },
-            )?;
+            let mut response = fetch(requested, etag)?;
+            if requested == route_for_timeline
+                && response.status == 304
+                && timeline_retry_due
+                && let Some(body) = cached.as_ref().and_then(|saved| saved.body.as_deref())
+                && serde_json::from_str::<Value>(body).is_ok_and(|pull| valid_pr(&pull, number))
+            {
+                response.status = 200;
+                response.body = body.as_bytes().to_vec();
+                if !response.headers.contains_key("etag")
+                    && let Some(etag) = cached.as_ref().and_then(|saved| saved.etag.as_deref())
+                {
+                    response.headers.insert("etag".into(), etag.to_owned());
+                }
+            }
             if requested == route_for_timeline
                 && response.status == 200
                 && let Some(floor_sec) = timeline_floor
-                && serde_json::from_slice::<Value>(&response.body)
-                    .is_ok_and(|pull| pull["state"] == "open")
+                && serde_json::from_slice::<Value>(&response.body).is_ok_and(|pull| {
+                    valid_pr(&pull, number)
+                        && matches!(pull["state"].as_str(), Some("open" | "closed"))
+                })
             {
-                if !timeline_due {
-                    timeline_failed.set(true);
-                } else {
+                let pull: Value = serde_json::from_slice(&response.body)
+                    .map_err(|_| Failure::new("invalid_response"))?;
+                if pull["state"] == "closed" {
+                    let closed_at = if pull["merged"] == true {
+                        pull["merged_at"].as_str()
+                    } else {
+                        pull["closed_at"].as_str()
+                    }
+                    .ok_or_else(|| Failure::new("invalid_response"))?;
+                    pr_notifications::ensure_closed_cycle(
+                        db,
+                        &repo_for_timeline,
+                        &number_for_timeline,
+                        closed_at,
+                    )
+                    .map_err(|_| Failure::new("database"))?;
+                }
+                let updated_at = pull["updated_at"]
+                    .as_str()
+                    .ok_or_else(|| Failure::new("invalid_response"))?;
+                let needs_scan = pending_reopen_needs_close
+                    || timeline_checkpoint.as_deref() != Some(updated_at);
+                if timeline_due && needs_scan {
                     match fetch_reopened_timeline(
                         db,
                         &mut fetch,
                         &repo_for_timeline,
                         &number_for_timeline,
                         floor_sec,
-                        pending_reopen_needs_close,
+                        true,
                         &timeline_calls,
                     ) {
                         Ok((events, _)) => {
-                            lifecycle_events.replace(Some(events));
-                            db.execute(
-                                "INSERT INTO github_poll_state
-                                 (endpoint,page,next_poll_ms,backoff_ms,last_success_ms,error_category,calls)
-                                 VALUES(?1,0,?2,?3,?4,NULL,?5)
-                                 ON CONFLICT(endpoint,page) DO UPDATE SET
-                                   next_poll_ms=excluded.next_poll_ms,backoff_ms=excluded.backoff_ms,
-                                   last_success_ms=excluded.last_success_ms,error_category=NULL,
-                                   calls=github_poll_state.calls+excluded.calls",
-                                params![timeline_route, now + INTERVAL_MS, INTERVAL_MS, now, timeline_calls.get() as i64],
-                            ).map_err(|_| Failure::new("database"))?;
+                            lifecycle_events.replace(Some(TimelineLifecycleBatch {
+                                events,
+                                updated_at: updated_at.to_owned(),
+                                route: timeline_route.clone(),
+                                calls: timeline_calls.get() as i64,
+                            }));
                         }
                         Err(error) => {
                             // Keep the valid PR snapshot usable, but retain a route-specific
@@ -264,7 +313,7 @@ where
                                 timeline_calls.get(),
                             )
                             .map_err(|_| Failure::new("database"))?;
-                            timeline_failed.set(true);
+                            timeline_error.set(Some(error.category));
                         }
                     }
                 }
@@ -343,6 +392,15 @@ where
                 let baseline = cursor_number(prior_sequence.unwrap_or(now));
                 let event_cursor = prior_sequence.map(|last| cursor_number(last.saturating_add(1)));
                 let mut condition_observations = Vec::new();
+                if let Some(batch) = lifecycle_events.borrow().as_ref() {
+                    apply_timeline_lifecycle_events(
+                        db,
+                        &resource.repo,
+                        &resource.resource,
+                        batch,
+                        now,
+                    )?;
+                }
                 if pr["state"] == "closed" {
                     if pr["merged"].as_bool().is_none() {
                         return Err(Failure::new("invalid_response"));
@@ -417,76 +475,7 @@ where
                         &event,
                     )
                     .map_err(|_| Failure::new("database"))?;
-                } else if !old.is_null() {
-                    if let Some(events) = lifecycle_events.borrow().clone() {
-                        let tx = rusqlite::Transaction::new_unchecked(
-                            db,
-                            rusqlite::TransactionBehavior::Immediate,
-                        )
-                        .map_err(|_| Failure::new("database"))?;
-                        for timeline_event in events {
-                            if timeline_event.event == "closed" {
-                                pr_notifications::record_closed_event_in(
-                                    &tx,
-                                    &resource.repo,
-                                    &resource.resource,
-                                    "closed",
-                                    &timeline_event.event_at,
-                                    &stable_source_key(
-                                        "pull_request",
-                                        &resource.repo.to_ascii_lowercase(),
-                                        &resource.resource,
-                                        "closed",
-                                        "",
-                                        &[&timeline_event.event_at],
-                                    ),
-                                    &timeline_event.source,
-                                )
-                                .map_err(|_| Failure::new("database"))?;
-                                continue;
-                            }
-                            let cycle = pr_notifications::record_reopened_event_in(
-                                &tx,
-                                &resource.repo,
-                                &resource.resource,
-                                "poll",
-                                &timeline_event.event_at,
-                                &format!("timeline:{}", timeline_event.event_id),
-                            )
-                            .map_err(|_| Failure::new("database"))?;
-                            let Some((event_key, _)) = cycle else {
-                                continue;
-                            };
-                            let notification_ids: Vec<String> = {
-                                let mut statement = tx
-                                    .prepare(
-                                        "SELECT id FROM automatic_pr_notifications
-                                 WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2
-                                   AND event='reopened' AND event_key=?3",
-                                    )
-                                    .map_err(|_| Failure::new("database"))?;
-                                statement
-                                    .query_map(
-                                        params![resource.repo, resource.resource, event_key],
-                                        |row| row.get(0),
-                                    )
-                                    .map_err(|_| Failure::new("database"))?
-                                    .collect::<rusqlite::Result<Vec<_>>>()
-                                    .map_err(|_| Failure::new("database"))?
-                            };
-                            for notification_id in notification_ids {
-                                codex_wake::pr_ci::consume_reopened_notification_in(
-                                    &tx,
-                                    &notification_id,
-                                    now,
-                                )
-                                .map_err(|_| Failure::new("database"))?;
-                            }
-                        }
-                        tx.commit().map_err(|_| Failure::new("database"))?;
-                    } else if timeline_floor.is_some() && !timeline_failed.get() {
-                        return Err(Failure::new("invalid_response"));
-                    }
+                } else {
                     if head_changed {
                         if let Some(cursor) = event_cursor.as_ref() {
                             condition_observations.push(ConditionObservation {
@@ -618,6 +607,9 @@ where
             validated_prs.insert(resource.clone());
         }
         report.record(outcome);
+        if let Some(error) = timeline_error.get() {
+            report.record_error(error);
+        }
     }
 
     for resource in &targets.reviews {
@@ -1135,6 +1127,9 @@ impl Report {
             *self.errors.entry(e.into()).or_default() += 1;
         }
     }
+    fn record_error(&mut self, error: &str) {
+        *self.errors.entry(error.to_owned()).or_default() += 1;
+    }
     fn json(&self, waits: usize, resources: usize) -> Value {
         json!({"calls":self.calls,"accepted":self.accepted,
         "errors":self.errors,"skipped":self.skipped,"pages":self.pages,"active_waits":waits,"active_resources":resources})
@@ -1308,7 +1303,15 @@ fn targets(db: &Connection) -> Result<Targets> {
             if !valid_repo(&repo) || !positive_text(&pr) {
                 continue;
             }
-            let target = Resource { repo, resource: pr };
+            let rule_repo = out
+                .rule_prs
+                .iter()
+                .find(|target| target.resource == pr && target.repo.eq_ignore_ascii_case(&repo))
+                .map(|target| target.repo.clone());
+            let target = Resource {
+                repo: rule_repo.unwrap_or(repo),
+                resource: pr,
+            };
             match kind.as_str() {
                 "pull_request" => {
                     out.pull_requests.insert(target);
@@ -2372,6 +2375,97 @@ struct TimelineLifecycleEvent {
     event_at: String,
     event_id: String,
     source: Value,
+}
+
+struct TimelineLifecycleBatch {
+    events: Vec<TimelineLifecycleEvent>,
+    updated_at: String,
+    route: String,
+    calls: i64,
+}
+
+fn apply_timeline_lifecycle_events(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+    batch: &TimelineLifecycleBatch,
+    now: i64,
+) -> std::result::Result<(), Failure> {
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| Failure::new("database"))?;
+    for event in &batch.events {
+        if event.event == "closed" {
+            pr_notifications::record_closed_event_in(
+                &tx,
+                repo,
+                pr,
+                "closed",
+                &event.event_at,
+                &stable_source_key(
+                    "pull_request",
+                    &repo.to_ascii_lowercase(),
+                    pr,
+                    "closed",
+                    "",
+                    &[&event.event_at],
+                ),
+                &event.source,
+            )
+            .map_err(|_| Failure::new("database"))?;
+            continue;
+        }
+        let cycle = pr_notifications::record_reopened_event_in(
+            &tx,
+            repo,
+            pr,
+            "poll",
+            &event.event_at,
+            &format!("timeline:{}", event.event_id),
+        )
+        .map_err(|_| Failure::new("database"))?;
+        let Some((event_key, _)) = cycle else {
+            continue;
+        };
+        let notification_ids: Vec<String> = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT id FROM automatic_pr_notifications
+                     WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2
+                       AND event='reopened' AND event_key=?3",
+                )
+                .map_err(|_| Failure::new("database"))?;
+            statement
+                .query_map(params![repo, pr, event_key], |row| row.get(0))
+                .map_err(|_| Failure::new("database"))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| Failure::new("database"))?
+        };
+        for notification_id in notification_ids {
+            codex_wake::pr_ci::consume_reopened_notification_in(&tx, &notification_id, now)
+                .map_err(|_| Failure::new("database"))?;
+        }
+    }
+    pr_notifications::mark_pending_reopens_timeline_scanned_in(&tx, repo, pr)
+        .map_err(|_| Failure::new("database"))?;
+    tx.execute(
+        "INSERT INTO github_poll_state
+         (endpoint,page,cursor,next_poll_ms,backoff_ms,last_success_ms,error_category,calls)
+         VALUES(?1,0,?2,?3,?4,?5,NULL,?6)
+         ON CONFLICT(endpoint,page) DO UPDATE SET
+           cursor=excluded.cursor,next_poll_ms=excluded.next_poll_ms,
+           backoff_ms=excluded.backoff_ms,last_success_ms=excluded.last_success_ms,
+           error_category=NULL,calls=github_poll_state.calls+excluded.calls",
+        params![
+            batch.route,
+            Some(json!({"updated_at":batch.updated_at}).to_string()),
+            now + INTERVAL_MS,
+            INTERVAL_MS,
+            now,
+            batch.calls
+        ],
+    )
+    .map_err(|_| Failure::new("database"))?;
+    tx.commit().map_err(|_| Failure::new("database"))
 }
 
 fn fetch_reopened_timeline<F>(
@@ -4164,6 +4258,114 @@ mod tests {
     }
 
     #[test]
+    fn closed_snapshot_recovers_intervening_reopen_from_timeline() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:30Z","updated_at":"2099-01-01T00:00:30Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+
+        let report = tick_with(&db, now_ms(), |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(closed.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":8100,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                    {"id":8101,"event":"reopened","created_at":"2099-01-01T00:00:20Z"},
+                    {"id":8102,"event":"closed","created_at":"2099-01-01T00:00:30Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .map(|notice| notice.event_key.as_str())
+                .collect::<Vec<_>>(),
+            ["reopened:4070908810"]
+        );
+    }
+
+    #[test]
+    fn first_poll_replays_post_registration_reopen_from_timeline() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let open = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+
+        let report = tick_with(&db, now_ms(), |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":8200,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                    {"id":8201,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+
+        assert_eq!(report["errors"], json!({}), "{report}");
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn successful_timeline_scan_does_not_repeat_for_an_unchanged_pr() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let webhook = json!({
+            "action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"state":"open",
+                "updated_at":"2099-01-01T00:00:20Z"}
+        });
+        pr_notifications::accept_authenticated_webhook(&db, "pull_request", &webhook).unwrap();
+        let open = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+
+        let first = tick_with(&db, now_ms(), |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}), "{first}");
+
+        let second = tick_with(&db, now_ms() + INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            _ => panic!("unchanged PR must not trigger a timeline rescan: {route}"),
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+    }
+
+    #[test]
     fn reopened_webhook_and_timeline_poll_share_identity_in_both_orders() {
         let thread = "11111111-1111-4111-8111-111111111111";
         let reopened_at = "2099-01-01T00:00:00Z";
@@ -4458,7 +4660,7 @@ mod tests {
             _ => panic!("unexpected route {route}"),
         })
         .unwrap();
-        assert_eq!(first["errors"], json!({}), "{first}");
+        assert_eq!(first["errors"], json!({"server_error": 1}), "{first}");
         let saved = state(&db, "/repos/owner/repo/pulls/7", 0).unwrap().unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&saved.body.unwrap()).unwrap()["state"],
@@ -4467,8 +4669,12 @@ mod tests {
 
         let second = tick_with(&db, INTERVAL_MS * 2 + 1, |route, etag| match route {
             "/repos/owner/repo/pulls/7" => {
-                assert_eq!(etag, None, "recovery must bypass a stale 304 validator");
-                Ok(response(open.clone(), false))
+                assert_eq!(etag, Some("\"version1\""));
+                Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
             }
             "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
                 json!([{"id":7201,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}]),
@@ -4478,6 +4684,94 @@ mod tests {
         })
         .unwrap();
         assert_eq!(second["errors"], json!({}), "{second}");
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn timeline_checkpoint_rolls_back_with_events_and_retries_same_pr_snapshot() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let baseline = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&baseline));
+        db.execute_batch(
+            "CREATE TRIGGER fail_reopen_journal BEFORE INSERT ON automatic_pr_event_journal
+             WHEN NEW.event='reopened'
+             BEGIN SELECT RAISE(ABORT,'simulated lifecycle journal failure'); END",
+        )
+        .unwrap();
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let timeline = || {
+            json!([
+                {"id":7301,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                {"id":7302,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+            ])
+        };
+        let failed = tick_with(&db, 2 * INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(timeline(), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(failed["errors"]["database"], json!(1), "{failed}");
+        let (timeline_cursor, journal_count): (Option<String>, i64) = db
+            .query_row(
+                "SELECT (SELECT cursor FROM github_poll_state
+                         WHERE endpoint='/repos/owner/repo/issues/7/timeline' AND page=0),
+                        (SELECT count(*) FROM automatic_pr_event_journal)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            timeline_cursor, None,
+            "failed application must not advance checkpoint"
+        );
+        assert_eq!(
+            journal_count, 0,
+            "failed application must roll back journal writes"
+        );
+        db.execute_batch("DROP TRIGGER fail_reopen_journal")
+            .unwrap();
+
+        let retried = tick_with(&db, 3 * INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(current.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(timeline(), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(retried["errors"], json!({}), "{retried}");
+        let timeline_cursor: String = db
+            .query_row(
+                "SELECT cursor FROM github_poll_state
+                 WHERE endpoint='/repos/owner/repo/issues/7/timeline' AND page=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&timeline_cursor).unwrap()["updated_at"],
+            current["updated_at"]
+        );
         assert_eq!(
             pr_notifications::pending(&db)
                 .unwrap()
@@ -4573,7 +4867,7 @@ mod tests {
             _ => panic!("unexpected route {route}"),
         })
         .unwrap();
-        assert_eq!(first["errors"], json!({}), "{first}");
+        assert_eq!(first["errors"], json!({"rate_limited": 1}), "{first}");
         let timeline = state(&db, "/repos/owner/repo/issues/7/timeline", 0)
             .unwrap()
             .unwrap();
@@ -4601,8 +4895,15 @@ mod tests {
                 >= now + 120_000
         );
 
-        let third = tick_with(&db, now + 121_000, |route, _| match route {
-            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+        let third = tick_with(&db, now + 121_000, |route, etag| match route {
+            "/repos/owner/repo/pulls/7" => {
+                assert_eq!(etag, Some("\"version1\""));
+                Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            }
             "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
                 json!([{"id":7201,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}]),
                 false,
@@ -4653,11 +4954,16 @@ mod tests {
             (1, "2099-01-02T00:00:00Z"),
             (INTERVAL_MS + 1, "2099-01-03T00:00:00Z"),
         ] {
-            let report = tick_with(&db, now, |route, _| {
-                assert_eq!(route, "/repos/owner/repo/pulls/7");
-                let mut later = current.clone();
-                later["updated_at"] = json!(updated_at);
-                Ok(response(later, false))
+            let report = tick_with(&db, now, |route, _| match route {
+                "/repos/owner/repo/pulls/7" => {
+                    let mut later = current.clone();
+                    later["updated_at"] = json!(updated_at);
+                    Ok(response(later, false))
+                }
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                    Ok(response(json!([]), false))
+                }
+                _ => panic!("unexpected route {route}"),
             })
             .unwrap();
             assert_eq!(report["errors"], json!({}), "{report}");
@@ -4697,9 +5003,14 @@ mod tests {
             })
         };
         assert!(
-            tick_with(&db, 2 * INTERVAL_MS, |route, _| {
-                assert_eq!(route, "/repos/owner/repo/pulls/7");
-                Ok(response(changed("2099-01-02T00:00:00Z"), false))
+            tick_with(&db, 2 * INTERVAL_MS, |route, _| match route {
+                "/repos/owner/repo/pulls/7" => {
+                    Ok(response(changed("2099-01-02T00:00:00Z"), false))
+                }
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                    Ok(response(json!([]), false))
+                }
+                _ => panic!("unexpected route {route}"),
             })
             .is_err()
         );
@@ -4723,9 +5034,12 @@ mod tests {
         db.execute_batch("DROP TRIGGER fail_pr_cursor_save")
             .unwrap();
 
-        tick_with(&db, 3 * INTERVAL_MS, |route, _| {
-            assert_eq!(route, "/repos/owner/repo/pulls/7");
-            Ok(response(changed("2099-01-03T00:00:00Z"), false))
+        tick_with(&db, 3 * INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(changed("2099-01-03T00:00:00Z"), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
         })
         .unwrap();
         assert_eq!(
@@ -4784,9 +5098,12 @@ mod tests {
                 snapshot('c', "stable", "2099-01-05T00:00:00Z"),
             ),
         ] {
-            let report = tick_with(&db, now, |route, _| {
-                assert_eq!(route, "/repos/owner/repo/pulls/7");
-                Ok(response(pr.clone(), false))
+            let report = tick_with(&db, now, |route, _| match route {
+                "/repos/owner/repo/pulls/7" => Ok(response(pr.clone(), false)),
+                "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                    Ok(response(json!([]), false))
+                }
+                _ => panic!("unexpected route {route}"),
             })
             .unwrap();
             assert_eq!(report["errors"], json!({}), "{report}");
@@ -4959,9 +5276,12 @@ mod tests {
             "updated_at":event_at,
             "head":{"sha":"b".repeat(40)},"base":{"ref":"release"}
         });
-        let report = tick_with(&db, 2 * INTERVAL_MS, |route, _| {
-            assert_eq!(route, "/repos/owner/repo/pulls/7");
-            Ok(response(snapshot.clone(), false))
+        let report = tick_with(&db, 2 * INTERVAL_MS, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(snapshot.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
         })
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
@@ -5032,9 +5352,12 @@ mod tests {
             "closed_at":"2099-01-02T00:00:00Z","updated_at":"2099-01-02T00:00:00Z",
             "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
         });
-        let report = tick_with(&db, INTERVAL_MS + 1, |route, _| {
-            assert_eq!(route, "/repos/owner/repo/pulls/7");
-            Ok(response(closed_now.clone(), false))
+        let report = tick_with(&db, INTERVAL_MS + 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(closed_now.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
         })
         .unwrap();
         assert!(report["errors"].as_object().unwrap().is_empty());

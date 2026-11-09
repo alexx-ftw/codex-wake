@@ -94,6 +94,7 @@ pub(crate) fn initialize(db: &Connection) -> Result<()> {
             event_at_sec INTEGER NOT NULL,
             event_at TEXT NOT NULL,
             source TEXT NOT NULL,
+            timeline_scanned INTEGER NOT NULL DEFAULT 0 CHECK(timeline_scanned IN (0,1)),
             UNIQUE(repo,pr,source_kind,source_id));",
     )?;
     Ok(())
@@ -555,13 +556,21 @@ pub(crate) fn ensure_closed_cycle_in(
     closed_at_sec: i64,
 ) -> Result<()> {
     let repo = repo.to_ascii_lowercase();
-    db.execute(
+    let inserted = db.execute(
         "INSERT OR IGNORE INTO automatic_pr_closed_cycles(repo,pr,closed_at_sec)
          SELECT ?1,?2,?3 WHERE NOT EXISTS(
              SELECT 1 FROM automatic_pr_closed_cycles
              WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND closed_at_sec=?3)",
         params![repo, pr, closed_at_sec],
     )?;
+    if inserted != 0 {
+        // A newly observed close can disambiguate retained reopen evidence.
+        db.execute(
+            "UPDATE automatic_pr_pending_reopens SET timeline_scanned=0
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2",
+            params![repo, pr],
+        )?;
+    }
     let current: Option<(i64, String, i64, Option<i64>)> = db
         .query_row(
             "SELECT epoch,state,closed_at_sec,reopened_at_sec
@@ -626,17 +635,6 @@ fn reconcile_pending_reopens_in(db: &Connection, repo: &str, pr: &str) -> Result
     for pair in closed_at.windows(2) {
         resolve_pending_reopen_interval_in(db, repo, pr, pair[0], Some(pair[1]))?;
     }
-    if let Some(latest) = closed_at.last() {
-        let current_closed: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM automatic_pr_lifecycle
-             WHERE repo=?1 AND pr=?2 AND state='closed' AND closed_at_sec=?3)",
-            params![repo, pr, latest],
-            |row| row.get(0),
-        )?;
-        if current_closed {
-            resolve_pending_reopen_interval_in(db, repo, pr, *latest, None)?;
-        }
-    }
     Ok(())
 }
 
@@ -689,7 +687,11 @@ pub(crate) fn record_reopened_event_in(
         reconcile_pending_reopens_in(db, &repo, pr)?;
         return Ok(None);
     };
-    let same_cycle = if current.state == "closed" {
+    let same_cycle = if source_kind == "webhook" {
+        // `pull_request.updated_at` is not the lifecycle event timestamp. A late close
+        // may still split this apparent tail interval, so keep webhook evidence pending.
+        false
+    } else if current.state == "closed" {
         event_at_sec > current.closed_at_sec
     } else {
         let seen_id = if source_kind == "webhook" {
@@ -738,6 +740,30 @@ pub(crate) fn record_reopened_event_in(
                 current.epoch
             ],
         )?;
+    }
+    if source_kind == "poll" {
+        let matching_webhooks: Vec<String> = {
+            let mut statement = db.prepare(
+                "SELECT source_id FROM automatic_pr_pending_reopens
+                 WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook'
+                   AND event_at_sec=?3 ORDER BY source_id",
+            )?;
+            statement
+                .query_map(params![repo, pr, event_at_sec], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if let [webhook_id] = matching_webhooks.as_slice() {
+            db.execute(
+                "UPDATE automatic_pr_lifecycle SET webhook_reopen_source_id=?3
+                 WHERE repo=?1 AND pr=?2 AND state='reopened' AND reopened_at_sec=?4",
+                params![repo, pr, webhook_id, event_at_sec],
+            )?;
+            db.execute(
+                "DELETE FROM automatic_pr_pending_reopens
+                 WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook' AND source_id=?3",
+                params![repo, pr, webhook_id],
+            )?;
+        }
     }
     Ok(Some((event_key, notifications)))
 }
@@ -844,7 +870,25 @@ fn resolve_pending_reopen_interval_in(
     };
     candidates.sort();
     candidates.dedup();
-    if candidates.len() != 1 {
+    // A timeline event is authoritative for the transition. A webhook observation can
+    // be folded into it only when both provider timestamps agree to the second.
+    let mut paired_webhook_id = None;
+    if candidates.len() == 2
+        && candidates[0].event_at_sec == candidates[1].event_at_sec
+        && candidates[0].source_kind != candidates[1].source_kind
+    {
+        paired_webhook_id = candidates
+            .iter()
+            .find(|candidate| candidate.source_kind == "webhook")
+            .map(|candidate| candidate.source_id.clone());
+        let poll = candidates
+            .iter()
+            .find(|candidate| candidate.source_kind == "poll")
+            .ok_or_else(|| anyhow::anyhow!("Matched reopen pair has no timeline source"))?
+            .clone();
+        candidates = vec![poll];
+    }
+    if candidates.len() != 1 || candidates[0].source_kind != "poll" {
         return Ok(());
     }
     let candidate = &candidates[0];
@@ -868,8 +912,8 @@ fn resolve_pending_reopen_interval_in(
             repo,
             pr,
             candidate.event_at_sec,
-            (candidate.source_kind == "webhook").then_some(candidate.source_id.as_str()),
-            (candidate.source_kind == "poll").then_some(candidate.source_id.as_str()),
+            paired_webhook_id,
+            candidate.source_id,
             after_sec
         ],
     )?;
@@ -877,6 +921,26 @@ fn resolve_pending_reopen_interval_in(
         "DELETE FROM automatic_pr_pending_reopens
          WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind=?3 AND source_id=?4",
         params![repo, pr, candidate.source_kind, candidate.source_id],
+    )?;
+    if let Some(webhook_id) = paired_webhook_id {
+        db.execute(
+            "DELETE FROM automatic_pr_pending_reopens
+             WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook' AND source_id=?3",
+            params![repo, pr, webhook_id],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_pending_reopens_timeline_scanned_in(
+    db: &Connection,
+    repo: &str,
+    pr: &str,
+) -> Result<()> {
+    db.execute(
+        "UPDATE automatic_pr_pending_reopens SET timeline_scanned=1
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2",
+        params![repo, pr],
     )?;
     Ok(())
 }
@@ -904,13 +968,24 @@ pub(crate) fn reopen_timeline_floor(
         params![repo, pr],
         |row| row.get(0),
     )?;
+    let registration_floor: Option<i64> = db.query_row(
+        "SELECT MIN(registered_at_sec) FROM automatic_pr_notification_listeners
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2",
+        params![repo, pr],
+        |row| row.get(0),
+    )?;
+    let needs_timeline: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automatic_pr_pending_reopens
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND timeline_scanned=0)",
+        params![repo, pr],
+        |row| row.get(0),
+    )?;
     Ok((
-        match (closed_floor, pending_floor) {
-            (Some(closed), Some(pending)) => Some(closed.min(pending)),
-            (Some(floor), None) | (None, Some(floor)) => Some(floor),
-            (None, None) => None,
-        },
-        pending_floor.is_some(),
+        [closed_floor, pending_floor, registration_floor]
+            .into_iter()
+            .flatten()
+            .min(),
+        needs_timeline,
     ))
 }
 
@@ -1210,6 +1285,7 @@ fn dispatch_with_clock(
                         db,
                         &notification.thread,
                         reason,
+                        &notification.id,
                     )?;
                 }
                 ensure!(
@@ -1782,6 +1858,25 @@ mod tests {
                 "closed_at":"2098-12-31T23:59:00Z"}
         });
         accept_authenticated_webhook(&db, "pull_request", &close).unwrap();
+        assert!(
+            pending(&db)
+                .unwrap()
+                .iter()
+                .all(|notification| notification.event != "reopened"),
+            "a webhook timestamp alone cannot finalize an open-ended cycle"
+        );
+        assert_eq!(
+            record_reopened_event_with_id(
+                &db,
+                "owner/repo",
+                "7",
+                "poll",
+                "2099-01-01T00:00:00Z",
+                "timeline:7001",
+            )
+            .unwrap(),
+            1
+        );
         let reopened: Vec<_> = pending(&db)
             .unwrap()
             .into_iter()
@@ -1834,6 +1929,18 @@ mod tests {
         assert_eq!(unresolved, 2);
 
         close("2099-01-01T00:00:30Z");
+        assert!(
+            pending(&db)
+                .unwrap()
+                .iter()
+                .all(|notification| notification.event != "reopened")
+        );
+        for (id, at) in [
+            ("timeline:20", "2099-01-01T00:00:20Z"),
+            ("timeline:40", "2099-01-01T00:00:40Z"),
+        ] {
+            record_reopened_event_with_id(&db, "owner/repo", "7", "poll", at, id).unwrap();
+        }
         let mut reopened: Vec<_> = pending(&db)
             .unwrap()
             .into_iter()
@@ -1874,6 +1981,21 @@ mod tests {
             "repository":{"full_name":"owner/repo"},
             "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
         accept_authenticated_webhook(&db, "pull_request", &reopen).unwrap();
+        assert!(
+            pending(&db)
+                .unwrap()
+                .iter()
+                .all(|notification| notification.event != "reopened")
+        );
+        record_reopened_event_with_id(
+            &db,
+            "owner/repo",
+            "7",
+            "poll",
+            "2099-01-01T00:00:20Z",
+            "timeline:20",
+        )
+        .unwrap();
 
         let notices = pending(&db).unwrap();
         let reopened: Vec<_> = notices
@@ -1919,6 +2041,24 @@ mod tests {
             0
         );
         close("2099-01-01T00:00:30Z");
+        assert_eq!(
+            pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notification| notification.event == "reopened")
+                .count(),
+            1,
+            "the delayed second webhook must remain unassigned until timeline evidence"
+        );
+        record_reopened_event_with_id(
+            &db,
+            "owner/repo",
+            "7",
+            "poll",
+            "2099-01-01T00:00:40Z",
+            "timeline:40",
+        )
+        .unwrap();
 
         let mut reopened: Vec<_> = pending(&db)
             .unwrap()
@@ -1997,6 +2137,18 @@ mod tests {
                 &payload,
             )
             .unwrap();
+        }
+        assert!(
+            pending(&db)
+                .unwrap()
+                .iter()
+                .all(|notification| notification.event != "reopened")
+        );
+        for (id, at) in [
+            ("timeline:20", "2099-01-01T00:00:20Z"),
+            ("timeline:40", "2099-01-01T00:00:40Z"),
+        ] {
+            record_reopened_event_with_id(&db, "owner/repo", "7", "poll", at, id).unwrap();
         }
         let mut keys: Vec<_> = pending(&db)
             .unwrap()
@@ -2279,22 +2431,24 @@ mod tests {
         )
         .unwrap();
 
+        let mut accepted_id = None;
         assert_eq!(
-            dispatch_with(&mut db, |_, _, _, _| {
+            dispatch_with(&mut db, |_, _, id, _| {
+                accepted_id = Some(id.to_owned());
                 Ok(("queued".into(), Some("native_queue_resume_warning".into())))
             })
             .unwrap(),
             1
         );
-        let (state, recovery_reason): (String, Option<String>) = db
+        let (state, recovery_reason, recovery_json): (String, Option<String>, Option<String>) = db
             .query_row(
-                "SELECT notification.state,recovery.reason
+                "SELECT notification.state,recovery.reason,recovery.client_ids_json
                  FROM automatic_pr_notifications AS notification
                  LEFT JOIN native_wake_recovery AS recovery
                    ON recovery.thread=notification.thread
                  WHERE notification.event_key='pr-event-wake-warning'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(state, "queued");
@@ -2302,6 +2456,13 @@ mod tests {
             recovery_reason.as_deref(),
             Some("native_queue_resume_warning")
         );
+        let recovery_payload: serde_json::Value =
+            serde_json::from_str(recovery_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            recovery_payload["client_ids"],
+            json!([accepted_id.unwrap()])
+        );
+        assert_eq!(recovery_payload["unattributed"], json!(false));
         assert_eq!(
             dispatch_with(&mut db, |_, _, _, _| unreachable!()).unwrap(),
             0
