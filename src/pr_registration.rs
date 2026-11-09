@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_verification_keeps_events_since_creation_observation() {
+    fn expired_verified_pre_survives_cleanup_until_reconcile_consumes_candidate() {
         let mut db = Connection::open_in_memory().unwrap();
         let observed_at_ms = unix_now_ms() - 30_000;
         let session = "11111111-1111-4111-8111-111111111111";
@@ -387,16 +387,71 @@ mod tests {
             60_000,
         )
         .unwrap();
-        let crate::pr_observation::HandleResult::Candidate { .. } = result else {
+        let crate::pr_observation::HandleResult::Candidate { record, .. } = result else {
             panic!("expected verified PR candidate");
         };
+        assert_eq!(
+            record.state,
+            crate::pr_observation::CandidateState::Verified
+        );
 
-        let claimed_at_ms = unix_now_ms();
-        let claimed =
-            crate::pr_observation::claim_verified_pending(&mut db, claimed_at_ms, 60_000, 1)
-                .unwrap();
-        assert_eq!(claimed.len(), 1);
-        assert!(register_claimed_candidate(&mut db, &claimed[0], claimed_at_ms + 60_000,).unwrap());
+        db.execute(
+            "UPDATE pr_hook_pre_observations SET expires_at_ms=0 WHERE tool_use_id=?1",
+            [call],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::pr_observation::cleanup_expired_pre(&db, unix_now_ms()).unwrap(),
+            0,
+            "an unconsumed verified candidate must retain its linked PreToolUse row"
+        );
+
+        let empty = std::path::PathBuf::new();
+        let config = crate::manager::Config {
+            state: empty.clone(),
+            runtime: empty.clone(),
+            config: empty.clone(),
+            unit: empty.clone(),
+            db: empty.clone(),
+            codex: empty.clone(),
+            gh: empty.clone(),
+            webhooks_enabled: false,
+            codex_home: empty.clone(),
+            rpc_socket: empty.clone(),
+            cache: empty,
+            plugin_base: None,
+        };
+        reconcile(&mut db, &config, unix_now_ms()).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM automatic_pr_rules", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1,
+            "reconcile must register the verified candidate after cleanup"
+        );
+        let consumed_at: Option<i64> = db
+            .query_row(
+                "SELECT consumed_at_ms FROM pr_hook_candidates WHERE id=?1",
+                [record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed_at.is_some());
+        assert_eq!(
+            crate::pr_observation::cleanup_expired_pre(&db, i64::MAX).unwrap(),
+            1,
+            "a consumed verified candidate must release its expired PreToolUse row"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM pr_hook_pre_observations WHERE tool_use_id=?1",
+                [call],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
 
         let event_at = utc_timestamp(observed_at_ms + 10_000);
         let eligible_rules: i64 = db

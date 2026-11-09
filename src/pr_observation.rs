@@ -760,7 +760,10 @@ pub fn cleanup_expired_pre(db: &Connection, now_ms: i64) -> Result<usize> {
          WHERE p.expires_at_ms<=?1
          AND NOT EXISTS (
              SELECT 1 FROM pr_hook_candidates c
-             WHERE c.pre_id=p.id AND c.state IN ('pending','timeout','transport_error','inconclusive')
+             WHERE c.pre_id=p.id AND (
+                 c.state IN ('pending','timeout','transport_error','inconclusive')
+                 OR (c.state='verified' AND c.consumed_at_ms IS NULL)
+             )
          )",
         [now_ms],
     )?)
@@ -1547,16 +1550,17 @@ fn shell_tokens(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
-    let mut escaped = false;
     let mut started = false;
-    for ch in command.chars() {
-        if escaped {
-            word.push(ch);
-            escaped = false;
-            started = true;
-        } else if ch == '\\' && quote != Some('\'') {
-            escaped = true;
-            started = true;
+    let mut chars = command.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && quote != Some('\'') {
+            match chars.next()? {
+                '\n' => continue,
+                escaped => {
+                    word.push(escaped);
+                    started = true;
+                }
+            }
         } else if quote == Some(ch) {
             quote = None;
         } else if quote.is_none() && matches!(ch, '\'' | '"') {
@@ -1572,7 +1576,7 @@ fn shell_tokens(command: &str) -> Option<Vec<String>> {
             started = true;
         }
     }
-    if escaped || quote.is_some() {
+    if quote.is_some() {
         return None;
     }
     if started {
@@ -2726,6 +2730,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pre_observation_tokenizer_removes_bash_line_continuations() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for (call, command) in [
+            ("between", "gh api \\\n -X POST repos/acme/widget/pulls"),
+            ("flag", "gh api --me\\\nthod POST repos/acme/widget/pulls"),
+            ("endpoint", "gh api -X POST repos/acme/\\\nwidget/pulls"),
+            (
+                "double-quoted",
+                "gh api -X POST \"/repos/acme/\\\nwidget/pulls\"",
+            ),
+            ("gh-pr", "gh pr \\\n create --title change"),
+        ] {
+            let event = pre("s", call, call, command);
+            assert!(is_relevant_pre_tool_use(&event), "{command:?}");
+            assert!(matches!(
+                record_pre_tool_use(&mut db, &event, 100, 1_000),
+                Ok(PreRecord::Recorded { .. })
+            ));
+        }
+
+        let single_quoted = "gh api -X POST 'repos/acme/\\\nwidget/pulls'";
+        let tokens = shell_tokens(single_quoted).unwrap();
+        assert_eq!(tokens[4], "repos/acme/\\\nwidget/pulls");
+        assert!(!is_relevant_pre_tool_use(&pre(
+            "s",
+            "single-quoted",
+            "single-quoted",
+            single_quoted
+        )));
+
+        let crlf = "gh api -X POST repos/acme/\\\r\nwidget/pulls";
+        assert!(!is_relevant_pre_tool_use(&pre("s", "crlf", "crlf", crlf)));
     }
 
     #[test]

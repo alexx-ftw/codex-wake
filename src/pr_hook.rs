@@ -256,24 +256,30 @@ fn shell_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
-    let mut chars = command.chars().peekable();
+    let mut chars = command.chars();
     let mut active = false;
     while let Some(ch) = chars.next() {
         match (quote, ch) {
             (Some('\''), '\'') | (Some('"'), '"') => quote = None,
             (Some('\''), _) => word.push(ch),
             (Some('"'), '$' | '`') => return None,
-            (Some('"'), '\\') => word.push(chars.next()?),
+            (Some('"'), '\\') => match chars.next()? {
+                '\n' => {}
+                escaped => word.push(escaped),
+            },
             (Some('"'), _) => word.push(ch),
             (Some(_), _) => return None,
             (None, '\'' | '"') => {
                 quote = Some(ch);
                 active = true;
             }
-            (None, '\\') => {
-                word.push(chars.next()?);
-                active = true;
-            }
+            (None, '\\') => match chars.next()? {
+                '\n' => {}
+                escaped => {
+                    word.push(escaped);
+                    active = true;
+                }
+            },
             (None, '$' | '`' | ';' | '&' | '|' | '<' | '>' | '\n' | '\r') => return None,
             (None, ch) if ch.is_whitespace() => {
                 if active {
@@ -866,6 +872,40 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn bash_line_continuations_are_removed_outside_single_quotes() {
+        let body = r#"{"number":42,"html_url":"https://github.com/acme/widget/pull/42"}"#;
+        for command in [
+            "gh api \\\n -X POST /repos/acme/widget/pulls",
+            "gh api --me\\\nthod POST repos/acme/widget/pulls",
+            "gh api -X POST repos/acme/\\\nwidget/pulls",
+            "gh api -X POST \"/repos/acme/\\\nwidget/pulls\"",
+        ] {
+            assert_eq!(
+                parse_pr_candidate(&bash(command, body)).unwrap().number,
+                42,
+                "{command:?}"
+            );
+        }
+
+        let continued_pr_create = "gh pr \\\n create --repo acme/widget --title change";
+        assert_eq!(
+            parse_pr_candidate(&bash(
+                continued_pr_create,
+                "https://github.com/acme/widget/pull/42"
+            ))
+            .unwrap()
+            .number,
+            42
+        );
+
+        let single_quoted = "gh api -X POST '/repos/acme/\\\nwidget/pulls'";
+        assert!(parse_pr_candidate(&bash(single_quoted, body)).is_none());
+
+        let crlf = "gh api -X POST repos/acme/\\\r\nwidget/pulls";
+        assert!(parse_pr_candidate(&bash(crlf, body)).is_none());
     }
 
     #[test]
