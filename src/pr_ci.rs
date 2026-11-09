@@ -433,6 +433,12 @@ where
     drop(stmt);
     let mut trackers_with_generation = Vec::with_capacity(trackers.len());
     for (repo, number, thread, old_sha, backoff) in trackers {
+        tx.execute(
+            "UPDATE pr_ci_tracker_generations SET generation=generation+1,
+                 closed_sweep_generation=NULL
+             WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+            params![repo, number, thread],
+        )?;
         let generation: i64 = tx.query_row(
             "SELECT generation FROM pr_ci_tracker_generations
              WHERE repo=?1 AND pull_number=?2 AND thread=?3",
@@ -1609,7 +1615,59 @@ mod tests {
     }
 
     #[test]
-    fn old_poll_does_not_overwrite_immediate_reopen_schedule() {
+    fn new_closed_poll_invalidates_old_sweep_before_pr_poller_reconciles() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        db.execute(
+            "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation
+             WHERE repo='owner/project' AND pull_number=7",
+            [],
+        )
+        .unwrap();
+
+        let mut observed_during_fetch = false;
+        let response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") {
+                if !observed_during_fetch {
+                    observed_during_fetch = true;
+                    // The PR poller observes the close before this CI scan has
+                    // discovered and persisted the newly pending run.
+                    observe_pull_request_state_in(&db, "owner/project", "7", "closed", 11)?;
+                }
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                let mut pending = run(7, SHA, 89, 1, "success");
+                pending["status"] = json!("in_progress");
+                pending["conclusion"] = Value::Null;
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":1,"workflow_runs":[pending]}),
+                })
+            }
+        };
+
+        assert_eq!(poll(&db, 20, response).unwrap().queued, 0);
+        let (active, runs, certificate): (i64, i64, Option<i64>) = db
+            .query_row(
+                "SELECT tracker.active,
+                        (SELECT count(*) FROM pr_ci_runs WHERE run_id=89 AND status='in_progress'),
+                        generation.closed_sweep_generation
+                 FROM pr_ci_trackers AS tracker
+                 JOIN pr_ci_tracker_generations AS generation USING(repo,pull_number,thread)
+                 WHERE tracker.repo='owner/project' AND tracker.pull_number=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((active, runs, certificate), (1, 1, None));
+    }
+
+    #[test]
+    fn equal_time_close_and_reopen_invalidate_an_in_flight_poll() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
         assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 100).unwrap());
@@ -1648,7 +1706,48 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((active, next_poll), (1, 0));
+        assert_eq!((active, next_poll), (1, 60_100));
+    }
+
+    #[test]
+    fn older_overlapping_poll_cannot_certify_newer_claim() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 10).unwrap());
+        let mut nested_started = false;
+        let response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/pulls/") && !nested_started {
+                nested_started = true;
+                let nested = poll(&db, 60_020, |_| anyhow::bail!("temporary poll failure"))?;
+                assert_eq!(nested.errors.len(), 1);
+            }
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":0,"workflow_runs":[]}),
+                })
+            }
+        };
+
+        assert_eq!(poll(&db, 20, response).unwrap().checked, 1);
+        let (active, certificate, generation): (i64, Option<i64>, i64) = db
+            .query_row(
+                "SELECT tracker.active,generation.closed_sweep_generation,generation.generation
+                 FROM pr_ci_trackers AS tracker
+                 JOIN pr_ci_tracker_generations AS generation USING(repo,pull_number,thread)
+                 WHERE tracker.repo='owner/project' AND tracker.pull_number=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+        assert_eq!(certificate, None);
+        assert!(generation >= 3);
     }
 
     #[test]
@@ -1670,6 +1769,14 @@ mod tests {
             }
         };
         poll(&db, 20, response).unwrap();
+        let active_before_pr_reconciliation: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_before_pr_reconciliation, 1);
         assert!(observe_pull_request_state_in(&db, "owner/project", "7", "closed", 21).unwrap());
         let active: i64 = db
             .query_row(

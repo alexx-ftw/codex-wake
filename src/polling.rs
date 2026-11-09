@@ -3284,15 +3284,13 @@ mod tests {
     }
 
     #[test]
-    fn reopened_pr_is_recorded_once_as_a_durable_notification() {
+    fn reopened_notification_and_open_poll_reconcile_ci_trackers() {
         let mut db = db();
         let thread = "11111111-1111-4111-8111-111111111111";
         let unregistered_thread = "22222222-2222-4222-8222-222222222222";
         codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
         codex_wake::pr_ci::register(&mut db, "owner/repo", "7", unregistered_thread).unwrap();
         codex_wake::pr_ci::unregister(&db, "owner/repo", "7", unregistered_thread).unwrap();
-        codex_wake::pr_ci::observe_pull_request_state_in(&db, "owner/repo", "7", "closed", 1)
-            .unwrap();
         let closed = json!({
             "number":7,"state":"closed","merged":false,"merged_at":null,
             "closed_at":"2098-12-31T23:59:00Z","updated_at":"2098-12-31T23:59:00Z",
@@ -3314,17 +3312,44 @@ mod tests {
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
 
-        // Simulate a closed-state write that commits before the poll cursor does.
-        // The next response is open→open from that cursor, but reconciliation must resume CI.
-        codex_wake::pr_ci::observe_pull_request_state_in(
-            &db,
-            "owner/repo",
-            "7",
-            "closed",
-            INTERVAL_MS + 2,
+        let closed_poll = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let report = tick_with(&db, INTERVAL_MS * 2 + 1, |requested, _| {
+            assert_eq!(requested, route);
+            Ok(response(closed_poll.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let active_after_close: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_after_close, 0, "closed poll must pause the tracker");
+
+        // Model a cursor that retained `open` while the closed-state reconciliation committed.
+        let mut cursor: Value = db
+            .query_row(
+                "SELECT cursor FROM github_poll_state WHERE endpoint=?1 AND page=0",
+                [route],
+                |row| {
+                    let value: String = row.get(0)?;
+                    Ok(serde_json::from_str(&value).unwrap())
+                },
+            )
+            .unwrap();
+        cursor["state"] = json!("open");
+        db.execute(
+            "UPDATE github_poll_state SET cursor=?1 WHERE endpoint=?2 AND page=0",
+            rusqlite::params![cursor.to_string(), route],
         )
         .unwrap();
-        let report = tick_with(&db, INTERVAL_MS * 2 + 1, |requested, _| {
+        let report = tick_with(&db, INTERVAL_MS * 3 + 1, |requested, _| {
             assert_eq!(requested, route);
             Ok(response(reopened.clone(), false))
         })
