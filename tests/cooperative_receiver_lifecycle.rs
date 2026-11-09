@@ -829,40 +829,25 @@ fn controller_and_webhook_survive_receiver_handoff() {
         serde_json::from_slice(&output.stdout).unwrap()
     };
     assert_eq!(submit_direct()["state"], "pending");
-    run(base(Path::new(wake)).args([
-        "cooperative-gate",
-        "transfer",
-        "--owner",
-        owner_b,
-        "--generation",
-        "2",
-        "--next-owner",
-        owner_c,
-    ]));
-    let mut new = standby(owner_c, "3");
-    wait_standby(&mut new);
-    new.0.stdin.take().unwrap().write_all(b"G").unwrap();
-    wait_for(|| ready(new.0.id()), "new receiver readiness");
-    wait_for(
-        || {
-            rusqlite::Connection::open(&db_path)
-                .ok()
-                .and_then(|db| {
-                    db.query_row(
-                        "SELECT state FROM cooperative_direct_queue WHERE request_id=?1",
-                        [request_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .ok()
-                })
-                .is_some_and(|state| state == "queued" || state == "needs_attention")
-        },
-        "native direct queue result",
+    // A killed bound receiver has no successful-exit proof. Never clear its binding.
+    assert!(
+        !base(Path::new(wake))
+            .args([
+                "cooperative-gate",
+                "transfer",
+                "--owner",
+                owner_b,
+                "--generation",
+                "2",
+                "--next-owner",
+                owner_c,
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
     );
-    let direct = submit_direct();
-    assert_eq!(direct["state"], "queued");
-    assert_eq!(direct["replayed"], true);
-    assert_ne!(old.0.id(), new.0.id());
+    assert_eq!(submit_direct()["state"], "pending");
     assert_eq!(controller.0.id(), pid_controller);
     assert!(controller.0.try_wait().unwrap().is_none());
     assert!(ingress.0.try_wait().unwrap().is_none());
@@ -908,19 +893,4 @@ fn controller_and_webhook_survive_receiver_handoff() {
     assert_ne!(state, "waiting");
     assert_eq!(conclusion.as_deref(), Some("failure"));
     drop(db);
-    run(base(Path::new(wake)).args([
-        "cooperative-gate",
-        "close",
-        "--owner",
-        owner_c,
-        "--generation",
-        "3",
-    ]));
-    assert!(
-        new.0
-            .wait_timeout(Duration::from_secs(30))
-            .unwrap()
-            .expect("new receiver did not stop")
-            .success()
-    );
 }

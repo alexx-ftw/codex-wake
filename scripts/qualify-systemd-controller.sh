@@ -89,7 +89,7 @@ cleanup() {
   trap - EXIT
   if [[ $manager_owned == 1 ]]; then
     if [[ $bus_active == 1 ]]; then
-      for unit in wake-handoff-failed.service wake-handoff-old.service wake-qualification-receiver.service wake-qualification-controller.service; do
+      for unit in codex-wake.service wake-handoff-failed.service wake-handoff-old.service wake-qualification-receiver.service wake-qualification-controller.service; do
         load_state=$(as_qual_user /usr/bin/systemctl --user show "$unit" --property=LoadState --value 2>/dev/null) || load_state=not-found
         if [[ $load_state != not-found ]]; then
           as_qual_user /usr/bin/systemctl --user stop "$unit" >/dev/null 2>&1 || clean=0
@@ -148,7 +148,7 @@ cleanup() {
       '. + {"native_sha256":$native,"wake_sha256":$wake,"probe_sha256":$probe,"source_commit":$commit}' \
       "$output" > "$output.tmp" && mv "$output.tmp" "$output" || clean=0
   fi
-  if [[ ${handoff_mode:-0} == 1 && -f $output ]]; then
+  if [[ ${handoff_mode:-0} != 0 && -f $output ]]; then
     if [[ ${handoff_done:-0} == 1 && $result == 0 ]]; then
       jq --arg sha "$handoff_sha" '. + {"cooperative_handoff_qualification_passed":true,"handoff_script_sha256":$sha}' "$output" > "$output.tmp" && mv "$output.tmp" "$output" || clean=0
     else
@@ -179,6 +179,10 @@ cleanup() {
     result=1
     jq '. + {"status":"failed","error_class":"invalid_receipt"}' "$output" > "$output.tmp" && mv "$output.tmp" "$output" || true
   fi
+  if [[ -f $output.upgrade && $result == 0 ]]; then
+    jq --slurpfile upgrade "$output.upgrade" '. + $upgrade[0]' "$output" > "$output.tmp" && mv "$output.tmp" "$output" || result=1
+    rm -- "$output.upgrade" || result=1
+  fi
   exit "$result"
 }
 
@@ -199,11 +203,13 @@ wake=$(realpath -- "$2")
 probe=$(realpath -- "$3")
 output=$4
 handoff_mode=${WAKE_QUALIFY_HANDOFF:-0}
-[[ $handoff_mode == 0 || $handoff_mode == 1 ]] || fail 'invalid qualification mode'
+[[ $handoff_mode == 0 || $handoff_mode == 1 || $handoff_mode == 2 ]] || fail 'invalid qualification mode'
 handoff_done=0
 handoff_sha=
-if [[ $handoff_mode == 1 ]]; then
-  handoff_script=$(realpath -- "$(dirname "$0")/qualify-cooperative-handoff.sh")
+if [[ $handoff_mode != 0 ]]; then
+  script=qualify-cooperative-handoff.sh
+  if [[ $handoff_mode == 2 ]]; then script=qualify-cooperative-upgrade.sh; fi
+  handoff_script=$(realpath -- "$(dirname "$0")/$script")
   [[ -f $handoff_script && ! -L $handoff_script ]] || fail 'handoff qualification script missing'
   command -v sqlite3 >/dev/null || fail 'sqlite3 is required for handoff qualification'
   handoff_sha=$(sha256sum "$handoff_script" | cut -d' ' -f1)
@@ -254,9 +260,14 @@ sudo install -d -m 700 -o "$qual_user" -g "$qual_user" "$qual_root/h" "$qual_roo
 sudo install -m 700 -o "$qual_user" -g "$qual_user" "$native" "$qual_root/codex"
 sudo install -m 700 -o "$qual_user" -g "$qual_user" "$wake" "$qual_root/wake"
 sudo install -m 700 -o "$qual_user" -g "$qual_user" "$probe" "$qual_root/probe"
-if [[ $handoff_mode == 1 ]]; then
+if [[ $handoff_mode != 0 ]]; then
   sudo install -m 700 -o "$qual_user" -g "$qual_user" "$handoff_script" "$qual_root/handoff"
   [[ $handoff_sha == "$(sudo sha256sum "$qual_root/handoff" | cut -d' ' -f1)" ]] || fail 'handoff script checksum mismatch'
+  if [[ $handoff_mode == 2 ]]; then
+    [[ -x ${WAKE_QUALIFY_LEGACY:-} ]] || fail 'legacy fixture missing'
+    sudo install -m 700 -o "$qual_user" -g "$qual_user" "$WAKE_QUALIFY_LEGACY" "$qual_root/legacy"
+    cmp <(sudo cat "$qual_root/legacy") "$WAKE_QUALIFY_LEGACY" || fail 'legacy fixture copy changed'
+  fi
 fi
 [[ $native_sha == "$(sudo sha256sum "$qual_root/codex" | cut -d' ' -f1)" && \
    $wake_sha == "$(sudo sha256sum "$qual_root/wake" | cut -d' ' -f1)" && \
@@ -282,11 +293,11 @@ as_qual_user /usr/bin/systemd-run "${common[@]}" --unit=wake-qualification-contr
 stage=controller_readiness
 as_qual_user /usr/bin/timeout 60 "$qual_root/probe" ready "$qual_root/codex" "$qual_root/socket" >/dev/null 2>&1 \
   || fail 'isolated controller readiness or identity failed'
-if [[ $handoff_mode == 1 ]]; then
+if [[ $handoff_mode != 0 ]]; then
   stage=cooperative_handoff
   controller_identity=$(as_qual_user /usr/bin/systemctl --user show wake-qualification-controller.service -p MainPID -p InvocationID) \
     || fail 'cannot identify isolated controller'
-  as_qual_user /usr/bin/timeout 180 "$qual_root/handoff" "$qual_root/wake" "$qual_root/codex" "$qual_root/socket" >/dev/null 2>&1 \
+  as_qual_user /usr/bin/timeout 240 "$qual_root/handoff" "$qual_root/wake" "$qual_root/codex" "$qual_root/socket" >/dev/null 2>&1 \
     || fail 'cooperative handoff qualification failed'
   controller_after=$(as_qual_user /usr/bin/systemctl --user show wake-qualification-controller.service -p MainPID -p InvocationID) \
     || fail 'cannot reidentify isolated controller'
@@ -294,6 +305,9 @@ if [[ $handoff_mode == 1 ]]; then
   as_qual_user /usr/bin/timeout 60 "$qual_root/probe" ready "$qual_root/codex" "$qual_root/socket" >/dev/null 2>&1 \
     || fail 'isolated controller did not remain ready after handoff'
   handoff_done=1
+  if [[ $handoff_mode == 2 ]]; then
+    printf '%s\n' '{"cooperative_upgrade_qualification_passed":true,"legacy_alpha2_untouched":true,"descendant_drain_verified":true,"concurrent_updates_serialized":true,"interrupted_transition_not_retried":true,"uncertain_send_preserved":true}' > "$output.upgrade"
+  fi
 fi
 stage=receiver_start
 as_qual_user /usr/bin/systemd-run "${common[@]}" --unit=wake-qualification-receiver \

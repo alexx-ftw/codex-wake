@@ -330,6 +330,7 @@ fn receiver_token() -> &'static uuid::Uuid {
 pub(crate) fn bind_receiver_gate(db: &mut Connection, owner: &str, generation: i64) -> Result<()> {
     let identity = crate::conditions::current_sender_identity()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    crate::upgrade::verify_binding(&tx, owner, generation)?;
     ensure!(
         receiver_binding_columns(&tx)? == 5,
         "Receiver binding is not armed"
@@ -350,6 +351,35 @@ pub(crate) fn control_claim_gate(
     owner: &str,
     generation: Option<i64>,
     next_owner: Option<&str>,
+) -> Result<Value> {
+    control_claim_gate_inner(db, action, owner, generation, next_owner, None)
+}
+
+pub(crate) fn transfer_receiver_gate(
+    db: &mut Connection,
+    owner: &str,
+    generation: i64,
+    next_owner: &str,
+    next: &crate::upgrade::Spec,
+    drained: &crate::upgrade::Drained,
+) -> Result<Value> {
+    control_claim_gate_inner(
+        db,
+        "transfer",
+        owner,
+        Some(generation),
+        Some(next_owner),
+        Some((next, drained)),
+    )
+}
+
+fn control_claim_gate_inner(
+    db: &mut Connection,
+    action: &str,
+    owner: &str,
+    generation: Option<i64>,
+    next_owner: Option<&str>,
+    proof: Option<(&crate::upgrade::Spec, &crate::upgrade::Drained)>,
 ) -> Result<Value> {
     let owner = uuid::Uuid::parse_str(owner).context("Invalid gate owner UUID")?;
     ensure!(!owner.is_nil(), "Invalid gate owner UUID");
@@ -443,6 +473,25 @@ pub(crate) fn control_claim_gate(
                     bound == 0 || bound == 5,
                     "Incomplete receiver binding metadata"
                 );
+                if bound == 5 {
+                    let bound_pid: Option<i64> = tx.query_row(
+                        "SELECT receiver_pid FROM wake_delivery_claim_gate WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if bound_pid.is_some() {
+                        let (_, drained) = proof.context(
+                            "Bound receiver requires verified invocation exit and cgroup drain",
+                        )?;
+                        drained.verify_gate(&tx)?;
+                    }
+                    if let Some((next, _)) = proof {
+                        tx.execute(
+                            "UPDATE wake_delivery_claim_gate SET receiver_lifecycle=?1 WHERE id=1",
+                            [serde_json::to_string(next)?],
+                        )?;
+                    }
+                }
                 let update = if bound == 5 {
                     "UPDATE wake_delivery_claim_gate SET owner=?1,generation=?2,receiver_pid=NULL,receiver_start=NULL,receiver_boot=NULL,receiver_namespace=NULL,receiver_token=NULL WHERE id=1"
                 } else {
@@ -1293,12 +1342,9 @@ mod tests {
                 .unwrap();
         }
         control_claim_gate(&mut db, "close", a, Some(1), None).unwrap();
-        control_claim_gate(&mut db, "transfer", a, Some(1), Some(b)).unwrap();
+        assert!(control_claim_gate(&mut db, "transfer", a, Some(1), Some(b)).is_err());
         assert!(bind_receiver_gate(&mut db, a, 1).is_err());
-        assert!(control_claim_gate(&mut db, "open", b, Some(2), None).is_err());
-        bind_receiver_gate(&mut db, b, 2).unwrap();
         assert!(!claims_open_for(&db, Some(a), Some("1")).unwrap());
-        assert!(claims_open_for(&db, Some(b), Some("2")).unwrap());
     }
 
     #[test]

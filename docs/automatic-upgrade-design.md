@@ -1,6 +1,9 @@
 # Automatic shared-service upgrade: design and qualification
 
-This is a design under review, not an implemented upgrade protocol.
+The original broad upgrade design below remains unqualified. A narrower automatic
+path for fresh future cooperative installations is now implemented; see
+[the protocol, verification and limits](cooperative-automatic-upgrade.md).
+It does not migrate an existing legacy installation.
 
 ## Existing installations
 

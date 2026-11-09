@@ -23,6 +23,7 @@ mod subscriptions;
 mod telemetry;
 mod templates;
 mod uninstall;
+mod upgrade;
 mod validation_obligations;
 
 use anyhow::{Context, Result, bail};
@@ -3285,6 +3286,9 @@ async fn run_command(
         }
         "mcp" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            if upgrade::configured(&config) {
+                manager::ensure_receiver(&config)?;
+            }
             match bound_mode_state(&config)? {
                 None => {
                     anyhow::ensure!(
@@ -5936,7 +5940,11 @@ mod hook_output_tests {
                     )
                     .unwrap();
                 assert_eq!(pending, 1);
-                bridge::control_claim_gate(&mut db, "transfer", A, Some(1), Some(B)).unwrap();
+                assert!(
+                    bridge::control_claim_gate(&mut db, "transfer", A, Some(1), Some(B)).is_err()
+                );
+                // Seed the post-transition fixture; real systemd verifies lifecycle proof in CI.
+                db.execute("UPDATE wake_delivery_claim_gate SET owner=?1,generation=2,receiver_pid=NULL,receiver_start=NULL,receiver_boot=NULL,receiver_namespace=NULL,receiver_token=NULL", [B]).unwrap();
                 drop(db);
                 let mut child = Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "hook_output_tests::bound_direct_persists_across_close_transfer_and_uncertainty"])

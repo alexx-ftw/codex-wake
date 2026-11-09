@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       probe:
-        description: Webhook smoke identifier, controller-systemd-qualification, or cooperative-handoff-qualification
+        description: Webhook probe, controller-systemd-qualification, cooperative-handoff-qualification, or cooperative-upgrade-qualification
         required: false
         default: manual
 
@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   test:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.probe != 'controller-systemd-qualification' && inputs.probe != 'cooperative-handoff-qualification') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.probe != 'controller-systemd-qualification' && inputs.probe != 'cooperative-handoff-qualification' && inputs.probe != 'cooperative-upgrade-qualification') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -46,6 +46,7 @@ jobs:
           CODEX_WAKE_WEBHOOK: ${{ github.workspace }}/.tools/webhook-linux-amd64/webhook
         run: |
           cargo test --locked --bin codex-wake
+          cargo test --locked --test automatic_upgrade_cli
           cargo test --locked --test hooks
           cargo test --locked --test cooperative_bound_direct_cli
           cargo test --locked --test validation_hooks
@@ -56,7 +57,7 @@ jobs:
           cargo test --locked --test http -- --include-ignored
 
   package:
-    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.probe != 'controller-systemd-qualification' && inputs.probe != 'cooperative-handoff-qualification') }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.probe != 'controller-systemd-qualification' && inputs.probe != 'cooperative-handoff-qualification' && inputs.probe != 'cooperative-upgrade-qualification') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -111,7 +112,7 @@ jobs:
         run: bash scripts/qualify-package-lifecycle.sh "$RUNNER_TEMP/release-candidate" "$RUNNER_TEMP/previous/codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz"
 
   controller-systemd-qualification:
-    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.probe == 'controller-systemd-qualification' || inputs.probe == 'cooperative-handoff-qualification') }}
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.probe == 'controller-systemd-qualification' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -123,14 +124,14 @@ jobs:
       - name: Check receipt and UID preflight regressions
         run: bash tests/qualify-systemd-controller.sh
       - name: Check handoff status regressions
-        if: ${{ inputs.probe == 'cooperative-handoff-qualification' }}
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification' }}
         run: bash tests/qualify-cooperative-handoff.sh
       - name: Build test receiver and qualification probe
         run: |
           cargo test --locked --jobs "$(nproc)" --example controller-systemd-qualification
           cargo build --locked --jobs "$(nproc)" --bin codex-wake --example controller-systemd-qualification
       - name: Install SQLite CLI for handoff qualification
-        if: ${{ inputs.probe == 'cooperative-handoff-qualification' }}
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification' }}
         run: |
           sudo apt-get update
           sudo apt-get install --yes sqlite3
@@ -195,9 +196,20 @@ jobs:
                 WAKE_LIFECYCLE_ISOLATED=1 WAKE_LIFECYCLE_CODEX="$1/codex" WAKE_LIFECYCLE_WEBHOOK="$1/webhook" \
                 WAKE_LIFECYCLE_WAKE="$1/wake" WAKE_LIFECYCLE_HOOKS="$1/hooks.json.tmpl" \
                 "$1/test" --include-ignored --nocapture' sh "$stage"
+      - name: Obtain pinned alpha.2 for automatic upgrade rejection
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/upgrade-legacy"
+          gh release download v0.2.0-alpha.2 --repo alexx-ftw/codex-wake \
+            --pattern 'codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' --dir "$RUNNER_TEMP/upgrade-legacy"
+          echo '98c3fd2c436ee5dd7a53d0839c0e53d2148e2923859875aefa69bf7a8932a1a7  codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' | (cd "$RUNNER_TEMP/upgrade-legacy" && sha256sum --check)
+          tar -xzf "$RUNNER_TEMP/upgrade-legacy/codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/upgrade-legacy"
       - name: Qualify independent units under a temporary user
         env:
-          WAKE_QUALIFY_HANDOFF: ${{ inputs.probe == 'cooperative-handoff-qualification' && '1' || '0' }}
+          WAKE_QUALIFY_HANDOFF: ${{ (github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification') && '2' || inputs.probe == 'cooperative-handoff-qualification' && '1' || '0' }}
+          WAKE_QUALIFY_LEGACY: ${{ runner.temp }}/upgrade-legacy/codex-wake-0.2.0-alpha.2/bin/codex-wake
         run: |
           native=$(node --input-type=module -e '
             import { createRequire } from "node:module";

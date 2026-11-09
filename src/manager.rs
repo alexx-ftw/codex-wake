@@ -179,6 +179,7 @@ pub(crate) fn source_digest() -> String {
     for source in [
         include_bytes!("main.rs").as_slice(),
         include_bytes!("manager.rs").as_slice(),
+        include_bytes!("upgrade.rs").as_slice(),
         include_bytes!("coordination_view.rs").as_slice(),
         include_bytes!("conditions.rs").as_slice(),
         include_bytes!("condition_alerts.rs").as_slice(),
@@ -381,7 +382,7 @@ pub fn run(command: &mut Command, timeout: Duration) -> Result<Output> {
     Ok(output)
 }
 
-fn systemctl(args: &[&str]) -> Result<String> {
+pub(crate) fn systemctl(args: &[&str]) -> Result<String> {
     let mut command = Command::new("systemctl");
     command.arg("--user").args(args);
     if env::var_os("XDG_RUNTIME_DIR").is_none() {
@@ -404,7 +405,7 @@ fn systemctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
-fn lock(config: &Config) -> Result<File> {
+pub(crate) fn lock(config: &Config) -> Result<File> {
     private_dir(&config.state)?;
     let file = OpenOptions::new()
         .read(true)
@@ -432,7 +433,7 @@ fn lock(config: &Config) -> Result<File> {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("Missing parent")?)?;
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(mode))?;
@@ -456,7 +457,7 @@ fn quote(value: &str) -> Result<String> {
     ))
 }
 
-fn unit(config: &Config) -> Result<String> {
+pub(crate) fn unit(config: &Config) -> Result<String> {
     let exe = quote(
         config
             .runtime
@@ -633,6 +634,9 @@ fn healthy(config: &Config) -> Result<()> {
 }
 
 pub fn status(config: &Config) -> Result<Value> {
+    if crate::upgrade::configured(config) {
+        return crate::upgrade::status(config);
+    }
     let properties = systemctl(&[
         "show",
         UNIT,
@@ -705,6 +709,9 @@ pub fn status(config: &Config) -> Result<Value> {
 }
 
 pub fn ensure_receiver(config: &Config) -> Result<Value> {
+    if crate::upgrade::configured(config) || cooperative_receiver_enabled()? {
+        return crate::upgrade::ensure_receiver(config);
+    }
     ensure!(
         !cooperative_receiver_enabled()?,
         "Cooperative receiver is only available for direct experiments"
@@ -1027,7 +1034,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 && env::var_os("CODEX_WAKE_GATE_GENERATION").is_some(),
             "Cooperative receiver requires a gate owner and generation"
         );
-        if !standby {
+        if !standby && env::var_os("CODEX_WAKE_RECEIVER_LIFECYCLE").is_none() {
             ensure!(
                 receiver_cycle_allowed(config)?,
                 "Cooperative receiver gate is closed or ownership is invalid"
@@ -1105,7 +1112,18 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     {
         crate::observability::capture(pipe, "webhook");
     }
-    if standby {
+    if env::var_os("CODEX_WAKE_RECEIVER_LIFECYCLE").is_some() {
+        ensure!(
+            !standby && cooperative && env::var("CODEX_WAKE_RECEIVER_LIFECYCLE")? == "1",
+            "Invalid lifecycle receiver mode"
+        );
+        let mut db = crate::bridge::open_existing_owned(&config.db)?;
+        crate::bridge::bind_receiver_gate(
+            &mut db,
+            &env::var("CODEX_WAKE_GATE_OWNER")?,
+            env::var("CODEX_WAKE_GATE_GENERATION")?.parse()?,
+        )?;
+    } else if standby {
         receiver_standby(config)?;
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);

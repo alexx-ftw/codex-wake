@@ -53,3 +53,9 @@ cgroup, staging a verified successor, recording crash-recovery state, transferri
 and reopening safely are not implemented by this identity. It does not migrate
 alpha.2, fence incompatible processes, confirm hook consumption, or constitute
 a global event barrier.
+
+The [automatic cooperative lifecycle](cooperative-automatic-upgrade.md) now owns
+verified bound transfers. A plain `transfer` fails once a receiver PID is bound;
+closing alone cannot authorize replacement. Strict lifecycle metadata also
+requires the receiver to verify its own unit, executable, invocation and cgroup
+before binding. The older unbound gate remains an experiment, not migration authority.
