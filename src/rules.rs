@@ -591,7 +591,7 @@ fn dispatch_with_identity(
                 rendered_prompt, input.repo, input.pr, comment_id, header
             );
             stage = "goal_or_delivery_outcome_unknown";
-            may_retry = input.goal_objective.is_none();
+            may_retry = true;
             if let Some((_, client_id)) = identity.as_ref() {
                 delivery_lock = Some(
                     codex_wake::pr_ci_runtime::try_native_wake_lock(db, client_id)
@@ -622,6 +622,7 @@ fn dispatch_with_identity(
                 })?;
                 delivery_intent = Some(token);
             }
+            may_retry = input.goal_objective.is_none();
             finish(
                 &thread,
                 &input,
@@ -984,6 +985,66 @@ mod tests {
         assert_eq!(starts, 1);
         assert_eq!(attempts, 2);
         assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "queued");
+    }
+
+    #[test]
+    fn goal_rule_retries_busy_lock_only_before_goal_creation() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let mut rule = input();
+        rule.goal_objective = Some("Handle PR".into());
+        rule.model = Some("test-model".into());
+        rule.reasoning_effort = Some("medium".into());
+        let rule_id = configure(&db, rule).unwrap();
+        let source = payload();
+        assert_eq!(accept(&db, "issue_comment", &source).unwrap(), 1);
+        let event =
+            crate::delivery_evidence::github_comment_event_identity("issue_comment", &source)
+                .unwrap()
+                .unwrap();
+        let key = crate::delivery_evidence::source_fields_identity(
+            "codex-wake/rule-delivery/v1",
+            &[&rule_id, &event],
+        )
+        .unwrap();
+        let client_id = crate::delivery_evidence::client_user_message_id(&key, THREAD).unwrap();
+        let lock = codex_wake::pr_ci_runtime::try_native_wake_lock(&db, &client_id)
+            .unwrap()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut starts = 0;
+        let mut rpc = |method: &str, _: Value| {
+            assert_eq!(method, "thread/start");
+            starts += 1;
+            Ok(json!({"thread":{"id":THREAD}}))
+        };
+        dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut rpc,
+            &mut |_, _, _, _, _| panic!("goal must not start while locked"),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(status(&db).unwrap()["deliveries"][0]["state"], "ready");
+        drop(lock);
+        db.execute(
+            "UPDATE rule_deliveries SET updated=datetime('now','-16 seconds')",
+            [],
+        )
+        .unwrap();
+        dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut rpc,
+            &mut |_, _, _, _, _| Err(crate::execution::TargetUnavailableBeforeSend.into()),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(starts, 1);
+        assert_eq!(
+            status(&db).unwrap()["deliveries"][0]["state"],
+            "needs_attention"
+        );
     }
 
     #[test]
