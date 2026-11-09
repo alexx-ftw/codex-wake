@@ -3323,14 +3323,55 @@ mod tests {
         })
         .unwrap();
         assert_eq!(report["errors"], json!({}), "{report}");
-        let active_after_close: i64 = db
+        let active_before_sweep: i64 = db
             .query_row(
                 "SELECT active FROM pr_ci_trackers WHERE thread=?1",
                 [thread],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(active_after_close, 0, "closed poll must pause the tracker");
+        assert_eq!(active_before_sweep, 1, "closed PR waits for a CI sweep");
+
+        let ci_closed_pull = json!({
+            "number":7,"state":"closed",
+            "base":{"repo":{"full_name":"owner/repo"}},
+            "head":{"sha":"a".repeat(40),"repo":{"full_name":"owner/repo"}}
+        });
+        let ci_sweep = codex_wake::pr_ci::poll(&db, INTERVAL_MS * 2 + 2, |requested| {
+            let body = if requested.contains("/pulls/") {
+                ci_closed_pull.clone()
+            } else {
+                json!({"total_count":0,"workflow_runs":[]})
+            };
+            Ok(codex_wake::pr_ci::ApiResponse { status: 200, body })
+        })
+        .unwrap();
+        assert_eq!(ci_sweep.checked, 1);
+        assert!(ci_sweep.errors.is_empty());
+        let (closed_sweep_generation, generation): (Option<i64>, i64) = db
+            .query_row(
+                "SELECT closed_sweep_generation,generation
+                 FROM pr_ci_tracker_generations WHERE repo='owner/repo' AND pull_number=7 AND thread=?1",
+                [thread],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(closed_sweep_generation, Some(generation));
+
+        let report = tick_with(&db, INTERVAL_MS * 3 + 1, |requested, _| {
+            assert_eq!(requested, route);
+            Ok(response(closed_poll.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let active_after_sweep: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_after_sweep, 0, "closed poll pauses after CI sweep");
 
         // Model a cursor that retained `open` while the closed-state reconciliation committed.
         let mut cursor: Value = db
@@ -3349,7 +3390,7 @@ mod tests {
             rusqlite::params![cursor.to_string(), route],
         )
         .unwrap();
-        let report = tick_with(&db, INTERVAL_MS * 3 + 1, |requested, _| {
+        let report = tick_with(&db, INTERVAL_MS * 4 + 1, |requested, _| {
             assert_eq!(requested, route);
             Ok(response(reopened.clone(), false))
         })
