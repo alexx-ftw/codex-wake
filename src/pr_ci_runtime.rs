@@ -531,6 +531,13 @@ mod tests {
         db
     }
 
+    fn dispatch_at<D>(db: &mut Connection, now_ms: i64, deliver: D) -> Result<DispatchReport>
+    where
+        D: FnMut(&Delivery, &str) -> Result<(String, Option<String>)>,
+    {
+        dispatch_with_clock(db, now_ms, deliver, || now_ms)
+    }
+
     #[test]
     fn accepted_queue_delivery_is_acknowledged() {
         let mut db = database();
@@ -556,7 +563,7 @@ mod tests {
     #[test]
     fn definitely_pre_send_result_returns_to_queue() {
         let mut db = database();
-        let report = dispatch(&mut db, 1_000, |_, _| Ok(("ready".into(), None))).unwrap();
+        let report = dispatch_at(&mut db, 1_000, |_, _| Ok(("ready".into(), None))).unwrap();
         assert_eq!(report.retried_before_send, 1);
         assert_eq!(
             pr_ci::claim_deliveries(&mut db, 6_000, 10, DELIVERY_LEASE)
@@ -591,7 +598,7 @@ mod tests {
 
         for marker in [BeforeSend::Unavailable, BeforeSend::Busy] {
             let mut db = database();
-            let report = dispatch(&mut db, 1_000, |_, _| {
+            let report = dispatch_at(&mut db, 1_000, |_, _| {
                 Err(anyhow::anyhow!("preparation failed").context(marker))
             })
             .unwrap();
@@ -605,7 +612,7 @@ mod tests {
         }
 
         let mut evidence_db = database();
-        let report = dispatch(&mut evidence_db, 2_000, |_, _| {
+        let report = dispatch_at(&mut evidence_db, 2_000, |_, _| {
             Err(before_send_failure(anyhow::anyhow!(
                 "could not open delivery evidence database"
             )))
@@ -678,7 +685,7 @@ mod tests {
         )
         .unwrap();
 
-        let first = dispatch(&mut db, 1_000, |delivery, _| {
+        let first = dispatch_at(&mut db, 1_000, |delivery, _| {
             assert_eq!(delivery.run_id, 101);
             Err(anyhow::anyhow!(
                 "Target thread has an active writer; input was not sent"
@@ -687,14 +694,14 @@ mod tests {
         .unwrap();
         assert_eq!(first.retried_before_send, 1);
 
-        let second = dispatch(&mut db, 1_000, |delivery, _| {
+        let second = dispatch_at(&mut db, 1_000, |delivery, _| {
             assert_eq!(delivery.run_id, 102);
             Ok(("queued".into(), None))
         })
         .unwrap();
         assert_eq!(second.accepted, 1);
 
-        let retry = dispatch(&mut db, 6_000, |delivery, _| {
+        let retry = dispatch_at(&mut db, 6_000, |delivery, _| {
             assert_eq!(delivery.run_id, 101);
             Ok(("queued".into(), None))
         })
