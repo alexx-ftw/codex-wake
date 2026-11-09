@@ -1823,8 +1823,8 @@ impl WakeTools {
         Parameters(input): Parameters<CancelSubscriptionInput>,
     ) -> CallToolResult {
         tool_result((|| {
-            subscriptions::cancel(&database(&self.config)?, &input.subscription_id)?;
-            Ok(json!({"cancelled": true, "subscription_id": input.subscription_id}))
+            let id = subscriptions::cancel(&database(&self.config)?, &input.subscription_id)?;
+            Ok(json!({"cancelled": true, "subscription_id": id}))
         })())
     }
 
@@ -2566,7 +2566,7 @@ async fn run_command(
         "cancel-subscription" => {
             let id = required(&mut args, "--subscription-id")?;
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
-            subscriptions::cancel(&database(&config)?, &id)?;
+            let id = subscriptions::cancel(&database(&config)?, &id)?;
             println!("{}", json!({"cancelled":true,"subscription_id":id}));
         }
         "subscribe" => {
@@ -2916,7 +2916,7 @@ mod hook_output_tests {
             subscriptions::subscribe(&db, "artifact", "ci", "two", "available", thread).unwrap();
         drop(db);
         let response = tools.cancel_subscription(Parameters(CancelSubscriptionInput {
-            subscription_id: id.clone(),
+            subscription_id: id.to_uppercase(),
         }));
         assert_ne!(response.is_error, Some(true));
         assert_eq!(response.structured_content.unwrap()["subscription_id"], id);

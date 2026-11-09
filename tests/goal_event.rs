@@ -41,6 +41,52 @@ fn cli(root: &Path, socket: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+#[test]
+fn cancellation_cli_returns_canonical_uuid() {
+    let temp = private_tempdir();
+    let socket = temp.path().join("unused.sock");
+    let registered = cli(
+        temp.path(),
+        &socket,
+        &[
+            "subscribe",
+            "--kind",
+            "artifact",
+            "--repo",
+            "ci",
+            "--resource",
+            "build",
+            "--event",
+            "available",
+            "--thread",
+            "11111111-1111-4111-8111-111111111111",
+        ],
+    );
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let registered: Value = serde_json::from_slice(&registered.stdout).unwrap();
+    let id = registered["subscription_id"].as_str().unwrap();
+    let cancelled = cli(
+        temp.path(),
+        &socket,
+        &[
+            "cancel-subscription",
+            "--subscription-id",
+            &id.to_uppercase(),
+        ],
+    );
+    assert!(
+        cancelled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+    let result: Value = serde_json::from_slice(&cancelled.stdout).unwrap();
+    assert_eq!(result["subscription_id"], id);
+}
+
 fn exercise(
     fail_set: bool,
     initial_active: bool,

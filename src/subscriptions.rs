@@ -252,7 +252,7 @@ fn immediate<T>(db: &Connection, operation: impl FnOnce() -> Result<T>) -> Resul
 }
 
 /// Remove one unclaimed subscription without publishing or dispatching an event.
-pub fn cancel(db: &Connection, id: &str) -> Result<()> {
+pub fn cancel(db: &Connection, id: &str) -> Result<String> {
     let id = uuid(id)?;
     immediate(db, || {
         let changed = db.execute(
@@ -262,16 +262,21 @@ pub fn cancel(db: &Connection, id: &str) -> Result<()> {
              AND NOT EXISTS (SELECT 1 FROM dependency_notice_uncertainties WHERE subscription_id=?1)",
             [&id],
         )?;
-        ensure!(
-            changed == 1,
-            "Subscription not found or has delivery/notice activity; inspect its status"
-        );
+        if changed == 0 {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE id=?1)",
+                [&id],
+                |row| row.get(0),
+            )?;
+            ensure!(exists, "Subscription not found");
+            anyhow::bail!("Subscription has delivery/notice activity; inspect its status");
+        }
         db.execute("DELETE FROM observers WHERE subscription_id=?1", [&id])?;
         db.execute(
             "DELETE FROM native_observers WHERE subscription_id=?1",
             [&id],
         )?;
-        Ok(())
+        Ok(id)
     })
 }
 
@@ -2310,7 +2315,7 @@ mod tests {
             [&target],
         )
         .unwrap();
-        cancel(&db, &target).unwrap();
+        assert_eq!(cancel(&db, &target.to_uppercase()).unwrap(), target);
         assert!(status_for_id(&db, &target).is_err());
         assert_eq!(status_for_id(&db, &other).unwrap()["state"], "waiting");
         assert_eq!(
@@ -2323,7 +2328,10 @@ mod tests {
             0
         );
         assert_eq!(status_for_id(&db, &other).unwrap()["state"], "waiting");
-        assert!(cancel(&db, &target).is_err());
+        assert_eq!(
+            cancel(&db, &target).unwrap_err().to_string(),
+            "Subscription not found"
+        );
         assert!(cancel(&db, "invalid").is_err());
         for state in ["ready", "sending", "queued", "needs_attention"] {
             db.execute(
@@ -2331,7 +2339,10 @@ mod tests {
                 params![state, other],
             )
             .unwrap();
-            assert!(cancel(&db, &other).is_err());
+            assert_eq!(
+                cancel(&db, &other).unwrap_err().to_string(),
+                "Subscription has delivery/notice activity; inspect its status"
+            );
             assert_eq!(status_for_id(&db, &other).unwrap()["state"], state);
         }
         db.execute("UPDATE subscriptions SET state='waiting',dependency_notice_state='sending' WHERE id=?1", [&other]).unwrap();
