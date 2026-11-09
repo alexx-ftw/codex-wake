@@ -330,16 +330,27 @@ fn receiver_token() -> &'static uuid::Uuid {
 pub(crate) fn bind_receiver_gate(db: &mut Connection, owner: &str, generation: i64) -> Result<()> {
     let identity = crate::conditions::current_sender_identity()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    crate::upgrade::verify_binding(&tx, owner, generation)?;
+    let lifecycle = crate::upgrade::verify_binding(&tx, owner, generation)?;
+    bind_receiver_gate_in(&tx, owner, generation, &identity, lifecycle)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn bind_receiver_gate_in(
+    db: &Connection,
+    owner: &str,
+    generation: i64,
+    identity: &crate::conditions::SenderIdentity,
+    lifecycle: bool,
+) -> Result<()> {
     ensure!(
-        receiver_binding_columns(&tx)? == 5,
+        receiver_binding_columns(db)? == 5,
         "Receiver binding is not armed"
     );
-    ensure!(tx.execute(
-        "UPDATE wake_delivery_claim_gate SET is_open=1,receiver_pid=?1,receiver_start=?2,receiver_boot=?3,receiver_namespace=?4,receiver_token=?5 WHERE id=1 AND is_open=0 AND owner=?6 AND generation=?7 AND receiver_pid IS NULL AND receiver_start IS NULL AND receiver_boot IS NULL AND receiver_namespace IS NULL AND receiver_token IS NULL",
-        params![identity.pid, identity.start, identity.boot, identity.namespace, receiver_token().to_string(), owner, generation],
+    ensure!(db.execute(
+        "UPDATE wake_delivery_claim_gate SET is_open=?8,receiver_pid=?1,receiver_start=?2,receiver_boot=?3,receiver_namespace=?4,receiver_token=?5 WHERE id=1 AND is_open=0 AND owner=?6 AND generation=?7 AND receiver_pid IS NULL AND receiver_start IS NULL AND receiver_boot IS NULL AND receiver_namespace IS NULL AND receiver_token IS NULL",
+        params![identity.pid, identity.start, identity.boot, identity.namespace, receiver_token().to_string(), owner, generation, !lifecycle],
     )? == 1, "Receiver gate closed state or ownership changed");
-    tx.commit()?;
     Ok(())
 }
 
@@ -1298,6 +1309,37 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    #[test]
+    fn prepared_lifecycle_binding_does_not_authorize_admission_or_transfer() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        control_claim_gate(&mut db, "init", owner, None, None).unwrap();
+        control_claim_gate(&mut db, "arm", owner, Some(1), None).unwrap();
+        let identity = crate::conditions::current_sender_identity().unwrap();
+        let tx = db.transaction().unwrap();
+        bind_receiver_gate_in(&tx, owner, 1, &identity, true).unwrap();
+        tx.commit().unwrap();
+        assert!(!claims_open_for(&db, Some(owner), Some("1")).unwrap());
+        assert!(control_claim_gate(&mut db, "open", owner, Some(1), None).is_err());
+        assert!(
+            control_claim_gate(
+                &mut db,
+                "transfer",
+                owner,
+                Some(1),
+                Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+            )
+            .is_err()
+        );
+        assert!(
+            !db.query_row("SELECT is_open FROM wake_delivery_claim_gate", [], |r| r
+                .get::<_, bool>(
+                0
+            ))
+            .unwrap()
+        );
     }
 
     #[test]

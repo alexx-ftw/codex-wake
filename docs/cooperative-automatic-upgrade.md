@@ -34,12 +34,17 @@ binary they only verify readiness. For a different binary they:
    cannot clear an existing process binding, even after SIGKILL.
 6. Only then stop the already drained unit, install the successor unit and start
    it. The receiver verifies its own invocation, cgroup, executable and unit
-   before atomically binding and opening. Another process cannot claim with its
-   owner UUID. Health requires its binding, heartbeat and controller readiness.
-7. Verify the same external controller peer/start/executable/cgroup survives and
-   publish the ready journal. The controller must be outside the receiver cgroup.
+   before binding with admission still closed. It checks controller readiness,
+   publishes an invocation-bound preparation marker and waits without workers.
+   The coordinator requires fresh preparation, verifies the same controller,
+   persists the ready journal and only then opens admission for that binding.
+7. Require a fresh heartbeat from that exact invocation and no later receiver
+   error. Verify the same controller peer/start/executable/socket/cgroup. A
+   controller in the receiver cgroup or any descendant is rejected.
 
-Failure closes admission and retains the journal/evidence. A pending journal is
+Read-only preflight failures leave the running generation and its gate unchanged.
+After admission closure starts, failure keeps admission closed and retains the
+journal/evidence. A pending journal is
 never resumed automatically, including on subsequent `ensure` calls. There is
 no automatic rollback, replay, forced drain, version download, or schema rollback.
 An operator must inspect the old/new invocation, cgroups, journal and uncertain
@@ -72,11 +77,16 @@ the current cooperative implementation as generations; these are **not two
 historical cooperative releases**. It holds the old receiver with SIGSTOP and a
 live cgroup descendant, checks that transfer stays closed until both finish,
 retains a producer request, serializes competing updates, verifies controller
-continuity and an uncertain send, and kills the coordinator after closure to
-check that the journal is not replayed. The existing native controller/HTTP
+continuity and an uncertain send, exercises a CLI --codex override different from its environment, and kills the
+coordinator after the successor binds but before activation to check that its
+gate stays closed and the journal is not replayed. The existing native controller/HTTP
 namespace test also runs with private home and no credentials.
 
 This does not qualify live production upgrades, actual user-chat delivery,
 consumption of active hook output, arbitrary schema migrations, or a real active
 model turn across the new systemd automatic transition. The independent native
 socket test and systemd lifecycle tests must not be described as that proof.
+
+The freshness tests cover old successful heartbeats, PID reuse across invocations,
+a newer heartbeat failure, and a worker error after a successful heartbeat.
+A socket-preflight regression checks that a healthy generation is not closed.

@@ -63,7 +63,7 @@ sleep 120 & helper=$!
 printf '%s\n' "$helper" > "/sys/fs/cgroup$old_group/cgroup.procs"
 kill -STOP "$old_pid"; stopped=$old_pid
 stage=closure
-"$wake" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
+CODEX_WAKE_CODEX=/usr/bin/false "$wake" --codex "$codex" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
 for ((i=0;i<300;i++)); do
   [[ $(sqlite3 -readonly "$db" 'SELECT is_open FROM wake_delivery_claim_gate') == 0 ]] && break
   kill -0 "$upgrader"
@@ -96,23 +96,30 @@ for file in second contender-result; do jq -e '.local_ready == true and .generat
 [[ $(ctl show codex-wake.service -p MainPID --value) != "$old_pid" ]]
 [[ $(sqlite3 -readonly "$db" 'SELECT state FROM waits WHERE run_id=9') == sending ]]
 [[ $(cat "$secret") == fixture-secret && $controller == "$(ctl show wake-qualification-controller.service -p MainPID -p InvocationID)" ]]
-# Kill the coordinator after it closes admission: later ensure must not resume the uncertain switch.
+# Hold the coordinator after start returns but before it can observe preparation or activate.
 stage=interruption
 cp -- "$wake" "$root/third"
 printf '\ncooperative-next-generation\n' >> "$root/third"
-pid=$(ctl show codex-wake.service -p MainPID --value)
-kill -STOP "$pid"; stopped=$pid
-"$root/third" ensure > /dev/null 2>&1 & upgrader=$!
+mkdir "$root/commands"
+cat > "$root/commands/systemctl" <<'WRAPPER'
+#!/bin/bash
+/usr/bin/systemctl "$@" || exit $?
+if [[ $1 == --user && $2 == start ]]; then
+  kill -STOP "$PPID"
+  printf paused > "$HOME/../coordinator-paused"
+fi
+WRAPPER
+chmod 700 "$root/commands/systemctl"
+PATH="$root/commands:/usr/bin:/bin" "$root/third" ensure > /dev/null 2>&1 & upgrader=$!
 for ((i=0;i<300;i++)); do
-  [[ $(sqlite3 -readonly "$db" 'SELECT is_open FROM wake_delivery_claim_gate') == 0 ]] && break
+  [[ -f $root/coordinator-paused && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open || ":" || (receiver_pid IS NOT NULL) FROM wake_delivery_claim_gate') == 3:0:1 ]] && break
   sleep .05
 done
-[[ $(sqlite3 -readonly "$db" 'SELECT is_open FROM wake_delivery_claim_gate') == 0 ]]
+[[ -f $root/coordinator-paused && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open || ":" || (receiver_pid IS NOT NULL) FROM wake_delivery_claim_gate') == 3:0:1 ]]
 kill -KILL "$upgrader"; wait "$upgrader" 2>/dev/null || true; upgrader=
 journal_hash=$(sha256sum "$journal")
 if "$root/third" ensure > /dev/null 2>&1; then exit 1; fi
-[[ $journal_hash == "$(sha256sum "$journal")" && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open FROM wake_delivery_claim_gate') == 2:0 ]]
-kill -CONT "$pid"; stopped=
+[[ $journal_hash == "$(sha256sum "$journal")" && $(sqlite3 -readonly "$db" 'SELECT generation || ":" || is_open FROM wake_delivery_claim_gate') == 3:0 ]]
 # No uncertain send is replayed, even after an interrupted automatic transition.
 [[ $(sqlite3 -readonly "$db" 'SELECT state FROM waits WHERE run_id=9') == sending ]]
 printf 'cooperative automatic upgrade qualification passed\n'

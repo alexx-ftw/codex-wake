@@ -1123,6 +1123,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
             &env::var("CODEX_WAKE_GATE_OWNER")?,
             env::var("CODEX_WAKE_GATE_GENERATION")?.parse()?,
         )?;
+        crate::upgrade::await_activation(config)?;
     } else if standby {
         receiver_standby(config)?;
     }
@@ -1244,7 +1245,13 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                     1,
                 );
             }
-            if heartbeat.elapsed() >= Duration::from_secs(60) {
+            if heartbeat.elapsed()
+                >= Duration::from_secs(if env::var_os("CODEX_WAKE_RECEIVER_LIFECYCLE").is_some() {
+                    5
+                } else {
+                    60
+                })
+            {
                 if let Err(error) = observe_queues(&config) {
                     crate::observability::emit(
                         "queue.snapshot",
@@ -1265,7 +1272,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                         .err()
                         .map(crate::observability::error_class)
                         .unwrap_or(""),
-                    None,
+                    env::var("INVOCATION_ID").ok().as_deref(),
                     started.elapsed(),
                     1,
                 );

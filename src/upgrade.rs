@@ -35,6 +35,15 @@ pub(crate) struct Spec {
 struct Record {
     phase: String,
     spec: Spec,
+    #[serde(default)]
+    activation: Option<Activation>,
+}
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+struct Activation {
+    invocation: String,
+    pid: u32,
+    start: i64,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -60,12 +69,13 @@ fn read_record(config: &Config) -> Result<Record> {
     );
     Ok(record)
 }
-fn save(config: &Config, phase: &str, spec: &Spec) -> Result<()> {
+fn save(config: &Config, phase: &str, spec: &Spec, activation: Option<Activation>) -> Result<()> {
     manager::atomic_write(
         &journal(config),
         &serde_json::to_vec(&Record {
             phase: phase.into(),
             spec: spec.clone(),
+            activation,
         })?,
         0o600,
     )?;
@@ -235,6 +245,7 @@ fn controller(config: &Config) -> Result<Controller> {
 
 // Only an authoritative successful exit of this invocation can construct this proof.
 pub(crate) struct Drained {
+    config: Config,
     spec: Spec,
     pid: i64,
     start: i64,
@@ -283,9 +294,8 @@ impl Drained {
                 && serde_json::from_str::<Spec>(&spec)? == self.spec,
             "Drain proof does not identify the bound receiver"
         );
-        let config = Config::from_env()?;
         let s = snapshot()?;
-        verify_unit(&config, &self.spec, &s)?;
+        verify_unit(&self.config, &self.spec, &s)?;
         ensure!(
             terminal(&s, &self.invocation)? && empty_group(&self.cgroup)?,
             "Receiver exit/drain proof changed"
@@ -294,17 +304,17 @@ impl Drained {
     }
 }
 
-pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> Result<()> {
+pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> Result<bool> {
     let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('wake_delivery_claim_gate') WHERE name='receiver_lifecycle')", [], |r| r.get(0))?;
     if !exists {
-        return Ok(());
+        return Ok(false);
     }
     let raw: Option<String> = db.query_row(
         "SELECT receiver_lifecycle FROM wake_delivery_claim_gate WHERE id=1",
         [],
         |r| r.get(0),
     )?;
-    let Some(raw) = raw else { return Ok(()) };
+    let Some(raw) = raw else { return Ok(false) };
     let spec: Spec = serde_json::from_str(&raw)?;
     ensure!(
         spec.owner == owner && spec.generation == generation,
@@ -321,7 +331,7 @@ pub(crate) fn verify_binding(db: &Connection, owner: &str, generation: i64) -> R
         outside_receiver(&controller(&config)?.group, group(&s)?),
         "Controller shares receiver cgroup"
     );
-    Ok(())
+    Ok(true)
 }
 
 fn install_spec(db: &Connection, spec: &Spec) -> Result<()> {
@@ -336,17 +346,7 @@ fn install_spec(db: &Connection, spec: &Spec) -> Result<()> {
 pub(crate) fn ensure_receiver(config: &Config) -> Result<Value> {
     manager::require_installed(config)?;
     let _lock = manager::lock(config)?;
-    let result = ensure_locked(config);
-    if result.is_err()
-        && configured(config)
-        && let Ok(db) = crate::bridge::open_existing_owned(&config.db)
-    {
-        db.execute(
-            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
-            [],
-        )?;
-    }
-    result
+    ensure_locked(config)
 }
 
 fn ensure_locked(config: &Config) -> Result<Value> {
@@ -387,8 +387,9 @@ fn ensure_locked(config: &Config) -> Result<Value> {
             outside_receiver(&peer.group, group(old_snapshot.as_ref().unwrap())?),
             "Controller shares receiver cgroup"
         );
+        let ready = health(config, old)?;
         if old.binary == binary {
-            return health(config, old);
+            return Ok(ready);
         }
     }
     let owner = uuid::Uuid::new_v4().to_string();
@@ -421,7 +422,8 @@ fn ensure_locked(config: &Config) -> Result<Value> {
         "Staged binary verification failed"
     );
     // Persist before the first admission/lifecycle side effect. No recovery by guessing.
-    save(config, "pending", &next)?;
+    save(config, "pending", &next, None)?;
+    let mut transition_started = false;
     let result = (|| -> Result<Value> {
         let mut db = if let Some(old) = &previous {
             let mut db = crate::bridge::open_existing_owned(&config.db)?;
@@ -433,6 +435,7 @@ fn ensure_locked(config: &Config) -> Result<Value> {
                 running(config, old)? == *s,
                 "Receiver changed before admission closure"
             );
+            transition_started = true;
             crate::bridge::control_claim_gate(
                 &mut db,
                 "close",
@@ -454,6 +457,7 @@ fn ensure_locked(config: &Config) -> Result<Value> {
                 thread::sleep(Duration::from_millis(50));
             }
             let drained = Drained {
+                config: config.clone(),
                 spec: old.clone(),
                 pid,
                 start,
@@ -474,6 +478,7 @@ fn ensure_locked(config: &Config) -> Result<Value> {
             )?;
             db
         } else {
+            transition_started = true;
             let mut db = crate::bridge::connect(&config.db)?;
             crate::bridge::control_claim_gate(&mut db, "init", &next.owner, None, None)?;
             crate::bridge::control_claim_gate(&mut db, "arm", &next.owner, Some(1), None)?;
@@ -493,9 +498,9 @@ fn ensure_locked(config: &Config) -> Result<Value> {
         manager::systemctl(&["enable", UNIT])?;
         manager::systemctl(&["start", UNIT])?;
         let deadline = Instant::now() + Duration::from_secs(30);
-        let ready = loop {
-            match health(config, &next) {
-                Ok(ready) => break ready,
+        let activation = loop {
+            match bound_health(config, &next, false, "receiver.prepared") {
+                Ok(s) => break activation(&s)?,
                 Err(error) if Instant::now() >= deadline => return Err(error),
                 Err(_) => thread::sleep(Duration::from_millis(50)),
             }
@@ -504,12 +509,19 @@ fn ensure_locked(config: &Config) -> Result<Value> {
             controller(config)? == peer,
             "Controller changed during activation"
         );
-        save(config, "ready", &next)?;
-        // Keep the connection alive until activation and journal publication finish.
-        let _ = &mut db;
-        Ok(ready)
+        // Journal, controller and this invocation's fresh readiness precede admission.
+        save(config, "ready", &next, Some(activation.clone()))?;
+        activate(config, &next, &activation, &peer, &mut db)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match health(config, &next) {
+                Ok(ready) => return Ok(ready),
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => thread::sleep(Duration::from_millis(50)),
+            }
+        }
     })();
-    if result.is_err() {
+    if result.is_err() && transition_started {
         // Closure is safe even if transfer/start/health had an uncertain result.
         if let Ok(db) = crate::bridge::open_existing_owned(&config.db) {
             let _ = db.execute(
@@ -520,20 +532,129 @@ fn ensure_locked(config: &Config) -> Result<Value> {
     }
     result
 }
-fn health(config: &Config, spec: &Spec) -> Result<Value> {
+fn activation(s: &Snapshot) -> Result<Activation> {
+    let pid: u32 = field(s, "MainPID")?.parse()?;
+    Ok(Activation {
+        invocation: invocation(s)?.into(),
+        pid,
+        start: i64::try_from(
+            crate::obligations::process_start_time(pid)
+                .context("Receiver start time unavailable")?,
+        )?,
+    })
+}
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+fn fresh_health(
+    db: &Connection,
+    pid: u32,
+    invocation: &str,
+    operation: &str,
+    now: i64,
+) -> Result<()> {
+    let (at, outcome): (i64,String) = db.query_row("SELECT at_ms,outcome FROM events WHERE pid=?1 AND subject=?2 AND operation=?3 ORDER BY at_ms DESC,rowid DESC LIMIT 1",params![pid,invocation,operation],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(
+        outcome == "ok" && at <= now && now - at <= 15_000,
+        "Receiver health is stale or failed"
+    );
+    let errors: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE pid=?1 AND at_ms>=?2 AND outcome='error' AND operation GLOB 'receiver.*')",params![pid,at],|r|r.get(0))?;
+    ensure!(
+        !errors,
+        "Receiver reported an error after its health marker"
+    );
+    Ok(())
+}
+fn bound_health(config: &Config, spec: &Spec, open: bool, operation: &str) -> Result<Snapshot> {
     let s = running(config, spec)?;
+    let a = activation(&s)?;
     let db = crate::bridge::open_existing_owned(&config.db)?;
-    let valid: bool = db.query_row("SELECT is_open=1 AND owner=?1 AND generation=?2 AND receiver_pid=?3 AND receiver_lifecycle=?4 FROM wake_delivery_claim_gate WHERE id=1",params![spec.owner,spec.generation,field(&s,"MainPID")?,serde_json::to_string(spec)?],|r| r.get(0))?;
+    let valid: bool = db.query_row("SELECT is_open=?1 AND owner=?2 AND generation=?3 AND receiver_pid=?4 AND receiver_start=?5 AND receiver_lifecycle=?6 FROM wake_delivery_claim_gate WHERE id=1",params![open,spec.owner,spec.generation,a.pid,a.start,serde_json::to_string(spec)?],|r|r.get(0))?;
     ensure!(valid, "Receiver has not bound its lifecycle generation");
     let telemetry = Connection::open_with_flags(
         config.state.join("telemetry.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
-    let heartbeat: bool = telemetry.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE pid=?1 AND operation='receiver.heartbeat' AND outcome='ok')",[field(&s,"MainPID")?],|r|r.get(0))?;
-    ensure!(heartbeat, "Receiver has no successful heartbeat");
+    fresh_health(&telemetry, a.pid, &a.invocation, operation, now_ms())?;
     ensure!(
         crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}))?["data"].is_array(),
         "Controller readiness failed"
+    );
+    ensure!(
+        activation(&running(config, spec)?)? == a,
+        "Receiver changed during health verification"
+    );
+    Ok(s)
+}
+fn activate(
+    config: &Config,
+    spec: &Spec,
+    expected: &Activation,
+    peer: &Controller,
+    db: &mut Connection,
+) -> Result<()> {
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let record = read_record(config)?;
+    ensure!(
+        record.phase == "ready"
+            && record.spec == *spec
+            && record.activation.as_ref() == Some(expected),
+        "Activation journal is not ready"
+    );
+    let s = bound_health(config, spec, false, "receiver.prepared")?;
+    ensure!(
+        activation(&s)? == *expected && controller(config)? == *peer,
+        "Activation process or controller changed"
+    );
+    ensure!(tx.execute("UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1 AND is_open=0 AND owner=?1 AND generation=?2 AND receiver_pid=?3 AND receiver_start=?4 AND receiver_lifecycle=?5",params![spec.owner,spec.generation,expected.pid,expected.start,serde_json::to_string(spec)?])? == 1,"Prepared receiver binding changed");
+    tx.commit()?;
+    Ok(())
+}
+// A bound successor cannot start workers until the coordinator publishes a verified activation.
+pub(crate) fn await_activation(config: &Config) -> Result<()> {
+    let invocation = env::var("INVOCATION_ID")?;
+    ensure!(
+        crate::goals::rpc(&config.codex, "thread/loaded/list", json!({}))?["data"].is_array(),
+        "Controller preparation failed"
+    );
+    crate::observability::emit(
+        "receiver.prepared",
+        "ok",
+        "",
+        Some(&invocation),
+        Duration::ZERO,
+        1,
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let db = crate::bridge::open_existing_owned(&config.db)?;
+        if crate::bridge::claims_open(&db)? {
+            let record = read_record(config)?;
+            let own = activation(&running(config, &record.spec)?)?;
+            ensure!(
+                record.phase == "ready" && record.activation.as_ref() == Some(&own),
+                "Receiver activation journal changed"
+            );
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Receiver activation deadline; no automatic retry"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+fn health(config: &Config, spec: &Spec) -> Result<Value> {
+    let s = bound_health(config, spec, true, "receiver.heartbeat")?;
+    let record = read_record(config)?;
+    ensure!(
+        record.phase == "ready"
+            && record.spec == *spec
+            && record.activation.as_ref() == Some(&activation(&s)?),
+        "Receiver activation journal mismatch"
     );
     Ok(
         json!({"local_ready":true,"controller_ready":true,"cooperative_protocol":PROTOCOL,"generation":spec.generation,"invocation":invocation(&s)?}),
@@ -552,6 +673,30 @@ pub(crate) fn status(config: &Config) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn health_requires_fresh_success_from_this_invocation_without_later_errors() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE events(at_ms INTEGER,outcome TEXT,pid INTEGER,subject TEXT,operation TEXT)").unwrap();
+        let add = |at, outcome, inv, op| {
+            db.execute(
+                "INSERT INTO events VALUES(?1,?2,123,?3,?4)",
+                params![at, outcome, inv, op],
+            )
+            .unwrap();
+        };
+        add(10, "ok", "old", "receiver.heartbeat");
+        assert!(fresh_health(&db, 123, "new", "receiver.heartbeat", 20).is_err());
+        add(20, "ok", "new", "receiver.heartbeat");
+        assert!(fresh_health(&db, 123, "new", "receiver.heartbeat", 21).is_ok());
+        assert!(fresh_health(&db, 123, "new", "receiver.heartbeat", 15_021).is_err());
+        add(22, "error", "new", "receiver.heartbeat");
+        assert!(fresh_health(&db, 123, "new", "receiver.heartbeat", 23).is_err());
+        add(24, "ok", "new", "receiver.heartbeat");
+        add(25, "error", "new", "receiver.worker");
+        assert!(fresh_health(&db, 123, "new", "receiver.heartbeat", 26).is_err());
+        add(27, "ok", "new", "receiver.heartbeat");
+        assert!(fresh_health(&db, 123, "new", "receiver.heartbeat", 28).is_ok());
+    }
     fn exited() -> Snapshot {
         [
             ("InvocationID", "11111111111111111111111111111111"),

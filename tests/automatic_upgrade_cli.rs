@@ -45,7 +45,7 @@ fn legacy_installation_is_rejected_before_database_or_unit_changes() {
     );
 }
 #[test]
-fn interrupted_outcome_is_closed_without_resuming_or_replaying() {
+fn interrupted_outcome_is_not_resumed_or_replayed() {
     let temp = setup();
     let root = temp.path();
     let owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -58,7 +58,7 @@ fn interrupted_outcome_is_closed_without_resuming_or_replaying() {
             .success()
     );
     let db = rusqlite::Connection::open(root.join("state/codex-wake/state.sqlite3")).unwrap();
-    db.execute_batch("UPDATE wake_delivery_claim_gate SET is_open=1; INSERT INTO waits(repo,run_id,attempt,thread,sha,state) VALUES('fixture/repo',1,1,'11111111-1111-4111-8111-111111111111','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sending');").unwrap();
+    db.execute_batch("INSERT INTO waits(repo,run_id,attempt,thread,sha,state) VALUES('fixture/repo',1,1,'11111111-1111-4111-8111-111111111111','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sending');").unwrap();
     let journal = root.join("state/codex-wake/cooperative-upgrade.json");
     let bytes = serde_json::to_vec(&json!({"phase":"pending","spec":{"protocol":1,"owner":owner,"generation":2,"executable":"/no/candidate","binary":"fixture","unit":"fixture"}})).unwrap();
     fs::write(&journal, &bytes).unwrap();
@@ -82,5 +82,38 @@ fn interrupted_outcome_is_closed_without_resuming_or_replaying() {
             "sending"
         );
     }
+    assert!(!root.join("mutated").exists());
+}
+
+#[test]
+fn socket_preflight_failure_does_not_close_a_running_generation() {
+    let temp = setup();
+    let root = temp.path();
+    let owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    assert!(
+        command(root)
+            .args(["cooperative-gate", "init", "--owner", owner])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let db = rusqlite::Connection::open(root.join("state/codex-wake/state.sqlite3")).unwrap();
+    db.execute_batch("UPDATE wake_delivery_claim_gate SET is_open=1")
+        .unwrap();
+    let path = root.join("state/codex-wake/cooperative-upgrade.json");
+    let record = serde_json::to_vec(&json!({"phase":"ready","spec":{"protocol":1,"owner":owner,"generation":1,"executable":"/no/candidate","binary":"fixture","unit":"fixture"}})).unwrap();
+    fs::write(&path, &record).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = command(root).arg("ensure").output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        db.query_row("SELECT is_open FROM wake_delivery_claim_gate", [], |r| r
+            .get::<_, bool>(
+            0
+        ))
+        .unwrap()
+    );
+    assert_eq!(fs::read(path).unwrap(), record);
     assert!(!root.join("mutated").exists());
 }
