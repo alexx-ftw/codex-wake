@@ -10,6 +10,20 @@ export TMPDIR="$root/t" XDG_STATE_HOME="$HOME/s" XDG_DATA_HOME="$HOME/d" XDG_CON
 export CODEX_WAKE_CODEX="$codex" CODEX_WAKE_GH=/usr/bin/false CODEX_WAKE_ENABLE_WEBHOOKS=0 CODEX_WAKE_RPC_SOCKET="$socket"
 ctl() { /usr/bin/systemctl --user "$@"; }
 receiver_journal() { /usr/bin/journalctl --user -u codex-wake.service -n 40 --no-pager -o cat; }
+freeze_receiver() {
+  local pid=$1
+  [[ $pid =~ ^[1-9][0-9]*$ ]]
+  stopped=$pid
+  # Exclude writers before stopping all receiver threads, then release the unchanged transaction.
+  sqlite3 -batch "$db" <<SQL
+.bail on
+.timeout 10000
+BEGIN IMMEDIATE;
+.shell /bin/kill -STOP $pid
+COMMIT;
+SQL
+  grep -q '^State:.*T' "/proc/$pid/status"
+}
 state=$XDG_STATE_HOME/codex-wake
 db=$state/state.sqlite3
 unit=$XDG_CONFIG_HOME/systemd/user/codex-wake.service
@@ -122,16 +136,7 @@ legacy_pid=$(ctl show codex-wake.service -p MainPID --value)
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]]
 for ((i=0;i<100;i++)); do [[ -f $db ]] && break; sleep .05; done
 [[ -f $db ]]
-stopped=$legacy_pid
-# Acquire the writer lock first so SIGSTOP cannot strand an exclusive schema transaction.
-sqlite3 -batch "$db" <<SQL
-.bail on
-.timeout 10000
-BEGIN IMMEDIATE;
-.shell /bin/kill -STOP $legacy_pid
-COMMIT;
-SQL
-grep -q '^State:.*T' "/proc/$legacy_pid/status"
+freeze_receiver "$legacy_pid"
 legacy_binary=$(sha256sum "$runtime/codex-wake")
 legacy_schema=$(sqlite3 -readonly "$db" '.schema')
 if CODEX_WAKE_COOPERATIVE_RECEIVER=1 "$wake" ensure > /dev/null 2>&1; then exit 1; fi
@@ -182,9 +187,13 @@ printf fixture-secret > "$secret"
 sqlite3 "$db" "INSERT INTO waits(repo,run_id,attempt,thread,sha,state) VALUES('fixture/repo',9,1,'11111111-1111-4111-8111-111111111111','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','sending');"
 # A live descendant must keep the barrier closed after MainPID has exited.
 stage=descendant
-sleep 120 & helper=$!
+/usr/bin/systemd-run --user --unit=wake-upgrade-helper --property=Type=exec \
+  --property=Restart=no --property=RemainAfterExit=yes --property=StandardOutput=null \
+  --property=StandardError=null /usr/bin/sleep 120 >/dev/null 2>&1
+helper=$(ctl show wake-upgrade-helper.service -p MainPID --value)
+[[ $helper =~ ^[1-9][0-9]*$ ]]
 printf '%s\n' "$helper" > "/sys/fs/cgroup$old_group/cgroup.procs"
-kill -STOP "$old_pid"; stopped=$old_pid
+freeze_receiver "$old_pid"
 stage=closure
 mkdir "$root/delayed"
 cat > "$root/delayed/systemctl" <<'DELAY'

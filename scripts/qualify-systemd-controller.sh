@@ -89,7 +89,7 @@ cleanup() {
   trap - EXIT
   if [[ $manager_owned == 1 ]]; then
     if [[ $bus_active == 1 ]]; then
-      for unit in codex-wake.service wake-handoff-failed.service wake-handoff-old.service wake-qualification-receiver.service wake-qualification-controller.service; do
+      for unit in codex-wake.service wake-upgrade-helper.service wake-handoff-failed.service wake-handoff-old.service wake-qualification-receiver.service wake-qualification-controller.service; do
         load_state=$(as_qual_user /usr/bin/systemctl --user show "$unit" --property=LoadState --value 2>/dev/null) || load_state=not-found
         if [[ $load_state != not-found ]]; then
           as_qual_user /usr/bin/systemctl --user stop "$unit" >/dev/null 2>&1 || clean=0
