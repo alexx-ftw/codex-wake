@@ -480,7 +480,7 @@ fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
         String::from_utf8_lossy(&subscribed.stderr)
     );
 
-    let (_receiver, addr) = start_receiver(&temp, &db, &codex, true);
+    let (receiver, addr) = start_receiver(&temp, &db, &codex, true);
     let comment = serde_json::to_vec(&json!({
         "action":"created", "repository":{"full_name":"owner/repo"},
         "issue":{"number":123,"pull_request":{"url":"https://example.invalid/pull/123"}},
