@@ -5051,6 +5051,8 @@ mod pr_hook_registration_integration_tests {
         let root = temp.path();
         let state = root.join("state");
         std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = state.join("state.sqlite3");
         let gh = root.join("gh");
         std::fs::write(
             &gh,
@@ -5063,7 +5065,7 @@ mod pr_hook_registration_integration_tests {
             runtime: root.join("runtime"),
             config: root.join("config"),
             unit: root.join("unit"),
-            db: root.join("state.sqlite3"),
+            db,
             codex: root.join("codex"),
             gh,
             webhooks_enabled: false,

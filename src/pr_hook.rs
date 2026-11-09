@@ -391,7 +391,8 @@ fn github_url_path(url: &str) -> Option<&str> {
 
 /// A PreToolUse observation linked to a PostToolUse by the observation layer.
 /// `exact_call_and_result` says whether that link and the direct result meet
-/// the stricter same-second attribution requirements.
+/// the attribution requirements, including a direct result from an accredited
+/// GitHub host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreToolUseObservation {
     /// UTC Unix milliseconds when this PreToolUse was observed by the caller.
@@ -401,7 +402,7 @@ pub struct PreToolUseObservation {
     pub base_ref: Option<String>,
     pub author_login: Option<String>,
     /// True only when the observation layer matched session, turn, tool_use_id,
-    /// and input digest exactly and parsed a direct, untransformed creation result.
+    /// and input digest exactly and parsed a direct result from an accredited host.
     pub(crate) exact_call_and_result: bool,
 }
 
@@ -584,14 +585,12 @@ pub fn verify_pr_candidate(
         };
     }
     let pre = plausible[0];
-    // GitHub's created_at has second precision. If both events land in the
-    // same second, their order cannot be established from these timestamps.
-    if created_at_ms.div_euclid(1000) == pre.observed_at_unix_ms.div_euclid(1000)
-        && !pre.exact_call_and_result
-    {
+    // Without an exact call link and an untransformed result from an
+    // accredited host, timestamp proximity alone cannot attribute a PR.
+    if !pre.exact_call_and_result {
         return VerificationOutcome::ExistsButAmbiguous {
             pull_request: verified,
-            reason: "PreToolUse and PR creation share one-second timestamp precision",
+            reason: "exact call, raw result, or GitHub host provenance is unavailable",
         };
     }
     if pre.head_ref.is_some() && head_ref.is_none()
@@ -936,7 +935,7 @@ mod tests {
             head_ref: Some("feature-x".into()),
             base_ref: Some("main".into()),
             author_login: Some("Alice".into()),
-            exact_call_and_result: false,
+            exact_call_and_result: true,
         }
     }
 
@@ -999,7 +998,8 @@ mod tests {
             VerificationOutcome::ExistsButAmbiguous { .. }
         ));
 
-        let same_second = pre_use("2025-01-02T03:04:06.500Z");
+        let mut same_second = pre_use("2025-01-02T03:04:06.500Z");
+        same_second.exact_call_and_result = false;
         let outcome = verify_pr_candidate(
             &candidate(),
             &[same_second],
@@ -1033,6 +1033,21 @@ mod tests {
         let outcome = verify_pr_candidate(
             &candidate(),
             &[fallback],
+            TEST_ATTRIBUTION_WINDOW_MS,
+            200,
+            &get_fixture(),
+            parse_utc_timestamp_ms("2025-01-02T03:04:07Z").unwrap(),
+        );
+        assert!(matches!(
+            outcome,
+            VerificationOutcome::ExistsButAmbiguous { .. }
+        ));
+
+        let mut unaccredited = pre_use("2025-01-02T03:04:03.500Z");
+        unaccredited.exact_call_and_result = false;
+        let outcome = verify_pr_candidate(
+            &candidate(),
+            &[unaccredited],
             TEST_ATTRIBUTION_WINDOW_MS,
             200,
             &get_fixture(),

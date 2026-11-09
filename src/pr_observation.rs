@@ -626,7 +626,7 @@ pub fn handle_post_tool_use(
                     pre_id,
                     exact_tool_use_id,
                     !command_output_can_be_filtered(tool_name, event.get("tool_input"))
-                        && !command_has_untrusted_api_host(tool_name, event.get("tool_input")),
+                        && !command_api_origin_is_unverified(tool_name, event.get("tool_input")),
                     candidate_id
                 ],
             )?;
@@ -1529,7 +1529,7 @@ fn command_output_can_be_filtered(tool_name: &str, input: Option<&Value>) -> boo
     })
 }
 
-fn command_has_untrusted_api_host(tool_name: &str, input: Option<&Value>) -> bool {
+fn command_api_origin_is_unverified(tool_name: &str, input: Option<&Value>) -> bool {
     if tool_name != "Bash" {
         return false;
     }
@@ -1547,64 +1547,10 @@ fn command_has_untrusted_api_host(tool_name: &str, input: Option<&Value>) -> boo
     {
         return false;
     }
-    api_host_is_unaccredited(&tokens, std::env::var_os("GH_HOST").as_deref())
-}
-
-fn api_host_is_unaccredited(tokens: &[String], inherited_host: Option<&std::ffi::OsStr>) -> bool {
-    let mut explicit_host = None;
-    let mut index = 2;
-    while index < tokens.len() {
-        let token = tokens[index].as_str();
-        let (option, inline) = token
-            .split_once('=')
-            .map_or((token, None), |(option, value)| (option, Some(value)));
-        if option == "--hostname" {
-            let host = if let Some(host) = inline {
-                host
-            } else {
-                index += 1;
-                let Some(host) = tokens.get(index).map(String::as_str) else {
-                    return true;
-                };
-                host
-            };
-            if explicit_host.replace(host).is_some() {
-                return true;
-            }
-        } else if matches!(
-            option,
-            "-H" | "--header"
-                | "-f"
-                | "--field"
-                | "-F"
-                | "--raw-field"
-                | "-X"
-                | "--method"
-                | "--input"
-                | "--preview"
-                | "-p"
-                | "--cache"
-                | "-q"
-                | "--jq"
-                | "-t"
-                | "--template"
-        ) && inline.is_none()
-        {
-            index += 1;
-        }
-        index += 1;
-    }
-    let host = if let Some(host) = explicit_host {
-        Some(host)
-    } else if let Some(host) = inherited_host {
-        let Some(host) = host.to_str() else {
-            return true;
-        };
-        Some(host)
-    } else {
-        None
-    };
-    host.is_some_and(|host| !host.eq_ignore_ascii_case("github.com"))
+    // PostToolUse has no effective-host or config evidence. `--hostname` and
+    // GH_HOST express selection, but gh's api_host setting can redirect API
+    // traffic. Retain the candidate, but do not attribute it from this payload.
+    true
 }
 
 fn candidate_invocation_key(
@@ -1787,10 +1733,10 @@ mod tests {
     }
 
     #[test]
-    fn unaccredited_gh_api_host_blocks_same_second_attribution() {
+    fn unaccredited_gh_api_host_blocks_attribution_at_any_age() {
         let command =
             "gh api --hostname api.attacker.test -X POST repos/acme/widget/pulls -f title=test";
-        let observed_at_ms = 1_735_787_046_500;
+        let observed_at_ms = 1_735_787_044_500;
         let mut db = Connection::open_in_memory().unwrap();
         record_pre_tool_use(
             &mut db,
@@ -1800,11 +1746,9 @@ mod tests {
         )
         .unwrap();
         let mut event = post("s", "t", Some("call"), command);
-        event["tool_response"] = json!({
-            "number":42,
-            "html_url":"https://github.com/acme/widget/pull/42",
-            "created_at":"2025-01-02T03:04:06Z"
-        });
+        event["tool_response"] = json!(
+            r#"{"number":42,"html_url":"https://github.com/acme/widget/pull/42","created_at":"2025-01-02T03:04:06Z"}"#
+        );
         let transport = fixture_transport();
         let HandleResult::Candidate { record, verified } =
             handle_post_tool_use(&mut db, &event, &transport, Duration::from_secs(2), 60_000)
@@ -1818,25 +1762,20 @@ mod tests {
     }
 
     #[test]
-    fn gh_host_environment_is_untrusted_unless_it_is_github_com() {
-        use std::ffi::OsStr;
-
-        let tokens = |command: &str| shell_tokens(command).unwrap();
-        assert!(api_host_is_unaccredited(
-            &tokens("gh api repos/acme/widget/pulls"),
-            Some(OsStr::new("ghe.example.test"))
-        ));
-        assert!(!api_host_is_unaccredited(
-            &tokens("gh api repos/acme/widget/pulls"),
-            Some(OsStr::new("github.com"))
-        ));
-        assert!(!api_host_is_unaccredited(
-            &tokens("gh api --hostname github.com repos/acme/widget/pulls"),
-            Some(OsStr::new("ghe.example.test"))
-        ));
-        assert!(api_host_is_unaccredited(
-            &tokens("gh api -H '--hostname=github.com' repos/acme/widget/pulls"),
-            Some(OsStr::new("ghe.example.test"))
+    fn gh_api_host_selector_does_not_prove_effective_api_origin() {
+        for command in [
+            "gh api repos/acme/widget/pulls",
+            "gh api --hostname github.com repos/acme/widget/pulls",
+            "gh api --hostname api.attacker.test repos/acme/widget/pulls",
+        ] {
+            let input = json!({"command":command});
+            assert!(command_api_origin_is_unverified("Bash", Some(&input)));
+        }
+        // The event does not carry GH_HOST. Empty and absent are both unknown;
+        // neither proves that gh's api_host configuration did not redirect.
+        assert!(!command_api_origin_is_unverified(
+            MCP_CREATE_PR_TOOL,
+            Some(&json!({"command":"gh api repos/acme/widget/pulls"}))
         ));
     }
 
@@ -2401,7 +2340,7 @@ mod tests {
         let gh = dir.path().join("configured-gh");
         std::fs::write(
             &gh,
-            "#!/bin/sh\nprintf 'HTTP/2 404 Not Found\\r\\ncontent-type: application/json\\r\\n\\r\\n{\\\"message\\\":\\\"Not Found\\\"}\\n'\nexit 1\n",
+            "#!/bin/sh\nprintf 'HTTP/2 404 Not Found\\r\\ncontent-type: application/json\\r\\n\\r\\n%s\\n' '{\"message\":\"Not Found\"}'\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
