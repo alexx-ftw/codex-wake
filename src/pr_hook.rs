@@ -6,9 +6,8 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrCandidate {
-    /// The PostToolUse invocation identifier. PreToolUse has no corresponding
-    /// identifier in the Codex hook payload contract, so this cannot pair the
-    /// events by itself.
+    /// The invocation identifier shared by PreToolUse and PostToolUse. The
+    /// observation layer also checks session, turn, and the input digest.
     pub tool_use_id: String,
     pub number: u64,
     pub url: String,
@@ -350,9 +349,8 @@ fn github_url_path(url: &str) -> Option<&str> {
         .or_else(|| url.strip_prefix("http://github.com/"))
 }
 
-/// A PreToolUse observation captured by the caller. Codex does not provide a
-/// tool_use_id for PreToolUse, so callers should retain all outstanding PR
-/// creation observations instead of pairing one to a PostToolUse by position.
+/// A PreToolUse observation already correlated by the caller using the shared
+/// tool_use_id, session, turn, and input digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreToolUseObservation {
     /// UTC Unix milliseconds when this PreToolUse was observed by the caller.

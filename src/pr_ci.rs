@@ -78,6 +78,13 @@ pub struct ApiResponse {
     pub body: Value,
 }
 
+#[derive(Clone, Copy)]
+struct RunPollIdentity<'a> {
+    repo: &'a str,
+    pull_request: i64,
+    sha: &'a str,
+}
+
 /// Create the isolated PR tracking schema. Safe to call on each connection.
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(TRACKERS_SCHEMA)?;
@@ -357,6 +364,11 @@ where
         }
         let run_id = positive_id(&run["id"]).context("Invalid workflow run ID")?;
         let attempt = positive_id(&run["run_attempt"]).context("Invalid workflow attempt")?;
+        let identity = RunPollIdentity {
+            repo,
+            pull_request: number,
+            sha: &run_sha,
+        };
         let known_attempts = known_attempts(db, repo, number, &run_sha, run_id)?;
         let mut attempt_runs = Vec::new();
         for (known_attempt, known_status) in &known_attempts {
@@ -378,16 +390,7 @@ where
                     // response for this same run ID and SHA is the exact link.
                     attempt_run["pull_requests"] = run["pull_requests"].clone();
                 }
-                process_run_attempt(
-                    db,
-                    now,
-                    repo,
-                    number,
-                    &run_sha,
-                    attempt_run,
-                    &mut discovered,
-                    &mut queued,
-                )?;
+                process_run_attempt(db, now, identity, attempt_run, &mut discovered, &mut queued)?;
             }
         }
         let max_known = known_attempts
@@ -398,7 +401,7 @@ where
         let missing_start = max_known.saturating_add(1).max(1);
         let gap_end = attempt.saturating_sub(1);
         ensure!(
-            gap_end < missing_start || gap_end - missing_start + 1 <= MAX_RECORDED_ATTEMPT_GAP,
+            gap_end < missing_start || gap_end - missing_start < MAX_RECORDED_ATTEMPT_GAP,
             "Workflow run attempt gap exceeds bounded recovery limit"
         );
         for missing in missing_start..=gap_end {
@@ -421,16 +424,7 @@ where
         }
         attempt_runs.push(run.clone());
         for attempt_run in attempt_runs {
-            process_run_attempt(
-                db,
-                now,
-                repo,
-                number,
-                &run_sha,
-                attempt_run,
-                &mut discovered,
-                &mut queued,
-            )?;
+            process_run_attempt(db, now, identity, attempt_run, &mut discovered, &mut queued)?;
         }
     }
     if pull["state"] == "closed" {
@@ -510,9 +504,7 @@ where
 fn process_run_attempt(
     db: &Connection,
     now: i64,
-    repo: &str,
-    number: i64,
-    expected_sha: &str,
+    identity: RunPollIdentity<'_>,
     run: Value,
     discovered: &mut usize,
     queued: &mut usize,
@@ -523,10 +515,10 @@ fn process_run_attempt(
         .map(str::to_ascii_lowercase)
         .context("Invalid workflow run head SHA")?;
     ensure!(
-        same_sha(&run_sha, expected_sha),
+        same_sha(&run_sha, identity.sha),
         "Workflow attempt SHA mismatch"
     );
-    if !run_links_pr(&run, number, &run_sha) {
+    if !run_links_pr(&run, identity.pull_request, &run_sha) {
         return Ok(());
     }
     let run_id = positive_id(&run["id"]).context("Invalid workflow run ID")?;
@@ -554,7 +546,7 @@ fn process_run_attempt(
             "INSERT INTO pr_ci_runs(repo,pull_number,sha,run_id,attempt,status,conclusion,source_json,updated_at_ms)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(repo,pull_number,sha,run_id,attempt) DO NOTHING",
-            params![repo, number, run_sha, run_id, attempt, status, conclusion, source, now],
+            params![identity.repo, identity.pull_request, run_sha, run_id, attempt, status, conclusion, source, now],
         )?;
     tx.execute(
         "UPDATE pr_ci_runs SET
@@ -564,7 +556,15 @@ fn process_run_attempt(
              updated_at_ms=?4
              WHERE repo=?5 AND pull_number=?6 AND sha=?7 AND run_id=?8 AND attempt=?9",
         params![
-            status, conclusion, source, now, repo, number, run_sha, run_id, attempt
+            status,
+            conclusion,
+            source,
+            now,
+            identity.repo,
+            identity.pull_request,
+            run_sha,
+            run_id,
+            attempt
         ],
     )?;
     // A unique outbox key ensures webhook/poll redelivery and reruns do not collide.
@@ -573,7 +573,7 @@ fn process_run_attempt(
                 "INSERT OR IGNORE INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
                  SELECT ?1,?2,?3,?4,?5,thread,?6,?7 FROM pr_ci_trackers
                  WHERE repo=?1 AND pull_number=?2 AND active=1",
-                params![repo, number, run_sha, run_id, attempt, conclusion, source],
+                params![identity.repo, identity.pull_request, run_sha, run_id, attempt, conclusion, source],
             )?;
         *queued += inserted_delivery;
     }
@@ -922,7 +922,7 @@ mod tests {
     fn poll_requires_exact_pr_fork_sha_and_attempt_and_deduplicates_delivery() {
         let mut db = db();
         register(&mut db, "owner/project", "7", THREAD).unwrap();
-        let mut response = |route: &str| -> Result<ApiResponse> {
+        let response = |route: &str| -> Result<ApiResponse> {
             if route.contains("/pulls/") {
                 Ok(ApiResponse {
                     status: 200,

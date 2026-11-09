@@ -256,26 +256,7 @@ pub enum HandleResult {
 
 pub fn initialize(db: &Connection) -> Result<()> {
     db.execute_batch(SCHEMA)
-        .context("initialize PR observation tables")?;
-    for (column, declaration) in [
-        ("consumed_at_ms", "INTEGER"),
-        ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
-        ("next_retry_at_ms", "INTEGER"),
-        ("work_claim_until_ms", "INTEGER"),
-    ] {
-        let exists = db
-            .prepare("PRAGMA table_info(pr_hook_candidates)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|name| name == column);
-        if !exists {
-            db.execute_batch(&format!(
-                "ALTER TABLE pr_hook_candidates ADD COLUMN {column} {declaration}"
-            ))?;
-        }
-    }
-    Ok(())
+        .context("initialize PR observation tables")
 }
 
 /// Cheap, side-effect-free gate for `PreToolUse`: callers can skip opening the
@@ -332,10 +313,11 @@ fn claim_candidates(
     let condition = if verified {
         "state='verified' AND consumed_at_ms IS NULL"
     } else {
-        "state IN ('timeout','transport_error') AND next_retry_at_ms<=?1"
+        "(state IN ('timeout','transport_error') AND next_retry_at_ms<=?1)
+         OR (state='pending' AND (work_claim_until_ms IS NULL OR work_claim_until_ms<=?1))"
     };
     let query = format!(
-        "SELECT id FROM pr_hook_candidates WHERE {condition}
+        "SELECT id FROM pr_hook_candidates WHERE ({condition})
          AND (work_claim_until_ms IS NULL OR work_claim_until_ms<=?1)
          ORDER BY COALESCE(next_retry_at_ms,created_at_ms),id LIMIT ?2"
     );
@@ -396,7 +378,8 @@ pub fn mark_candidate_consumed(db: &Connection, id: i64, now_ms: i64) -> Result<
     )? == 1)
 }
 
-/// Read candidates whose timeout/network retry backoff has elapsed.
+/// Read candidates whose timeout/network backoff has elapsed, plus pending
+/// verifications whose worker lease expired after an interruption.
 pub fn list_due_retries(
     db: &Connection,
     now_ms: i64,
@@ -405,15 +388,17 @@ pub fn list_due_retries(
     initialize(db)?;
     list_candidates(
         db,
-        "SELECT id FROM pr_hook_candidates WHERE state IN ('timeout','transport_error')
-         AND next_retry_at_ms<=?1 ORDER BY next_retry_at_ms,id LIMIT ?2",
+        "SELECT id FROM pr_hook_candidates
+         WHERE (state IN ('timeout','transport_error') AND next_retry_at_ms<=?1)
+            OR (state='pending' AND (work_claim_until_ms IS NULL OR work_claim_until_ms<=?1))
+         ORDER BY COALESCE(next_retry_at_ms,created_at_ms),id LIMIT ?2",
         limit,
         Some(now_ms),
     )
 }
 
-/// Atomically lease due retries so concurrent workers cannot issue duplicate
-/// GitHub GET requests for the same candidate.
+/// Atomically lease due retries or interrupted pending verifications so
+/// concurrent workers cannot issue duplicate GitHub GET requests.
 pub fn claim_due_retries(
     db: &mut Connection,
     now_ms: i64,
@@ -917,6 +902,20 @@ fn verify_persisted_candidate(
             });
         }
     };
+    if let Some(reason) = retryable_http_failure(response.status, &response.body) {
+        set_candidate_state(
+            db,
+            candidate_id,
+            CandidateState::TransportError,
+            Some(reason),
+            Some(response.status),
+            None,
+        )?;
+        return Ok(HandleResult::Candidate {
+            record: candidate_record(db, candidate_id)?.expect("candidate exists"),
+            verified: None,
+        });
+    }
     let outcome = verify_pr_candidate(
         &candidate,
         &[observation],
@@ -946,6 +945,21 @@ fn verify_persisted_candidate(
         record: candidate_record(db, candidate_id)?.expect("candidate exists"),
         verified,
     })
+}
+
+fn retryable_http_failure(status: u16, body: &Value) -> Option<&'static str> {
+    match status {
+        429 => Some("GitHub API rate limited"),
+        503 => Some("GitHub API temporarily unavailable"),
+        403 if body
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("rate limit")) =>
+        {
+            Some("GitHub API rate limited")
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1260,6 +1274,8 @@ fn intent_metadata(
                 _ => {}
             }
             index += 1;
+        } else if takes_value(token) {
+            index += 1;
         } else {
             if let Some(value) = token.strip_prefix("--repo=") {
                 repo = safe_repository(value).map(str::to_owned);
@@ -1272,6 +1288,27 @@ fn intent_metadata(
         index += 1;
     }
     (repo, head, base, None)
+}
+
+fn takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "-a" | "--assignee"
+            | "-b"
+            | "--body"
+            | "-F"
+            | "--body-file"
+            | "-l"
+            | "--label"
+            | "-m"
+            | "--milestone"
+            | "--project"
+            | "-r"
+            | "--reviewer"
+            | "--recover"
+            | "-t"
+            | "--title"
+    )
 }
 
 fn shell_tokens(command: &str) -> Option<Vec<String>> {
@@ -1330,6 +1367,10 @@ fn api_endpoint(args: &[String]) -> Option<&str> {
                 | "--raw-field"
                 | "-X"
                 | "--method"
+                | "--input"
+                | "--preview"
+                | "-p"
+                | "--cache"
                 | "--hostname"
                 | "-q"
                 | "--jq"
@@ -1714,11 +1755,19 @@ mod tests {
             [],
         )
         .unwrap();
+        let now = unix_now_ms();
+        assert_eq!(list_due_retries(&db, now, 10).unwrap().len(), 1);
+        let claimed = claim_due_retries(&mut db, now, 60_000, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
         let transport = fixture_transport();
-        let HandleResult::Candidate { record, .. } =
-            handle_post_tool_use(&mut db, &event, &transport, Duration::from_secs(2), 60_000)
-                .unwrap()
-        else {
+        let HandleResult::Candidate { record, .. } = retry_candidate(
+            &mut db,
+            claimed[0].id,
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
             panic!()
         };
         assert_eq!(record.state, CandidateState::Verified);
@@ -1793,6 +1842,87 @@ mod tests {
         ).unwrap();
         assert!(!stored.contains(secret));
         assert!(!stored.contains("feature"));
+    }
+
+    #[test]
+    fn gh_pr_body_value_cannot_be_misread_as_head_metadata() {
+        let secret = "Bearer-SECRET-value";
+        let command = format!("gh pr create --body '--head={secret}'");
+        let event = pre("s", "t", "c", &command);
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(&mut db, &event, 100, 1000).unwrap();
+        let (repo, head, base, author) = intent_metadata("Bash", &event["tool_input"]);
+        assert_eq!((repo, head, base, author), (None, None, None, None));
+        let persisted: String = db.query_row(
+            "SELECT COALESCE(repository,'') || COALESCE(head_ref,'') || COALESCE(base_ref,'') || COALESCE(author_login,'') FROM pr_hook_pre_observations",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!persisted.contains(secret));
+    }
+
+    #[test]
+    fn gh_api_creation_intent_skips_input_preview_and_cache_values_before_route() {
+        let command = "gh api --input body.json --preview corsair --cache 1m -X POST /repos/acme/widget/pulls -f title=x";
+        let event = pre("s", "t", "call", command);
+        assert!(is_relevant_pre_tool_use(&event));
+        let mut db = Connection::open_in_memory().unwrap();
+        assert!(matches!(
+            record_pre_tool_use(&mut db, &event, 100, 1000).unwrap(),
+            PreRecord::Recorded { .. }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_and_service_unavailable_responses_are_backoff_retries() {
+        for (status, body, expected_reason) in [
+            (
+                429,
+                json!({"message":"secondary rate limit"}),
+                "GitHub API rate limited",
+            ),
+            (
+                403,
+                json!({"message":"API rate limit exceeded"}),
+                "GitHub API rate limited",
+            ),
+            (
+                503,
+                json!({"message":"service unavailable"}),
+                "GitHub API temporarily unavailable",
+            ),
+        ] {
+            let mut db = Connection::open_in_memory().unwrap();
+            let command = "gh pr create --title test";
+            record_pre_tool_use(
+                &mut db,
+                &pre("s", "t", "call", command),
+                1_735_787_045_500,
+                60_000,
+            )
+            .unwrap();
+            let mut response = fixture_response();
+            response.status = status;
+            response.body = body;
+            let transport = FixtureTransport {
+                response: Ok(response),
+                calls: Cell::new(0),
+            };
+            let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+                &mut db,
+                &post("s", "t", Some("call"), command),
+                &transport,
+                Duration::from_secs(2),
+                60_000,
+            )
+            .unwrap() else {
+                panic!()
+            };
+            assert_eq!(record.state, CandidateState::TransportError);
+            assert_eq!(record.get_status, Some(status));
+            assert_eq!(record.reason.as_deref(), Some(expected_reason));
+            assert!(record.next_retry_at_ms.is_some());
+            assert!(verified.is_none());
+        }
     }
 
     #[test]
