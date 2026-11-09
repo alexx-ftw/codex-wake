@@ -216,7 +216,16 @@ fn parse_gh_api_create(args: &[String]) -> Option<String> {
     {
         return None;
     }
-    let path = endpoint?.strip_prefix('/').unwrap_or(endpoint?);
+    let endpoint = endpoint?;
+    let endpoint = if let Some(path) = endpoint.strip_prefix("https://api.github.com/") {
+        if path.starts_with('/') {
+            return None;
+        }
+        path
+    } else {
+        endpoint
+    };
+    let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
     let mut parts = path.split('/');
     if parts.next()? != "repos" {
         return None;
@@ -805,6 +814,7 @@ mod tests {
             "gh api /repos/Acme/Widget/pulls -f title=change -f head=feature -f base=main",
             "gh api --field title=change /repos/Acme/Widget/pulls",
             "gh api /repos/Acme/Widget/pulls --method=POST",
+            "gh api -X POST https://api.github.com/repos/Acme/Widget/pulls",
         ] {
             assert_eq!(
                 parse_pr_candidate(&bash(command, body)).unwrap().number,
@@ -823,6 +833,9 @@ mod tests {
             "gh api --method POST /repos/acme/widget/issues",
             "gh api -X POST /repos/acme/widget/pulls/42",
             "gh api -X POST /repos/{owner}/{repo}/pulls",
+            "gh api -X POST https://api.github.com.evil/repos/acme/widget/pulls",
+            "gh api -X POST https://ghe.example.test/repos/acme/widget/pulls",
+            "gh api -X POST https://api.github.com//repos/acme/widget/pulls",
         ] {
             assert!(
                 parse_pr_candidate(&bash(command, body)).is_none(),

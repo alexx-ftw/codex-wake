@@ -183,7 +183,7 @@ impl PullRequestGetTransport for GhCliPullRequestGet {
         if !valid_repository(repository) || number == 0 {
             return Err(TransportFailure::Other);
         }
-        let endpoint = format!("repos/{repository}/pulls/{number}");
+        let endpoint = format!("https://api.github.com/repos/{repository}/pulls/{number}");
         let mut command = Command::new(&self.gh);
         command.args(["api", &endpoint, "--method", "GET", "--include"]);
         let output = crate::manager::run(&mut command, timeout).map_err(|error| {
@@ -626,7 +626,10 @@ pub fn handle_post_tool_use(
                     pre_id,
                     exact_tool_use_id,
                     !command_output_can_be_filtered(tool_name, event.get("tool_input"))
-                        && !command_api_origin_is_unverified(tool_name, event.get("tool_input")),
+                        && !command_has_explicit_foreign_api_host(
+                            tool_name,
+                            event.get("tool_input"),
+                        ),
                     candidate_id
                 ],
             )?;
@@ -1464,6 +1467,14 @@ fn api_endpoint(args: &[String]) -> Option<&str> {
 }
 
 fn api_pulls_repository(endpoint: &str) -> Option<&str> {
+    let endpoint = if let Some(path) = endpoint.strip_prefix("https://api.github.com/") {
+        if path.starts_with('/') {
+            return None;
+        }
+        path
+    } else {
+        endpoint
+    };
     let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
     let tail = path.strip_prefix("repos/")?;
     let mut parts = tail.split('/');
@@ -1529,7 +1540,11 @@ fn command_output_can_be_filtered(tool_name: &str, input: Option<&Value>) -> boo
     })
 }
 
-fn command_api_origin_is_unverified(tool_name: &str, input: Option<&Value>) -> bool {
+// Native `gh pr create` output and relative `gh api` output remain eligible
+// when the exact call is correlated. Hook events do not capture `api_host`, so
+// a configured gateway can still serve these commands; only an explicit
+// foreign `--hostname` is rejected here.
+fn command_has_explicit_foreign_api_host(tool_name: &str, input: Option<&Value>) -> bool {
     if tool_name != "Bash" {
         return false;
     }
@@ -1547,10 +1562,50 @@ fn command_api_origin_is_unverified(tool_name: &str, input: Option<&Value>) -> b
     {
         return false;
     }
-    // PostToolUse has no effective-host or config evidence. `--hostname` and
-    // GH_HOST express selection, but gh's api_host setting can redirect API
-    // traffic. Retain the candidate, but do not attribute it from this payload.
-    true
+
+    let mut index = 2;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        let (option, inline) = token
+            .split_once('=')
+            .map_or((token, None), |(option, value)| (option, Some(value)));
+        if option == "--hostname" {
+            let host = if let Some(host) = inline {
+                host
+            } else {
+                index += 1;
+                let Some(host) = tokens.get(index).map(String::as_str) else {
+                    return true;
+                };
+                host
+            };
+            if !host.eq_ignore_ascii_case("github.com") {
+                return true;
+            }
+        } else if matches!(
+            option,
+            "-H" | "--header"
+                | "-f"
+                | "--field"
+                | "-F"
+                | "--raw-field"
+                | "-X"
+                | "--method"
+                | "--input"
+                | "--preview"
+                | "-p"
+                | "--cache"
+                | "-q"
+                | "--jq"
+                | "-t"
+                | "--template"
+        ) && inline.is_none()
+        {
+            index += 1;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn candidate_invocation_key(
@@ -1621,6 +1676,9 @@ mod tests {
     use std::cell::Cell;
     use std::sync::mpsc;
 
+    const TRUSTED_API_CREATE: &str =
+        "gh api -X POST https://api.github.com/repos/acme/widget/pulls -f title=test";
+
     struct FixtureTransport {
         response: std::result::Result<GetPullRequestResponse, TransportFailure>,
         calls: Cell<usize>,
@@ -1650,13 +1708,23 @@ mod tests {
     }
 
     fn post(session: &str, turn: &str, call: Option<&str>, command: &str) -> Value {
+        let tool_response = if command.starts_with("gh api ") {
+            json!({
+                "number":42,
+                "html_url":"https://github.com/acme/widget/pull/42",
+                "created_at":"2025-01-02T03:04:06Z"
+            })
+            .to_string()
+        } else {
+            "https://github.com/acme/widget/pull/42".to_owned()
+        };
         let mut value = json!({
             "hook_event_name":"PostToolUse",
             "session_id":session,
             "turn_id":turn,
             "tool_name":"Bash",
             "tool_input":{"command":command},
-            "tool_response":"https://github.com/acme/widget/pull/42"
+            "tool_response":tool_response
         });
         if let Some(call) = call {
             value["tool_use_id"] = json!(call);
@@ -1733,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn unaccredited_gh_api_host_blocks_attribution_at_any_age() {
+    fn explicit_foreign_gh_api_host_blocks_attribution_at_any_age() {
         let command =
             "gh api --hostname api.attacker.test -X POST repos/acme/widget/pulls -f title=test";
         let observed_at_ms = 1_735_787_044_500;
@@ -1762,27 +1830,30 @@ mod tests {
     }
 
     #[test]
-    fn gh_api_host_selector_does_not_prove_effective_api_origin() {
+    fn only_explicit_foreign_gh_api_hostname_is_rejected() {
         for command in [
             "gh api repos/acme/widget/pulls",
             "gh api --hostname github.com repos/acme/widget/pulls",
-            "gh api --hostname api.attacker.test repos/acme/widget/pulls",
+            "gh api -H '--hostname=api.attacker.test' repos/acme/widget/pulls",
+            "gh pr create --title test",
+            TRUSTED_API_CREATE,
         ] {
             let input = json!({"command":command});
-            assert!(command_api_origin_is_unverified("Bash", Some(&input)));
+            assert!(!command_has_explicit_foreign_api_host("Bash", Some(&input)));
         }
-        // The event does not carry GH_HOST. Empty and absent are both unknown;
-        // neither proves that gh's api_host configuration did not redirect.
-        assert!(!command_api_origin_is_unverified(
-            MCP_CREATE_PR_TOOL,
-            Some(&json!({"command":"gh api repos/acme/widget/pulls"}))
-        ));
+        for command in [
+            "gh api --hostname api.attacker.test repos/acme/widget/pulls",
+            "gh api --hostname=api.attacker.test https://api.github.com/repos/acme/widget/pulls",
+        ] {
+            let input = json!({"command":command});
+            assert!(command_has_explicit_foreign_api_host("Bash", Some(&input)));
+        }
     }
 
     #[test]
     fn durable_pre_matches_post_by_session_turn_id_and_digest_then_get_verifies() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = "gh pr create --title test";
+        let command = TRUSTED_API_CREATE;
         let recorded = record_pre_tool_use(
             &mut db,
             &pre("s1", "t1", "call-1", command),
@@ -1822,7 +1893,7 @@ mod tests {
     #[test]
     fn repeated_post_returns_durable_verification_without_another_get() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = "gh pr create --title test";
+        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
             &pre("s", "t", "call", command),
@@ -1867,14 +1938,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_tool_identity_and_raw_result_allow_matching_pr_created_in_same_second() {
+    fn exact_gh_pr_create_result_allows_attribution() {
         let command = "gh pr create --title test";
-        let observed_at_ms = 1_735_787_046_500; // 2025-01-02T03:04:06.500Z
         let mut db = Connection::open_in_memory().unwrap();
         record_pre_tool_use(
             &mut db,
             &pre("s", "t", "call", command),
-            observed_at_ms,
+            1_735_787_044_500,
             60_000,
         )
         .unwrap();
@@ -1887,11 +1957,43 @@ mod tests {
             60_000,
         )
         .unwrap() else {
-            panic!("the recognized creation output should produce a candidate")
+            panic!("recognized CLI URL should remain a candidate")
         };
         assert_eq!(record.state, CandidateState::Verified);
         assert_eq!(verified.unwrap().number, 42);
         assert_eq!(transport.calls.get(), 1);
+    }
+
+    #[test]
+    fn exact_native_api_results_allow_same_second_creation() {
+        let observed_at_ms = 1_735_787_046_500; // 2025-01-02T03:04:06.500Z
+        for command in [
+            TRUSTED_API_CREATE,
+            "gh api -X POST repos/acme/widget/pulls -f title=test",
+        ] {
+            let mut db = Connection::open_in_memory().unwrap();
+            record_pre_tool_use(
+                &mut db,
+                &pre("s", "t", "call", command),
+                observed_at_ms,
+                60_000,
+            )
+            .unwrap();
+            let transport = fixture_transport();
+            let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+                &mut db,
+                &post("s", "t", Some("call"), command),
+                &transport,
+                Duration::from_secs(2),
+                60_000,
+            )
+            .unwrap() else {
+                panic!("recognized native response should produce a candidate")
+            };
+            assert_eq!(record.state, CandidateState::Verified, "{command}");
+            assert_eq!(verified.unwrap().number, 42, "{command}");
+            assert_eq!(transport.calls.get(), 1, "{command}");
+        }
     }
 
     #[test]
@@ -1976,7 +2078,7 @@ mod tests {
         }
 
         let mut db = Connection::open_in_memory().unwrap();
-        let command = "gh pr create --title test";
+        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
             &pre("s", "t", "call", command),
@@ -2103,7 +2205,7 @@ mod tests {
     #[test]
     fn verified_snapshot_survives_database_reopen() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let command = "gh pr create --title test";
+        let command = TRUSTED_API_CREATE;
         let id = {
             let mut db = Connection::open(file.path()).unwrap();
             record_pre_tool_use(
@@ -2140,6 +2242,18 @@ mod tests {
         assert_eq!(
             api_pulls_repository("/repos/acme/widget/pulls"),
             Some("acme/widget")
+        );
+        assert_eq!(
+            api_pulls_repository("https://api.github.com/repos/acme/widget/pulls"),
+            Some("acme/widget")
+        );
+        assert_eq!(
+            api_pulls_repository("https://api.github.com.evil/repos/acme/widget/pulls"),
+            None
+        );
+        assert_eq!(
+            api_pulls_repository("https://api.github.com//repos/acme/widget/pulls"),
+            None
         );
         assert_eq!(api_pulls_repository("repos/acme/widget/pulls/42"), None);
         let secret = "Bearer-very-secret-42";
@@ -2340,7 +2454,7 @@ mod tests {
         let gh = dir.path().join("configured-gh");
         std::fs::write(
             &gh,
-            "#!/bin/sh\nprintf 'HTTP/2 404 Not Found\\r\\ncontent-type: application/json\\r\\n\\r\\n%s\\n' '{\"message\":\"Not Found\"}'\nexit 1\n",
+            "#!/bin/sh\n[ \"$2\" = \"https://api.github.com/repos/acme/widget/pulls/42\" ] || exit 2\nprintf 'HTTP/2 404 Not Found\\r\\ncontent-type: application/json\\r\\n\\r\\n%s\\n' '{\"message\":\"Not Found\"}'\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2415,7 +2529,7 @@ mod tests {
     #[test]
     fn timeout_and_transport_error_are_visible_and_retryable() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = "gh pr create --title test";
+        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
             &pre("s1", "t1", "call-1", command),
@@ -2474,7 +2588,7 @@ mod tests {
     #[test]
     fn verified_worker_claims_once_and_acknowledges_only_after_claim() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = "gh pr create --title test";
+        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
             &pre("s", "t", "call", command),
