@@ -266,6 +266,91 @@ mod tests {
     }
 
     #[test]
+    fn registration_replays_lifecycle_events_recorded_before_listener_exists() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize_registration(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let closed_at = "2025-01-02T03:04:05Z";
+        let reopened_at = "2025-01-03T04:05:06Z";
+
+        assert!(
+            crate::polling::pr_notifications::record_closed_event(
+                &db,
+                "owner/repo",
+                "7",
+                "closed",
+                closed_at,
+                "close-before-registration",
+                &serde_json::json!({
+                    "action":"closed",
+                    "number":7,
+                    "repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"merged":false,"closed_at":closed_at}
+                }),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            crate::polling::pr_notifications::record_reopened_event_with_id(
+                &db,
+                "owner/repo",
+                "7",
+                "webhook",
+                reopened_at,
+                "reopen-before-registration",
+            )
+            .unwrap(),
+            0
+        );
+
+        let expected_events: Vec<(String, String)> = {
+            let mut statement = db
+                .prepare(
+                    "SELECT event,event_key FROM automatic_pr_event_journal
+                     WHERE kind='pull_request' AND repo='owner/repo' AND pr='7'
+                     ORDER BY event_at_sec,event_key",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(expected_events.len(), 2);
+        let registered_at_sec =
+            crate::polling::pr_notifications::timestamp_second(&db, "2025-01-01T00:00:00Z")
+                .unwrap();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        register_in(&tx, "owner/repo", "7", thread, Some(registered_at_sec)).unwrap();
+        tx.commit().unwrap();
+
+        let mut lifecycle: Vec<(String, String)> = crate::polling::pr_notifications::pending(&db)
+            .unwrap()
+            .into_iter()
+            .filter(|notice| notice.thread == thread)
+            .map(|notice| (notice.event, notice.event_key))
+            .collect();
+        assert_eq!(lifecycle.len(), 2, "close and reopen must be replayed");
+        lifecycle.sort();
+        assert_eq!(lifecycle, expected_events);
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        register_in(&tx, "owner/repo", "7", thread, Some(registered_at_sec)).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            crate::polling::pr_notifications::pending(&db)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn delayed_verification_keeps_events_since_creation_observation() {
         let mut db = Connection::open_in_memory().unwrap();
         let observed_at_ms = unix_now_ms() - 30_000;

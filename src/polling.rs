@@ -198,38 +198,75 @@ where
                 )?;
             }
         }
-        let timeline_floor = if cached_prior_state.as_deref() == Some("closed") {
-            Some(
-                pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)?
-                    .ok_or_else(|| anyhow::anyhow!("Missing retained PR close timestamp"))?,
-            )
-        } else {
-            None
-        };
-        let reopened_at = std::cell::RefCell::new(None::<Vec<ReopenedTimelineEvent>>);
+        let timeline_floor =
+            pr_notifications::reopen_timeline_floor(db, &resource.repo, &resource.resource)?;
+        let timeline_route = format!(
+            "/repos/{}/issues/{}/timeline",
+            resource.repo, resource.resource
+        );
+        let timeline_due = state(db, &timeline_route, 0)?
+            .is_none_or(|timeline_state| timeline_state.next_poll <= now);
+        let lifecycle_events = std::cell::RefCell::new(None::<Vec<TimelineLifecycleEvent>>);
+        let timeline_failed = std::cell::Cell::new(false);
         let timeline_calls = std::cell::Cell::new(0_u64);
         let repo_for_timeline = resource.repo.clone();
         let number_for_timeline = resource.resource.clone();
         let route_for_timeline = route.clone();
         let mut pr_fetch = |requested: &str, etag: Option<&str>| {
-            let response = fetch(requested, etag)?;
+            let response = fetch(
+                requested,
+                if requested == route_for_timeline && timeline_floor.is_some() {
+                    None
+                } else {
+                    etag
+                },
+            )?;
             if requested == route_for_timeline
                 && response.status == 200
-                && cached_prior_state.as_deref() == Some("closed")
+                && let Some(floor_sec) = timeline_floor
                 && serde_json::from_slice::<Value>(&response.body)
                     .is_ok_and(|pull| pull["state"] == "open")
             {
-                let floor_sec = timeline_floor.ok_or_else(|| Failure::new("invalid_response"))?;
-                let (events, calls) = fetch_reopened_timeline(
-                    db,
-                    &mut fetch,
-                    &repo_for_timeline,
-                    &number_for_timeline,
-                    floor_sec,
-                    &timeline_calls,
-                )?;
-                reopened_at.replace(Some(events));
-                debug_assert_eq!(timeline_calls.get(), calls);
+                if !timeline_due {
+                    timeline_failed.set(true);
+                } else {
+                    match fetch_reopened_timeline(
+                        db,
+                        &mut fetch,
+                        &repo_for_timeline,
+                        &number_for_timeline,
+                        floor_sec,
+                        &timeline_calls,
+                    ) {
+                        Ok((events, _)) => {
+                            lifecycle_events.replace(Some(events));
+                            db.execute(
+                                "INSERT INTO github_poll_state
+                                 (endpoint,page,next_poll_ms,backoff_ms,last_success_ms,error_category,calls)
+                                 VALUES(?1,0,?2,?3,?4,NULL,?5)
+                                 ON CONFLICT(endpoint,page) DO UPDATE SET
+                                   next_poll_ms=excluded.next_poll_ms,backoff_ms=excluded.backoff_ms,
+                                   last_success_ms=excluded.last_success_ms,error_category=NULL,
+                                   calls=github_poll_state.calls+excluded.calls",
+                                params![timeline_route, now + INTERVAL_MS, INTERVAL_MS, now, timeline_calls.get() as i64],
+                            ).map_err(|_| Failure::new("database"))?;
+                        }
+                        Err(error) => {
+                            // Keep the valid PR snapshot usable, but retain a route-specific
+                            // retry deadline and the rate-limit/global backoff semantics.
+                            record_failure(
+                                db,
+                                &timeline_route,
+                                0,
+                                now,
+                                &error,
+                                timeline_calls.get(),
+                            )
+                            .map_err(|_| Failure::new("database"))?;
+                            timeline_failed.set(true);
+                        }
+                    }
+                }
             }
             Ok(response)
         };
@@ -275,9 +312,33 @@ where
                     .pointer("/base/ref")
                     .and_then(Value::as_str)
                     .ok_or_else(|| Failure::new("invalid_response"))?;
+                let changed_at = pr["updated_at"].as_str();
                 let old: Value = cursor
                     .and_then(|raw| serde_json::from_str(raw).ok())
                     .unwrap_or(Value::Null);
+                let head_changed = old["head"]
+                    .as_str()
+                    .is_some_and(|previous| previous != head);
+                let base_changed = old["base"]
+                    .as_str()
+                    .is_some_and(|previous| previous != base);
+                // A PR-wide updated_at can change for title/body edits; it is evidence for a
+                // head/base event only when this poll observed the corresponding transition.
+                let head_event_at = if head_changed {
+                    changed_at
+                } else {
+                    old["head_updated_at"].as_str()
+                };
+                let base_event_at = if base_changed {
+                    changed_at
+                } else {
+                    old["base_updated_at"].as_str()
+                };
+                let base_changed_from = if base_changed {
+                    old["base"].as_str().map(str::to_owned)
+                } else {
+                    old["base_changed_from"].as_str().map(str::to_owned)
+                };
                 // Older PR cursors omit state; recover it from the cached response.
                 let prior_state = match old["state"].as_str() {
                     Some(state @ ("open" | "closed")) => Some(state.to_owned()),
@@ -373,18 +434,33 @@ where
                     )
                     .map_err(|_| Failure::new("database"))?;
                 } else if !old.is_null() {
-                    let changed_at = pr["updated_at"].as_str();
-                    if prior_state.as_deref() == Some("closed") {
-                        let events = reopened_at
-                            .borrow()
-                            .clone()
-                            .ok_or_else(|| Failure::new("invalid_response"))?;
+                    if let Some(events) = lifecycle_events.borrow().clone() {
                         let tx = rusqlite::Transaction::new_unchecked(
                             db,
                             rusqlite::TransactionBehavior::Immediate,
                         )
                         .map_err(|_| Failure::new("database"))?;
                         for timeline_event in events {
+                            if timeline_event.event == "closed" {
+                                pr_notifications::record_closed_event_in(
+                                    &tx,
+                                    &resource.repo,
+                                    &resource.resource,
+                                    "closed",
+                                    &timeline_event.event_at,
+                                    &stable_source_key(
+                                        "pull_request",
+                                        &resource.repo,
+                                        &resource.resource,
+                                        "closed",
+                                        "",
+                                        &[&timeline_event.event_at],
+                                    ),
+                                    &timeline_event.source,
+                                )
+                                .map_err(|_| Failure::new("database"))?;
+                                continue;
+                            }
                             let cycle = pr_notifications::record_reopened_event_in(
                                 &tx,
                                 &resource.repo,
@@ -424,8 +500,10 @@ where
                             }
                         }
                         tx.commit().map_err(|_| Failure::new("database"))?;
+                    } else if timeline_floor.is_some() && !timeline_failed.get() {
+                        return Err(Failure::new("invalid_response"));
                     }
-                    if old["head"].as_str().is_some_and(|v| v != head) {
+                    if head_changed {
                         let event_key = stable_source_key(
                             "pull_request",
                             &resource.repo,
@@ -454,21 +532,8 @@ where
                             &resource.resource,
                             changed_at,
                         )? as u64;
-                        if let Some(event_at) = changed_at {
-                            pr_notifications::record_event(
-                                db,
-                                "pull_request",
-                                &resource.repo,
-                                &resource.resource,
-                                "synchronize",
-                                event_at,
-                                &event_key,
-                                &full("synchronize", Value::Null),
-                            )
-                            .map_err(|_| Failure::new("database"))?;
-                        }
                     }
-                    if old["base"].as_str().is_some_and(|v| v != base) {
+                    if base_changed {
                         let event_key = stable_source_key(
                             "pull_request",
                             &resource.repo,
@@ -497,19 +562,45 @@ where
                             &resource.resource,
                             changed_at,
                         )? as u64;
-                        if let Some(event_at) = changed_at {
-                            pr_notifications::record_event(
-                                db,
-                                "pull_request",
-                                &resource.repo,
-                                &resource.resource,
-                                "base_changed",
-                                event_at,
-                                &event_key,
-                                &full("edited", json!({"base":{"ref":old["base"]}})),
-                            )
-                            .map_err(|_| Failure::new("database"))?;
-                        }
+                    }
+                }
+                if pr["state"] == "open" {
+                    for (event_name, identity, event_at, source) in [
+                        (
+                            "synchronize",
+                            head,
+                            head_event_at,
+                            full("synchronize", Value::Null),
+                        ),
+                        (
+                            "base_changed",
+                            base,
+                            base_event_at,
+                            full("edited", json!({"base":{"ref":base_changed_from}})),
+                        ),
+                    ] {
+                        let Some(event_at) = event_at else {
+                            continue;
+                        };
+                        let event_key = stable_source_key(
+                            "pull_request",
+                            &resource.repo,
+                            &resource.resource,
+                            event_name,
+                            "",
+                            &[event_at, identity],
+                        );
+                        pr_notifications::record_event(
+                            db,
+                            "pull_request",
+                            &resource.repo,
+                            &resource.resource,
+                            event_name,
+                            event_at,
+                            &event_key,
+                            &source,
+                        )
+                        .map_err(|_| Failure::new("database"))?;
                     }
                 }
                 accepted += observe_conditions(
@@ -524,6 +615,8 @@ where
                 Ok((
                 Some(
                     json!({"head":head,"base":base,"state":pr["state"],"updated_at":pr["updated_at"],
+                    "head_updated_at":head_event_at,"base_updated_at":base_event_at,
+                    "base_changed_from":base_changed_from,
                     "poll_seq":now})
                     .to_string(),
                 ),
@@ -570,7 +663,7 @@ where
                         "APPROVED" => "approved",
                         "CHANGES_REQUESTED" => "changes_requested",
                         "COMMENTED" => "commented",
-                        _ => state,
+                        _ => continue,
                     };
                     let condition_events = if normalized == "commented" {
                         vec!["submitted"]
@@ -863,12 +956,12 @@ where
                         // Re-evaluate each rule against the provider timestamps even when a
                         // shared endpoint cursor already contains this comment. Rule delivery
                         // identity is unique per rule/comment, so this does not redeliver.
-                        matched +=
-                            accept_comment(db, header, &repo, &pr, comment, "created")? as u64;
                         if timestamp_gt(db, updated, created)? {
                             matched +=
                                 accept_comment(db, header, &repo, &pr, comment, "edited")? as u64;
                         }
+                        matched +=
+                            accept_comment(db, header, &repo, &pr, comment, "created")? as u64;
                     }
                     Ok((
                         Some(
@@ -2244,9 +2337,11 @@ impl HttpResponse {
 }
 
 #[derive(Clone)]
-struct ReopenedTimelineEvent {
+struct TimelineLifecycleEvent {
+    event: &'static str,
     event_at: String,
     event_id: String,
+    source: Value,
 }
 
 fn fetch_reopened_timeline<F>(
@@ -2256,7 +2351,7 @@ fn fetch_reopened_timeline<F>(
     number: &str,
     floor_sec: i64,
     calls: &std::cell::Cell<u64>,
-) -> std::result::Result<(Vec<ReopenedTimelineEvent>, u64), Failure>
+) -> std::result::Result<(Vec<TimelineLifecycleEvent>, u64), Failure>
 where
     F: FnMut(&str, Option<&str>) -> std::result::Result<HttpResponse, Failure>,
 {
@@ -2275,7 +2370,7 @@ where
             return Err(page.failure());
         }
     }
-    let mut reopened = Vec::new();
+    let mut lifecycle_events = Vec::new();
     loop {
         let page_events = serde_json::from_slice::<Value>(&page.body)
             .ok()
@@ -2283,9 +2378,13 @@ where
             .ok_or_else(|| Failure::new("invalid_response"))?;
         let mut reached_floor = false;
         for event in page_events {
-            let event_kind = event["event"].as_str();
-            let reopened_event = event_kind == Some("reopened");
-            let event_at = if reopened_event {
+            let lifecycle_kind = match event["event"].as_str() {
+                Some("closed") => Some("closed"),
+                Some("reopened") => Some("reopened"),
+                _ => None,
+            };
+            let lifecycle_event = lifecycle_kind.is_some();
+            let event_at = if lifecycle_event {
                 let event_id = event["id"]
                     .as_i64()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
@@ -2303,31 +2402,27 @@ where
             };
             let event_at_sec = match pr_notifications::timestamp_second(db, event_at) {
                 Ok(event_at_sec) => event_at_sec,
-                Err(_) if reopened_event => return Err(Failure::new("invalid_response")),
+                Err(_) if lifecycle_event => return Err(Failure::new("invalid_response")),
                 Err(_) => continue,
             };
             reached_floor |= event_at_sec < floor_sec;
-            if reopened_event && event_at_sec >= floor_sec {
+            if lifecycle_event && event_at_sec >= floor_sec {
                 let event_id = event_id.ok_or_else(|| Failure::new("invalid_response"))?;
-                reopened.push(ReopenedTimelineEvent {
+                lifecycle_events.push(TimelineLifecycleEvent {
+                    event: lifecycle_kind.ok_or_else(|| Failure::new("invalid_response"))?,
                     event_at: event_at.to_owned(),
                     event_id: event_id.to_string(),
+                    source: event,
                 });
             }
         }
         if reached_floor {
-            if reopened.is_empty() {
-                return Err(Failure::new("invalid_response"));
-            }
-            reopened.sort_by(|left, right| left.event_at.cmp(&right.event_at));
-            return Ok((reopened, calls.get()));
+            lifecycle_events.sort_by(|left, right| left.event_at.cmp(&right.event_at));
+            return Ok((lifecycle_events, calls.get()));
         }
         let Some(previous) = page_link_route(&page, "prev") else {
-            if reopened.is_empty() {
-                return Err(Failure::new("invalid_response"));
-            }
-            reopened.sort_by(|left, right| left.event_at.cmp(&right.event_at));
-            return Ok((reopened, calls.get()));
+            lifecycle_events.sort_by(|left, right| left.event_at.cmp(&right.event_at));
+            return Ok((lifecycle_events, calls.get()));
         };
         if previous == page_route {
             return Err(Failure::new("invalid_response"));
@@ -4038,6 +4133,336 @@ mod tests {
     }
 
     #[test]
+    fn open_poll_replays_reopen_close_reopen_timeline_cycles() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        let open = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:50Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let report = tick_with(&db, INTERVAL_MS + 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":7101,"event":"reopened","created_at":"2099-01-01T00:00:20Z"},
+                    {"id":7102,"event":"closed","created_at":"2099-01-01T00:00:30Z"},
+                    {"id":7103,"event":"reopened","created_at":"2099-01-01T00:00:40Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let mut reopened: Vec<_> = pr_notifications::pending(&db)
+            .unwrap()
+            .into_iter()
+            .filter(|notice| notice.event == "reopened")
+            .map(|notice| notice.event_key)
+            .collect();
+        reopened.sort();
+        assert_eq!(reopened, ["reopened:4070908810", "reopened:4070908830"]);
+    }
+
+    #[test]
+    fn failed_reopen_timeline_does_not_block_open_snapshot_and_retries() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        let open = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let first = tick_with(&db, INTERVAL_MS + 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(HttpResponse {
+                status: 500,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}), "{first}");
+        let saved = state(&db, "/repos/owner/repo/pulls/7", 0).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&saved.body.unwrap()).unwrap()["state"],
+            "open"
+        );
+
+        let second = tick_with(&db, INTERVAL_MS * 2 + 1, |route, etag| match route {
+            "/repos/owner/repo/pulls/7" => {
+                assert_eq!(etag, None, "recovery must bypass a stale 304 validator");
+                Ok(response(open.clone(), false))
+            }
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([{"id":7201,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn close_webhook_and_timeline_replay_create_one_closed_notice() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let closed_at = "2099-01-01T00:00:10Z";
+        let closed_webhook = json!({
+            "action":"closed","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false,"closed_at":closed_at}
+        });
+        assert_eq!(
+            pr_notifications::accept_authenticated_webhook(&db, "pull_request", &closed_webhook)
+                .unwrap(),
+            1
+        );
+        let closed_snapshot = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":closed_at,"updated_at":closed_at,
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed_snapshot));
+        let open = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let report = tick_with(&db, now_ms(), |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":8100,"event":"closed","created_at":closed_at},
+                    {"id":8101,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.event == "closed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1
+        );
+        assert_eq!(notices.len(), 2);
+    }
+
+    #[test]
+    fn rate_limited_reopen_timeline_keeps_its_retry_deadline_without_blocking_pr_poll() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread).unwrap();
+        let closed = json!({
+            "number":7,"state":"closed","merged":false,"merged_at":null,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        let open = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}
+        });
+        let now = now_ms();
+        let first = tick_with(&db, now, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(HttpResponse {
+                status: 429,
+                headers: [("retry-after".into(), "120".into())].into(),
+                body: vec![],
+            }),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}), "{first}");
+        let timeline = state(&db, "/repos/owner/repo/issues/7/timeline", 0)
+            .unwrap()
+            .unwrap();
+        assert!(timeline.next_poll >= now + 120_000);
+        let category: String = db
+            .query_row(
+                "SELECT error_category FROM github_poll_state
+                 WHERE endpoint='/repos/owner/repo/issues/7/timeline' AND page=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category, "rate_limited");
+
+        let second = tick_with(&db, now + INTERVAL_MS, |route, _| {
+            panic!("rate-limited global route must not be fetched early: {route}")
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+        assert!(
+            state(&db, "/repos/owner/repo/issues/7/timeline", 0)
+                .unwrap()
+                .unwrap()
+                .next_poll
+                >= now + 120_000
+        );
+
+        let third = tick_with(&db, now + 121_000, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([{"id":7201,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(third["errors"], json!({}), "{third}");
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn title_only_updated_at_does_not_create_head_or_base_notices() {
+        let db = db();
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-02T00:00:00Z",
+            "head":{"sha":"b".repeat(40)},"base":{"ref":"release"}
+        });
+        seed_legacy_pr_cursor(&db, Some(&current));
+        let legacy_cursor = json!({
+            "head":"b".repeat(40),"base":"release",
+            "updated_at":"2099-01-02T00:00:00Z","poll_seq":INTERVAL_MS
+        });
+        db.execute(
+            "UPDATE github_poll_state SET cursor=?1 WHERE endpoint='/repos/owner/repo/pulls/7' AND page=0",
+            [legacy_cursor.to_string()],
+        )
+        .unwrap();
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+
+        for (now, updated_at) in [
+            (1, "2099-01-02T00:00:00Z"),
+            (INTERVAL_MS + 1, "2099-01-03T00:00:00Z"),
+        ] {
+            let report = tick_with(&db, now, |route, _| {
+                assert_eq!(route, "/repos/owner/repo/pulls/7");
+                let mut later = current.clone();
+                later["updated_at"] = json!(updated_at);
+                Ok(response(later, false))
+            })
+            .unwrap();
+            assert_eq!(report["errors"], json!({}), "{report}");
+        }
+        let mut events: Vec<_> = pr_notifications::pending(&db)
+            .unwrap()
+            .into_iter()
+            .map(|notice| notice.event)
+            .collect();
+        events.sort();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn persisted_base_change_replay_uses_previous_base_ref() {
+        let db = db();
+        let current = json!({
+            "number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-03T00:00:00Z",
+            "head":{"sha":"b".repeat(40)},"base":{"ref":"release"},
+            "head_updated_at":"2099-01-02T00:00:00Z",
+            "base_updated_at":"2099-01-02T00:00:00Z",
+            "base_changed_from":"main"
+        });
+        seed_legacy_pr_cursor(&db, Some(&current));
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let report = tick_with(&db, 1, |route, _| {
+            assert_eq!(route, "/repos/owner/repo/pulls/7");
+            Ok(response(current.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let notice = pr_notifications::pending(&db)
+            .unwrap()
+            .into_iter()
+            .find(|notice| notice.event == "base_changed")
+            .unwrap();
+        let source: Value = serde_json::from_str(&notice.source).unwrap();
+        assert_eq!(source["changes"]["base"]["ref"], "main");
+        assert_eq!(source["pull_request"]["base"]["ref"], "release");
+        let second = tick_with(&db, INTERVAL_MS + 1, |route, _| {
+            assert_eq!(route, "/repos/owner/repo/pulls/7");
+            Ok(response(current.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}), "{second}");
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "base_changed")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn historical_reopen_is_not_consumed_while_poll_observes_closed_pr() {
         let db = db();
         let thread = "11111111-1111-4111-8111-111111111111";
@@ -5246,6 +5671,35 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_review_is_not_replayed_as_a_submission() {
+        let db = db();
+        pr_notifications::register_in_since(
+            &db,
+            "review",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let report = tick_with(&db, 1, |route, _| {
+            assert_eq!(
+                route,
+                "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1"
+            );
+            Ok(response(
+                json!([{
+                    "id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:00:00Z"
+                }]),
+                false,
+            ))
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+    }
+
+    #[test]
     fn already_seen_review_fans_out_to_late_automatic_listener_once() {
         let db = db();
         let subscription = subscribe(&db, "review", "7", "approved");
@@ -5530,6 +5984,46 @@ mod tests {
             }).unwrap();
             assert_eq!(count(), expected);
         }
+    }
+
+    #[test]
+    fn first_observation_of_an_edited_comment_keeps_the_edit_action() {
+        let db = db();
+        rule(&db);
+        let comment = json!({
+            "id":51,"body":"wake","user":{"login":"trusted","type":"User"},
+            "created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-03T00:00:00Z"
+        });
+        let report = tick_with(&db, 1, |route, _| {
+            if route == "/repos/owner/repo/pulls/7" {
+                Ok(response(
+                    json!({
+                        "number":7,"state":"open","head":{"sha":"a".repeat(40)},
+                        "base":{"ref":"main"},"updated_at":"2026-01-03T00:00:00Z"
+                    }),
+                    false,
+                ))
+            } else if route.starts_with("/repos/owner/repo/issues/7/comments") {
+                Ok(response(json!([comment.clone()]), false))
+            } else {
+                assert!(route.starts_with("/repos/owner/repo/pulls/7/comments"));
+                Ok(response(json!([]), false))
+            }
+        })
+        .unwrap();
+        assert_eq!(report["errors"], json!({}), "{report}");
+        let (count, source): (i64, String) = db
+            .query_row(
+                "SELECT count(*),min(source) FROM rule_deliveries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&source).unwrap()["action"],
+            "edited"
+        );
     }
 
     #[test]
