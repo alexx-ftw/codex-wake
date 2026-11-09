@@ -75,7 +75,7 @@ fn cancellation_cli_returns_canonical_uuid() {
         &[
             "cancel-subscription",
             "--subscription-id",
-            &id.to_uppercase(),
+            &id.replace('-', "").to_uppercase(),
         ],
     );
     assert!(
@@ -85,6 +85,15 @@ fn cancellation_cli_returns_canonical_uuid() {
     );
     let result: Value = serde_json::from_slice(&cancelled.stdout).unwrap();
     assert_eq!(result["subscription_id"], id);
+    let db = rusqlite::Connection::open(temp.path().join("state.sqlite3")).unwrap();
+    let count: i64 = db
+        .query_row(
+            "SELECT count(*) FROM subscriptions WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 fn exercise(

@@ -2916,7 +2916,7 @@ mod hook_output_tests {
             subscriptions::subscribe(&db, "artifact", "ci", "two", "available", thread).unwrap();
         drop(db);
         let response = tools.cancel_subscription(Parameters(CancelSubscriptionInput {
-            subscription_id: id.to_uppercase(),
+            subscription_id: id.replace('-', "").to_uppercase(),
         }));
         assert_ne!(response.is_error, Some(true));
         assert_eq!(response.structured_content.unwrap()["subscription_id"], id);

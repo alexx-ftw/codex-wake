@@ -2315,7 +2315,10 @@ mod tests {
             [&target],
         )
         .unwrap();
-        assert_eq!(cancel(&db, &target.to_uppercase()).unwrap(), target);
+        assert_eq!(
+            cancel(&db, &target.replace('-', "").to_uppercase()).unwrap(),
+            target
+        );
         assert!(status_for_id(&db, &target).is_err());
         assert_eq!(status_for_id(&db, &other).unwrap()["state"], "waiting");
         assert_eq!(
