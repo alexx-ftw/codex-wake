@@ -14,6 +14,7 @@ mod observability;
 mod observers;
 mod polling;
 mod probe;
+mod process_watch;
 mod producers;
 mod result_conflicts;
 mod rules;
@@ -36,7 +37,7 @@ use std::{
     collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::PathBuf,
     time::Duration,
@@ -121,6 +122,19 @@ struct PublicationInput {
     attempt: Option<u64>,
     /// Explicit structured scope, compared only with validations linked to this exact kind/namespace/resource.
     scope: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProcessWatchInput {
+    /// Existing waiting job/completed subscription ID.
+    subscription_id: String,
+    /// Rust byte-regex matched independently against stdout and stderr.
+    regex: String,
+    /// Seconds before the timeout event; the process is not stopped.
+    timeout_secs: u64,
+    /// Program followed by argv; values are not included in watcher logs.
+    command: Vec<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -475,6 +489,7 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     let db = bridge::connect(&config.db)?;
     delivery_evidence::initialize(&db)?;
     subscriptions::initialize(&db)?;
+    process_watch::initialize(&db)?;
     conditions::initialize(&db)?;
     condition_alerts::initialize(&db)?;
     rules::initialize(&db)?;
@@ -503,6 +518,11 @@ fn recover(config: &manager::Config) -> Result<usize> {
             + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
             + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
     )
+}
+
+fn resume_stale_process_watches(config: &manager::Config) -> Result<Value> {
+    let db = database(config)?;
+    process_watch::schedule_stale(&db, &config.db)
 }
 
 pub(crate) fn dispatch_conditions(
@@ -1368,6 +1388,39 @@ fn tool_result(result: Result<Value>) -> CallToolResult {
 
 #[tool_router]
 impl WakeTools {
+    #[tool(
+        description = "Schedule a process under a separate systemd user service. Publishes the first observed stdout/stderr regex match, process exit, or monitor timeout to an existing job/completed subscription. Timeout does not stop the process; returns its unit, a supervisor PID when still running, and a diagnostics path. Use process-watch-status to inspect the child and output logs after it starts.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn watch_process(&self, Parameters(input): Parameters<ProcessWatchInput>) -> CallToolResult {
+        tool_result((|| {
+            anyhow::ensure!(!input.command.is_empty(), "Missing process command");
+            anyhow::ensure!(
+                input.timeout_secs > 0,
+                "Process watch timeout must be positive"
+            );
+            regex::bytes::Regex::new(&input.regex)
+                .map_err(|_| anyhow::anyhow!("Invalid Rust byte-regex pattern"))?;
+            let id = input.subscription_id;
+            let diagnostic = process_watch::diagnostic_path(&self.config.db, &id)?;
+            let supervisor = process_watch::launch_mcp_supervisor(
+                &self.config,
+                &id,
+                &input.regex,
+                input.timeout_secs,
+                &input.command,
+            )?;
+            Ok(json!({
+                "state":if supervisor.pid.is_some() { "starting" } else { "launched" },
+                "subscription_id":id,
+                "supervisor_pid":supervisor.pid,
+                "supervisor_unit":supervisor.unit,
+                "supervision":"systemd_user_service",
+                "diagnostic_path":diagnostic
+            }))
+        })())
+    }
+
     #[tool(
         description = "Register an explicit chat-to-chat wait with evidence; mutual waits create durable notices for both chats.",
         annotations(
@@ -2275,6 +2328,255 @@ impl WakeTools {
     }
 }
 
+#[cfg(test)]
+mod process_watch_cli_tests {
+    use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).into()).collect()
+    }
+
+    fn global(args: &[&str]) -> ParsedGlobalArgs {
+        parse_global_args(strings(args)).unwrap()
+    }
+
+    fn run(args: &[String]) -> (String, String, Vec<String>) {
+        let ProcessWatchArgs::Run {
+            subscription_id,
+            regex,
+            command,
+            ..
+        } = parse_process_watch_args(args).unwrap()
+        else {
+            panic!("expected process run");
+        };
+        (subscription_id, regex, command)
+    }
+
+    #[test]
+    fn global_options_do_not_consume_process_watch_values() {
+        let parsed = global(&[
+            "watch-process",
+            "--subscription-id",
+            "id",
+            "--regex",
+            "--db",
+            "--timeout-seconds",
+            "2",
+            "--",
+            "printf",
+            "--",
+        ]);
+        assert_eq!(
+            (parsed.db, parsed.codex, parsed.command.as_str()),
+            (None, None, "watch-process")
+        );
+        let (id, regex, command) = run(&parsed.args);
+        assert_eq!(id, "id");
+        assert_eq!(regex, "--db");
+        assert_eq!(command, ["printf", "--"]);
+    }
+
+    #[test]
+    fn double_dash_is_a_regex_value_until_the_next_unconsumed_separator() {
+        let args = strings(&[
+            "--subscription-id",
+            "id",
+            "--regex",
+            "--",
+            "--timeout-seconds",
+            "2",
+            "--",
+            "printf",
+            "--resume",
+        ]);
+        let (_, regex, command) = run(&args);
+        assert_eq!(regex, "--");
+        assert_eq!(command, ["printf", "--resume"]);
+    }
+
+    #[test]
+    fn process_watch_claim_token_is_parsed_before_the_command_separator() {
+        let args = strings(&[
+            "--subscription-id",
+            "id",
+            "--regex",
+            "READY",
+            "--timeout-seconds",
+            "5",
+            "--claim-token",
+            "request-token",
+            "--",
+            "printf",
+            "--claim-token",
+        ]);
+        let ProcessWatchArgs::Run {
+            claim_token,
+            command,
+            ..
+        } = parse_process_watch_args(&args).unwrap()
+        else {
+            panic!("expected process run");
+        };
+        assert_eq!(claim_token.as_deref(), Some("request-token"));
+        assert_eq!(command, ["printf", "--claim-token"]);
+    }
+
+    #[test]
+    fn global_database_override_is_only_parsed_before_the_command() {
+        let parsed = global(&["--db", "state.sqlite", "watch-process", "--regex", "--db"]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        assert_eq!(parsed.codex, None);
+        assert_eq!(parsed.command, "watch-process");
+        assert_eq!(parsed.args, ["--regex", "--db"]);
+    }
+
+    #[test]
+    fn ordinary_commands_keep_trailing_global_database_options() {
+        let parsed = global(&["status", "--db", "state.sqlite"]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        assert_eq!(parsed.codex, None);
+        assert_eq!(parsed.command, "status");
+        assert!(parsed.args.is_empty());
+    }
+
+    #[test]
+    fn literal_double_dash_message_template_does_not_hide_global_options() {
+        let parsed = global(&[
+            "subscribe",
+            "--message-template",
+            "--",
+            "--db",
+            "state.sqlite",
+        ]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        assert_eq!(parsed.args, ["--message-template", "--"]);
+    }
+
+    #[test]
+    fn literal_double_dash_resource_does_not_hide_global_options() {
+        let parsed = global(&[
+            "subscribe",
+            "--kind",
+            "resource",
+            "--resource",
+            "--",
+            "--event",
+            "completed",
+            "--thread",
+            "11111111-1111-4111-8111-111111111111",
+            "--db",
+            "state.sqlite",
+        ]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        assert_eq!(parsed.args[3], "--");
+
+        let mut args = parsed.args;
+        assert_eq!(required(&mut args, "--kind").unwrap(), "resource");
+        assert_eq!(required(&mut args, "--resource").unwrap(), "--");
+        assert_eq!(required(&mut args, "--event").unwrap(), "completed");
+    }
+
+    #[test]
+    fn global_database_does_not_consume_option_values_that_look_like_globals() {
+        let parsed = global(&[
+            "subscribe",
+            "--resource",
+            "--db",
+            "--repo",
+            "--",
+            "--event",
+            "released",
+            "--db",
+            "state.sqlite",
+        ]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        let mut args = parsed.args;
+        assert_eq!(required(&mut args, "--resource").unwrap(), "--db");
+        assert_eq!(option(&mut args, "--repo").unwrap().as_deref(), Some("--"));
+        assert_eq!(required(&mut args, "--event").unwrap(), "released");
+    }
+
+    #[test]
+    fn literal_double_dash_repository_does_not_hide_global_options() {
+        let parsed = global(&[
+            "subscribe",
+            "--kind",
+            "resource",
+            "--repo",
+            "--",
+            "--resource",
+            "abc",
+            "--event",
+            "completed",
+            "--thread",
+            "11111111-1111-4111-8111-111111111111",
+            "--db",
+            "state.sqlite",
+        ]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        let mut args = parsed.args;
+        assert_eq!(required(&mut args, "--kind").unwrap(), "resource");
+        assert_eq!(option(&mut args, "--repo").unwrap().as_deref(), Some("--"));
+        assert_eq!(required(&mut args, "--resource").unwrap(), "abc");
+    }
+
+    #[test]
+    fn double_dash_values_for_raw_cli_options_preserve_later_globals() {
+        for (command, option) in [
+            ("subscribe", "--repo"),
+            ("subscribe", "--resource"),
+            ("subscribe", "--message-template"),
+            ("configure-rule", "--file"),
+            ("handle", "--payload-env"),
+            ("handle", "--event-env"),
+            ("smoke-live", "--webhook"),
+            ("publish", "--event-id"),
+            ("publish", "--group-id"),
+            ("publish", "--turn-id"),
+        ] {
+            let parsed = global(&[command, option, "--", "--db", "state.sqlite"]);
+            assert_eq!(
+                parsed.db.as_deref(),
+                Some("state.sqlite"),
+                "{command} {option}"
+            );
+            assert_eq!(parsed.args, [option, "--"], "{command} {option}");
+        }
+
+        let parsed = global(&["status", "--db", "--", "--codex", "codex"]);
+        assert_eq!(parsed.db.as_deref(), Some("--"));
+        assert_eq!(parsed.codex.as_deref(), Some("codex"));
+        assert!(parsed.args.is_empty());
+
+        let parsed = global(&["status", "--codex", "--", "--db", "state.sqlite"]);
+        assert_eq!(parsed.db.as_deref(), Some("state.sqlite"));
+        assert_eq!(parsed.codex.as_deref(), Some("--"));
+        assert!(parsed.args.is_empty());
+    }
+
+    #[test]
+    fn watch_process_still_accepts_unambiguous_leading_global_override() {
+        let parsed = global(&[
+            "watch-process",
+            "--db",
+            "watch.sqlite",
+            "--subscription-id",
+            "id",
+            "--regex",
+            "--db",
+            "--timeout-seconds",
+            "2",
+            "--",
+            "printf",
+        ]);
+        assert_eq!(parsed.db.as_deref(), Some("watch.sqlite"));
+        assert_eq!(parsed.command, "watch-process");
+        let (_, regex, _) = run(&parsed.args);
+        assert_eq!(regex, "--db");
+    }
+}
+
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl rmcp::ServerHandler for WakeTools {
     async fn call_tool(
@@ -2373,6 +2675,170 @@ fn required(args: &mut Vec<String>, name: &str) -> Result<String> {
     option(args, name)?.with_context(|| format!("Missing {name}"))
 }
 
+struct ParsedGlobalArgs {
+    db: Option<String>,
+    codex: Option<String>,
+    command: String,
+    args: Vec<String>,
+}
+
+fn parse_global_args(mut args: Vec<String>) -> Result<ParsedGlobalArgs> {
+    let mut db = None;
+    let mut codex = None;
+    let take_prefix_globals = |args: &mut Vec<String>,
+                               db: &mut Option<String>,
+                               codex: &mut Option<String>|
+     -> Result<()> {
+        while args
+            .first()
+            .is_some_and(|arg| arg == "--db" || arg == "--codex")
+        {
+            let name = args.remove(0);
+            anyhow::ensure!(!args.is_empty(), "Missing value for {name}");
+            let value = args.remove(0);
+            if name == "--db" {
+                anyhow::ensure!(db.replace(value).is_none(), "Duplicate option {name}");
+            } else {
+                anyhow::ensure!(codex.replace(value).is_none(), "Duplicate option {name}");
+            }
+        }
+        Ok(())
+    };
+    take_prefix_globals(&mut args, &mut db, &mut codex)?;
+    anyhow::ensure!(!args.is_empty(), "Missing command");
+    let command = args.remove(0);
+    if command == "watch-process" {
+        // Process-watch values may themselves be `--db`, `--codex`, or `--`.
+        // Only unambiguous leading globals are consumed before its strict parser.
+        take_prefix_globals(&mut args, &mut db, &mut codex)?;
+    } else {
+        // Consume globals in one left-to-right pass. Paired option values are
+        // copied first, so a literal value equal to `--db`, `--codex`, or `--`
+        // is not mistaken for a global option or separator.
+        let original = std::mem::take(&mut args);
+        let mut retained = Vec::with_capacity(original.len());
+        let mut index = 0;
+        while index < original.len() {
+            let arg = &original[index];
+            if arg == "--" {
+                retained.extend_from_slice(&original[index..]);
+                break;
+            }
+            if matches!(
+                arg.as_str(),
+                "--message-template"
+                    | "--resource"
+                    | "--repo"
+                    | "--file"
+                    | "--payload-env"
+                    | "--event-env"
+                    | "--webhook"
+                    | "--event-id"
+                    | "--group-id"
+                    | "--turn-id"
+            ) && index + 1 < original.len()
+            {
+                retained.push(arg.clone());
+                retained.push(original[index + 1].clone());
+                index += 2;
+                continue;
+            }
+            if arg == "--db" || arg == "--codex" {
+                anyhow::ensure!(index + 1 < original.len(), "Missing value for {arg}");
+                let value = original[index + 1].clone();
+                if arg == "--db" {
+                    anyhow::ensure!(db.replace(value).is_none(), "Duplicate option --db");
+                } else {
+                    anyhow::ensure!(codex.replace(value).is_none(), "Duplicate option --codex");
+                }
+                index += 2;
+                continue;
+            }
+            retained.push(arg.clone());
+            index += 1;
+        }
+        args = retained;
+    }
+    Ok(ParsedGlobalArgs {
+        db,
+        codex,
+        command,
+        args,
+    })
+}
+
+enum ProcessWatchArgs {
+    Resume {
+        subscription_id: String,
+    },
+    Run {
+        subscription_id: String,
+        regex: String,
+        timeout_secs: u64,
+        claim_token: Option<String>,
+        command: Vec<String>,
+    },
+}
+
+fn parse_process_watch_args(args: &[String]) -> Result<ProcessWatchArgs> {
+    let mut subscription_id = None;
+    let mut regex = None;
+    let mut timeout_secs = None;
+    let mut claim_token = None;
+    let mut resume = false;
+    let mut separator = false;
+    let mut command = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                separator = true;
+                command.extend_from_slice(&args[index + 1..]);
+                break;
+            }
+            "--resume" => {
+                anyhow::ensure!(!resume, "Duplicate option --resume");
+                resume = true;
+                index += 1;
+            }
+            "--subscription-id" | "--regex" | "--timeout-seconds" | "--claim-token" => {
+                let name = args[index].clone();
+                let value = args
+                    .get(index + 1)
+                    .with_context(|| format!("Missing value for {name}"))?
+                    .clone();
+                let slot = match name.as_str() {
+                    "--subscription-id" => &mut subscription_id,
+                    "--regex" => &mut regex,
+                    "--timeout-seconds" => &mut timeout_secs,
+                    _ => &mut claim_token,
+                };
+                anyhow::ensure!(slot.replace(value).is_none(), "Duplicate option {name}");
+                index += 2;
+            }
+            other => anyhow::bail!("Unexpected process-watch argument {other}"),
+        }
+    }
+
+    let subscription_id = subscription_id.context("Missing --subscription-id")?;
+    if resume {
+        anyhow::ensure!(
+            !separator && regex.is_none() && timeout_secs.is_none() && claim_token.is_none(),
+            "--resume cannot be combined with command options"
+        );
+        return Ok(ProcessWatchArgs::Resume { subscription_id });
+    }
+    anyhow::ensure!(separator, "Expected -- before the process command");
+    anyhow::ensure!(!command.is_empty(), "Missing process command");
+    Ok(ProcessWatchArgs::Run {
+        subscription_id,
+        regex: regex.context("Missing --regex")?,
+        timeout_secs: timeout_secs.context("Missing --timeout-seconds")?.parse()?,
+        claim_token,
+        command,
+    })
+}
+
 fn diagnostics(config: &manager::Config, days: u32) -> Result<Value> {
     anyhow::ensure!((1..=90).contains(&days), "days must be between 1 and 90");
     let mut report = telemetry::report(&config.state.join("telemetry.sqlite3"), days)
@@ -2410,6 +2876,21 @@ fn diagnostics(config: &manager::Config, days: u32) -> Result<Value> {
     Ok(report)
 }
 
+fn report_process_watch_ready(pid: u32, stdout: &std::path::Path, stderr: &std::path::Path) {
+    println!(
+        "{}",
+        json!({
+            "ready":true,
+            "pid":pid,
+            "stdout_path":stdout.display().to_string(),
+            "stderr_path":stderr.display().to_string(),
+            "stdout_retained_path":process_watch::retained_output_path(stdout).display().to_string(),
+            "stderr_retained_path":process_watch::retained_output_path(stderr).display().to_string()
+        })
+    );
+    let _ = io::stdout().flush();
+}
+
 fn cli_execution(args: &mut Vec<String>) -> Result<Option<execution::ExecutionOptions>> {
     let model = option(args, "--model")?;
     let effort = option(args, "--reasoning-effort")?;
@@ -2424,19 +2905,20 @@ fn cli_execution(args: &mut Vec<String>) -> Result<Option<execution::ExecutionOp
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
-    let mut args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = env::args().skip(1).collect();
+    let ParsedGlobalArgs {
+        db,
+        codex,
+        command,
+        args,
+    } = parse_global_args(args)?;
     let mut config = manager::Config::from_env()?;
-    if let Some(value) = option(&mut args, "--db")? {
+    if let Some(value) = db {
         config.db = PathBuf::from(value);
     }
-    if let Some(value) = option(&mut args, "--codex")? {
+    if let Some(value) = codex {
         config.codex = PathBuf::from(value);
     }
-    anyhow::ensure!(
-        !args.is_empty(),
-        "Usage: codex-wake [--db PATH] [--codex PATH] mcp|ensure|receiver|poll|register|subscribe|cancel-subscription|publish|handle|hook|status|subscriptions|recover|remove-service|smoke-live|smoke-github"
-    );
-    let command = args.remove(0);
     // Cleanup must never recreate state after removing the plugin.
     if command != "cleanup-uninstalled" && command != "diagnostics" {
         observability::configure(config.state.join("telemetry.sqlite3"));
@@ -2451,6 +2933,9 @@ async fn main() -> Result<()> {
         "subscribe" => "cli.subscribe",
         "cancel-subscription" => "cli.cancel_subscription",
         "publish" => "cli.publish",
+        "watch-process" => "cli.watch_process",
+        "process-watch-status" => "cli.process_watch_status",
+        "recover-process-watches" => "cli.recover_process_watches",
         "handle" => "cli.handle",
         "hook" => "cli.hook",
         "status" => "cli.status",
@@ -2727,6 +3212,50 @@ async fn run_command(
                 probe::github(&repo, &thread, &webhook)?
             };
             println!("{result}");
+        }
+        "watch-process" => {
+            let db = database(&config)?;
+            let result = match parse_process_watch_args(&args)? {
+                ProcessWatchArgs::Resume { subscription_id } => process_watch::resume_started(
+                    &db,
+                    &subscription_id,
+                    report_process_watch_ready,
+                )?,
+                ProcessWatchArgs::Run {
+                    subscription_id,
+                    regex,
+                    timeout_secs,
+                    claim_token,
+                    command,
+                } => process_watch::run_started_with_claim_token(
+                    &db,
+                    &subscription_id,
+                    &regex,
+                    Duration::from_secs(timeout_secs),
+                    &command,
+                    claim_token.as_deref(),
+                    report_process_watch_ready,
+                )?,
+            };
+            eprintln!("{result}");
+        }
+        "process-watch-status" => {
+            let id = required(&mut args, "--subscription-id")?;
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            println!("{}", process_watch::status(&database(&config)?, &id)?);
+        }
+        "recover-process-watches" => {
+            let background = args.first().is_some_and(|arg| arg == "--background");
+            if background {
+                args.remove(0);
+            }
+            anyhow::ensure!(args.is_empty(), "Unexpected arguments");
+            let result = resume_stale_process_watches(&config)?;
+            if background {
+                eprintln!("{result}");
+            } else {
+                println!("{result}");
+            }
         }
         "handle" => {
             let source = option(&mut args, "--payload-env")?;

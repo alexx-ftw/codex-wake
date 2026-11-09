@@ -201,6 +201,7 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("polling.rs").as_slice(),
         include_bytes!("observers.rs").as_slice(),
         include_bytes!("native_poll.rs").as_slice(),
+        include_bytes!("process_watch.rs").as_slice(),
         include_bytes!("steer.rs").as_slice(),
         include_bytes!("status_view.rs").as_slice(),
         include_bytes!("../hooks/hooks.json").as_slice(),
@@ -943,6 +944,53 @@ pub fn run_receiver(config: &Config) -> Result<()> {
         crate::observability::capture(pipe, "webhook");
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
+    let recovery_config = config.clone();
+    thread::spawn(move || {
+        loop {
+            let result = (|| -> Result<serde_json::Value> {
+                let db = crate::bridge::connect(&recovery_config.db)?;
+                crate::process_watch::initialize(&db)?;
+                crate::process_watch::schedule_stale_auto(&db, &recovery_config.db)
+            })();
+            match result {
+                Ok(report) => {
+                    if let Some(scheduled) = report["scheduled"].as_array() {
+                        for item in scheduled {
+                            crate::observability::emit(
+                                "process.watch.recovery",
+                                "scheduled",
+                                "stale_supervisor",
+                                item["subscription_id"].as_str(),
+                                Duration::ZERO,
+                                1,
+                            );
+                        }
+                    }
+                    if let Some(errors) = report["errors"].as_array() {
+                        for item in errors {
+                            crate::observability::emit(
+                                "process.watch.recovery",
+                                "error",
+                                "resume_spawn_failed",
+                                item["subscription_id"].as_str(),
+                                Duration::ZERO,
+                                1,
+                            );
+                        }
+                    }
+                }
+                Err(error) => crate::observability::emit(
+                    "process.watch.recovery",
+                    "error",
+                    crate::observability::error_class(&error),
+                    None,
+                    Duration::ZERO,
+                    1,
+                ),
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
     for source in ["github", "external", "native", "delivery"] {
         let poll_config = config.clone();

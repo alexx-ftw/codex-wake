@@ -20,7 +20,7 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let id: i32 = db.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts')", [], |row| row.get(0))?;
+    let unrelated: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('waits','subscriptions','rules','rule_deliveries','github_poll_state','github_poll_generation','observers','native_observers','native_condition_observers','steers','obligations','obligation_reviews','obligation_review_events','obligation_transfers','validation_evidence','validation_scope_links','result_reports','circular_waits','circular_notices','coordinators','coordinator_alerts','coordinator_hook_events','dependency_notice_uncertainties','delivery_evidence','user_message_observations','condition_groups','condition_members','condition_completions','condition_publications','condition_pending_events','condition_publication_collisions','condition_alerts','process_watches')", [], |row| row.get(0))?;
     ensure!(
         id == DATABASE_ID && unrelated == 0,
         "Database ownership could not be verified; unrelated data was preserved"
@@ -35,6 +35,8 @@ pub fn remove_external_database(path: &Path) -> Result<()> {
     }
     let _poll_guard = crate::polling::lock_database_parent(&path.canonicalize()?, true)?;
     validate_external_database(path)?;
+    let _process_watch_guard = crate::process_watch::external_database_removal_guard(path)?;
+    crate::process_watch::remove_external_outputs(path)?;
     fs::remove_file(path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_owned();
@@ -145,7 +147,7 @@ pub fn remove_unit_file(path: &Path, expected: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn cleanup_refuses_active_poll_lock_and_leaves_no_lock_sidecar() {
@@ -207,6 +209,84 @@ mod tests {
         remove_external_database(&path).unwrap();
         assert!(!path.exists());
         remove_external_database(&path).unwrap();
+    }
+
+    #[test]
+    fn external_database_cleanup_preserves_ambiguous_legacy_monitor_logs() {
+        use sha2::Digest;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = temp.path().join("external.sqlite");
+        let id = "watch-to-remove";
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        crate::process_watch::initialize(&db).unwrap();
+        let directory = temp.path().join("process-watch");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let hash = format!("{:x}", sha2::Sha256::digest(id.as_bytes()));
+        let stem = format!("{hash}-550e8400-e29b-41d4-a716-446655440000");
+        let stdout = directory.join(format!("{stem}.stdout"));
+        let stderr = directory.join(format!("{stem}.stderr"));
+        let owned = vec![
+            stdout.clone(),
+            crate::process_watch::retained_output_path(&stdout),
+            stdout.with_file_name(format!(
+                "{}.match",
+                stdout.file_name().unwrap().to_string_lossy()
+            )),
+            stdout.with_extension("identity.json"),
+            stderr.clone(),
+            crate::process_watch::retained_output_path(&stderr),
+            crate::process_watch::diagnostic_path(&path, id).unwrap(),
+        ];
+        let legacy_diagnostic = directory.join(format!("{hash}.monitor.log"));
+        let unrelated = directory.join("user-data.log");
+        for file in &owned {
+            fs::write(file, b"private output").unwrap();
+        }
+        fs::write(
+            &legacy_diagnostic,
+            b"legacy diagnostic has no database identity",
+        )
+        .unwrap();
+        fs::write(&unrelated, b"leave this file").unwrap();
+        db.execute(
+            "INSERT INTO process_watches(subscription_id,state,supervisor_pid,supervisor_start,regex,stdout_path,stderr_path,selection_json,retention_state)
+             VALUES(?1,'published',4294967295,'dead','READY',?2,?3,'{}','complete')",
+            rusqlite::params![
+                id,
+                stdout.display().to_string(),
+                stderr.display().to_string()
+            ],
+        )
+        .unwrap();
+        drop(db);
+
+        let other_database = temp.path().join("other.sqlite");
+        let other = rusqlite::Connection::open(&other_database).unwrap();
+        other
+            .pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        crate::process_watch::initialize(&other).unwrap();
+        other.execute(
+            "INSERT INTO process_watches(subscription_id,state,supervisor_pid,supervisor_start,regex,stdout_path,stderr_path,selection_json,retention_state)
+             VALUES(?1,'published',4294967295,'dead','READY','/other/out','/other/err','{}','complete')",
+            [id],
+        ).unwrap();
+        drop(other);
+
+        remove_external_database(&path).unwrap();
+
+        assert!(!path.exists());
+        assert!(owned.iter().all(|file| !file.exists()));
+        assert_eq!(
+            fs::read(&legacy_diagnostic).unwrap(),
+            b"legacy diagnostic has no database identity"
+        );
+        assert_eq!(fs::read(unrelated).unwrap(), b"leave this file");
+        assert!(other_database.exists());
     }
 
     #[test]

@@ -121,6 +121,7 @@ dependencies = [
  "hmac",
  "libc",
  "regex",
+ "regex-syntax",
  "rmcp",
  "rusqlite",
  "serde",

@@ -22,6 +22,40 @@ pub fn subscription_status(db: &Connection, id: &str) -> Result<Value> {
     Ok(subscription)
 }
 
+fn process_watch_producer(db: &Connection, id: &str) -> Result<Option<Value>> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='process_watches')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists
+        || !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM process_watches WHERE subscription_id=?1)",
+            [id],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Ok(None);
+    }
+    let watch = crate::process_watch::status(db, id)?;
+    let needs_attention =
+        matches!(
+            watch["state"].as_str(),
+            Some("needs_attention" | "launch_uncertain" | "publish_error")
+        ) || matches!(watch["retention_state"].as_str(), Some("error" | "failed"))
+            || watch["supervisor_alive"] == false;
+    Ok(Some(json!({
+        "type":"process_watch",
+        "health":if needs_attention { "needs_attention" } else { "unverified" },
+        "state":watch["state"],
+        "retention_state":watch["retention_state"],
+        "supervisor_alive":watch["supervisor_alive"],
+        "child_alive":watch["child_alive"],
+        "diagnostic":watch["diagnostic"],
+        "retention_diagnostic":watch["retention_diagnostic"]
+    })))
+}
+
 pub fn status(db: &Connection, id: &str) -> Result<Value> {
     let (kind, repo, resource, event, state): (String, String, String, String, String) = db
         .query_row(
@@ -40,6 +74,17 @@ pub fn status(db: &Connection, id: &str) -> Result<Value> {
     if state != "waiting" {
         return Ok(Value::Null);
     }
+    let watch = if kind == "job" && event == "completed" {
+        process_watch_producer(db, id).unwrap_or_else(|_| {
+            Some(json!({
+                "type":"process_watch",
+                "health":"needs_attention",
+                "diagnostic":"Process-watch status is unavailable; inspect its database and output directory."
+            }))
+        })
+    } else {
+        None
+    };
     let observed: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM observers WHERE subscription_id=?1)
              OR EXISTS(SELECT 1 FROM native_observers WHERE subscription_id=?1)",
@@ -58,6 +103,9 @@ pub fn status(db: &Connection, id: &str) -> Result<Value> {
         if let Some((Some(reason), checked)) = observation {
             producer["last_observation"] = json!(reason);
             producer["last_check"] = json!(checked);
+        }
+        if let Some(watch) = watch {
+            producer["process_watch"] = watch;
         }
         return Ok(producer);
     }
@@ -78,17 +126,68 @@ pub fn status(db: &Connection, id: &str) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if threads.is_empty() {
-        Ok(
-            json!({"type":"unknown", "warning":"No publisher is recorded in Wake for this event; the subscription may wait indefinitely."}),
-        )
+        Ok(watch.unwrap_or_else(|| json!({"type":"unknown", "warning":"No publisher is recorded in Wake for this event; the subscription may wait indefinitely."})))
     } else {
-        Ok(json!({"type":"obligation", "threads":threads}))
+        let mut producer = json!({"type":"obligation", "threads":threads});
+        if let Some(watch) = watch {
+            producer["process_watch"] = watch;
+        }
+        Ok(producer)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inaccessible_watch_status_does_not_hide_other_subscriptions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::observers::initialize(&db).unwrap();
+        crate::native_poll::initialize(&db).unwrap();
+        crate::obligations::initialize(&db).unwrap();
+        crate::process_watch::initialize(&db).unwrap();
+        let thread = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let watched =
+            crate::subscriptions::subscribe(&db, "job", "local", "one", "completed", thread)
+                .unwrap();
+        let other =
+            crate::subscriptions::subscribe(&db, "job", "local", "two", "completed", thread)
+                .unwrap();
+        db.execute("INSERT INTO process_watches(subscription_id,state,supervisor_pid,supervisor_start,regex,stdout_path,stderr_path) VALUES(?1,'watching',1,'test','x','/tmp/out','/tmp/err')", [&watched]).unwrap();
+        let output = dir.path().join("process-watch");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let readable = subscription_status(&db, &watched).unwrap();
+        assert!(readable["producer"]["diagnostic"].is_null());
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        db.execute(
+            "UPDATE process_watches SET selection_json='invalid' WHERE subscription_id=?1",
+            [&watched],
+        )
+        .unwrap();
+        let rows = subscriptions_status(&db).unwrap();
+        let rows = rows.as_array().unwrap();
+        let broken = rows.iter().find(|row| row["id"] == watched).unwrap();
+        assert_eq!(broken["producer"]["health"], "needs_attention");
+        assert!(
+            broken["producer"]["diagnostic"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable")
+        );
+        assert!(rows.iter().any(|row| row["id"] == other));
+        assert_eq!(
+            subscription_status(&db, &watched).unwrap()["producer"]["health"],
+            "needs_attention"
+        );
+    }
 
     #[test]
     fn distinguishes_automatic_registered_unknown_and_finished() {
@@ -204,5 +303,94 @@ mod tests {
         db.execute("UPDATE subscriptions SET state='ready' WHERE id=?1", [&a])
             .unwrap();
         assert!(status(&db, &a).unwrap().is_null());
+    }
+
+    #[test]
+    fn process_watch_status_reports_supervisor_and_failure_without_claiming_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::observers::initialize(&db).unwrap();
+        crate::native_poll::initialize(&db).unwrap();
+        crate::obligations::initialize(&db).unwrap();
+        crate::process_watch::initialize(&db).unwrap();
+        let id = crate::subscriptions::subscribe(
+            &db,
+            "job",
+            "local",
+            "build",
+            "completed",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        .unwrap();
+        assert_eq!(status(&db, &id).unwrap()["type"], "unknown");
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let start = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap();
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let identity = format!("{}:{start}", boot.trim());
+        db.execute(
+            "INSERT INTO process_watches(subscription_id,state,supervisor_pid,supervisor_start,regex,stdout_path,stderr_path) VALUES(?1,'watching',?2,?3,'READY','/tmp/stdout','/tmp/stderr')",
+            params![id, std::process::id(), identity],
+        ).unwrap();
+        let producer = subscription_status(&db, &id).unwrap()["producer"].clone();
+        assert_eq!(producer["type"], "process_watch");
+        assert_eq!(producer["health"], "unverified");
+        assert_eq!(producer["state"], "watching");
+        assert_eq!(producer["supervisor_alive"], true);
+        assert_eq!(subscriptions_status(&db).unwrap()[0]["producer"], producer);
+
+        let obligated = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        crate::obligations::register(
+            &db,
+            obligated,
+            "job",
+            "local",
+            "build",
+            "completed",
+            "publish",
+        )
+        .unwrap();
+        db.execute("UPDATE process_watches SET state='needs_attention',diagnostic='watch failed',retention_state='failed' WHERE subscription_id=?1", [&id]).unwrap();
+        let obligated_status = status(&db, &id).unwrap();
+        assert_eq!(obligated_status["type"], "obligation");
+        assert_eq!(obligated_status["threads"], json!([obligated]));
+        assert_eq!(
+            obligated_status["process_watch"]["health"],
+            "needs_attention"
+        );
+        db.execute(
+            "INSERT INTO observers(subscription_id,config) VALUES(?1,'{}')",
+            [&id],
+        )
+        .unwrap();
+        let observed_status = status(&db, &id).unwrap();
+        assert_eq!(observed_status["type"], "automatic_configured");
+        assert_eq!(
+            observed_status["process_watch"]["health"],
+            "needs_attention"
+        );
+        db.execute("DELETE FROM observers WHERE subscription_id=?1", [&id])
+            .unwrap();
+        crate::obligations::resolve_publication(&db, "job", "local", "build", "completed").unwrap();
+
+        let failed = status(&db, &id).unwrap();
+        assert_eq!(failed["health"], "needs_attention");
+        assert_eq!(failed["state"], "needs_attention");
+        assert_eq!(failed["retention_state"], "failed");
+        assert_eq!(failed["diagnostic"], "watch failed");
+
+        db.execute("UPDATE process_watches SET state='watching',retention_state='not_started',supervisor_start='stale' WHERE subscription_id=?1", [&id]).unwrap();
+        let stopped = status(&db, &id).unwrap();
+        assert_eq!(stopped["supervisor_alive"], false);
+        assert_eq!(stopped["health"], "needs_attention");
+        db.execute("UPDATE subscriptions SET state='ready' WHERE id=?1", [&id])
+            .unwrap();
+        assert!(status(&db, &id).unwrap().is_null());
     }
 }
