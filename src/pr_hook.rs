@@ -89,13 +89,14 @@ fn gh_repo_option(args: &[String]) -> Option<Option<String>> {
             "-R" | "--repo" => {
                 i += 1;
                 let value = args.get(i)?;
-                if parse_repo(value).is_none() || repo.replace(value.clone()).is_some() {
+                let value = normalize_repository(value)?;
+                if repo.replace(value.to_owned()).is_some() {
                     return None;
                 }
             }
             arg if arg.starts_with("--repo=") => {
-                let value = &arg[7..];
-                if parse_repo(value).is_none() || repo.replace(value.to_owned()).is_some() {
+                let value = normalize_repository(&arg[7..])?;
+                if repo.replace(value.to_owned()).is_some() {
                     return None;
                 }
             }
@@ -186,7 +187,14 @@ fn parse_gh_api_create(args: &[String]) -> Option<String> {
                 has_field = true;
             }
             "--hostname" | "-H" | "--header" | "-q" | "--jq" | "-t" | "--template" | "-p"
-            | "--preview" | "--cache" | "--input" => {
+            | "--preview" | "--cache" => {
+                if inline.is_none() {
+                    i += 1;
+                    args.get(i)?;
+                }
+            }
+            "--input" => {
+                has_field = true;
                 if inline.is_none() {
                     i += 1;
                     args.get(i)?;
@@ -384,6 +392,14 @@ fn parse_repo(repo: &str) -> Option<(&str, &str)> {
         .then_some((owner, name))
 }
 
+pub(crate) fn normalize_repository(repository: &str) -> Option<&str> {
+    let repository = repository
+        .split_once('/')
+        .filter(|(host, _)| host.eq_ignore_ascii_case("github.com"))
+        .map_or(repository, |(_, path)| path);
+    parse_repo(repository).map(|_| repository)
+}
+
 fn valid_repo_part(part: &str) -> bool {
     !part.is_empty()
         && part != "."
@@ -394,7 +410,9 @@ fn valid_repo_part(part: &str) -> bool {
 }
 
 fn same_repo(left: &str, right: &str) -> bool {
-    parse_repo(left).is_some_and(|_| left.eq_ignore_ascii_case(right))
+    normalize_repository(left)
+        .zip(normalize_repository(right))
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 fn repository_from_url(url: &str) -> Option<String> {
@@ -816,6 +834,17 @@ mod tests {
             "https://github.com/acme/widget/pull/42",
         );
         assert!(parse_pr_candidate(&bad).is_none());
+
+        let host_qualified = bash(
+            "gh pr create --repo github.com/acme/widget",
+            "https://github.com/acme/widget/pull/42",
+        );
+        assert_eq!(parse_pr_candidate(&host_qualified).unwrap().number, 42);
+        let other_host_repo = bash(
+            "gh pr create --repo github.com/acme/other",
+            "https://github.com/acme/widget/pull/42",
+        );
+        assert!(parse_pr_candidate(&other_host_repo).is_none());
     }
 
     #[test]
@@ -824,6 +853,8 @@ mod tests {
         for command in [
             "gh api -X POST /repos/ACME/Widget/pulls",
             "gh api --method POST /repos/Acme/Widget/pulls",
+            "gh api repos/Acme/Widget/pulls --input pr.json",
+            "gh api --input=pr.json repos/Acme/Widget/pulls",
             "gh api /repos/Acme/Widget/pulls -f title=change -f head=feature -f base=main",
             "gh api --field title=change /repos/Acme/Widget/pulls",
             "gh api /repos/Acme/Widget/pulls --method=POST",
@@ -842,6 +873,8 @@ mod tests {
         let body = r#"{"number":42,"html_url":"https://github.com/acme/widget/pull/42"}"#;
         for command in [
             "gh api /repos/acme/widget/pulls",
+            "gh api -X GET /repos/acme/widget/pulls --input pr.json",
+            "gh api --method=GET --input=pr.json /repos/acme/widget/pulls",
             "gh api -X GET /repos/acme/widget/pulls -f title=change",
             "gh api --method POST /repos/acme/widget/issues",
             "gh api -X POST /repos/acme/widget/pulls/42",

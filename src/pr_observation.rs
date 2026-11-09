@@ -182,7 +182,10 @@ impl PullRequestGetTransport for GhCliPullRequestGet {
         number: u64,
         timeout: Duration,
     ) -> std::result::Result<GetPullRequestResponse, TransportFailure> {
-        if !valid_repository(repository) || number == 0 {
+        let Some(repository) = safe_repository(repository) else {
+            return Err(TransportFailure::Other);
+        };
+        if number == 0 {
             return Err(TransportFailure::Other);
         }
         let endpoint = format!("https://api.github.com/repos/{repository}/pulls/{number}");
@@ -230,21 +233,6 @@ fn parse_included_http_response(
         .ok_or(TransportFailure::Other)?;
     let body = serde_json::from_str(body.trim()).map_err(|_| TransportFailure::Other)?;
     Ok((status, body))
-}
-
-fn valid_repository(repository: &str) -> bool {
-    let Some((owner, repo)) = repository.split_once('/') else {
-        return false;
-    };
-    let valid_part = |part: &str| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && part
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    };
-    valid_part(owner) && valid_part(repo) && !repo.contains('/')
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -552,6 +540,7 @@ pub fn handle_post_tool_use(
 ) -> Result<HandleResult> {
     initialize(db)?;
     let Some((candidate, post_id)) = parse_candidate_preserving_missing_id(event) else {
+        record_completed_non_candidate_call(db, event)?;
         return Ok(HandleResult::Ignored);
     };
     let tool_name = event
@@ -649,11 +638,9 @@ pub fn handle_post_tool_use(
                 params![
                     pre_id,
                     exact_tool_use_id,
-                    !command_output_can_be_filtered(tool_name, event.get("tool_input"))
-                        && !command_has_explicit_foreign_api_host(
-                            tool_name,
-                            event.get("tool_input"),
-                        ),
+                    // Trust local gh configuration by default. An explicit foreign
+                    // endpoint is rejected below; the public GitHub GET remains required.
+                    raw_creation_result(tool_name, event.get("tool_input")),
                     candidate_id
                 ],
             )?;
@@ -929,15 +916,6 @@ fn verify_persisted_candidate(
             .as_deref()
             .is_some_and(|digest| Some(digest) == pre.input_digest.as_deref())
         && pre.tool_name.as_deref() == Some(tool_name.as_str());
-    let observation = PreToolUseObservation {
-        observed_at_unix_ms: pre.observed_at_ms,
-        repository: pre.repository.unwrap_or(repo.clone()),
-        head_ref: pre.head_ref,
-        base_ref: pre.base_ref,
-        author_login: pre.author_login,
-        exact_call_and_result,
-    };
-
     let response = match transport.get_pull_request(&repo, candidate.number, timeout) {
         Ok(response) => response,
         Err(TransportFailure::Timeout) => {
@@ -977,9 +955,21 @@ fn verify_persisted_candidate(
         )?;
         return candidate_result(db, candidate_id, None);
     }
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let observations = match (session_id.as_deref(), turn_id.as_deref()) {
+        (Some(session), Some(turn)) => load_plausible_pre_observations(
+            &tx,
+            session,
+            turn,
+            &repo,
+            pre_id,
+            exact_call_and_result,
+        )?,
+        _ => Vec::new(),
+    };
     let outcome = verify_pr_candidate(
         &candidate,
-        &[observation],
+        &observations,
         max_pre_to_creation_ms,
         response.status,
         &response.body,
@@ -995,7 +985,7 @@ fn verify_persisted_candidate(
         }
     };
     let changed = set_candidate_state(
-        db,
+        &tx,
         candidate_id,
         state,
         (expected_state, expected_lease_until),
@@ -1003,12 +993,95 @@ fn verify_persisted_candidate(
         Some(response.status),
         verified.as_ref(),
     )?;
+    tx.commit()?;
     let verified = if changed {
         verified
     } else {
         candidate_record(db, candidate_id)?.and_then(|record| record.verified)
     };
     candidate_result(db, candidate_id, verified)
+}
+
+fn raw_creation_result(tool_name: &str, tool_input: Option<&Value>) -> bool {
+    if tool_name == MCP_CREATE_PR_TOOL {
+        return true;
+    }
+    if tool_name != "Bash" {
+        return false;
+    }
+    let Some(command) = tool_input
+        .and_then(|input| input.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(args) = shell_tokens(command) else {
+        return false;
+    };
+    if args.get(1).map(String::as_str) == Some("api") {
+        !has_explicit_foreign_api_host(&args)
+    } else {
+        true
+    }
+}
+
+fn has_explicit_foreign_api_host(args: &[String]) -> bool {
+    if args.first().map(String::as_str) != Some("gh")
+        || args.get(1).map(String::as_str) != Some("api")
+    {
+        return false;
+    }
+    let api_index = 1;
+    for (index, arg) in args.iter().enumerate().skip(api_index + 1) {
+        if let Some(host) = arg.strip_prefix("--hostname=")
+            && !is_github_api_host(host)
+        {
+            return true;
+        }
+        if arg == "--hostname"
+            && args
+                .get(index + 1)
+                .is_some_and(|host| !is_github_api_host(host))
+        {
+            return true;
+        }
+        if let Some(path) = arg.strip_prefix("https://") {
+            let host = path.split('/').next().unwrap_or_default();
+            if !is_github_api_host(host) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_github_api_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("api.github.com") || host.eq_ignore_ascii_case("github.com")
+}
+
+fn record_completed_non_candidate_call(db: &mut Connection, event: &Value) -> Result<()> {
+    if event.get("hook_event_name").and_then(Value::as_str) != Some("PostToolUse") {
+        return Ok(());
+    }
+    let (Some(session), Some(turn), Some(call)) = (
+        nonempty(event.get("session_id").and_then(Value::as_str)),
+        nonempty(event.get("turn_id").and_then(Value::as_str)),
+        nonempty(event.get("tool_use_id").and_then(Value::as_str)),
+    ) else {
+        return Ok(());
+    };
+    let input_digest = event
+        .get("tool_input")
+        .and_then(|input| input_digest(input).ok().flatten());
+    if input_digest.is_none() {
+        return Ok(());
+    }
+    db.execute(
+        "UPDATE pr_hook_pre_observations SET state='completed',reason='tool call completed without a PR candidate'
+         WHERE session_id=?1 AND turn_id=?2 AND tool_use_id=?3 AND input_digest=?4 AND state='pending'",
+        params![session, turn, call, input_digest],
+    )?;
+    Ok(())
 }
 
 fn retryable_http_failure(status: u16, body: &Value) -> Option<&'static str> {
@@ -1139,6 +1212,45 @@ fn load_pre_observation(db: &Connection, id: i64) -> Result<Option<StoredPre>> {
             },
         )
         .optional()?)
+}
+
+fn load_plausible_pre_observations(
+    db: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    candidate_repo: &str,
+    correlated_pre_id: i64,
+    correlated_exact_call: bool,
+) -> Result<Vec<PreToolUseObservation>> {
+    let ids = {
+        let mut statement = db.prepare(
+            "SELECT p.id FROM pr_hook_pre_observations p
+             WHERE p.session_id=?1 AND p.turn_id=?2 AND (
+                 p.state='pending' OR (p.state='linked' AND NOT EXISTS (
+                     SELECT 1 FROM pr_hook_candidates c
+                     WHERE c.pre_id=p.id AND c.state='verified'
+                 ))
+             )",
+        )?;
+        statement
+            .query_map(params![session_id, turn_id], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut observations = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(pre) = load_pre_observation(db, id)? else {
+            continue;
+        };
+        observations.push(PreToolUseObservation {
+            observed_at_unix_ms: pre.observed_at_ms,
+            repository: pre.repository.unwrap_or_else(|| candidate_repo.to_owned()),
+            head_ref: pre.head_ref,
+            base_ref: pre.base_ref,
+            author_login: pre.author_login,
+            exact_call_and_result: id == correlated_pre_id && correlated_exact_call,
+        });
+    }
+    Ok(observations)
 }
 
 fn candidate_record(db: &Connection, id: i64) -> Result<Option<CandidateRecord>> {
@@ -1528,10 +1640,7 @@ fn api_pulls_repository(endpoint: &str) -> Option<&str> {
 }
 
 fn safe_repository(value: &str) -> Option<&str> {
-    if !valid_repository(value) {
-        return None;
-    }
-    Some(value)
+    crate::pr_hook::normalize_repository(value)
 }
 
 fn safe_ref(value: &str) -> Option<&str> {
@@ -1578,83 +1687,6 @@ fn command_output_can_be_filtered(tool_name: &str, input: Option<&Value>) -> boo
             || token.starts_with("--jq=")
             || token.starts_with("--template=")
     })
-}
-
-// Native `gh pr create` output and relative `gh api` output remain eligible
-// when the exact call is correlated. Hook events do not capture `api_host`, so
-// a configured gateway can still serve these commands; only an explicit
-// foreign `--hostname` on a relative API route is rejected here. Absolute
-// canonical API URLs use their URL authority instead.
-fn command_has_explicit_foreign_api_host(tool_name: &str, input: Option<&Value>) -> bool {
-    if tool_name != "Bash" {
-        return false;
-    }
-    let Some(command) = input
-        .and_then(|value| value.get("command"))
-        .and_then(Value::as_str)
-    else {
-        return false;
-    };
-    let Some(tokens) = shell_tokens(command) else {
-        return true;
-    };
-    if tokens.first().map(String::as_str) != Some("gh")
-        || tokens.get(1).map(String::as_str) != Some("api")
-    {
-        return false;
-    }
-    if api_endpoint(&tokens[2..]).is_some_and(|endpoint| {
-        endpoint
-            .strip_prefix("https://api.github.com/")
-            .and_then(api_pulls_repository)
-            .is_some()
-    }) {
-        return false;
-    }
-
-    let mut index = 2;
-    while index < tokens.len() {
-        let token = tokens[index].as_str();
-        let (option, inline) = token
-            .split_once('=')
-            .map_or((token, None), |(option, value)| (option, Some(value)));
-        if option == "--hostname" {
-            let host = if let Some(host) = inline {
-                host
-            } else {
-                index += 1;
-                let Some(host) = tokens.get(index).map(String::as_str) else {
-                    return true;
-                };
-                host
-            };
-            if !host.eq_ignore_ascii_case("github.com") {
-                return true;
-            }
-        } else if matches!(
-            option,
-            "-H" | "--header"
-                | "-f"
-                | "--field"
-                | "-F"
-                | "--raw-field"
-                | "-X"
-                | "--method"
-                | "--input"
-                | "--preview"
-                | "-p"
-                | "--cache"
-                | "-q"
-                | "--jq"
-                | "-t"
-                | "--template"
-        ) && inline.is_none()
-        {
-            index += 1;
-        }
-        index += 1;
-    }
-    false
 }
 
 fn candidate_invocation_key(
@@ -1753,6 +1785,36 @@ mod tests {
             "tool_use_id":call,
             "tool_name":"Bash",
             "tool_input":{"command":command}
+        })
+    }
+
+    fn mcp_input() -> Value {
+        json!({"repository_full_name":"acme/widget","title":"change"})
+    }
+
+    fn mcp_pre(session: &str, turn: &str, call: &str) -> Value {
+        json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":session,
+            "turn_id":turn,
+            "tool_use_id":call,
+            "tool_name":MCP_CREATE_PR_TOOL,
+            "tool_input":mcp_input()
+        })
+    }
+
+    fn mcp_post(session: &str, turn: &str, call: &str) -> Value {
+        json!({
+            "hook_event_name":"PostToolUse",
+            "session_id":session,
+            "turn_id":turn,
+            "tool_use_id":call,
+            "tool_name":MCP_CREATE_PR_TOOL,
+            "tool_input":mcp_input(),
+            "tool_response":{"structuredContent":{
+                "number":42,
+                "html_url":"https://github.com/acme/widget/pull/42"
+            }}
         })
     }
 
@@ -1879,36 +1941,39 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_foreign_gh_api_hostname_is_rejected() {
-        for command in [
-            "gh api repos/acme/widget/pulls",
-            "gh api --hostname github.com repos/acme/widget/pulls",
-            "gh api -H '--hostname=api.attacker.test' repos/acme/widget/pulls",
-            "gh pr create --title test",
-            TRUSTED_API_CREATE,
-        ] {
-            let input = json!({"command":command});
-            assert!(!command_has_explicit_foreign_api_host("Bash", Some(&input)));
+    fn explicit_foreign_host_cannot_attribute_a_bash_creation() {
+        let command = "gh api --hostname=api.attacker.test -X POST https://api.github.com/repos/acme/widget/pulls -f title=test";
+        {
+            let mut db = Connection::open_in_memory().unwrap();
+            record_pre_tool_use(
+                &mut db,
+                &pre("s", "t", "call", command),
+                1_735_787_045_500,
+                60_000,
+            )
+            .unwrap();
+            let transport = fixture_transport();
+            let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+                &mut db,
+                &post("s", "t", Some("call"), command),
+                &transport,
+                Duration::from_secs(2),
+                60_000,
+            )
+            .unwrap() else {
+                panic!("recognized creation output should remain queryable")
+            };
+            assert_eq!(record.state, CandidateState::Ambiguous);
+            assert!(verified.is_none());
         }
-        let input =
-            json!({"command":"gh api --hostname api.attacker.test repos/acme/widget/pulls"});
-        assert!(command_has_explicit_foreign_api_host("Bash", Some(&input)));
-        let absolute_with_foreign_hostname = json!({
-            "command":"gh api --hostname=api.attacker.test -X POST https://api.github.com/repos/acme/widget/pulls"
-        });
-        assert!(!command_has_explicit_foreign_api_host(
-            "Bash",
-            Some(&absolute_with_foreign_hostname)
-        ));
     }
 
     #[test]
     fn durable_pre_matches_post_by_session_turn_id_and_digest_then_get_verifies() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = TRUSTED_API_CREATE;
         let recorded = record_pre_tool_use(
             &mut db,
-            &pre("s1", "t1", "call-1", command),
+            &mcp_pre("s1", "t1", "call-1"),
             1_735_787_045_500,
             60_000,
         )
@@ -1918,7 +1983,7 @@ mod tests {
         let transport = fixture_transport();
         let result = handle_post_tool_use(
             &mut db,
-            &post("s1", "t1", Some("call-1"), command),
+            &mcp_post("s1", "t1", "call-1"),
             &transport,
             Duration::from_secs(3),
             60_000,
@@ -1939,16 +2004,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored.len(), 64);
-        assert!(!stored.contains("gh pr create"));
+        assert!(!stored.contains("repository_full_name"));
     }
 
     #[test]
     fn repeated_post_returns_durable_verification_without_another_get() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
-            &pre("s", "t", "call", command),
+            &mcp_pre("s", "t", "call"),
             1_735_787_045_500,
             60_000,
         )
@@ -1956,7 +2020,7 @@ mod tests {
         let transport = fixture_transport();
         let first = handle_post_tool_use(
             &mut db,
-            &post("s", "t", Some("call"), command),
+            &mcp_post("s", "t", "call"),
             &transport,
             Duration::from_secs(2),
             60_000,
@@ -1970,7 +2034,7 @@ mod tests {
 
         let repeated = handle_post_tool_use(
             &mut db,
-            &post("s", "t", Some("call"), command),
+            &mcp_post("s", "t", "call"),
             &transport,
             Duration::from_secs(2),
             60_000,
@@ -1990,7 +2054,97 @@ mod tests {
     }
 
     #[test]
-    fn exact_gh_pr_create_result_allows_attribution() {
+    fn all_plausible_pre_calls_make_creation_ambiguous() {
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &mcp_pre("s", "t", "call-1"),
+            1_735_787_045_500,
+            60_000,
+        )
+        .unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &mcp_pre("s", "t", "call-2"),
+            1_735_787_045_600,
+            60_000,
+        )
+        .unwrap();
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+            &mut db,
+            &mcp_post("s", "t", "call-1"),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("candidate should remain queryable")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(record.reason.unwrap().contains("multiple outstanding"));
+        assert!(verified.is_none());
+    }
+
+    #[test]
+    fn retry_rechecks_all_plausible_pre_calls() {
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &mcp_pre("s", "t", "call-1"),
+            1_735_787_045_500,
+            60_000,
+        )
+        .unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &mcp_pre("s", "t", "call-2"),
+            1_735_787_045_600,
+            60_000,
+        )
+        .unwrap();
+        let timeout = FixtureTransport {
+            response: Err(TransportFailure::Timeout),
+            calls: Cell::new(0),
+        };
+        let HandleResult::Candidate { record, .. } = handle_post_tool_use(
+            &mut db,
+            &mcp_post("s", "t", "call-1"),
+            &timeout,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("timed out candidate should remain queryable")
+        };
+        assert_eq!(record.state, CandidateState::Timeout);
+        db.execute(
+            "UPDATE pr_hook_candidates SET next_retry_at_ms=0 WHERE id=?1",
+            [record.id],
+        )
+        .unwrap();
+        let claim = claim_due_retries(&mut db, unix_now_ms(), 60_000, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } = retry_candidate(
+            &mut db,
+            claim.id,
+            claim.work_claim_until_ms.unwrap(),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("retried candidate should remain queryable")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
+    }
+
+    #[test]
+    fn exact_gh_pr_create_result_is_attributed_after_github_get() {
         let command = "gh pr create --title test";
         let mut db = Connection::open_in_memory().unwrap();
         record_pre_tool_use(
@@ -2012,41 +2166,263 @@ mod tests {
             panic!("recognized CLI URL should remain a candidate")
         };
         assert_eq!(record.state, CandidateState::Verified);
-        assert_eq!(verified.unwrap().number, 42);
+        assert!(verified.is_some());
         assert_eq!(transport.calls.get(), 1);
     }
 
     #[test]
-    fn exact_native_api_results_allow_same_second_creation() {
+    fn explicit_foreign_gh_api_host_stays_ambiguous() {
         let observed_at_ms = 1_735_787_046_500; // 2025-01-02T03:04:06.500Z
-        for command in [
-            TRUSTED_API_CREATE,
-            "gh api -X POST repos/acme/widget/pulls -f title=test",
-            "gh api --hostname=api.attacker.test -X POST https://api.github.com/repos/acme/widget/pulls -f title=test",
-        ] {
-            let mut db = Connection::open_in_memory().unwrap();
-            record_pre_tool_use(
+        let command =
+            "gh api --hostname=api.attacker.test -X POST repos/acme/widget/pulls -f title=test";
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call", command),
+            observed_at_ms,
+            60_000,
+        )
+        .unwrap();
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+            &mut db,
+            &post("s", "t", Some("call"), command),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("relative API endpoint should produce a queryable candidate")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
+        assert_eq!(transport.calls.get(), 1);
+
+        let absolute_foreign =
+            "gh api -X POST https://api.attacker.test/repos/acme/widget/pulls -f title=test";
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "absolute-call", absolute_foreign),
+            observed_at_ms,
+            60_000,
+        )
+        .unwrap();
+        let transport = fixture_transport();
+        assert_eq!(
+            handle_post_tool_use(
                 &mut db,
-                &pre("s", "t", "call", command),
-                observed_at_ms,
-                60_000,
-            )
-            .unwrap();
-            let transport = fixture_transport();
-            let HandleResult::Candidate { record, verified } = handle_post_tool_use(
-                &mut db,
-                &post("s", "t", Some("call"), command),
+                &post("s", "t", Some("absolute-call"), absolute_foreign),
                 &transport,
                 Duration::from_secs(2),
                 60_000,
             )
-            .unwrap() else {
-                panic!("recognized native response should produce a candidate")
-            };
-            assert_eq!(record.state, CandidateState::Verified, "{command}");
-            assert_eq!(verified.unwrap().number, 42, "{command}");
-            assert_eq!(transport.calls.get(), 1, "{command}");
+            .unwrap(),
+            HandleResult::Ignored
+        );
+        assert_eq!(transport.calls.get(), 0);
+    }
+
+    #[test]
+    fn completed_creation_does_not_block_a_later_creation() {
+        let command = "gh pr create --title test";
+        let mut db = Connection::open_in_memory().unwrap();
+        let first_pre = pre("s", "t", "call-1", command);
+        record_pre_tool_use(&mut db, &first_pre, 1_735_787_046_500, 60_000).unwrap();
+        let transport = fixture_transport();
+        let first = handle_post_tool_use(
+            &mut db,
+            &post("s", "t", Some("call-1"), command),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(first, HandleResult::Candidate { record, .. } if record.state == CandidateState::Verified)
+        );
+
+        let second_pre = pre("s", "t", "call-2", command);
+        record_pre_tool_use(&mut db, &second_pre, 1_735_787_046_600, 60_000).unwrap();
+        let mut second_post = post("s", "t", Some("call-2"), command);
+        second_post["tool_response"] = json!("https://github.com/acme/widget/pull/43");
+        let response_43 = FixtureTransport {
+            response: Ok(GetPullRequestResponse {
+                status: 200,
+                observed_at_ms: 1_735_787_047_000,
+                body: json!({
+                    "number":43,
+                    "html_url":"https://github.com/acme/widget/pull/43",
+                    "created_at":"2025-01-02T03:04:06Z",
+                    "base":{"ref":"main","repo":{"full_name":"acme/widget"}},
+                    "head":{"ref":"feature"},
+                    "user":{"login":"alice"}
+                }),
+            }),
+            calls: Cell::new(0),
+        };
+        let second = handle_post_tool_use(
+            &mut db,
+            &second_post,
+            &response_43,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(second, HandleResult::Candidate { record, .. } if record.state == CandidateState::Verified)
+        );
+        let linked: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_hook_pre_observations WHERE state='linked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, 2);
+    }
+
+    #[test]
+    fn failed_concurrent_call_completing_during_successful_get_does_not_block_attribution() {
+        struct BlockingTransport {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
         }
+        impl PullRequestGetTransport for BlockingTransport {
+            fn get_pull_request(
+                &self,
+                _repository: &str,
+                _number: u64,
+                _timeout: Duration,
+            ) -> std::result::Result<GetPullRequestResponse, TransportFailure> {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(fixture_response())
+            }
+        }
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let failed_command = "gh pr create --title failed";
+        let successful_command = "gh pr create --title successful";
+        {
+            let mut db = Connection::open(file.path()).unwrap();
+            record_pre_tool_use(
+                &mut db,
+                &pre("s", "t", "call-failed", failed_command),
+                1_735_787_046_400,
+                60_000,
+            )
+            .unwrap();
+            record_pre_tool_use(
+                &mut db,
+                &pre("s", "t", "call-success", successful_command),
+                1_735_787_046_500,
+                60_000,
+            )
+            .unwrap();
+        }
+
+        let path = file.path().to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let success_event = post("s", "t", Some("call-success"), successful_command);
+        let verifier = std::thread::spawn(move || {
+            let mut db = Connection::open(path).unwrap();
+            handle_post_tool_use(
+                &mut db,
+                &success_event,
+                &BlockingTransport {
+                    started: started_tx,
+                    release: release_rx,
+                },
+                Duration::from_secs(3),
+                60_000,
+            )
+            .unwrap()
+        });
+        started_rx.recv().unwrap();
+
+        let mut failed_post = post("s", "t", Some("call-failed"), failed_command);
+        failed_post["tool_response"] = json!("creation failed");
+        let mut db = Connection::open(file.path()).unwrap();
+        assert_eq!(
+            handle_post_tool_use(
+                &mut db,
+                &failed_post,
+                &fixture_transport(),
+                Duration::from_secs(3),
+                60_000,
+            )
+            .unwrap(),
+            HandleResult::Ignored
+        );
+        release_tx.send(()).unwrap();
+
+        let HandleResult::Candidate { record, verified } = verifier.join().unwrap() else {
+            panic!("successful creation candidate should be retained")
+        };
+        assert_eq!(record.state, CandidateState::Verified);
+        assert!(verified.is_some());
+        let failed_state: String = db
+            .query_row(
+                "SELECT state FROM pr_hook_pre_observations WHERE tool_use_id='call-failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_state, "completed");
+    }
+
+    #[test]
+    fn completed_non_candidate_call_does_not_block_concurrent_success() {
+        let failed_command = "gh pr create --title failed";
+        let successful_command = "gh pr create --title successful";
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call-failed", failed_command),
+            1_735_787_046_500,
+            60_000,
+        )
+        .unwrap();
+        let mut failed_post = post("s", "t", Some("call-failed"), failed_command);
+        failed_post["tool_response"] = json!("creation failed");
+        assert_eq!(
+            handle_post_tool_use(
+                &mut db,
+                &failed_post,
+                &fixture_transport(),
+                Duration::from_secs(2),
+                60_000,
+            )
+            .unwrap(),
+            HandleResult::Ignored
+        );
+        let failed_state: String = db
+            .query_row("SELECT state FROM pr_hook_pre_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(failed_state, "completed");
+
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call-success", successful_command),
+            1_735_787_046_600,
+            60_000,
+        )
+        .unwrap();
+        let result = handle_post_tool_use(
+            &mut db,
+            &post("s", "t", Some("call-success"), successful_command),
+            &fixture_transport(),
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        assert!(
+            matches!(result, HandleResult::Candidate { record, .. } if record.state == CandidateState::Verified)
+        );
     }
 
     #[test]
@@ -2131,15 +2507,14 @@ mod tests {
         }
 
         let mut db = Connection::open_in_memory().unwrap();
-        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
-            &pre("s", "t", "call", command),
+            &mcp_pre("s", "t", "call"),
             1_735_787_045_500,
             60_000,
         )
         .unwrap();
-        let event = post("s", "t", Some("call"), command);
+        let event = mcp_post("s", "t", "call");
         let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = handle_post_tool_use(
                 &mut db,
@@ -2258,18 +2633,17 @@ mod tests {
 
     #[test]
     fn new_or_conflicting_pre_during_get_cannot_authorize_attribution() {
-        let command = "gh pr create --title same";
         let mut control_db = Connection::open_in_memory().unwrap();
         record_pre_tool_use(
             &mut control_db,
-            &pre("control", "turn", "call", command),
+            &mcp_pre("control", "turn", "call"),
             1_735_787_045_500,
             60_000,
         )
         .unwrap();
         let control = handle_post_tool_use(
             &mut control_db,
-            &post("control", "turn", Some("call"), command),
+            &mcp_post("control", "turn", "call"),
             &fixture_transport(),
             Duration::from_secs(3),
             60_000,
@@ -2283,93 +2657,83 @@ mod tests {
             panic!("an unconflicted exact call should verify")
         };
         assert_eq!(record.state, CandidateState::Verified);
-
-        fn exercise(post_id: Option<&str>, extra_id: &str, extra_command: &str) {
-            struct BlockingTransport {
-                started: mpsc::Sender<()>,
-                release: mpsc::Receiver<()>,
-                response: GetPullRequestResponse,
+        struct BlockingTransport {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            response: GetPullRequestResponse,
+        }
+        impl PullRequestGetTransport for BlockingTransport {
+            fn get_pull_request(
+                &self,
+                _repository: &str,
+                _number: u64,
+                _timeout: Duration,
+            ) -> std::result::Result<GetPullRequestResponse, TransportFailure> {
+                self.started.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(self.response.clone())
             }
-            impl PullRequestGetTransport for BlockingTransport {
-                fn get_pull_request(
-                    &self,
-                    _repository: &str,
-                    _number: u64,
-                    _timeout: Duration,
-                ) -> std::result::Result<GetPullRequestResponse, TransportFailure> {
-                    self.started.send(()).unwrap();
-                    self.release.recv().unwrap();
-                    Ok(self.response.clone())
-                }
-            }
+        }
 
-            let file = tempfile::NamedTempFile::new().unwrap();
-            let command = "gh pr create --title same";
-            {
-                let mut db = Connection::open(file.path()).unwrap();
-                record_pre_tool_use(
-                    &mut db,
-                    &pre("s", "t", "call", command),
-                    1_735_787_045_500,
-                    60_000,
-                )
-                .unwrap();
-            }
-            let path = file.path().to_owned();
-            let (started_tx, started_rx) = mpsc::channel();
-            let (release_tx, release_rx) = mpsc::channel();
-            let event = post("s", "t", post_id, command);
-            let verifier = std::thread::spawn(move || {
-                let mut db = Connection::open(path).unwrap();
-                let transport = BlockingTransport {
-                    started: started_tx,
-                    release: release_rx,
-                    response: fixture_response(),
-                };
-                handle_post_tool_use(&mut db, &event, &transport, Duration::from_secs(3), 60_000)
-                    .unwrap()
-            });
-
-            started_rx.recv().unwrap();
-            let mut conflict_db = Connection::open(file.path()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut db = Connection::open(file.path()).unwrap();
             record_pre_tool_use(
-                &mut conflict_db,
-                &pre("s", "t", extra_id, extra_command),
+                &mut db,
+                &mcp_pre("s", "t", "call-1"),
                 1_735_787_045_500,
                 60_000,
             )
             .unwrap();
-            release_tx.send(()).unwrap();
-
-            let HandleResult::Candidate { record, verified } = verifier.join().unwrap() else {
-                panic!("in-flight candidate should remain queryable")
-            };
-            assert_eq!(record.state, CandidateState::Ambiguous);
-            assert!(verified.is_none());
         }
+        let path = file.path().to_owned();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let event = mcp_post("s", "t", "call-1");
+        let verifier = std::thread::spawn(move || {
+            let mut db = Connection::open(path).unwrap();
+            let transport = BlockingTransport {
+                started: started_tx,
+                release: release_rx,
+                response: fixture_response(),
+            };
+            handle_post_tool_use(&mut db, &event, &transport, Duration::from_secs(3), 60_000)
+                .unwrap()
+        });
 
-        // A digest-only match becomes ambiguous when another matching call appears.
-        exercise(None, "other-call", "gh pr create --title same");
-        // Reuse of the exact call identity with changed input invalidates its candidate.
-        exercise(Some("call"), "call", "gh pr create --title changed");
+        started_rx.recv().unwrap();
+        let mut second_pre = Connection::open(file.path()).unwrap();
+        record_pre_tool_use(
+            &mut second_pre,
+            &mcp_pre("s", "t", "call-2"),
+            1_735_787_045_600,
+            60_000,
+        )
+        .unwrap();
+        release_tx.send(()).unwrap();
+
+        let HandleResult::Candidate { record, verified } = verifier.join().unwrap() else {
+            panic!("in-flight candidate should remain queryable")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
     }
 
     #[test]
     fn verified_snapshot_survives_database_reopen() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let command = TRUSTED_API_CREATE;
         let id = {
             let mut db = Connection::open(file.path()).unwrap();
             record_pre_tool_use(
                 &mut db,
-                &pre("s", "t", "call", command),
+                &mcp_pre("s", "t", "call"),
                 1_735_787_045_500,
                 60_000,
             )
             .unwrap();
             let HandleResult::Candidate { record, .. } = handle_post_tool_use(
                 &mut db,
-                &post("s", "t", Some("call"), command),
+                &mcp_post("s", "t", "call"),
                 &fixture_transport(),
                 Duration::from_secs(2),
                 60_000,
@@ -2447,6 +2811,26 @@ mod tests {
         ).unwrap();
         assert!(!persisted.contains(secret));
         assert!(!persisted.contains("other/repo"));
+    }
+
+    #[test]
+    fn gh_pr_repo_host_prefix_is_normalized_in_pretool_metadata() {
+        let event = pre(
+            "s",
+            "t",
+            "c",
+            "gh pr create --repo github.com/owner/repo --head feature",
+        );
+        assert!(is_relevant_pre_tool_use(&event));
+        assert_eq!(
+            intent_metadata("Bash", &event["tool_input"]),
+            (
+                Some("owner/repo".into()),
+                Some("feature".into()),
+                None,
+                None
+            )
+        );
     }
 
     #[test]
@@ -2681,10 +3065,9 @@ mod tests {
     #[test]
     fn timeout_and_transport_error_are_visible_and_retryable() {
         let mut db = Connection::open_in_memory().unwrap();
-        let command = TRUSTED_API_CREATE;
         record_pre_tool_use(
             &mut db,
-            &pre("s1", "t1", "call-1", command),
+            &mcp_pre("s1", "t1", "call-1"),
             1_735_787_045_500,
             60_000,
         )
@@ -2695,7 +3078,7 @@ mod tests {
         };
         let result = handle_post_tool_use(
             &mut db,
-            &post("s1", "t1", Some("call-1"), command),
+            &mcp_post("s1", "t1", "call-1"),
             &timeout,
             Duration::from_millis(50),
             60_000,
