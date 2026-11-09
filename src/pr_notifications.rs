@@ -1648,14 +1648,7 @@ mod tests {
         };
         close("2099-01-01T00:00:10Z");
         assert_eq!(
-            record_reopened_event(
-                &db,
-                "owner/repo",
-                "7",
-                "poll",
-                "2099-01-01T00:00:20Z",
-            )
-            .unwrap(),
+            record_reopened_event(&db, "owner/repo", "7", "poll", "2099-01-01T00:00:20Z",).unwrap(),
             1
         );
         let later_webhook = json!({"action":"reopened","number":7,
