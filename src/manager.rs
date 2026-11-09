@@ -1914,7 +1914,7 @@ mod tests {
             &db,
             1_001,
             |thread, ids| {
-                assert_eq!(ids, &[current_id.to_owned()]);
+                assert_eq!(ids, std::slice::from_ref(&current_id));
                 let accepted_ids = ids.iter().cloned().collect();
                 start_accepted_native_message(
                     &db,
