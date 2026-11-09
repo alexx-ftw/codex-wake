@@ -389,8 +389,9 @@ fn github_url_path(url: &str) -> Option<&str> {
         .or_else(|| url.strip_prefix("http://github.com/"))
 }
 
-/// A PreToolUse observation already correlated by the caller using the shared
-/// tool_use_id, session, turn, and input digest.
+/// A PreToolUse observation linked to a PostToolUse by the observation layer.
+/// `exact_call_and_result` says whether that link and the direct result meet
+/// the stricter same-second attribution requirements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreToolUseObservation {
     /// UTC Unix milliseconds when this PreToolUse was observed by the caller.
@@ -399,6 +400,9 @@ pub struct PreToolUseObservation {
     pub head_ref: Option<String>,
     pub base_ref: Option<String>,
     pub author_login: Option<String>,
+    /// True only when the observation layer matched session, turn, tool_use_id,
+    /// and input digest exactly and parsed a direct, untransformed creation result.
+    pub(crate) exact_call_and_result: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,8 +436,7 @@ pub enum VerificationOutcome {
 /// calls and has no registration side effects.
 ///
 /// `outstanding_pre_tool_uses` must contain every still-plausible PR creation
-/// PreToolUse for the candidate repository. There is no Codex-provided ID with
-/// which this function could verify that bookkeeping itself. Attribution also
+/// PreToolUse for the candidate repository. Attribution also
 /// requires `created_at` to fall within the caller's configured maximum delay
 /// from PreToolUse; overlong calls become ambiguous.
 pub fn verify_pr_candidate(
@@ -583,7 +586,9 @@ pub fn verify_pr_candidate(
     let pre = plausible[0];
     // GitHub's created_at has second precision. If both events land in the
     // same second, their order cannot be established from these timestamps.
-    if created_at_ms / 1000 == pre.observed_at_unix_ms / 1000 {
+    if created_at_ms.div_euclid(1000) == pre.observed_at_unix_ms.div_euclid(1000)
+        && !pre.exact_call_and_result
+    {
         return VerificationOutcome::ExistsButAmbiguous {
             pull_request: verified,
             reason: "PreToolUse and PR creation share one-second timestamp precision",
@@ -931,6 +936,7 @@ mod tests {
             head_ref: Some("feature-x".into()),
             base_ref: Some("main".into()),
             author_login: Some("Alice".into()),
+            exact_call_and_result: false,
         }
     }
 
@@ -1001,6 +1007,36 @@ mod tests {
             200,
             &get_fixture(),
             verified_at,
+        );
+        assert!(matches!(
+            outcome,
+            VerificationOutcome::ExistsButAmbiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn same_second_is_attributed_only_with_exact_call_and_untransformed_result() {
+        let mut exact = pre_use("2025-01-02T03:04:06.500Z");
+        exact.exact_call_and_result = true;
+        let outcome = verify_pr_candidate(
+            &candidate(),
+            &[exact],
+            TEST_ATTRIBUTION_WINDOW_MS,
+            200,
+            &get_fixture(),
+            parse_utc_timestamp_ms("2025-01-02T03:04:07Z").unwrap(),
+        );
+        assert!(matches!(outcome, VerificationOutcome::Attributed(_)));
+
+        let mut fallback = pre_use("2025-01-02T03:04:06.500Z");
+        fallback.exact_call_and_result = false;
+        let outcome = verify_pr_candidate(
+            &candidate(),
+            &[fallback],
+            TEST_ATTRIBUTION_WINDOW_MS,
+            200,
+            &get_fixture(),
+            parse_utc_timestamp_ms("2025-01-02T03:04:07Z").unwrap(),
         );
         assert!(matches!(
             outcome,

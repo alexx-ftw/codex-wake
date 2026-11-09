@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS pr_hook_candidates (
     tool_use_id TEXT,
     tool_name TEXT NOT NULL,
     input_digest TEXT,
+    exact_id_correlation INTEGER NOT NULL DEFAULT 0,
+    raw_creation_result INTEGER NOT NULL DEFAULT 0,
     number INTEGER NOT NULL,
     url TEXT NOT NULL,
     invocation_key TEXT NOT NULL UNIQUE,
@@ -585,10 +587,19 @@ pub fn handle_post_tool_use(
         input_digest.as_deref(),
     )?;
     match correlation {
-        Correlation::Unique(pre_id) => {
+        Correlation::Unique {
+            pre_id,
+            exact_tool_use_id,
+        } => {
             tx.execute(
-                "UPDATE pr_hook_candidates SET pre_id=?1 WHERE id=?2",
-                params![pre_id, candidate_id],
+                "UPDATE pr_hook_candidates SET pre_id=?1,exact_id_correlation=?2,
+                 raw_creation_result=?3 WHERE id=?4",
+                params![
+                    pre_id,
+                    exact_tool_use_id,
+                    !command_output_can_be_filtered(tool_name, event.get("tool_input")),
+                    candidate_id
+                ],
             )?;
             tx.execute(
                 "UPDATE pr_hook_pre_observations SET state='linked',reason=NULL WHERE id=?1",
@@ -715,7 +726,10 @@ pub fn cleanup_expired_pre(db: &Connection, now_ms: i64) -> Result<usize> {
 
 #[derive(Debug)]
 enum Correlation {
-    Unique(i64),
+    Unique {
+        pre_id: i64,
+        exact_tool_use_id: bool,
+    },
     Ambiguous(&'static str),
 }
 
@@ -751,13 +765,13 @@ fn correlate_pre(
         match (post_tool_use_id, pre_id.as_deref()) {
             (Some(post_id), Some(pre_id)) if post_id == pre_id => {
                 if pre_digest.as_deref() == Some(digest) {
-                    matches.push(id);
+                    matches.push((id, true));
                 } else {
                     id_input_conflict = true;
                 }
             }
             (Some(_), Some(_)) => {}
-            _ if pre_digest.as_deref() == Some(digest) => matches.push(id),
+            _ if pre_digest.as_deref() == Some(digest) => matches.push((id, false)),
             _ => {}
         }
     }
@@ -767,7 +781,10 @@ fn correlate_pre(
         ));
     }
     match matches.as_slice() {
-        [id] => Ok(Correlation::Unique(*id)),
+        [(id, exact_tool_use_id)] => Ok(Correlation::Unique {
+            pre_id: *id,
+            exact_tool_use_id: *exact_tool_use_id,
+        }),
         [] => Ok(Correlation::Ambiguous(
             "no PreToolUse matches session, turn, tool and input digest",
         )),
@@ -793,6 +810,13 @@ fn verify_persisted_candidate(
         candidate,
         pre_id,
         state,
+        session_id,
+        turn_id,
+        tool_use_id,
+        tool_name,
+        input_digest,
+        exact_id_correlation,
+        raw_creation_result,
     } = stored;
     if matches!(state, CandidateState::Verified | CandidateState::Ambiguous) {
         return candidate_result(db, candidate_id, None);
@@ -802,8 +826,7 @@ fn verify_persisted_candidate(
             db,
             candidate_id,
             CandidateState::Ambiguous,
-            expected_state,
-            expected_lease_until,
+            (expected_state, expected_lease_until),
             Some("candidate has no correlated PreToolUse"),
             None,
             None,
@@ -815,8 +838,7 @@ fn verify_persisted_candidate(
             db,
             candidate_id,
             CandidateState::Ambiguous,
-            expected_state,
-            expected_lease_until,
+            (expected_state, expected_lease_until),
             Some("correlated PreToolUse evidence is unavailable"),
             None,
             None,
@@ -825,12 +847,28 @@ fn verify_persisted_candidate(
     };
     let repo = repository_from_pr_url(&candidate.url)
         .ok_or_else(|| anyhow!("persisted candidate URL has invalid repository"))?;
+    let exact_call_and_result = exact_id_correlation
+        && raw_creation_result
+        && session_id
+            .as_deref()
+            .is_some_and(|id| Some(id) == pre.session_id.as_deref())
+        && turn_id
+            .as_deref()
+            .is_some_and(|id| Some(id) == pre.turn_id.as_deref())
+        && tool_use_id
+            .as_deref()
+            .is_some_and(|id| Some(id) == pre.tool_use_id.as_deref())
+        && input_digest
+            .as_deref()
+            .is_some_and(|digest| Some(digest) == pre.input_digest.as_deref())
+        && pre.tool_name.as_deref() == Some(tool_name.as_str());
     let observation = PreToolUseObservation {
         observed_at_unix_ms: pre.observed_at_ms,
         repository: pre.repository.unwrap_or(repo.clone()),
         head_ref: pre.head_ref,
         base_ref: pre.base_ref,
         author_login: pre.author_login,
+        exact_call_and_result,
     };
 
     let response = match transport.get_pull_request(&repo, candidate.number, timeout) {
@@ -840,8 +878,7 @@ fn verify_persisted_candidate(
                 db,
                 candidate_id,
                 CandidateState::Timeout,
-                expected_state,
-                expected_lease_until,
+                (expected_state, expected_lease_until),
                 Some("GitHub GET timed out"),
                 None,
                 None,
@@ -853,8 +890,7 @@ fn verify_persisted_candidate(
                 db,
                 candidate_id,
                 CandidateState::TransportError,
-                expected_state,
-                expected_lease_until,
+                (expected_state, expected_lease_until),
                 Some(failure.safe_label()),
                 None,
                 None,
@@ -867,8 +903,7 @@ fn verify_persisted_candidate(
             db,
             candidate_id,
             CandidateState::TransportError,
-            expected_state,
-            expected_lease_until,
+            (expected_state, expected_lease_until),
             Some(reason),
             Some(response.status),
             None,
@@ -896,8 +931,7 @@ fn verify_persisted_candidate(
         db,
         candidate_id,
         state,
-        expected_state,
-        expected_lease_until,
+        (expected_state, expected_lease_until),
         reason,
         Some(response.status),
         verified.as_ref(),
@@ -930,42 +964,83 @@ struct StoredCandidate {
     candidate: PrCandidate,
     pre_id: Option<i64>,
     state: CandidateState,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    tool_use_id: Option<String>,
+    tool_name: String,
+    input_digest: Option<String>,
+    exact_id_correlation: bool,
+    raw_creation_result: bool,
 }
 
 fn load_candidate_for_verify(db: &Connection, id: i64) -> Result<Option<StoredCandidate>> {
     let row = db
         .query_row(
-            "SELECT tool_use_id,number,url,pre_id,state FROM pr_hook_candidates WHERE id=?1",
+            "SELECT session_id,turn_id,tool_use_id,tool_name,input_digest,number,url,pre_id,state,
+                    exact_id_correlation,raw_creation_result
+             FROM pr_hook_candidates WHERE id=?1",
             [id],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, bool>(10)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(tool_use_id, number, url, pre_id, state)| {
-        Ok(StoredCandidate {
-            candidate: PrCandidate {
-                tool_use_id: tool_use_id.unwrap_or_default(),
-                number: u64::try_from(number).context("invalid stored PR number")?,
-                url,
-            },
+    row.map(
+        |(
+            session_id,
+            turn_id,
+            tool_use_id,
+            tool_name,
+            input_digest,
+            number,
+            url,
             pre_id,
-            state: CandidateState::from_str(&state)
-                .ok_or_else(|| anyhow!("unknown persisted candidate state"))?,
-        })
-    })
+            state,
+            exact_id_correlation,
+            raw_creation_result,
+        )| {
+            Ok(StoredCandidate {
+                candidate: PrCandidate {
+                    tool_use_id: tool_use_id.unwrap_or_default(),
+                    number: u64::try_from(number).context("invalid stored PR number")?,
+                    url,
+                },
+                pre_id,
+                state: CandidateState::from_str(&state)
+                    .ok_or_else(|| anyhow!("unknown persisted candidate state"))?,
+                session_id,
+                turn_id,
+                tool_use_id,
+                tool_name,
+                input_digest,
+                exact_id_correlation,
+                raw_creation_result,
+            })
+        },
+    )
     .transpose()
 }
 
 #[derive(Debug)]
 struct StoredPre {
     observed_at_ms: i64,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    tool_use_id: Option<String>,
+    tool_name: Option<String>,
+    input_digest: Option<String>,
     repository: Option<String>,
     head_ref: Option<String>,
     base_ref: Option<String>,
@@ -975,16 +1050,22 @@ struct StoredPre {
 fn load_pre_observation(db: &Connection, id: i64) -> Result<Option<StoredPre>> {
     Ok(db
         .query_row(
-            "SELECT observed_at_ms,repository,head_ref,base_ref,author_login
+            "SELECT observed_at_ms,session_id,turn_id,tool_use_id,tool_name,input_digest,
+                    repository,head_ref,base_ref,author_login
              FROM pr_hook_pre_observations WHERE id=?1",
             [id],
             |row| {
                 Ok(StoredPre {
                     observed_at_ms: row.get(0)?,
-                    repository: row.get(1)?,
-                    head_ref: row.get(2)?,
-                    base_ref: row.get(3)?,
-                    author_login: row.get(4)?,
+                    session_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    tool_use_id: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    input_digest: row.get(5)?,
+                    repository: row.get(6)?,
+                    head_ref: row.get(7)?,
+                    base_ref: row.get(8)?,
+                    author_login: row.get(9)?,
                 })
             },
         )
@@ -1061,12 +1142,12 @@ fn set_candidate_state(
     db: &Connection,
     id: i64,
     state: CandidateState,
-    expected_state: CandidateState,
-    expected_lease_until: i64,
+    expected: (CandidateState, i64),
     reason: Option<&str>,
     get_status: Option<u16>,
     verified: Option<&VerifiedPullRequest>,
 ) -> Result<bool> {
+    let (expected_state, expected_lease_until) = expected;
     let verified_json = verified.map(verified_to_json).transpose()?;
     let retry_count: u32 = db.query_row(
         "SELECT retry_count FROM pr_hook_candidates WHERE id=?1",
@@ -1636,6 +1717,62 @@ mod tests {
         assert_eq!(second.id, first.id);
         assert_eq!(second.verified, first.verified);
         assert_eq!(verified, first.verified);
+        assert_eq!(transport.calls.get(), 1);
+    }
+
+    #[test]
+    fn exact_tool_identity_and_raw_result_allow_matching_pr_created_in_same_second() {
+        let command = "gh pr create --title test";
+        let observed_at_ms = 1_735_787_046_500; // 2025-01-02T03:04:06.500Z
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call", command),
+            observed_at_ms,
+            60_000,
+        )
+        .unwrap();
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+            &mut db,
+            &post("s", "t", Some("call"), command),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("the recognized creation output should produce a candidate")
+        };
+        assert_eq!(record.state, CandidateState::Verified);
+        assert_eq!(verified.unwrap().number, 42);
+        assert_eq!(transport.calls.get(), 1);
+    }
+
+    #[test]
+    fn same_second_digest_fallback_remains_ambiguous() {
+        let command = "gh pr create --title test";
+        let observed_at_ms = 1_735_787_046_500;
+        let mut db = Connection::open_in_memory().unwrap();
+        record_pre_tool_use(
+            &mut db,
+            &pre("s", "t", "call", command),
+            observed_at_ms,
+            60_000,
+        )
+        .unwrap();
+        let transport = fixture_transport();
+        let HandleResult::Candidate { record, verified } = handle_post_tool_use(
+            &mut db,
+            &post("s", "t", None, command),
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap() else {
+            panic!("fallback-correlated candidate should be retained")
+        };
+        assert_eq!(record.state, CandidateState::Ambiguous);
+        assert!(verified.is_none());
         assert_eq!(transport.calls.get(), 1);
     }
 

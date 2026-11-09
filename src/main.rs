@@ -5054,7 +5054,7 @@ mod pr_hook_registration_integration_tests {
         let gh = root.join("gh");
         std::fs::write(
             &gh,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nif [ ! -e \"$0.seen\" ]; then : > \"$0.seen\"; exit 1; fi\nprintf 'HTTP/2 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\\\"number\\\":42,\\\"html_url\\\":\\\"https://github.com/owner/repo/pull/42\\\",\\\"created_at\\\":\\\"'\ndate -u +'%Y-%m-%dT%H:%M:%SZ'\nprintf '\\\",\\\"base\\\":{\\\"ref\\\":\\\"main\\\",\\\"repo\\\":{\\\"full_name\\\":\\\"owner/repo\\\"}},\\\"head\\\":{\\\"ref\\\":\\\"feature\\\"},\\\"user\\\":{\\\"login\\\":\\\"alice\\\"}}'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nif [ ! -e \"$0.seen\" ]; then : > \"$0.seen\"; exit 1; fi\nprintf 'HTTP/2 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\\\"number\\\":42,\\\"html_url\\\":\\\"https://github.com/owner/repo/pull/42\\\",\\\"created_at\\\":\\\"'\nprintf '%s' \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"\nprintf '\\\",\\\"base\\\":{\\\"ref\\\":\\\"main\\\",\\\"repo\\\":{\\\"full_name\\\":\\\"owner/repo\\\"}},\\\"head\\\":{\\\"ref\\\":\\\"feature\\\"},\\\"user\\\":{\\\"login\\\":\\\"alice\\\"}}'\n",
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
