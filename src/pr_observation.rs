@@ -1013,7 +1013,7 @@ fn load_candidate_for_verify(db: &Connection, id: i64) -> Result<Option<StoredCa
         )| {
             Ok(StoredCandidate {
                 candidate: PrCandidate {
-                    tool_use_id: tool_use_id.unwrap_or_default(),
+                    tool_use_id: tool_use_id.clone().unwrap_or_default(),
                     number: u64::try_from(number).context("invalid stored PR number")?,
                     url,
                 },
