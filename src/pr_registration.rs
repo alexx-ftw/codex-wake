@@ -8,7 +8,7 @@ pub fn register(db: &mut Connection, repo: &str, number: &str, thread: &str) -> 
         crate::subscriptions::validate_source("pull_request", repo, number, "closed", thread)?;
     initialize_registration(db)?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    register_in(&tx, repo, &number, &thread)?;
+    register_in(&tx, repo, &number, &thread, None)?;
     tx.commit()?;
     Ok(())
 }
@@ -22,10 +22,27 @@ fn initialize_registration(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn register_in(db: &Connection, repo: &str, number: &str, thread: &str) -> Result<()> {
+fn register_in(
+    db: &Connection,
+    repo: &str,
+    number: &str,
+    thread: &str,
+    registered_at_sec: Option<i64>,
+) -> Result<()> {
     codex_wake::pr_ci::register_in(db, repo, number, thread)?;
     for kind in ["pull_request", "review"] {
-        crate::polling::pr_notifications::register_in(db, kind, repo, number, thread)?;
+        if let Some(registered_at_sec) = registered_at_sec {
+            crate::polling::pr_notifications::register_in_since(
+                db,
+                kind,
+                repo,
+                number,
+                thread,
+                registered_at_sec,
+            )?;
+        } else {
+            crate::polling::pr_notifications::register_in(db, kind, repo, number, thread)?;
+        }
     }
     let existing: Option<String> = db
         .query_row(
@@ -99,7 +116,18 @@ fn register_claimed_candidate(
     if !eligible {
         return Ok(false);
     }
-    register_in(&tx, &pr.repository, &number, &thread)?;
+    let observed_at_ms: i64 = tx.query_row(
+        "SELECT created_at_ms FROM pr_hook_candidates WHERE id=?1",
+        [candidate.id],
+        |row| row.get(0),
+    )?;
+    register_in(
+        &tx,
+        &pr.repository,
+        &number,
+        &thread,
+        Some(observed_at_ms.div_euclid(1000)),
+    )?;
     let consumed = tx.execute(
         "UPDATE pr_hook_candidates SET consumed_at_ms=?1,work_claim_until_ms=NULL,updated_at_ms=?1
          WHERE id=?2 AND state='verified' AND consumed_at_ms IS NULL
@@ -209,6 +237,75 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn delayed_verification_keeps_events_since_creation_observation() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let observed_at_ms = unix_now_ms() - 30_000;
+        let session = "11111111-1111-4111-8111-111111111111";
+        let turn = "turn-delayed";
+        let call = "call-delayed";
+        let command = "gh pr create --repo owner/repo --title delayed";
+        let pre = serde_json::json!({
+            "hook_event_name":"PreToolUse",
+            "session_id":session,
+            "turn_id":turn,
+            "tool_use_id":call,
+            "tool_name":"Bash",
+            "tool_input":{"command":command}
+        });
+        crate::pr_observation::record_pre_tool_use(&mut db, &pre, observed_at_ms, 60_000).unwrap();
+        let post = serde_json::json!({
+            "hook_event_name":"PostToolUse",
+            "session_id":session,
+            "turn_id":turn,
+            "tool_use_id":call,
+            "tool_name":"Bash",
+            "tool_input":{"command":command},
+            "tool_response":"https://github.com/owner/repo/pull/42"
+        });
+        let transport = FixtureTransport {
+            created_at: utc_timestamp(observed_at_ms + 1_000),
+        };
+        let result = crate::pr_observation::handle_post_tool_use(
+            &mut db,
+            &post,
+            &transport,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        let crate::pr_observation::HandleResult::Candidate { record, .. } = result else {
+            panic!("expected verified PR candidate");
+        };
+        db.execute(
+            "UPDATE pr_hook_candidates SET created_at_ms=?1 WHERE id=?2",
+            params![observed_at_ms, record.id],
+        )
+        .unwrap();
+
+        let claimed_at_ms = unix_now_ms();
+        let claimed =
+            crate::pr_observation::claim_verified_pending(&mut db, claimed_at_ms, 60_000, 1)
+                .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert!(register_claimed_candidate(&mut db, &claimed[0], claimed_at_ms + 60_000,).unwrap());
+
+        let event_at = utc_timestamp(observed_at_ms + 10_000);
+        let notices = crate::polling::pr_notifications::record_event(
+            &db,
+            "review",
+            "owner/repo",
+            "42",
+            "approved",
+            &event_at,
+            "review-during-verification",
+            &serde_json::json!({"review":{"id":73,"state":"approved"}}),
+        )
+        .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].thread, session);
     }
 
     #[test]

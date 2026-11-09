@@ -196,6 +196,13 @@ where
                     report.uncertain += 1;
                 }
             }
+            Err(error) if known_before_send_failure(&error) => {
+                if pr_ci::retry_delivery(db, delivery.id)? {
+                    report.retried_before_send += 1;
+                } else {
+                    report.uncertain += 1;
+                }
+            }
             Ok(_) | Err(_) => {
                 pr_ci::mark_delivery_uncertain(db, delivery.id)?;
                 report.uncertain += 1;
@@ -203,6 +210,17 @@ where
         }
     }
     Ok(report)
+}
+
+fn known_before_send_failure(error: &anyhow::Error) -> bool {
+    // These typed markers belong to the host binary; match their unique display text here.
+    error.chain().any(|cause| {
+        matches!(
+            cause.to_string().as_str(),
+            "Target unavailable during preparation; input was not sent"
+                | "Target thread has an active writer; input was not sent"
+        )
+    })
 }
 
 /// Dispatch from an independent worker and independent database connection.
@@ -286,6 +304,66 @@ mod tests {
         assert_eq!(report.retried_before_send, 1);
         assert_eq!(
             pr_ci::claim_deliveries(&mut db, 2_000, 10, DELIVERY_LEASE)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn known_before_send_errors_retry_but_unknown_errors_stay_uncertain() {
+        use std::{error::Error, fmt};
+
+        #[derive(Clone, Copy, Debug)]
+        enum BeforeSend {
+            Unavailable,
+            Busy,
+        }
+
+        impl fmt::Display for BeforeSend {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(match self {
+                    Self::Unavailable => {
+                        "Target unavailable during preparation; input was not sent"
+                    }
+                    Self::Busy => "Target thread has an active writer; input was not sent",
+                })
+            }
+        }
+
+        impl Error for BeforeSend {}
+
+        for marker in [BeforeSend::Unavailable, BeforeSend::Busy] {
+            let mut db = database();
+            let report = dispatch(&mut db, 1_000, |_, _| {
+                Err(anyhow::anyhow!("preparation failed").context(marker))
+            })
+            .unwrap();
+            assert_eq!((report.retried_before_send, report.uncertain), (1, 0));
+            assert_eq!(
+                pr_ci::claim_deliveries(&mut db, 2_000, 10, DELIVERY_LEASE)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        let mut uncertain_db = database();
+        let report = dispatch(&mut uncertain_db, 3_000, |_, _| {
+            Err(anyhow::anyhow!("unknown send state"))
+        })
+        .unwrap();
+        assert_eq!((report.retried_before_send, report.uncertain), (0, 1));
+        assert_eq!(pr_ci::uncertain_deliveries(&uncertain_db).unwrap().len(), 1);
+
+        let mut unknown_state_db = database();
+        let report = dispatch(&mut unknown_state_db, 4_000, |_, _| {
+            Ok(("unknown".into(), None))
+        })
+        .unwrap();
+        assert_eq!((report.retried_before_send, report.uncertain), (0, 1));
+        assert_eq!(
+            pr_ci::uncertain_deliveries(&unknown_state_db)
                 .unwrap()
                 .len(),
             1

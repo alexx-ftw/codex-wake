@@ -84,6 +84,29 @@ pub(crate) fn register_in(
     pr: &str,
     thread: &str,
 ) -> Result<bool> {
+    register_in_with_boundary(db, kind, repo, pr, thread, None)
+}
+
+/// Register with the per-listener event-time boundary captured when PR creation was observed.
+pub(crate) fn register_in_since(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    pr: &str,
+    thread: &str,
+    registered_at_sec: i64,
+) -> Result<bool> {
+    register_in_with_boundary(db, kind, repo, pr, thread, Some(registered_at_sec))
+}
+
+fn register_in_with_boundary(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    pr: &str,
+    thread: &str,
+    registered_at_sec: Option<i64>,
+) -> Result<bool> {
     let validation_event = match kind {
         "pull_request" => "closed",
         "review" => "submitted",
@@ -94,11 +117,11 @@ pub(crate) fn register_in(
     initialize(db)?;
     if db.is_autocommit() {
         let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
-        let inserted = insert_listener(&tx, kind, repo, &pr, &thread)?;
+        let inserted = insert_listener(&tx, kind, repo, &pr, &thread, registered_at_sec)?;
         tx.commit()?;
         Ok(inserted)
     } else {
-        insert_listener(db, kind, repo, &pr, &thread)
+        insert_listener(db, kind, repo, &pr, &thread, registered_at_sec)
     }
 }
 
@@ -108,12 +131,31 @@ fn insert_listener(
     repo: &str,
     pr: &str,
     thread: &str,
+    registered_at_sec: Option<i64>,
 ) -> Result<bool> {
-    Ok(db.execute(
-        "INSERT OR IGNORE INTO automatic_pr_notification_listeners(kind,repo,pr,thread)
-         VALUES(?1,?2,?3,?4)",
-        params![kind, repo, pr, thread],
-    )? != 0)
+    let inserted = match registered_at_sec {
+        Some(registered_at_sec) => db.execute(
+            "INSERT OR IGNORE INTO automatic_pr_notification_listeners
+             (kind,repo,pr,thread,registered_at_sec) VALUES(?1,?2,?3,?4,?5)",
+            params![kind, repo, pr, thread, registered_at_sec],
+        )?,
+        None => db.execute(
+            "INSERT OR IGNORE INTO automatic_pr_notification_listeners(kind,repo,pr,thread)
+             VALUES(?1,?2,?3,?4)",
+            params![kind, repo, pr, thread],
+        )?,
+    };
+    if inserted == 0 {
+        if let Some(registered_at_sec) = registered_at_sec {
+            db.execute(
+                "UPDATE automatic_pr_notification_listeners
+                 SET registered_at_sec=MIN(registered_at_sec,?5)
+                 WHERE kind=?1 AND repo=?2 AND pr=?3 AND thread=?4",
+                params![kind, repo, pr, thread, registered_at_sec],
+            )?;
+        }
+    }
+    Ok(inserted != 0)
 }
 
 /// Record one provider event for every registered destination. `event_key` must be the
@@ -325,14 +367,14 @@ pub(crate) fn dispatch(
     codex: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<usize> {
-    dispatch_with(db, |thread, message, id| {
-        crate::execution::queue_with_identity(codex, thread, message, id, false, timeout)
+    dispatch_with(db, |thread, message, id, resume| {
+        crate::execution::queue_with_identity(codex, thread, message, id, resume, timeout)
     })
 }
 
 fn dispatch_with(
     db: &mut Connection,
-    mut queue: impl FnMut(&str, &str, &str) -> Result<(String, Option<String>)>,
+    mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
 ) -> Result<usize> {
     const BATCH: usize = 16;
     let mut attempted = 0;
@@ -348,7 +390,7 @@ fn dispatch_with(
             notification.repo,
             notification.pr,
         );
-        match queue(&notification.thread, &message, &notification.id) {
+        match queue(&notification.thread, &message, &notification.id, true) {
             Ok((state, _)) if state == "queued" => {
                 ensure!(
                     mark_queued(db, &notification.id)?,
@@ -602,9 +644,10 @@ mod tests {
         .unwrap();
         let mut sent_id = String::new();
         assert_eq!(
-            dispatch_with(&mut db, |thread, message, id| {
+            dispatch_with(&mut db, |thread, message, id, resume| {
                 assert_eq!(thread, "11111111-1111-4111-8111-111111111111");
                 assert!(message.contains("owner/repo#7 synchronize"));
+                assert!(resume, "PR notices must wake unloaded chats");
                 sent_id = id.to_owned();
                 anyhow::bail!("RPC response lost after send")
             })
@@ -614,7 +657,7 @@ mod tests {
         assert_eq!(needs_attention(&db).unwrap()[0].id, sent_id);
         let mut resend_count = 0;
         assert_eq!(
-            dispatch_with(&mut db, |_, _, _| {
+            dispatch_with(&mut db, |_, _, _, _| {
                 resend_count += 1;
                 Ok(("queued".into(), None))
             })
