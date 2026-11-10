@@ -353,7 +353,7 @@ fn resume_with(thread: &str, call: &mut impl FnMut(&str, Value) -> Result<Value>
     Ok(goal)
 }
 
-fn validate_objective(objective: &str) -> Result<()> {
+pub(crate) fn validate_objective(objective: &str) -> Result<()> {
     ensure!(!objective.is_empty(), "Goal objective must not be empty");
     ensure!(
         objective.chars().count() <= 4000,
@@ -362,7 +362,7 @@ fn validate_objective(objective: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_budget(token_budget: Option<i64>) -> Result<()> {
+pub(crate) fn validate_budget(token_budget: Option<i64>) -> Result<()> {
     ensure!(
         token_budget.is_none_or(|budget| budget > 0),
         "Token budget must be positive"

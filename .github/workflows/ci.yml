@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       probe:
-        description: Identifier for an explicitly requested webhook smoke test
+        description: Webhook probe, controller-systemd-qualification, cooperative-handoff-qualification, or cooperative-upgrade-qualification
         required: false
         default: manual
 
@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   test:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.probe != 'controller-systemd-qualification' && inputs.probe != 'cooperative-handoff-qualification' && inputs.probe != 'cooperative-upgrade-qualification') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -45,14 +46,18 @@ jobs:
           CODEX_WAKE_WEBHOOK: ${{ github.workspace }}/.tools/webhook-linux-amd64/webhook
         run: |
           cargo test --locked --bin codex-wake
+          cargo test --locked --test automatic_upgrade_cli
           cargo test --locked --test hooks
+          cargo test --locked --test cooperative_bound_direct_cli
           cargo test --locked --test validation_hooks
           cargo test --locked --test goal_event
           cargo test --locked --test release
           cargo test --locked --test telemetry
+          cargo test --locked --test cooperative_bound_direct_cli
           cargo test --locked --test http -- --include-ignored
 
   package:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.probe != 'controller-systemd-qualification' && inputs.probe != 'cooperative-handoff-qualification' && inputs.probe != 'cooperative-upgrade-qualification') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -105,3 +110,138 @@ jobs:
         env:
           CODEX_CLI: ${{ runner.temp }}/codex-cli/node_modules/.bin/codex
         run: bash scripts/qualify-package-lifecycle.sh "$RUNNER_TEMP/release-candidate" "$RUNNER_TEMP/previous/codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz"
+
+  controller-systemd-qualification:
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.probe == 'controller-systemd-qualification' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Check receipt and UID preflight regressions
+        run: bash tests/qualify-systemd-controller.sh
+      - name: Check handoff status regressions
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        run: |
+          bash tests/qualify-cooperative-handoff.sh
+          bash tests/qualify-cooperative-upgrade.sh
+      - name: Build test receiver and qualification probe
+        run: |
+          cargo test --locked --jobs "$(nproc)" --example controller-systemd-qualification
+          cargo build --locked --jobs "$(nproc)" --bin codex-wake --example controller-systemd-qualification
+      - name: Install SQLite CLI for handoff qualification
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-handoff-qualification' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes sqlite3
+      - name: Check cooperative admission beyond the ordinary lock deadline
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --jobs "$(nproc)" --bin codex-wake --test automatic_upgrade_cli -- -D warnings
+          cargo test --locked --jobs "$(nproc)" --test automatic_upgrade_cli -- --include-ignored
+      - name: Obtain native Codex for the isolated test
+        run: npm install --prefix "$RUNNER_TEMP/codex-qualification" --no-save --no-audit --no-fund @openai/codex@0.166.0
+      - name: Qualify native receiver handoff in private namespaces
+        run: |
+          mkdir -p "$RUNNER_TEMP/handoff-webhook"
+          curl --fail --location --max-time 60 --silent --show-error \
+            --output "$RUNNER_TEMP/handoff-webhook/webhook.tar.gz" \
+            https://github.com/adnanh/webhook/releases/download/2.8.3/webhook-linux-amd64.tar.gz
+          printf '%s  %s\n' \
+            3cdf93f0615f11bfc575c158d0d613666394228f6e830ff6f792178933773f7b \
+            "$RUNNER_TEMP/handoff-webhook/webhook.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/handoff-webhook/webhook.tar.gz" -C "$RUNNER_TEMP/handoff-webhook" webhook-linux-amd64/webhook
+          webhook="$RUNNER_TEMP/handoff-webhook/webhook-linux-amd64/webhook"
+          printf '%s  %s\n' \
+            12c895f29250cbc4289ca45838235d334b39af6cf49d8e17fb43d8efed10372d \
+            "$webhook" | sha256sum --check
+          native=$(node --input-type=module -e '
+            import { createRequire } from "node:module";
+            import { dirname, join } from "node:path";
+            const require = createRequire(process.argv[1]);
+            console.log(join(dirname(require.resolve("@openai/codex-linux-x64/package.json")),
+              "vendor/x86_64-unknown-linux-musl/bin/codex"));
+          ' "$RUNNER_TEMP/codex-qualification/node_modules/@openai/codex/bin/codex.js")
+          cargo test --locked --jobs "$(nproc)" --test cooperative_receiver_lifecycle --no-run --message-format=json > "$RUNNER_TEMP/handoff-build.jsonl"
+          test_bin=$(jq -ers '[.[] | select(.reason == "compiler-artifact" and .target.name == "cooperative_receiver_lifecycle" and .profile.test == true) | .executable | select(type == "string")] | if length == 1 then .[0] else error("expected one test executable") end' "$RUNNER_TEMP/handoff-build.jsonl")
+          wake="$GITHUB_WORKSPACE/target/debug/codex-wake"
+          hooks="$GITHUB_WORKSPACE/hooks.json.tmpl"
+          [[ $native == /* && $webhook == /* && $test_bin == /* && -x $native && -x $webhook && -x $test_bin && -x $wake && -f $hooks ]]
+          stage=$(mktemp -d /var/tmp/cw-native.XXXXXXXX)
+          cleanup_stage() {
+            local result=$? item
+            trap - EXIT
+            for item in test codex webhook wake hooks.json.tmpl; do
+              if [[ -e $stage/$item || -L $stage/$item ]]; then
+                rm -- "$stage/$item" || result=1
+              fi
+            done
+            rmdir -- "$stage" || result=1
+            if [[ $result != 0 ]]; then printf 'Native qualification failed or staging cleanup failed\n' >&2; fi
+            exit "$result"
+          }
+          trap cleanup_stage EXIT
+          chmod 755 "$stage"
+          install -m 755 "$test_bin" "$stage/test"
+          install -m 755 "$native" "$stage/codex"
+          install -m 755 "$webhook" "$stage/webhook"
+          install -m 755 "$wake" "$stage/wake"
+          install -m 644 "$hooks" "$stage/hooks.json.tmpl"
+          cmp "$test_bin" "$stage/test"
+          cmp "$native" "$stage/codex"
+          cmp "$webhook" "$stage/webhook"
+          cmp "$wake" "$stage/wake"
+          cmp "$hooks" "$stage/hooks.json.tmpl"
+          sudo timeout --signal=TERM --kill-after=10s 180s unshare --user --map-root-user --mount --net --pid --fork --mount-proc \
+            sh -c 'mount --make-rprivate / &&
+              mount -t tmpfs -o mode=1777,size=1G tmpfs /tmp && ip link set lo up &&
+              mkdir -m 700 /tmp/home &&
+              exec env -i PATH=/usr/bin:/bin HOME=/tmp/home CODEX_HOME=/tmp/home/codex TMPDIR=/tmp \
+                WAKE_LIFECYCLE_ISOLATED=1 WAKE_LIFECYCLE_CODEX="$1/codex" WAKE_LIFECYCLE_WEBHOOK="$1/webhook" \
+                WAKE_LIFECYCLE_WAKE="$1/wake" WAKE_LIFECYCLE_HOOKS="$1/hooks.json.tmpl" \
+                "$1/test" --include-ignored --nocapture' sh "$stage"
+      - name: Obtain pinned alpha.2 for automatic upgrade rejection
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/upgrade-legacy"
+          gh release download v0.2.0-alpha.2 --repo alexx-ftw/codex-wake \
+            --pattern 'codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' --dir "$RUNNER_TEMP/upgrade-legacy"
+          echo '98c3fd2c436ee5dd7a53d0839c0e53d2148e2923859875aefa69bf7a8932a1a7  codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz' | (cd "$RUNNER_TEMP/upgrade-legacy" && sha256sum --check)
+          tar -xzf "$RUNNER_TEMP/upgrade-legacy/codex-wake-0.2.0-alpha.2-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/upgrade-legacy"
+      - name: Reproduce independent alpha.2 schema initialization
+        if: ${{ github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification' }}
+        env:
+          WAKE_LEGACY_BINARY: ${{ runner.temp }}/upgrade-legacy/codex-wake-0.2.0-alpha.2/bin/codex-wake
+        run: cargo test --locked --test legacy_schema_race -- --ignored --nocapture
+      - name: Qualify independent units under a temporary user
+        env:
+          WAKE_QUALIFY_HANDOFF: ${{ (github.event_name == 'pull_request' || inputs.probe == 'cooperative-upgrade-qualification') && '2' || inputs.probe == 'cooperative-handoff-qualification' && '1' || '0' }}
+          WAKE_QUALIFY_LEGACY: ${{ runner.temp }}/upgrade-legacy/codex-wake-0.2.0-alpha.2/bin/codex-wake
+        run: |
+          native=$(node --input-type=module -e '
+            import { createRequire } from "node:module";
+            import { dirname, join } from "node:path";
+            const require = createRequire(process.argv[1]);
+            console.log(join(dirname(require.resolve("@openai/codex-linux-x64/package.json")),
+              "vendor/x86_64-unknown-linux-musl/bin/codex"));
+          ' "$RUNNER_TEMP/codex-qualification/node_modules/@openai/codex/bin/codex.js")
+          bash scripts/qualify-systemd-controller.sh \
+            "$native" \
+            "$GITHUB_WORKSPACE/target/debug/codex-wake" \
+            "$GITHUB_WORKSPACE/target/debug/examples/controller-systemd-qualification" \
+            "$RUNNER_TEMP/controller-systemd-qualification.json"
+      - name: Preserve sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: controller-systemd-qualification
+          path: |
+            ${{ runner.temp }}/controller-systemd-qualification.json
+            ${{ runner.temp }}/controller-systemd-qualification.json.upgrade-diagnostic.json
+          if-no-files-found: ignore

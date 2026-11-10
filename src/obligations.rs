@@ -730,6 +730,7 @@ fn dispatch_coordinator_alerts_with(
     db: &mut Connection,
     send: &mut impl FnMut(&str, &str) -> Result<(String, Option<String>)>,
 ) -> Result<usize> {
+    crate::bridge::initialize_claim_gate(db)?;
     let pid = i64::from(std::process::id());
     let started = process_start_time(std::process::id())
         .and_then(|started| i64::try_from(started).ok())
@@ -737,6 +738,10 @@ fn dispatch_coordinator_alerts_with(
     let mut attempted = 0;
     loop {
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !crate::bridge::claims_open(&transaction)? {
+            transaction.commit()?;
+            return Ok(attempted);
+        }
         let row = transaction
             .query_row(
                 "SELECT id,coordinator,message FROM coordinator_alerts
@@ -952,9 +957,14 @@ fn dispatch_with(
     transfer_id: Option<&str>,
     send: &mut impl FnMut(&str, &str, bool) -> Result<(String, Option<String>)>,
 ) -> Result<usize> {
+    crate::bridge::initialize_claim_gate(db)?;
     let mut attempted = 0;
     loop {
         let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !crate::bridge::claims_open(&transaction)? {
+            transaction.commit()?;
+            return Ok(attempted);
+        }
         let row = transaction
             .query_row(
                 "SELECT id, target_thread, notification_message FROM obligation_transfers
@@ -1925,6 +1935,43 @@ mod tests {
     }
 
     #[test]
+    fn claim_gate_retains_transfer_notice_until_reopened() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let (_, transfer_id, _) = transfer_input(&mut db);
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| panic!(
+                "closed gate sent notice"
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "ready"
+        );
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_with(&mut db, None, &mut |_, _, _| Ok(("queued".into(), None))).unwrap(),
+            1
+        );
+        assert_eq!(
+            notification_status(&db, &transfer_id).unwrap().state,
+            "queued"
+        );
+    }
+
+    #[test]
     fn durable_notification_resumes_idle_recipient_and_is_not_repeated_after_queue_ack() {
         let mut db = Connection::open_in_memory().unwrap();
         initialize(&db).unwrap();
@@ -2442,6 +2489,50 @@ mod tests {
             .map(std::result::Result::unwrap)
             .collect();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn claim_gate_retains_coordinator_alert_until_reopened() {
+        let mut db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        insert_coordinator_alert(
+            &db,
+            "alert",
+            "ready",
+            Some(COORDINATOR_ALERT_READY_REASON),
+            None,
+            None,
+            "notice",
+        );
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| panic!("closed gate sent alert"))
+                .unwrap(),
+            0
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM coordinator_alerts WHERE id='alert'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_coordinator_alerts_with(&mut db, &mut |_, _| Ok(("queued".into(), None)))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

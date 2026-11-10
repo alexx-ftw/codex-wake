@@ -442,9 +442,14 @@ fn dispatch_with_identity(
     check_execution: &mut impl FnMut(&RuleInput) -> Result<()>,
 ) -> Result<usize> {
     initialize(db)?;
+    crate::bridge::initialize_claim_gate(db)?;
     let mut count = 0;
     loop {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !crate::bridge::claims_open(&tx)? {
+            tx.commit()?;
+            return Ok(count);
+        }
         let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source,d.source_event_key,d.event_identity_verified,d.thread_id FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 AND (d.reason IS NULL OR d.reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR d.updated<=datetime('now','-15 seconds')) ORDER BY d.updated,d.rule_id LIMIT 1", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?))).optional()?;
         let Some((
             rule_id,
@@ -1025,6 +1030,49 @@ mod tests {
         p["issue"].as_object_mut().unwrap().remove("pull_request");
         assert_eq!(accept(&db, "issue_comment", &p).unwrap(), 0);
     }
+    #[test]
+    fn closed_claim_gate_retains_rule_event_until_reopened() {
+        let mut db = Connection::open_in_memory().unwrap();
+        configure(&db, input()).unwrap();
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(accept(&db, "issue_comment", &payload()).unwrap(), 1);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            test_dispatch(
+                &mut db,
+                dir.path(),
+                &mut |_, _| unreachable!(),
+                &mut |_, _, _| unreachable!()
+            )
+            .unwrap(),
+            0
+        );
+        let state: String = db
+            .query_row("SELECT state FROM rule_deliveries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "ready");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            test_dispatch(
+                &mut db,
+                dir.path(),
+                &mut |_, _| Ok(json!({"thread":{"id":THREAD}})),
+                &mut |_, _, _| Ok(("queued".into(), None))
+            )
+            .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn dedup_and_claim_never_recreate_and_body_is_not_forwarded() {
         let mut db = Connection::open_in_memory().unwrap();

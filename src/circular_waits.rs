@@ -210,9 +210,14 @@ fn dispatch_with(
     db: &mut Connection,
     deliver: &mut impl FnMut(&str, &str) -> Result<(String, Option<String>)>,
 ) -> Result<usize> {
+    crate::bridge::initialize_claim_gate(db)?;
     let mut count = 0;
     loop {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !crate::bridge::claims_open(&tx)? {
+            tx.commit()?;
+            return Ok(count);
+        }
         let row: Option<(String,String,String)> = tx.query_row("SELECT id,thread,message FROM circular_notices WHERE state='ready' AND (reason IS NULL OR updated<=datetime('now','-15 seconds')) ORDER BY rowid LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((id, _, _)) = &row {
             tx.execute("UPDATE circular_notices SET state='sending',reason=NULL,updated=CURRENT_TIMESTAMP WHERE id=?1 AND state='ready'", [id])?;
@@ -333,6 +338,40 @@ mod tests {
         assert_eq!(
             dispatch_with(&mut db, &mut |_, _| panic!("queued notice must not replay")).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn claim_gate_retains_circular_notices_until_reopened() {
+        let mut db = db();
+        register(&mut db, A, B, "first", "none", None).unwrap();
+        register(&mut db, B, A, "second", "none", None).unwrap();
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_with(&mut db, &mut |_, _| panic!("closed gate sent notice")).unwrap(),
+            0
+        );
+        let ready: i64 = db
+            .query_row(
+                "SELECT count(*) FROM circular_notices WHERE state='ready'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready, 2);
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_with(&mut db, &mut |_, _| Ok(("queued".into(), None))).unwrap(),
+            2
         );
     }
 

@@ -286,8 +286,9 @@ pub(crate) fn current_sender_identity() -> Result<SenderIdentity> {
     let start = crate::obligations::process_start_time(pid)
         .and_then(|value| i64::try_from(value).ok())
         .context("Could not verify condition sender start time")?;
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    let namespace = std::fs::read_link("/proc/self/ns/pid")?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .context("Read sender boot identity")?;
+    let namespace = std::fs::read_link("/proc/self/ns/pid").context("Read sender PID namespace")?;
     let boot = boot.trim().to_owned();
     let namespace = namespace
         .to_str()
@@ -1460,7 +1461,12 @@ pub fn pending_polling_members(
 /// because the external send may have succeeded despite an unknown receipt.
 pub fn claim_ready(db: &Connection) -> Result<Option<Delivery>> {
     initialize(db)?;
+    crate::bridge::initialize_claim_gate(db)?;
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !crate::bridge::claims_open(&tx)? {
+        tx.commit()?;
+        return Ok(None);
+    }
     tx.execute(
         "UPDATE condition_groups SET state='ready',reason=NULL,retry_at=NULL,sender_pid=NULL,
              sender_start=NULL,sender_boot=NULL,sender_namespace=NULL
@@ -2066,6 +2072,34 @@ mod tests {
         let group = register(db, Mode::And, std::slice::from_ref(&selector), None);
         record_published_event(db, &published(selector)).unwrap();
         group
+    }
+
+    #[test]
+    fn claim_gate_retains_ready_condition_until_reopened() {
+        let (_dir, db) = db();
+        let group = ready_group(&db);
+        crate::bridge::initialize_claim_gate(&db).unwrap();
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=0 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert!(claim_ready(&db).unwrap().is_none());
+        let state: String = db
+            .query_row(
+                "SELECT state FROM condition_groups WHERE id=?1",
+                [&group],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+        db.execute(
+            "UPDATE wake_delivery_claim_gate SET is_open=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(claim_ready(&db).unwrap().unwrap().group_id, group);
+        assert!(claim_ready(&db).unwrap().is_none());
     }
 
     #[test]

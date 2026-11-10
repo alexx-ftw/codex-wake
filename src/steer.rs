@@ -18,18 +18,34 @@ pub fn initialize(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn enqueue(db: &Connection, thread: &str, message: &str) -> Result<Value> {
+pub(crate) fn validate_input(thread: &str, message: &str) -> Result<String> {
     let thread = Uuid::parse_str(thread)?.to_string();
     ensure!(!message.trim().is_empty(), "Steer input is empty");
     ensure!(
         serde_json::to_string(message)?.len() <= MAX_INPUT_BYTES,
         "JSON-encoded steer input exceeds 2048 bytes"
     );
-    let id = Uuid::new_v4().to_string();
+    Ok(thread)
+}
+
+pub(crate) fn enqueue_with_id(
+    db: &Connection,
+    thread: &str,
+    message: &str,
+    id: &str,
+) -> Result<()> {
+    let thread = validate_input(thread, message)?;
+    let id = Uuid::parse_str(id)?.to_string();
     db.execute(
         "INSERT INTO steers(id,thread,message) VALUES(?1,?2,?3)",
         params![id, thread, message],
     )?;
+    Ok(())
+}
+
+pub fn enqueue(db: &Connection, thread: &str, message: &str) -> Result<Value> {
+    let id = Uuid::new_v4().to_string();
+    enqueue_with_id(db, thread, message, &id)?;
     crate::observability::emit(
         "steer.enqueue",
         "pending",

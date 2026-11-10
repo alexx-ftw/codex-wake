@@ -119,11 +119,33 @@ fi
 as_qual_user systemctl --user is-active --quiet codex-wake.service || fail "user receiver did not become active"
 main_pid=$(as_qual_user systemctl --user show codex-wake.service --property=MainPID --value)
 [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "user receiver has no running MainPID"
+controller_pid=$(as_qual_user pgrep -P "$main_pid" -f 'app-server --listen' || true)
+[[ "$controller_pid" =~ ^[1-9][0-9]*$ ]] || fail "user receiver has no unique app-server child"
 subscription=$(as_qual_user "$plugin_root/bin/codex-wake" subscribe \
   --kind artifact --repo qualification --resource pending --event available \
   --thread 11111111-1111-4111-8111-111111111111 | jq -er .subscription_id)
 as_qual_user "$plugin_root/bin/codex-wake" subscriptions | \
   jq -e --arg id "$subscription" 'any(.[]; .id == $id and .state == "waiting")' >/dev/null
+candidate_root="$plugin_parent/codex-wake/candidate-$version"
+sudo cp -a "$qual_root/unpacked/codex-wake-$version" "$candidate_root"
+sudo chown -R "$qual_user:$qual_user" "$candidate_root"
+runtime="$qual_home/.local/share/codex-wake/runtime/codex-wake"
+runtime_hash=$(as_qual_user sha256sum "$runtime")
+if legacy_output=$(as_qual_user env CODEX_WAKE_PLUGIN_ROOT="$candidate_root" \
+  "$candidate_root/bin/codex-wake" ensure 2>&1); then
+  fail "candidate replaced or accepted an active legacy receiver"
+fi
+grep -Fq 'Active receiver uses a different runtime' <<<"$legacy_output" \
+  || fail "candidate failed for a reason other than the legacy runtime barrier"
+[[ "$(as_qual_user systemctl --user show codex-wake.service --property=MainPID --value)" == "$main_pid" ]] \
+  || fail "candidate changed the active legacy receiver"
+[[ "$(as_qual_user pgrep -P "$main_pid" -f 'app-server --listen' || true)" == "$controller_pid" ]] \
+  || fail "candidate changed the legacy app-server child"
+[[ "$(as_qual_user sha256sum "$runtime")" == "$runtime_hash" ]] \
+  || fail "candidate changed the active legacy runtime"
+as_qual_user "$plugin_root/bin/codex-wake" subscriptions | \
+  jq -e --arg id "$subscription" 'any(.[]; .id == $id and .state == "waiting")' >/dev/null \
+  || fail "candidate changed the waiting legacy subscription"
 printf 'package-lifecycle: service active (MainPID %s); upgrading to %s\n' "$main_pid" "$archive_name"
 
 as_qual_user systemctl --user stop codex-wake.service
@@ -137,6 +159,37 @@ restarted_pid=$(as_qual_user systemctl --user show codex-wake.service --property
 as_qual_user "$plugin_root/bin/codex-wake" subscriptions | \
   jq -e --arg id "$subscription" 'any(.[]; .id == $id and .state == "waiting")' >/dev/null \
   || fail "waiting subscription did not survive restart"
+
+cancel_subscription=$(as_qual_user "$plugin_root/bin/codex-wake" subscribe \
+  --kind artifact --repo qualification --resource cancel-test --event available \
+  --thread 11111111-1111-4111-8111-111111111111 | jq -er .subscription_id)
+as_qual_user timeout 30 node - "$plugin_root/bin/codex-wake" "$cancel_subscription" <<'NODE'
+const { spawn } = require('node:child_process');
+const readline = require('node:readline');
+const child = spawn(process.argv[2], ['mcp'], { stdio: ['pipe', 'pipe', 'inherit'] });
+const send = value => child.stdin.write(`${JSON.stringify(value)}\n`);
+let cancelled = false;
+readline.createInterface({ input: child.stdout }).on('line', line => {
+  const reply = JSON.parse(line);
+  if (reply.id === 1 && !reply.error) {
+    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+      name: 'cancel_subscription', arguments: { subscription_id: process.argv[3] },
+    } });
+  } else if (reply.id === 2) {
+    cancelled = reply.result?.structuredContent?.cancelled === true && !reply.result?.isError;
+    child.stdin.end();
+  }
+});
+child.on('exit', code => { if (code !== 0 || !cancelled) process.exitCode = 1; });
+send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+  protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'lifecycle', version: '1' },
+} });
+NODE
+as_qual_user "$plugin_root/bin/codex-wake" subscriptions | \
+  jq -e --arg kept "$subscription" --arg cancelled "$cancel_subscription" \
+    'any(.[]; .id == $kept and .state == "waiting") and all(.[]; .id != $cancelled)' >/dev/null \
+  || fail "MCP cancellation changed the retained subscription or did not cancel its target"
 
 printf 'package-lifecycle: removing isolated plugin cache and waiting for product cleanup\n'
 sudo rm -rf -- "$plugin_parent/codex-wake"
