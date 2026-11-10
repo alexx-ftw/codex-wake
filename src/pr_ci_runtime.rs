@@ -829,26 +829,11 @@ fn gh_api_with_probe(
         cancelled.store(true, Ordering::Relaxed);
         cleanup_error = terminate_process_group(&mut child, &group_handle).err();
     }
-    let output = output
-        .unwrap_or_else(|| stdout_reader.unwrap().join())
-        .map_err(|_| anyhow::anyhow!("gh stdout reader panicked"))??;
-    let diagnostics = diagnostics
-        .unwrap_or_else(|| stderr_reader.unwrap().join())
-        .map_err(|_| anyhow::anyhow!("gh stderr reader panicked"))??;
+    let output = output.unwrap_or_else(|| stdout_reader.unwrap().join());
+    let diagnostics = diagnostics.unwrap_or_else(|| stderr_reader.unwrap().join());
+    let (output, diagnostics) = finish_pipe_reads(output, diagnostics, cleanup_error, timed_out)?;
     if timed_out {
-        if let Some(error) = cleanup_error {
-            return Err(
-                anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain).context(format!(
-                    "GitHub CLI request timed out; process group cleanup incomplete: {error}"
-                )),
-            );
-        }
         bail!("GitHub CLI request timed out")
-    }
-    if let Some(error) = cleanup_error {
-        return Err(anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain).context(format!(
-            "GitHub CLI output exceeded its size limit; process group cleanup incomplete: {error}"
-        )));
     }
     ensure!(
         !exceeded.load(Ordering::Relaxed),
@@ -861,6 +846,29 @@ fn gh_api_with_probe(
     }
     let body: Value = serde_json::from_slice(&output).context("Decode GitHub API response")?;
     Ok(ApiResponse { status: 200, body })
+}
+
+fn finish_pipe_reads(
+    output: thread::Result<Result<Vec<u8>>>,
+    diagnostics: thread::Result<Result<Vec<u8>>>,
+    cleanup_error: Option<std::io::Error>,
+    timed_out: bool,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if let Some(error) = cleanup_error {
+        let reason = if timed_out {
+            "timed out"
+        } else {
+            "output exceeded its size limit"
+        };
+        return Err(
+            anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain).context(format!(
+                "GitHub CLI request {reason}; process group cleanup incomplete: {error}"
+            )),
+        );
+    }
+    let output = output.map_err(|_| anyhow::anyhow!("gh stdout reader panicked"))??;
+    let diagnostics = diagnostics.map_err(|_| anyhow::anyhow!("gh stderr reader panicked"))??;
+    Ok((output, diagnostics))
 }
 
 #[cfg(target_os = "linux")]
@@ -1905,6 +1913,77 @@ fn notification(delivery: &Delivery) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_failure_does_not_hide_cleanup_uncertainty_in_tracker_status() {
+        for (timed_out, stdout_fails, panics) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let mut db = Connection::open_in_memory().unwrap();
+            crate::pr_ci::register(
+                &mut db,
+                "owner/repo",
+                "7",
+                "11111111-1111-4111-8111-111111111111",
+            )
+            .unwrap();
+            let report = crate::pr_ci::poll(&db, 1, |_| {
+                let failure: thread::Result<Result<Vec<u8>>> = if panics {
+                    Err(Box::new("private reader panic"))
+                } else {
+                    Ok(Err(anyhow::anyhow!("private reader error")))
+                };
+                let ok = Ok(Ok(Vec::new()));
+                let (stdout, stderr) = if stdout_fails {
+                    (failure, ok)
+                } else {
+                    (ok, failure)
+                };
+                finish_pipe_reads(
+                    stdout,
+                    stderr,
+                    Some(std::io::Error::other("private cleanup error")),
+                    timed_out,
+                )
+                .map(|_| ApiResponse {
+                    status: 200,
+                    body: serde_json::json!({}),
+                })
+            })
+            .unwrap();
+            assert_eq!(report.cleanup_uncertain, 1);
+            assert_eq!(report.errors, ["owner/repo#7: process_cleanup_uncertain"]);
+            let (error, marker_count): (String, i64) = db
+                .query_row(
+                    "SELECT error,(SELECT count(*) FROM pr_ci_cleanup_uncertainties) FROM pr_ci_trackers",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(error, "process_cleanup_uncertain");
+            assert_eq!(marker_count, 1);
+        }
+    }
+
+    #[test]
+    fn pipe_failure_with_confirmed_cleanup_keeps_reader_error() {
+        let error = finish_pipe_reads(
+            Ok(Err(anyhow::anyhow!("reader failed"))),
+            Ok(Ok(Vec::new())),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "reader failed");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
+    }
     use rusqlite::params;
 
     #[test]
