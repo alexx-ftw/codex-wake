@@ -73,16 +73,66 @@ where
         db.is_autocommit(),
         "Webhook REST reconciliation requires an autocommit connection"
     );
+    let reopen = event == "pull_request" && payload["action"] == "reopened";
+    if reopen {
+        pr_notifications::initialize(db)?;
+    }
+    let tx = if reopen {
+        Some(rusqlite::Transaction::new_unchecked(
+            db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    } else {
+        None
+    };
+    let acceptance_db: &Connection = tx.as_deref().unwrap_or(db);
+    let duplicate_reopen = if reopen {
+        if let (Some(repo), Some(number)) = (
+            payload["repository"]["full_name"].as_str(),
+            payload["pull_request"]["number"]
+                .as_i64()
+                .or_else(|| payload["number"].as_i64())
+                .filter(|number| *number > 0),
+        ) {
+            let source_id = if let Some(delivery_id) = delivery_id.filter(|id| !id.is_empty()) {
+                format!("webhook:{delivery_id}")
+            } else {
+                let source = serde_json::to_string(payload)?;
+                stable_source_key(
+                    "pull_request",
+                    &repo.to_ascii_lowercase(),
+                    &number.to_string(),
+                    "webhook_reopened",
+                    "",
+                    &[&source],
+                )
+            };
+            acceptance_db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM automatic_pr_pending_reopens
+                 WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook' AND source_id=?3)
+                 OR EXISTS(SELECT 1 FROM automatic_pr_lifecycle WHERE repo=?1 COLLATE NOCASE AND pr=?2
+                 AND webhook_reopen_source_id=?3)",
+                params![repo, number.to_string(), source_id], |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     let accepted = match delivery_id.filter(|id| !id.is_empty()) {
         Some(delivery_id) => pr_notifications::accept_authenticated_webhook_with_delivery_id(
-            db,
+            acceptance_db,
             event,
             delivery_id,
             payload,
         )?,
-        None => pr_notifications::accept_authenticated_webhook(db, event, payload)?,
+        None => pr_notifications::accept_authenticated_webhook(acceptance_db, event, payload)?,
     };
-    if event != "pull_request" || payload["action"] != "reopened" {
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
+    if !reopen || duplicate_reopen {
         return Ok(accepted);
     }
     let Some(repo) = payload["repository"]["full_name"].as_str() else {
@@ -90,6 +140,7 @@ where
     };
     let Some(number) = payload["pull_request"]["number"]
         .as_i64()
+        .or_else(|| payload["number"].as_i64())
         .filter(|number| *number > 0)
     else {
         return Ok(accepted);
@@ -103,7 +154,10 @@ where
     ] {
         db.execute(
             "UPDATE github_poll_state SET next_poll_ms=?2
-             WHERE endpoint=?1 AND error_category IS NULL",
+             WHERE endpoint=?1 COLLATE NOCASE AND error_category IS NULL
+               AND NOT EXISTS(SELECT 1 FROM github_poll_state AS failed
+                   WHERE failed.endpoint=?1 COLLATE NOCASE AND failed.page=0
+                         AND failed.error_category IS NOT NULL AND failed.next_poll_ms>?2)",
             params![endpoint, now],
         )?;
     }
@@ -283,6 +337,13 @@ where
     for resource in &targets.pull_requests {
         let number: i64 = resource.resource.parse().unwrap_or(0);
         let route = format!("/repos/{}/pulls/{}", resource.repo, resource.resource);
+        if active_case_variant_error(db, &route, now)? {
+            if cached_pr_is_valid(db, &route, number)? {
+                validated_prs.insert(resource.clone());
+            }
+            report.skipped += 1;
+            continue;
+        }
         let automatic_generation = std::cell::Cell::new(0_i64);
         let validated = &mut validated_prs;
         let cached = state(db, &route, 0)?;
@@ -366,9 +427,11 @@ where
             resource.repo, resource.resource
         );
         let timeline_state = state(db, &timeline_route, 0)?;
-        let timeline_due = timeline_state
-            .as_ref()
-            .is_none_or(|timeline_state| timeline_state.next_poll <= now);
+        let timeline_blocked = active_case_variant_error(db, &timeline_route, now)?;
+        let timeline_due = !timeline_blocked
+            && timeline_state
+                .as_ref()
+                .is_none_or(|timeline_state| timeline_state.next_poll <= now);
         let timeline_has_error: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM github_poll_state
              WHERE endpoint=?1 AND page=0 AND error_category IS NOT NULL)",
@@ -439,6 +502,7 @@ where
                     || timeline_has_error
                     || timeline_checkpoint.as_deref() != Some(updated_at);
                 let changed_pending_snapshot = pending_close_floor.is_some()
+                    && !timeline_blocked
                     && !timeline_has_error
                     && timeline_checkpoint.as_deref() != Some(updated_at);
                 if (timeline_due || changed_pending_snapshot) && needs_scan {
@@ -2642,6 +2706,14 @@ struct PageUpdate {
 fn state(db: &Connection, endpoint: &str, page: usize) -> Result<Option<State>> {
     Ok(db.query_row("SELECT etag,body,cursor,has_next,next_poll_ms,backoff_ms,last_success_ms FROM github_poll_state WHERE endpoint=?1 AND page=?2",params![endpoint,page as i64],|r|Ok(State{etag:r.get(0)?,body:r.get(1)?,cursor:r.get(2)?,has_next:r.get::<_,i64>(3)?!=0,next_poll:r.get(4)?,backoff:r.get(5)?,last_success:r.get(6)?})).optional()?)
 }
+fn active_case_variant_error(db: &Connection, endpoint: &str, now: i64) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM github_poll_state WHERE endpoint=?1 COLLATE NOCASE
+         AND page=0 AND error_category IS NOT NULL AND next_poll_ms>?2)",
+        params![endpoint, now],
+        |row| row.get(0),
+    )?)
+}
 fn save_success(
     db: &Connection,
     route: &str,
@@ -3009,9 +3081,19 @@ fn apply_timeline_lifecycle_events(
     )
     .map_err(|_| Failure::new("database"))?;
     let has_pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
-        WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='pending_timeline_closed')",
+        WHERE kind='pull_request' AND repo=?1 COLLATE NOCASE AND pr=?2 AND event='pending_timeline_closed')
+        OR EXISTS(SELECT 1 FROM automatic_pr_pending_reopens
+        WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook')",
         params![repo,pr], |row| row.get(0)).map_err(|_| Failure::new("database"))?;
-    let delay = if has_pending {
+    let has_unscanned_reopen: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_pr_pending_reopens
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND timeline_scanned=0)",
+            params![repo, pr],
+            |row| row.get(0),
+        )
+        .map_err(|_| Failure::new("database"))?;
+    let delay = if has_pending && !has_unscanned_reopen {
         state(&tx, &batch.route, 0)
             .map_err(|_| Failure::new("database"))?
             .map_or(INTERVAL_MS, |saved| saved.backoff.max(INTERVAL_MS))
@@ -5281,6 +5363,383 @@ mod tests {
     }
 
     #[test]
+    fn same_second_webhook_stays_pending_and_retries_an_unchanged_snapshot() {
+        let db = db();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        pr_notifications::register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            pr_notifications::timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let closed = json!({"number":7,"state":"closed","merged":false,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        pr_notifications::accept_authenticated_webhook(
+            &db,
+            "pull_request",
+            &json!({
+                "action":"closed","number":7,"repository":{"full_name":"owner/repo"},
+                "pull_request":{"number":7,"merged":false,"closed_at":"2099-01-01T00:00:10Z"}
+            }),
+        )
+        .unwrap();
+        let webhook = json!({"action":"reopened","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
+        for _ in 0..2 {
+            pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                &db,
+                "pull_request",
+                "second",
+                &webhook,
+            )
+            .unwrap();
+        }
+        let open = json!({"number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z","head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        let first = tick_with(&db, 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":1,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                    {"id":2,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"], json!({}));
+        let pending_webhooks = || -> i64 {
+            db.query_row("SELECT count(*) FROM automatic_pr_pending_reopens WHERE source_kind='webhook' AND source_id='webhook:second'", [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(
+            pending_webhooks(),
+            1,
+            "same-second delivery is not proof of identity"
+        );
+        let due = state(&db, "/repos/owner/repo/issues/7/timeline", 0)
+            .unwrap()
+            .unwrap()
+            .next_poll;
+        assert!(
+            due > 1 + INTERVAL_MS,
+            "ambiguous evidence uses bounded backoff"
+        );
+        let second = tick_with(&db, due, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
+                json!([
+                    {"id":1,"event":"closed","created_at":"2099-01-01T00:00:10Z"},
+                    {"id":2,"event":"reopened","created_at":"2099-01-01T00:00:20Z"},
+                    {"id":3,"event":"closed","created_at":"2099-01-01T00:00:20Z"},
+                    {"id":4,"event":"reopened","created_at":"2099-01-01T00:00:20Z"}
+                ]),
+                false,
+            )),
+            _ => panic!("unexpected retry route {route}"),
+        })
+        .unwrap();
+        assert_eq!(second["errors"], json!({}));
+        assert_eq!(pending_webhooks(), 1, "equal timestamps remain ambiguous");
+        let poll_pending: i64 = db.query_row("SELECT count(*) FROM automatic_pr_pending_reopens WHERE source_kind='poll' AND source_id='timeline:4'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            poll_pending, 1,
+            "the later timeline transition remains available for reconciliation"
+        );
+        assert_eq!(
+            pr_notifications::pending(&db)
+                .unwrap()
+                .iter()
+                .filter(|notice| notice.event == "reopened")
+                .count(),
+            1,
+            "ambiguous identity must not cause duplicate delivery"
+        );
+    }
+
+    #[test]
+    fn idless_webhook_redelivery_does_not_bypass_timeline_backoff() {
+        let db = db();
+        let webhook = json!({"action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
+        pr_notifications::accept_authenticated_webhook(&db, "pull_request", &webhook).unwrap();
+        db.execute(
+            "INSERT INTO github_poll_state(endpoint,page,next_poll_ms,backoff_ms,calls)
+            VALUES('/repos/owner/repo/issues/7/timeline',0,999999,3600000,0)",
+            [],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                accept_authenticated_pr_webhook_with_fetch_at(
+                    &db,
+                    1,
+                    "pull_request",
+                    None,
+                    &webhook,
+                    |route, _| panic!("redelivery must not fetch {route}")
+                )
+                .unwrap(),
+                0
+            );
+        }
+        let saved = state(&db, "/repos/owner/repo/issues/7/timeline", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!((saved.next_poll, saved.backoff), (999999, 3600000));
+    }
+
+    #[test]
+    fn reopen_webhook_uses_root_number_for_target_and_deduplication() {
+        let db = db();
+        let webhook = json!({"action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"updated_at":"2099-01-01T00:00:20Z"}});
+        let mut calls = 0;
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            1,
+            "pull_request",
+            Some("root-number"),
+            &webhook,
+            |route, _| {
+                assert_eq!(route, "/repos/owner/repo/pulls/7");
+                calls += 1;
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            2,
+            "pull_request",
+            Some("root-number"),
+            &webhook,
+            |route, _| panic!("redelivery must not fetch {route}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reopen_webhook_reschedules_existing_endpoint_regardless_of_repo_case() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let closed = json!({"number":7,"state":"closed","merged":false,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        db.execute("UPDATE github_poll_state SET next_poll_ms=999999 WHERE endpoint='/repos/owner/repo/pulls/7'", []).unwrap();
+        let webhook = json!({"action":"reopened","number":7,
+            "repository":{"full_name":"Owner/Repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
+        let mut calls = 0;
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            1,
+            "pull_request",
+            Some("case"),
+            &webhook,
+            |route, _| {
+                assert_eq!(route, "/repos/owner/repo/pulls/7");
+                calls += 1;
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls, 1,
+            "new webhook must not wait for the old endpoint schedule"
+        );
+    }
+
+    #[test]
+    fn reopen_webhook_does_not_advance_healthy_case_variant_past_error() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let closed = json!({"number":7,"state":"closed","merged":false,
+            "closed_at":"2099-01-01T00:00:10Z","updated_at":"2099-01-01T00:00:10Z",
+            "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        seed_legacy_pr_cursor(&db, Some(&closed));
+        db.execute("UPDATE github_poll_state SET next_poll_ms=999999 WHERE endpoint='/repos/owner/repo/pulls/7'", []).unwrap();
+        db.execute("INSERT INTO github_poll_state(endpoint,page,next_poll_ms,backoff_ms,error_category,calls)
+            VALUES('/repos/Owner/Repo/pulls/7',0,999999,60000,'server_error',0)", []).unwrap();
+        let webhook = json!({"action":"reopened","number":7,"repository":{"full_name":"Owner/Repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            1,
+            "pull_request",
+            Some("case-error"),
+            &webhook,
+            |route, _| panic!("error backoff must not trigger fetch: {route}"),
+        )
+        .unwrap();
+        assert_eq!(
+            state(&db, "/repos/owner/repo/pulls/7", 0)
+                .unwrap()
+                .unwrap()
+                .next_poll,
+            999999
+        );
+        assert_eq!(
+            state(&db, "/repos/Owner/Repo/pulls/7", 0)
+                .unwrap()
+                .unwrap()
+                .next_poll,
+            999999
+        );
+        db.execute("UPDATE github_poll_state SET next_poll_ms=0 WHERE endpoint='/repos/Owner/Repo/pulls/7'", []).unwrap();
+        let mut calls = 0;
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            1,
+            "pull_request",
+            Some("case-expired"),
+            &webhook,
+            |route, _| {
+                assert_eq!(route, "/repos/owner/repo/pulls/7");
+                calls += 1;
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls, 1,
+            "an expired error must not block fresh evidence indefinitely"
+        );
+    }
+
+    #[test]
+    fn due_or_absent_case_variant_does_not_bypass_pr_error_deadline() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        db.execute("INSERT INTO github_poll_state(endpoint,page,next_poll_ms,backoff_ms,error_category,calls)
+            VALUES('/repos/Owner/Repo/pulls/7',0,60000,60000,'server_error',0)", []).unwrap();
+        let webhook = json!({"action":"reopened","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            1,
+            "pull_request",
+            Some("case-block"),
+            &webhook,
+            |route, _| panic!("active case-variant error must block fetch: {route}"),
+        )
+        .unwrap();
+        let mut calls = 0;
+        accept_authenticated_pr_webhook_with_fetch_at(
+            &db,
+            60001,
+            "pull_request",
+            Some("case-retry"),
+            &webhook,
+            |route, _| {
+                assert_eq!(route, "/repos/owner/repo/pulls/7");
+                calls += 1;
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1, "expired case-variant error must permit retry");
+    }
+
+    #[test]
+    fn absent_timeline_case_variant_respects_error_deadline() {
+        let db = db();
+        pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let webhook = json!({"action":"reopened","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:20Z"}});
+        pr_notifications::accept_authenticated_webhook_with_delivery_id(
+            &db,
+            "pull_request",
+            "timeline-case",
+            &webhook,
+        )
+        .unwrap();
+        db.execute("INSERT INTO github_poll_state(endpoint,page,next_poll_ms,backoff_ms,error_category,calls)
+            VALUES('/repos/Owner/Repo/issues/7/timeline',0,60000,60000,'server_error',0)", []).unwrap();
+        let open = json!({"number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:20Z","head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+        tick_with(&db, 1, |route, _| {
+            assert_eq!(
+                route, "/repos/owner/repo/pulls/7",
+                "timeline must respect case-variant backoff"
+            );
+            Ok(response(open.clone(), false))
+        })
+        .unwrap();
+        let mut timeline_calls = 0;
+        tick_with(&db, 60001, |route, _| match route {
+            "/repos/owner/repo/pulls/7" => Ok(response(open.clone(), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                timeline_calls += 1;
+                Ok(response(json!([]), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(
+            timeline_calls, 1,
+            "expired timeline error must permit retry"
+        );
+    }
+
+    #[test]
     fn merge_timeline_close_reconciles_in_either_order_and_preserves_older_close() {
         for merge_first in [false, true] {
             let db = db();
@@ -6090,7 +6549,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(pending_reopens, 0);
+        assert_eq!(pending_reopens, 1, "webhook identity remains unattributed");
 
         let replay = accept_authenticated_pr_webhook_with_fetch_at(
             &db,
@@ -6869,8 +7328,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            pending_reopens, 0,
-            "REST replay resolves the queued webhook"
+            pending_reopens, 1,
+            "REST replay preserves the unattributed webhook"
         );
     }
 

@@ -889,30 +889,6 @@ pub(crate) fn record_reopened_event_in(
             ],
         )?;
     }
-    if source_kind == "poll" {
-        let matching_webhooks: Vec<String> = {
-            let mut statement = db.prepare(
-                "SELECT source_id FROM automatic_pr_pending_reopens
-                 WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook'
-                   AND event_at_sec=?3 ORDER BY source_id",
-            )?;
-            statement
-                .query_map(params![repo, pr, event_at_sec], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        if let [webhook_id] = matching_webhooks.as_slice() {
-            db.execute(
-                "UPDATE automatic_pr_lifecycle SET webhook_reopen_source_id=?3
-                 WHERE repo=?1 AND pr=?2 AND state='reopened' AND reopened_at_sec=?4",
-                params![repo, pr, webhook_id, event_at_sec],
-            )?;
-            db.execute(
-                "DELETE FROM automatic_pr_pending_reopens
-                 WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook' AND source_id=?3",
-                params![repo, pr, webhook_id],
-            )?;
-        }
-    }
     Ok(notifications)
 }
 
@@ -957,7 +933,7 @@ fn store_pending_reopen_in(
     event_at_sec: i64,
     event_at: &str,
 ) -> Result<()> {
-    db.execute(
+    let inserted = db.execute(
         "INSERT OR IGNORE INTO automatic_pr_pending_reopens
          (repo,pr,source_kind,source_id,event_at_sec,event_at,source)
          SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(
@@ -973,6 +949,25 @@ fn store_pending_reopen_in(
             serde_json::to_string(&minimal_reopen_source(repo, pr, event_at))?
         ],
     )?;
+    if inserted != 0 && source_kind == "webhook" {
+        let has_poll_state: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='github_poll_state')",
+            [], |row| row.get(0),
+        )?;
+        if has_poll_state {
+            // Fresh evidence should not inherit a long ambiguity backoff. An
+            // HTTP failure or rate limit retains its existing retry deadline.
+            let route = format!("/repos/{repo}/issues/{pr}/timeline");
+            db.execute(
+                "UPDATE github_poll_state SET next_poll_ms=0,backoff_ms=?2
+                 WHERE endpoint=?1 COLLATE NOCASE AND page=0 AND error_category IS NULL
+                   AND NOT EXISTS(SELECT 1 FROM github_poll_state AS failed
+                       WHERE failed.endpoint=?1 COLLATE NOCASE AND failed.page=0
+                         AND failed.error_category IS NOT NULL)",
+                params![route, super::INTERVAL_MS],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -992,8 +987,8 @@ fn resolve_pending_reopen_interval_in(
     after_sec: i64,
     closed_at_sec: Option<i64>,
 ) -> Result<Vec<Notification>> {
-    // A single timeline event identifies this interval. Retain webhook evidence unless
-    // it can be paired using the existing exact-second rule.
+    // A single timeline event identifies this interval. A webhook timestamp
+    // alone cannot prove that it describes this same transition.
     let mut candidates: Vec<PendingReopen> = {
         let mut statement = db.prepare(
             "SELECT source_kind,source_id,event_at_sec,event_at
@@ -1015,19 +1010,6 @@ fn resolve_pending_reopen_interval_in(
     };
     candidates.sort();
     candidates.dedup();
-    // A timeline event is authoritative for the transition. A webhook observation can
-    // be folded into it only when both provider timestamps agree to the second.
-    let paired_webhook_id = if candidates.len() == 2
-        && candidates[0].event_at_sec == candidates[1].event_at_sec
-        && candidates[0].source_kind != candidates[1].source_kind
-    {
-        candidates
-            .iter()
-            .find(|candidate| candidate.source_kind == "webhook")
-            .map(|candidate| candidate.source_id.clone())
-    } else {
-        None
-    };
     let polls: Vec<_> = candidates
         .iter()
         .filter(|candidate| candidate.source_kind == "poll")
@@ -1049,13 +1031,12 @@ fn resolve_pending_reopen_interval_in(
     )?;
     db.execute(
         "UPDATE automatic_pr_lifecycle SET state='reopened',reopened_at_sec=?3,
-             webhook_reopen_source_id=?4,poll_reopen_source_id=?5
-         WHERE repo=?1 AND pr=?2 AND closed_at_sec=?6 AND state='closed'",
+             webhook_reopen_source_id=NULL,poll_reopen_source_id=?4
+         WHERE repo=?1 AND pr=?2 AND closed_at_sec=?5 AND state='closed'",
         params![
             repo,
             pr,
             candidate.event_at_sec,
-            paired_webhook_id,
             candidate.source_id,
             after_sec
         ],
@@ -1065,13 +1046,6 @@ fn resolve_pending_reopen_interval_in(
          WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind=?3 AND source_id=?4",
         params![repo, pr, candidate.source_kind, candidate.source_id],
     )?;
-    if let Some(webhook_id) = paired_webhook_id {
-        db.execute(
-            "DELETE FROM automatic_pr_pending_reopens
-             WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND source_kind='webhook' AND source_id=?3",
-            params![repo, pr, webhook_id],
-        )?;
-    }
     Ok(notifications)
 }
 
@@ -1120,7 +1094,7 @@ pub(crate) fn reopen_timeline_floor(
     )?;
     let needs_timeline: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM automatic_pr_pending_reopens
-         WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND timeline_scanned=0)",
+         WHERE repo=?1 COLLATE NOCASE AND pr=?2 AND (timeline_scanned=0 OR source_kind='webhook'))",
         params![repo, pr],
         |row| row.get(0),
     )?;
@@ -2506,7 +2480,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unresolved, 0);
+        assert_eq!(
+            unresolved, 1,
+            "unattributed webhook evidence remains pending"
+        );
     }
 
     #[test]
@@ -2574,7 +2551,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unresolved, 0);
+        assert_eq!(
+            unresolved, 2,
+            "unattributed webhook evidence remains pending"
+        );
     }
 
     #[test]
@@ -2626,7 +2606,71 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unresolved, 0);
+        assert_eq!(
+            unresolved, 1,
+            "unattributed webhook evidence remains pending"
+        );
+    }
+
+    #[test]
+    fn new_webhook_advances_only_successful_timeline_backoff() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        db.execute_batch("CREATE TABLE github_poll_state(endpoint TEXT,page INTEGER,next_poll_ms INTEGER,backoff_ms INTEGER,error_category TEXT);
+            INSERT INTO github_poll_state VALUES('/repos/owner/repo/issues/7/timeline',0,999999,3600000,NULL);").unwrap();
+        let insert = |id: &str| {
+            store_pending_reopen_in(
+                &db,
+                "owner/repo",
+                "7",
+                "webhook",
+                id,
+                20,
+                "1970-01-01T00:00:20Z",
+            )
+            .unwrap()
+        };
+        db.execute_batch("SAVEPOINT webhook").unwrap();
+        insert("first");
+        let next = || -> i64 {
+            db.query_row("SELECT next_poll_ms FROM github_poll_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(next(), 0);
+        db.execute_batch("ROLLBACK TO webhook; RELEASE webhook")
+            .unwrap();
+        assert_eq!(
+            next(),
+            999999,
+            "the reschedule rolls back with webhook evidence"
+        );
+        insert("first");
+        db.execute("UPDATE github_poll_state SET next_poll_ms=12345", [])
+            .unwrap();
+        insert("first");
+        assert_eq!(next(), 12345, "redelivery must not reschedule");
+        db.execute(
+            "UPDATE github_poll_state SET error_category='rate_limited'",
+            [],
+        )
+        .unwrap();
+        insert("second");
+        assert_eq!(next(), 12345, "rate-limit deadline must be retained");
+        db.execute("UPDATE github_poll_state SET error_category=NULL", [])
+            .unwrap();
+        insert("third");
+        assert_eq!(next(), 0, "new evidence bypasses old ambiguity backoff");
+        db.execute("UPDATE github_poll_state SET next_poll_ms=12345", [])
+            .unwrap();
+        db.execute("INSERT INTO github_poll_state VALUES('/repos/Owner/Repo/issues/7/timeline',0,999999,3600000,'server_error')", []).unwrap();
+        insert("fourth");
+        let healthy: i64 = db.query_row("SELECT next_poll_ms FROM github_poll_state WHERE endpoint='/repos/owner/repo/issues/7/timeline'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            healthy, 12345,
+            "a case variant with an error must retain backoff"
+        );
     }
 
     #[test]
@@ -2878,7 +2922,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unresolved, 0);
+        assert_eq!(
+            unresolved, 1,
+            "unattributed webhook evidence remains pending"
+        );
     }
 
     #[test]
