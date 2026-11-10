@@ -443,9 +443,12 @@ fn dispatch_with_identity(
 ) -> Result<usize> {
     initialize(db)?;
     let mut count = 0;
+    let mut failed_destinations: Vec<String> = Vec::new();
+    let mut persistence_error = None;
     loop {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source,d.source_event_key,d.event_identity_verified,d.thread_id FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 AND (d.reason IS NULL OR d.reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR d.updated<=datetime('now','-15 seconds')) ORDER BY d.updated,d.rule_id LIMIT 1", [], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?))).optional()?;
+        let excluded = serde_json::to_string(&failed_destinations)?;
+        let row = tx.query_row("SELECT d.rule_id,d.event_header,d.comment_id,r.input,d.source,d.source_event_key,d.event_identity_verified,d.thread_id FROM rule_deliveries d JOIN rules r ON r.id=d.rule_id WHERE d.state='ready' AND r.enabled=1 AND (d.reason IS NULL OR d.reason NOT IN ('target_busy_before_send','target_unavailable_before_send') OR d.updated<=datetime('now','-15 seconds')) AND (?1='[]' OR (coalesce(d.thread_id,CASE WHEN json_valid(r.input) THEN json_extract(r.input,'$.target_thread') END) IS NOT NULL AND NOT EXISTS(SELECT 1 FROM json_each(?1) WHERE value=coalesce(d.thread_id,CASE WHEN json_valid(r.input) THEN json_extract(r.input,'$.target_thread') END) COLLATE NOCASE))) ORDER BY d.updated,d.rule_id LIMIT 1", [&excluded], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,bool>(6)?,r.get::<_,Option<String>>(7)?))).optional()?;
         let Some((
             rule_id,
             header,
@@ -458,7 +461,10 @@ fn dispatch_with_identity(
         )) = row
         else {
             tx.commit()?;
-            return Ok(count);
+            return match persistence_error {
+                Some(error) => Err(error),
+                None => Ok(count),
+            };
         };
         tx.execute("UPDATE rule_deliveries SET state='creating',updated=CURRENT_TIMESTAMP WHERE rule_id=?1 AND event_header=?2 AND comment_id=?3 AND state='ready'", params![rule_id,header,comment_id])?;
         tx.commit()?;
@@ -659,34 +665,49 @@ fn dispatch_with_identity(
                 Some(format!("{stage}: {error}").chars().take(1024).collect()),
             ),
         };
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
-            let thread = delivery_thread
-                .as_deref()
-                .context("Accepted rule delivery has no target thread")?;
-            if let Some(client_id) = delivery_client_id.as_deref() {
-                codex_wake::pr_ci_runtime::record_native_wake_recovery(
-                    &tx,
-                    thread,
-                    "native_queue_resume_warning",
-                    client_id,
-                )?;
-            } else {
-                codex_wake::pr_ci_runtime::record_unattributed_native_wake_recovery(
-                    &tx,
-                    thread,
-                    "native_queue_resume_warning",
-                )?;
+        let persist = (|| -> Result<()> {
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
+                let thread = delivery_thread
+                    .as_deref()
+                    .context("Accepted rule delivery has no target thread")?;
+                if let Some(client_id) = delivery_client_id.as_deref() {
+                    codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                        &tx,
+                        thread,
+                        "native_queue_resume_warning",
+                        client_id,
+                    )?;
+                } else {
+                    codex_wake::pr_ci_runtime::record_unattributed_native_wake_recovery(
+                        &tx,
+                        thread,
+                        "native_queue_resume_warning",
+                    )?;
+                }
             }
+            ensure!(tx.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5 AND state='creating'",params![state,reason,rule_id,header,comment_id])? == 1, "Rule delivery claim was lost");
+            if (state == "queued" || state == "ready")
+                && let (Some(thread), Some(token)) =
+                    (delivery_thread.as_deref(), delivery_intent.as_deref())
+            {
+                codex_wake::pr_ci_runtime::finish_native_wake_intent(&tx, thread, token)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = persist {
+            if state != "queued" {
+                return Err(error);
+            }
+            let Some(thread) = delivery_thread else {
+                return Err(error);
+            };
+            failed_destinations.push(thread);
+            persistence_error.get_or_insert(error);
+            drop(delivery_lock);
+            continue;
         }
-        ensure!(tx.execute("UPDATE rule_deliveries SET state=?1,reason=?2,updated=CURRENT_TIMESTAMP WHERE rule_id=?3 AND event_header=?4 AND comment_id=?5 AND state='creating'",params![state,reason,rule_id,header,comment_id])? == 1, "Rule delivery claim was lost");
-        if (state == "queued" || state == "ready")
-            && let (Some(thread), Some(token)) =
-                (delivery_thread.as_deref(), delivery_intent.as_deref())
-        {
-            codex_wake::pr_ci_runtime::finish_native_wake_intent(&tx, thread, token)?;
-        }
-        tx.commit()?;
         drop(delivery_lock);
         span.finish(
             match state.as_str() {
@@ -1108,6 +1129,113 @@ mod tests {
         let stored_ids: Value = serde_json::from_str(&raw_ids).unwrap();
         assert_eq!(stored_ids["client_ids"], json!([expected_client_id]));
         assert_eq!(stored_ids["unattributed"], false);
+    }
+
+    #[test]
+    fn accepted_persistence_failure_does_not_block_other_destination() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let other = "22222222-2222-4222-8222-222222222222";
+        let mut first = input();
+        first.target_thread = Some(THREAD.into());
+        first.model = Some("test-model".into());
+        first.reasoning_effort = Some("medium".into());
+        let first_rule = configure(&db, first.clone()).unwrap();
+        let same_rule = configure(&db, first.clone()).unwrap();
+        first.target_thread = Some(other.into());
+        let second_rule = configure(&db, first).unwrap();
+        assert_eq!(accept(&db, "issue_comment", &payload()).unwrap(), 3);
+        db.execute(
+            "UPDATE rule_deliveries SET updated='2000-01-01' WHERE rule_id=?1",
+            [&first_rule],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE rule_deliveries SET updated='2000-06-01' WHERE rule_id=?1",
+            [&same_rule],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE rule_deliveries SET updated='2001-01-01' WHERE rule_id=?1",
+            [&second_rule],
+        )
+        .unwrap();
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            THREAD,
+            "native_queue_resume_warning",
+            "11111111-1111-4111-8111-111111111112",
+        )
+        .unwrap();
+        db.execute("DELETE FROM native_wake_recovery", []).unwrap();
+        db.execute_batch(&format!("CREATE TRIGGER fail_first_recovery BEFORE UPDATE ON native_wake_recovery WHEN NEW.thread='{THREAD}' BEGIN SELECT RAISE(ABORT,'recovery unavailable'); END;")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut sent = Vec::new();
+        let result = dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut |_, _| unreachable!(),
+            &mut |thread, _, _, _, id| {
+                sent.push((thread.to_owned(), id.unwrap().to_owned()));
+                Ok((
+                    "queued".into(),
+                    (thread == THREAD).then(|| "native_queue_resume_warning".into()),
+                ))
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].0, THREAD);
+        assert_eq!(sent[1].0, other);
+        let first_state: String = db
+            .query_row(
+                "SELECT state FROM rule_deliveries WHERE rule_id=?1",
+                [&first_rule],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_state: String = db
+            .query_row(
+                "SELECT state FROM rule_deliveries WHERE rule_id=?1",
+                [&second_rule],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_state, "creating");
+        assert_eq!(second_state, "queued");
+        let same_state: String = db
+            .query_row(
+                "SELECT state FROM rule_deliveries WHERE rule_id=?1",
+                [&same_rule],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(same_state, "ready");
+        let saved: String = db
+            .query_row(
+                "SELECT client_ids_json FROM native_wake_recovery WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(saved.contains(&sent[0].1));
+        db.execute_batch("DROP TRIGGER fail_first_recovery")
+            .unwrap();
+        assert_eq!(
+            dispatch_with_identity(
+                &mut db,
+                directory.path(),
+                &mut |_, _| unreachable!(),
+                &mut |thread, _, _, _, id| {
+                    assert_eq!(thread, THREAD);
+                    assert_ne!(id.unwrap(), sent[0].1);
+                    Ok(("queued".into(), None))
+                },
+                &mut |_| Ok(())
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
