@@ -115,3 +115,22 @@ test('imported guest sources retain environment and policy guards', () => {
   assert(ci.includes('git archive "$expected"'));
   assert(!/--(?:privileged|volume|mount)\b/.test(ci));
 });
+test('actual build test commands run before packaging and a Rust test failure stops construction', t => {
+  const lines=fs.readFileSync(path.join(here,'build.sh'),'utf8').split('\n');
+  const start=lines.findIndex(line=>line.startsWith('cargo test '));
+  const end=lines.indexOf('cd /rootfs');
+  assert(start>=0&&end>start,'Rust tests must run before rootfs packaging');
+  assert(lines[start].includes('--manifest-path "$lab/Cargo.toml"'));
+  assert(lines[start].includes('--locked'));
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'wake-build-test-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  fs.writeFileSync(path.join(dir,'cargo'),'#!/bin/sh\nprintf "%s\\n" "$1" >> "$CALLS"\nif [ "$1" = test ]; then exit "$TEST_EXIT"; fi\n',{mode:0o755});
+  fs.writeFileSync(path.join(dir,'node'),'#!/bin/sh\nprintf "rootfs\\n" >> "$CALLS"\n',{mode:0o755});
+  for(const status of [42,0]) {
+    const calls=path.join(dir,`calls-${status}`);
+    const run=spawnSync('bash',['-c','set -Eeuo pipefail\n'+lines.slice(start,end).join('\n')],
+      {env:{...process.env,PATH:dir+':'+process.env.PATH,lab:here,CALLS:calls,TEST_EXIT:String(status)}});
+    assert.equal(run.status,status);
+    assert.deepEqual(fs.readFileSync(calls,'utf8').trim().split('\n'),status?['test']:['test','build','rootfs']);
+  }
+});

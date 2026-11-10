@@ -29,6 +29,7 @@ tar -xzf /deps/codex.tgz -C /deps package/vendor/x86_64-unknown-linux-musl/bin/c
 cp /deps/codex-wake-0.2.0-alpha.2/bin/codex-wake /deps/legacy
 cp /deps/package/vendor/x86_64-unknown-linux-musl/bin/codex /deps/codex
 cargo build --locked --release --jobs "$(nproc)" --bin codex-wake
+cargo test --locked --release --jobs "$(nproc)" --manifest-path "$lab/Cargo.toml" --bin alpha2-vm-probe
 cargo build --locked --release --jobs "$(nproc)" --manifest-path "$lab/Cargo.toml" --bin alpha2-vm-probe
 node "$lab/build-root.mjs"
 cd /rootfs

@@ -1,7 +1,8 @@
 # Isolated alpha.2 laboratory for hosted Actions
 
 Prepared against `144e1b08bad400b33964265e22a87b6e49c57b32`. This adds a
-**manual-only** workflow; it does not change the existing CI or production Wake.
+**manual-only** laboratory job to the existing `ci.yml`, using its `probe` input.
+Ordinary push/PR CI keeps its existing routing; production Wake is unchanged.
 The laboratory deliberately reproduces hazards before checking its corrected
 transaction. A successful experiment does **not** qualify a production migration.
 
@@ -24,6 +25,10 @@ Both Cargo locks fix Rust dependency versions and checksums. Kernel deb, kernel
 extraction script, public alpha.2 archive and public Codex 0.166.0 package have
 explicit SHA-256/SHA-512 checks. Runtime package versions are preserved.
 The alpha.2 executable is only used **inside the guest**, without uninstall.
+The image build runs `cargo test --manifest-path scripts/alpha2-vm/Cargo.toml`
+with the pinned toolchain, locked dependencies and release profile before
+packaging the probe/rootfs. All three RPC counter tests must pass; any failure
+stops construction before packaging or guest boot.
 
 `ci.sh` requires a clean checkout whose full SHA matches its argument and which
 descends from the preparation base. Its build context is a `git archive` allowlist:
@@ -42,7 +47,8 @@ Actions job. TCG performance on hosted runners remains to be measured.
 
 ## Receipt and review
 
-The manually selected `expected_sha` must equal the workflow's `github.sha`.
+The SHA explicitly provided in `probe=alpha2-vm-qualification:FULL_SHA` must equal
+the workflow's `github.sha`. Checkout and the build wrapper use that exact SHA.
 The receipt binds that SHA and Git tree, individual source hashes, Actions run
 ID/attempt, runner image version, package inventory, kernel/config/initramfs and
 guest executable hashes, console/stderr hashes, selected accelerator and a fresh
@@ -69,12 +75,34 @@ attestation: authentication relies on obtaining the artifact from the matching
 GitHub repository/run/attempt. It does not prove that an untrusted runner behaved
 honestly or that initramfs generation is byte-reproducible.
 
+## Manual invocation after review
+
+The dispatch uses `ci.yml`, which already exists on the default branch, and only
+its existing `probe` input. No new workflow registration or dispatch input is
+required. A branch/tag containing the reviewed change must be available remotely.
+This is the command for a later authorized run; preparing it does not dispatch:
+
+```sh
+gh workflow run ci.yml --repo alexx-ftw/codex-wake --ref REVIEWED_BRANCH_OR_TAG \
+  -f probe=alpha2-vm-qualification:FULL_REVIEWED_COMMIT_SHA
+```
+
+If the selected ref resolves to a different SHA, validation fails before the VM
+build. This probe selects only `alpha2-vm`: ordinary tests, package,
+package-lifecycle and controller qualification do not run. Malformed values in
+the laboratory probe namespace also fail its preflight instead of starting
+ordinary jobs. Existing probes keep their previous behavior.
+
+GitHub requires a default-branch workflow and a branch/tag ref for dispatch:
+[workflow dispatch documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch),
+[dispatch API](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
+
 ## Local checks without booting or dispatching CI
 
 ```sh
-node --test scripts/alpha2-vm/test.mjs
+node --test scripts/alpha2-vm/test.mjs scripts/alpha2-vm/workflow.test.mjs
 shellcheck -x -P scripts/alpha2-vm scripts/alpha2-vm/{build,run,ci}.sh
-actionlint .github/workflows/alpha2-vm.yml
+actionlint .github/workflows/ci.yml
 cargo check --locked --manifest-path scripts/alpha2-vm/Cargo.toml
 ```
 
