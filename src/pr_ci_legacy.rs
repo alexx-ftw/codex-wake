@@ -27,6 +27,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+macro_rules! uncertain {
+    ($($arg:tt)*) => {
+        return Err(anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain)
+            .context(format!($($arg)*)))
+    };
+}
+
 struct Prepared {
     program: OsString,
     route: String,
@@ -61,11 +68,11 @@ fn reap(fd: std::fs::File, deadline: Instant) -> Result<()> {
         if rc != 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::Interrupted {
-                bail!("process cleanup uncertain: waitid: {error}");
+                uncertain!("process cleanup uncertain: waitid: {error}");
             }
         }
         if Instant::now() >= deadline {
-            bail!("process cleanup uncertain: reaping timed out");
+            uncertain!("process cleanup uncertain: reaping timed out");
         }
         thread::sleep(Duration::from_millis(2));
     }
@@ -117,7 +124,7 @@ fn owner(
         host,
     } = channels;
     if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
-        bail!("GitHub CLI request timed out; process cleanup uncertain");
+        bail!("GitHub CLI request timed out");
     }
     let environment: Vec<CString> = std::env::vars_os()
         .map(|(key, value)| {
@@ -181,7 +188,7 @@ fn owner(
     let mut shell_ptrs: Vec<*mut *mut c_char> = shells.iter_mut().map(|s| s.as_mut_ptr()).collect();
     let mut path_ptrs: Vec<*mut c_char> = paths.iter().map(|p| p.as_ptr() as *mut c_char).collect();
     if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
-        bail!("GitHub CLI request timed out; process cleanup uncertain");
+        bail!("GitHub CLI request timed out");
     }
     let exceeded = Arc::new(AtomicBool::new(false));
     let out = reader(
@@ -199,7 +206,7 @@ fn owner(
     status.set_nonblocking(true)?;
     diagnostics.set_nonblocking(true)?;
     if cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
-        bail!("GitHub CLI request timed out; process cleanup uncertain");
+        bail!("GitHub CLI request timed out");
     }
     let mut pidfd = -1;
     let mut child_pid = -1;
@@ -236,7 +243,7 @@ fn owner(
         if pid == -2 && pidfd >= 0 {
             let fd = unsafe { std::fs::File::from_raw_fd(pidfd) };
             let _ = reap(fd, deadline);
-            bail!("Start gh failed; process cleanup uncertain: {spawn_error}");
+            uncertain!("Start gh failed; process cleanup uncertain: {spawn_error}");
         }
         return Err(spawn_error).context("Start gh supervisor");
     }
@@ -333,25 +340,25 @@ fn owner(
     let reaped = reap(supervisor, cleanup_deadline);
     if !sent || !clean {
         if let Some(Err(error)) = &output {
-            bail!("gh stdout read failed: {error}; process cleanup uncertain");
+            uncertain!("gh stdout read failed: {error}; process cleanup uncertain");
         }
         if let Some(Err(error)) = &errors {
-            bail!("gh stderr read failed: {error}; process cleanup uncertain");
+            uncertain!("gh stderr read failed: {error}; process cleanup uncertain");
         }
         if exceeded.load(Ordering::Relaxed) {
-            bail!("GitHub CLI output exceeded its size limit; process cleanup uncertain");
+            uncertain!("GitHub CLI output exceeded its size limit; process cleanup uncertain");
         }
         if timed_out {
-            bail!("GitHub CLI request timed out; process cleanup uncertain");
+            uncertain!("GitHub CLI request timed out; process cleanup uncertain");
         }
-        bail!("GitHub CLI request failed; process cleanup uncertain");
+        uncertain!("GitHub CLI request failed; process cleanup uncertain");
     }
     reaped?;
     let mut final_report = [0_u8; 12];
     let mut final_position = 0;
     while final_position < final_report.len() {
         match status.read(&mut final_report[final_position..]) {
-            Ok(0) => bail!(
+            Ok(0) => uncertain!(
                 "gh supervisor closed before guardian confirmation; process cleanup uncertain"
             ),
             Ok(n) => final_position += n,
@@ -360,26 +367,26 @@ fn owner(
                     || error.kind() == std::io::ErrorKind::WouldBlock =>
             {
                 if Instant::now() >= deadline {
-                    bail!("gh guardian confirmation timed out; process cleanup uncertain");
+                    uncertain!("gh guardian confirmation timed out; process cleanup uncertain");
                 }
                 thread::sleep(Duration::from_millis(2));
             }
             Err(error) => {
-                bail!("gh guardian confirmation failed: {error}; process cleanup uncertain")
+                uncertain!("gh guardian confirmation failed: {error}; process cleanup uncertain")
             }
         }
     }
     let guard_status = i32::from_ne_bytes(final_report[0..4].try_into()?);
     let final_stage = i32::from_ne_bytes(final_report[4..8].try_into()?);
     if final_stage != 8 || guard_status != 0 {
-        bail!("gh supervisor did not confirm guardian completion; process cleanup uncertain");
+        uncertain!("gh supervisor did not confirm guardian completion; process cleanup uncertain");
     }
     let output = output.context("gh stdout reader did not finish")??;
     let errors = errors.context("gh stderr reader did not finish")??;
     let (wait, stage, error) = result.context("gh supervisor returned no status")?;
     if stage != 0 {
         bail!(
-            "Start gh failed at stage {stage}: {}; process cleanup uncertain",
+            "Start gh failed at stage {stage}: {}",
             std::io::Error::from_raw_os_error(error)
         );
     }
@@ -406,7 +413,7 @@ pub(super) fn gh_api(
 ) -> Result<ApiResponse> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        bail!("GitHub CLI request timed out; process cleanup uncertain");
+        bail!("GitHub CLI request timed out");
     }
     let (control, child_control) = UnixStream::pair()?;
     let owner_control = control.try_clone()?;
@@ -453,10 +460,10 @@ pub(super) fn gh_api(
         Err(mpsc::RecvTimeoutError::Timeout) => {
             cancelled.store(true, Ordering::Relaxed);
             let _ = send(&control, b'K');
-            bail!("GitHub CLI request timed out; process cleanup uncertain");
+            uncertain!("GitHub CLI request timed out; process cleanup uncertain");
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            bail!("gh supervisor owner stopped; process cleanup uncertain")
+            uncertain!("gh supervisor owner stopped; process cleanup uncertain")
         }
     }
 }

@@ -756,6 +756,13 @@ fn gh_api_with_probe(
     #[cfg(unix)]
     if let Err(error) = set_pipe_nonblocking(&stdout).and_then(|()| set_pipe_nonblocking(&stderr)) {
         let cleanup = terminate_process_group(&mut child, &group_handle);
+        if cleanup.is_err() {
+            return Err(
+                anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain).context(format!(
+                    "Set GitHub CLI pipes nonblocking: {error}; cleanup: {cleanup:?}"
+                )),
+            );
+        }
         return Err(error).context(format!(
             "Set GitHub CLI pipes nonblocking; cleanup: {cleanup:?}"
         ));
@@ -802,6 +809,12 @@ fn gh_api_with_probe(
                 Err(error) => {
                     cancelled.store(true, Ordering::Relaxed);
                     let cleanup = terminate_process_group(&mut child, &group_handle);
+                    if cleanup.is_err() {
+                        return Err(anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain)
+                            .context(format!(
+                                "Check gh process: {error}; process group cleanup: {cleanup:?}"
+                            )));
+                    }
                     bail!("Check gh process: {error}; process group cleanup: {cleanup:?}");
                 }
             }
@@ -824,14 +837,18 @@ fn gh_api_with_probe(
         .map_err(|_| anyhow::anyhow!("gh stderr reader panicked"))??;
     if timed_out {
         if let Some(error) = cleanup_error {
-            bail!("GitHub CLI request timed out; process group cleanup incomplete: {error}");
+            return Err(
+                anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain).context(format!(
+                    "GitHub CLI request timed out; process group cleanup incomplete: {error}"
+                )),
+            );
         }
         bail!("GitHub CLI request timed out")
     }
     if let Some(error) = cleanup_error {
-        bail!(
+        return Err(anyhow::Error::new(crate::pr_ci::ProcessCleanupUncertain).context(format!(
             "GitHub CLI output exceeded its size limit; process group cleanup incomplete: {error}"
-        );
+        )));
     }
     ensure!(
         !exceeded.load(Ordering::Relaxed),
@@ -877,12 +894,17 @@ impl fmt::Display for GroupProbeCleanupUncertain {
 }
 
 #[cfg(target_os = "linux")]
-impl Error for GroupProbeCleanupUncertain {}
+impl Error for GroupProbeCleanupUncertain {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&crate::pr_ci::ProcessCleanupUncertain)
+    }
+}
 
 #[cfg(target_os = "linux")]
 enum GroupReceipt {
     Handle(std::os::fd::OwnedFd),
     ProbeUnsupported(std::os::fd::OwnedFd),
+    ProbeTimedOut(std::os::fd::OwnedFd),
     ProbeTransferFailed(std::os::fd::OwnedFd, libc::c_int),
     Invalid,
 }
@@ -905,6 +927,7 @@ struct ProbeShared {
     phase: std::sync::atomic::AtomicI32,
     pid: std::sync::atomic::AtomicI32,
     error: std::sync::atomic::AtomicI32,
+    spawn_finished: AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
@@ -931,6 +954,7 @@ impl ProbeMapping {
                 phase: std::sync::atomic::AtomicI32::new(0),
                 pid: std::sync::atomic::AtomicI32::new(0),
                 error: std::sync::atomic::AtomicI32::new(0),
+                spawn_finished: AtomicBool::new(true),
             });
         }
         Ok(Arc::new(Self(address as usize)))
@@ -954,6 +978,16 @@ impl Drop for ProbeMapping {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct SpawnFinished(Arc<ProbeMapping>);
+
+#[cfg(target_os = "linux")]
+impl Drop for SpawnFinished {
+    fn drop(&mut self) {
+        self.0.state().spawn_finished.store(true, Ordering::Release);
+    }
+}
+
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 static REAP_GROUP_PROBE_IN_TEST: AtomicBool = AtomicBool::new(false);
 
@@ -962,6 +996,16 @@ static TRUNCATE_GROUP_PROBE_IN_TEST: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 static PAUSE_AFTER_EMPTY_PROBE_POLL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static DELAY_GROUP_PROBE_IN_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static TRACK_RECEIVER_IN_TEST: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static RECEIVER_STARTED_IN_TEST: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static RECEIVER_FINISHED_IN_TEST: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
 unsafe fn exit_unsupported_group_probe(
@@ -974,6 +1018,10 @@ unsafe fn exit_unsupported_group_probe(
     // wait can panic if an embedder has already reaped the child. Transfer the
     // exact pidfd instead, then let the parent use waitid(P_PIDFD).
     unsafe {
+        #[cfg(all(test, target_arch = "x86_64"))]
+        if DELAY_GROUP_PROBE_IN_TEST.load(Ordering::Relaxed) {
+            libc::poll(std::ptr::null_mut(), 0, 100);
+        }
         let mut marker = UNSUPPORTED_GROUP_PROBE;
         let mut iov = libc::iovec {
             iov_base: (&mut marker as *mut u8).cast(),
@@ -1202,14 +1250,28 @@ fn receive_group_handle(
     shared: Arc<ProbeMapping>,
 ) -> GroupReceipt {
     use std::os::fd::{AsRawFd, FromRawFd};
+    #[cfg(all(test, target_arch = "x86_64"))]
+    struct ReceiverFinished(bool);
+    #[cfg(all(test, target_arch = "x86_64"))]
+    impl Drop for ReceiverFinished {
+        fn drop(&mut self) {
+            if self.0 {
+                RECEIVER_FINISHED_IN_TEST.store(true, Ordering::Release);
+            }
+        }
+    }
+    #[cfg(all(test, target_arch = "x86_64"))]
+    let _finished = {
+        let tracked = TRACK_RECEIVER_IN_TEST.load(Ordering::Acquire);
+        if tracked {
+            RECEIVER_STARTED_IN_TEST.store(true, Ordering::Release);
+        }
+        ReceiverFinished(tracked)
+    };
     let deadline = Instant::now() + Duration::from_millis(handshake_ms.max(0) as u64);
     let state = shared.state();
     let mut invalid_message = false;
     loop {
-        if Instant::now() >= deadline {
-            state.phase.store(PROBE_ABANDONED, Ordering::Release);
-            return GroupReceipt::Invalid;
-        }
         // Inspect a queued SCM_RIGHTS message before using shared recovery.
         let mut pollfd = libc::pollfd {
             fd: receiver.as_raw_fd(),
@@ -1261,7 +1323,11 @@ fn receive_group_handle(
                         ));
                         if byte == UNSUPPORTED_GROUP_PROBE {
                             state.phase.store(PROBE_ACCEPTED, Ordering::Release);
-                            return GroupReceipt::ProbeUnsupported(fd);
+                            return if Instant::now() >= deadline {
+                                GroupReceipt::ProbeTimedOut(fd)
+                            } else {
+                                GroupReceipt::ProbeUnsupported(fd)
+                            };
                         }
                         let ack = 1_u8;
                         if libc::send(
@@ -1278,6 +1344,20 @@ fn receive_group_handle(
                     }
                     discard_received_rights(&message);
                     invalid_message = true;
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    if !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) || Instant::now() >= deadline
+                    {
+                        // A queued datagram cannot be consumed (for example,
+                        // recvmsg is denied by policy). Recover using the
+                        // child's separately confirmed pidfd instead.
+                        invalid_message = true;
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
             }
         }
@@ -1302,6 +1382,7 @@ fn receive_group_handle(
             // Opening by PID is only provisional: the child must confirm after
             // this open, while still alive, before the descriptor is used.
             let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            let recovery_deadline = deadline.max(Instant::now() + Duration::from_millis(100));
             if state
                 .phase
                 .compare_exchange(
@@ -1326,7 +1407,7 @@ fn receive_group_handle(
                         },
                     );
                 }
-                if Instant::now() >= deadline {
+                if Instant::now() >= recovery_deadline {
                     let previous = state.phase.swap(PROBE_ABANDONED, Ordering::AcqRel);
                     if previous == PROBE_CONFIRMED {
                         return GroupReceipt::ProbeTransferFailed(
@@ -1344,11 +1425,24 @@ fn receive_group_handle(
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if remaining.is_zero() && state.spawn_finished.load(Ordering::Acquire) {
+            // The child may have sent its final message after the poll above
+            // but before Command::spawn returned; drain it before giving up.
+            if state.phase.load(Ordering::Acquire) == PROBE_REQUEST
+                || !invalid_message
+                    && unsafe { libc::poll(&mut pollfd, 1, 0) } == 1
+                    && pollfd.revents & libc::POLLIN != 0
+            {
+                continue;
+            }
             state.phase.store(PROBE_ABANDONED, Ordering::Release);
             return GroupReceipt::Invalid;
         }
-        let wait = remaining.min(Duration::from_millis(5));
+        let wait = if remaining.is_zero() {
+            Duration::from_millis(5)
+        } else {
+            remaining.min(Duration::from_millis(5))
+        };
         unsafe { libc::poll(&mut pollfd, 1, wait.as_millis().max(1) as libc::c_int) };
     }
 }
@@ -1402,13 +1496,22 @@ fn spawn_with_group_handle(
     let (receiver, sender, shared) =
         prepare_group_handle(command, deny_pidfd, deny_group, handshake_ms)
             .ok_or_else(|| std::io::Error::other("cannot prepare safe process cleanup"))?;
+    shared
+        .state()
+        .spawn_finished
+        .store(false, Ordering::Release);
+    let spawn_finished = SpawnFinished(Arc::clone(&shared));
+    let receiver_shared = Arc::clone(&shared);
     let receiver_thread = thread::Builder::new()
-        .spawn(move || receive_group_handle(receiver, handshake_ms, shared))?;
+        .spawn(move || receive_group_handle(receiver, handshake_ms, receiver_shared))?;
     let child = command.spawn();
     drop(sender);
-    let handle = receiver_thread
-        .join()
-        .map_err(|_| std::io::Error::other("pidfd receiver panicked"))?;
+    drop(spawn_finished);
+    let handle = receiver_thread.join().map_err(|_| {
+        std::io::Error::other(GroupProbeCleanupUncertain(
+            "pidfd receiver panicked; process cleanup uncertain".into(),
+        ))
+    })?;
     let child = child?;
     match handle {
         GroupReceipt::Handle(handle) => Ok((child, Some(handle))),
@@ -1430,13 +1533,27 @@ fn spawn_with_group_handle(
                 Err(std::io::Error::from_raw_os_error(libc::EINVAL))
             }
         }
+        GroupReceipt::ProbeTimedOut(handle) => {
+            #[cfg(all(test, target_arch = "x86_64"))]
+            if REAP_GROUP_PROBE_IN_TEST.load(Ordering::Relaxed) {
+                let mut status = 0;
+                unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) };
+            }
+            let result = reap_group_probe(&handle, Instant::now() + Duration::from_millis(100));
+            drop(child);
+            result?;
+            Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
+        }
         GroupReceipt::ProbeTransferFailed(handle, send_error) => {
             #[cfg(all(test, target_arch = "x86_64"))]
             if REAP_GROUP_PROBE_IN_TEST.load(Ordering::Relaxed) {
                 let mut status = 0;
                 unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) };
             }
-            let result = reap_group_probe(&handle, deadline);
+            let result = reap_group_probe(
+                &handle,
+                deadline.max(Instant::now() + Duration::from_millis(100)),
+            );
             drop(child);
             result?;
             Err(std::io::Error::from_raw_os_error(send_error))
@@ -2946,6 +3063,175 @@ esac
         );
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn delayed_probe_fixture(
+        test_name: &str,
+        external_reaper: bool,
+        deny_sendmsg: bool,
+        deny_recvmsg: Option<i32>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_DELAYED_PROBE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("pr_ci_runtime::tests::{test_name}"),
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        DELAY_GROUP_PROBE_IN_TEST.store(true, Ordering::Relaxed);
+        REAP_GROUP_PROBE_IN_TEST.store(external_reaper, Ordering::Relaxed);
+        if deny_sendmsg {
+            deny_test_syscall(libc::SYS_sendmsg);
+        }
+        if let Some(errno) = deny_recvmsg {
+            deny_test_syscall_with_errno(libc::SYS_recvmsg, errno);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("gh");
+        let marker = dir.path().join("executed");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(executable);
+        let error = spawn_with_group_handle(&mut command, false, true, Duration::from_millis(20))
+            .unwrap_err();
+        if external_reaper {
+            assert!(error.to_string().contains("cleanup uncertain"));
+        } else if deny_sendmsg {
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        } else if deny_recvmsg.is_some() {
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        } else {
+            assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        }
+        let typed = anyhow::Error::new(error);
+        assert_eq!(
+            typed
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>()),
+            external_reaper
+        );
+        assert!(!marker.exists());
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn timed_out_probe_is_reaped() {
+        delayed_probe_fixture("timed_out_probe_is_reaped", false, false, None);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn timed_out_probe_reaped_externally_is_uncertain() {
+        delayed_probe_fixture(
+            "timed_out_probe_reaped_externally_is_uncertain",
+            true,
+            false,
+            None,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn timed_out_probe_with_failed_transfer_is_reaped() {
+        delayed_probe_fixture(
+            "timed_out_probe_with_failed_transfer_is_reaped",
+            false,
+            true,
+            None,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn timed_out_probe_with_recvmsg_denied_is_reaped() {
+        delayed_probe_fixture(
+            "timed_out_probe_with_recvmsg_denied_is_reaped",
+            false,
+            false,
+            Some(libc::EPERM),
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn timed_out_probe_with_recvmsg_eagain_is_reaped() {
+        delayed_probe_fixture(
+            "timed_out_probe_with_recvmsg_eagain_is_reaped",
+            false,
+            false,
+            Some(libc::EAGAIN),
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn probe_receiver_finishes_if_spawn_unwinds() {
+        const CHILD: &str = "CODEX_WAKE_TEST_PROBE_SPAWN_UNWIND";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pr_ci_runtime::tests::probe_receiver_finishes_if_spawn_unwinds",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        TRACK_RECEIVER_IN_TEST.store(true, Ordering::Release);
+        let result = std::panic::catch_unwind(|| {
+            spawn_with_group_handle(
+                &mut Command::new("true"),
+                true,
+                false,
+                Duration::from_millis(20),
+            )
+        });
+        assert!(!matches!(result, Ok(Ok(_))));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (!RECEIVER_STARTED_IN_TEST.load(Ordering::Acquire)
+            || !RECEIVER_FINISHED_IN_TEST.load(Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(RECEIVER_STARTED_IN_TEST.load(Ordering::Acquire));
+        assert!(RECEIVER_FINISHED_IN_TEST.load(Ordering::Acquire));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn group_probe_marker_rejects_truncated_datagrams() {
@@ -3099,7 +3385,47 @@ esac
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(error.to_string().contains("cleanup uncertain"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn legacy_deadline_before_spawn_has_no_cleanup_uncertainty() {
+        let error = legacy::gh_api(
+            Path::new("/nonexistent-gh"),
+            "/repos/owner/project/pulls/7",
+            ".",
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn legacy_missing_executable_with_confirmed_cleanup_is_not_uncertain() {
+        let error = gh_api_with_probe(
+            Path::new("/codex-wake-nonexistent-gh"),
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Start gh failed"));
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3124,6 +3450,11 @@ esac
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn deny_test_syscall(number: libc::c_long) {
+        deny_test_syscall_with_errno(number, libc::EPERM);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn deny_test_syscall_with_errno(number: libc::c_long, errno: i32) {
         let filter = [
             libc::sock_filter {
                 code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
@@ -3141,7 +3472,7 @@ esac
                 code: (libc::BPF_RET | libc::BPF_K) as u16,
                 jt: 0,
                 jf: 0,
-                k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                k: libc::SECCOMP_RET_ERRNO | errno as u32,
             },
             libc::sock_filter {
                 code: (libc::BPF_RET | libc::BPF_K) as u16,
@@ -3201,6 +3532,28 @@ esac
         .unwrap_err();
         assert!(error.to_string().contains("cleanup uncertain"));
         assert!(error.to_string().contains("waitid"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
+        let mut db = Connection::open_in_memory().unwrap();
+        crate::pr_ci::register(
+            &mut db,
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let report = crate::pr_ci::poll(&db, 1, |route| {
+            gh_api_with_probe(&executable, route, Duration::from_secs(3), true)
+        })
+        .unwrap();
+        assert_eq!(report.errors, ["owner/repo#7: process_cleanup_uncertain"]);
+        let stored: String = db
+            .query_row("SELECT error FROM pr_ci_trackers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, "process_cleanup_uncertain");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3244,6 +3597,11 @@ esac
         .unwrap_err();
         assert!(error.to_string().contains("cleanup uncertain"));
         assert!(error.to_string().contains("waitid"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3490,6 +3848,11 @@ esac
         )
         .unwrap_err();
         assert!(error.to_string().contains("cleanup uncertain"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3510,6 +3873,11 @@ esac
         .unwrap_err();
         assert!(error.to_string().contains("gh exit"));
         assert!(!error.to_string().contains("cleanup uncertain"));
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::pr_ci::ProcessCleanupUncertain>())
+        );
     }
 
     #[cfg(target_os = "linux")]

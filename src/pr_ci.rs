@@ -58,6 +58,11 @@ const TRACKER_GENERATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_track
 const PR_CI_MIGRATIONS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_schema_migrations (
     name TEXT PRIMARY KEY
 );";
+const CLEANUP_UNCERTAINTIES_SCHEMA: &str =
+    "CREATE TABLE IF NOT EXISTS pr_ci_cleanup_uncertainties (
+    repo TEXT NOT NULL, pull_number INTEGER NOT NULL, thread TEXT NOT NULL,
+    PRIMARY KEY(repo,pull_number,thread)
+);";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Delivery {
@@ -80,6 +85,8 @@ pub struct PollReport {
     /// Runs matching this PR's head SHA that GitHub did not link to a PR.
     /// They are intentionally not attributed or delivered.
     pub unlinked_runs: usize,
+    /// Polls whose subprocess cleanup could not be confirmed.
+    pub cleanup_uncertain: usize,
     pub errors: Vec<String>,
 }
 
@@ -101,6 +108,18 @@ pub struct ApiResponse {
     pub status: u16,
     pub body: Value,
 }
+
+/// The transport could not establish that its process cleanup completed.
+#[derive(Debug)]
+pub struct ProcessCleanupUncertain;
+
+impl std::fmt::Display for ProcessCleanupUncertain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("process cleanup uncertain")
+    }
+}
+
+impl std::error::Error for ProcessCleanupUncertain {}
 
 #[derive(Clone, Copy)]
 struct RunPollIdentity<'a> {
@@ -138,6 +157,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
     migrate_observation_identity(db)?;
     db.execute_batch(TRACKER_GENERATIONS_SCHEMA)?;
     db.execute_batch(PR_CI_MIGRATIONS_SCHEMA)?;
+    db.execute_batch(CLEANUP_UNCERTAINTIES_SCHEMA)?;
     backfill_tracker_generations_once(db)?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS pr_ci_due ON pr_ci_trackers(active,next_poll_ms);
@@ -817,10 +837,28 @@ where
                 )?;
                 tx.commit()?;
             }
-            Err(_) => {
+            Err(error) => {
+                let cleanup_uncertain = error
+                    .chain()
+                    .any(|cause| cause.is::<ProcessCleanupUncertain>());
+                report.cleanup_uncertain += usize::from(cleanup_uncertain);
+                let category = if cleanup_uncertain {
+                    "process_cleanup_uncertain"
+                } else {
+                    "poll_failed"
+                };
                 let delay = backoff.clamp(60_000, MAX_BACKOFF_MS);
                 let next = delay.saturating_mul(2).min(MAX_BACKOFF_MS);
-                db.execute(
+                let persist = || -> Result<()> {
+                    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+                    if cleanup_uncertain {
+                        tx.execute(
+                        "INSERT OR IGNORE INTO pr_ci_cleanup_uncertainties(repo,pull_number,thread)
+                         VALUES(?1,?2,?3)",
+                        params![repo, number, thread],
+                    )?;
+                    }
+                    tx.execute(
                     "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=?2,error=CASE WHEN active=1 THEN ?3 ELSE error END,
                      updated_at_ms=?4 WHERE repo=?5 AND pull_number=?6 AND thread=?7
                        AND (active=1 OR (active=0 AND EXISTS(
@@ -834,7 +872,7 @@ where
                     params![
                         schedule_after_completion_ms(now_ms, elapsed_ms, delay),
                         next,
-                        "poll_failed",
+                        category,
                         finished_ms,
                         repo,
                         number,
@@ -842,9 +880,23 @@ where
                         expected_generation
                     ],
                 )?;
-                report
-                    .errors
-                    .push(format!("{repo}#{number}: tracking poll failed"));
+                    tx.commit()?;
+                    Ok(())
+                };
+                persist().map_err(|error| {
+                    if cleanup_uncertain {
+                        anyhow::Error::new(ProcessCleanupUncertain)
+                            .context("failed to persist cleanup uncertainty")
+                    } else {
+                        error
+                    }
+                })?;
+                let message = if cleanup_uncertain {
+                    "process_cleanup_uncertain"
+                } else {
+                    "tracking poll failed"
+                };
+                report.errors.push(format!("{repo}#{number}: {message}"));
             }
         }
     }
@@ -3073,6 +3125,145 @@ mod tests {
         let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap();
         assert!((60_100..=60_100 + elapsed).contains(&next));
         assert_eq!(backoff, 120_000);
+    }
+
+    #[test]
+    fn poll_reports_cleanup_uncertainty_without_exposing_transport_details() {
+        for errno in [libc::ECHILD, libc::EPERM] {
+            let mut db = db();
+            register(&mut db, "owner/project", "7", THREAD).unwrap();
+            let report = poll(&db, 100, |_| {
+                Err(anyhow::Error::new(ProcessCleanupUncertain).context(format!(
+                    "private-token: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                )))
+            })
+            .unwrap();
+            assert_eq!(report.cleanup_uncertain, 1);
+            assert_eq!(
+                report.errors,
+                ["owner/project#7: process_cleanup_uncertain"]
+            );
+            let (category, next): (String, i64) = db
+                .query_row(
+                    "SELECT error,next_poll_ms FROM pr_ci_trackers WHERE thread=?1",
+                    [THREAD],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(category, "process_cleanup_uncertain");
+
+            let recovered = poll(&db, next, |route| {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: if route.contains("/pulls/") {
+                        pull(7, "open", SHA)
+                    } else {
+                        json!({"total_count":0,"workflow_runs":[]})
+                    },
+                })
+            })
+            .unwrap();
+            assert!(recovered.errors.is_empty());
+            let error: Option<String> = db
+                .query_row(
+                    "SELECT error FROM pr_ci_trackers WHERE thread=?1",
+                    [THREAD],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(error, None);
+        }
+    }
+
+    #[test]
+    fn untyped_transport_failure_remains_sanitized_and_generic() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        let report = poll(&db, 100, |_| {
+            anyhow::bail!("process cleanup uncertain: private-token")
+        })
+        .unwrap();
+        assert_eq!(report.cleanup_uncertain, 0);
+        assert_eq!(report.errors, ["owner/project#7: tracking poll failed"]);
+        let category: String = db
+            .query_row(
+                "SELECT error FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category, "poll_failed");
+    }
+
+    #[test]
+    fn cleanup_uncertainty_is_reported_when_tracker_is_unregistered_during_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        db.execute(
+            "UPDATE pr_ci_trackers SET error='previous evidence' WHERE thread=?1",
+            [THREAD],
+        )
+        .unwrap();
+        let report = poll(&db, 100, |_| {
+            unregister(&db, "owner/project", "7", THREAD)?;
+            Err(anyhow::Error::new(ProcessCleanupUncertain))
+        })
+        .unwrap();
+        assert_eq!(report.cleanup_uncertain, 1);
+        assert_eq!(
+            report.errors,
+            ["owner/project#7: process_cleanup_uncertain"]
+        );
+        let (active, error): (i64, String) = db
+            .query_row(
+                "SELECT active,error FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, error.as_str()), (0, "previous evidence"));
+        // No telemetry is emitted by poll; the evidence must survive independently.
+        drop(db);
+        let db = Connection::open(&path).unwrap();
+        let count: i64 = db.query_row(
+            "SELECT count(*) FROM pr_ci_cleanup_uncertainties WHERE repo=?1 AND pull_number=7 AND thread=?2",
+            params!["owner/project", THREAD],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn failed_cleanup_marker_write_does_not_commit_error_update() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        db.execute_batch(
+            "UPDATE pr_ci_trackers SET error='previous evidence';
+             CREATE TRIGGER fail_cleanup_marker BEFORE INSERT ON pr_ci_cleanup_uncertainties
+             BEGIN SELECT RAISE(ABORT, 'write failed'); END;",
+        )
+        .unwrap();
+        let failure = poll(&db, 100, |_| {
+            Err(anyhow::Error::new(ProcessCleanupUncertain))
+        })
+        .unwrap_err();
+        assert!(
+            failure
+                .chain()
+                .any(|cause| cause.is::<ProcessCleanupUncertain>())
+        );
+        assert!(!format!("{failure:#}").contains("write failed"));
+        let error: String = db
+            .query_row(
+                "SELECT error FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "previous evidence");
     }
 
     #[test]

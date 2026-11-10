@@ -196,6 +196,11 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("rules.rs").as_slice(),
         include_bytes!("pr_ci.rs").as_slice(),
         include_bytes!("pr_ci_runtime.rs").as_slice(),
+        include_bytes!("pr_ci_legacy.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/fds.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/guard.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/start.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/supervisor.rs").as_slice(),
         include_bytes!("pr_notifications.rs").as_slice(),
         include_bytes!("pr_hook.rs").as_slice(),
         include_bytes!("pr_observation.rs").as_slice(),
@@ -877,6 +882,17 @@ fn remove_stale_socket_in(path: &Path, temp: &Path) -> Result<()> {
     Ok(())
 }
 
+fn pr_ci_cleanup_uncertain_count(result: &Result<codex_wake::pr_ci::PollReport>) -> usize {
+    match result {
+        Ok(report) => report.cleanup_uncertain,
+        Err(error) => usize::from(
+            error
+                .chain()
+                .any(|cause| cause.is::<codex_wake::pr_ci::ProcessCleanupUncertain>()),
+        ),
+    }
+}
+
 pub fn run_receiver(config: &Config) -> Result<()> {
     require_installed(config)?;
     let root = env::current_exe()?
@@ -990,11 +1006,23 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                     .duration_since(std::time::UNIX_EPOCH)?
                                     .as_millis(),
                             )?;
-                            let report = codex_wake::pr_ci_runtime::poll_one_with_gh(
+                            let result = codex_wake::pr_ci_runtime::poll_one_with_gh(
                                 &db,
                                 &poll_config.gh,
                                 now,
-                            )?;
+                            );
+                            let cleanup_uncertain = pr_ci_cleanup_uncertain_count(&result);
+                            if cleanup_uncertain > 0 {
+                                crate::observability::emit(
+                                    "poll.pr_ci",
+                                    "error",
+                                    "process_cleanup_uncertain",
+                                    None,
+                                    Duration::ZERO,
+                                    cleanup_uncertain as u64,
+                                );
+                            }
+                            let report = result?;
                             if !report.errors.is_empty() {
                                 bail!("PR CI polling failed; see tracking status");
                             }
@@ -1756,6 +1784,25 @@ fn start_accepted_native_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_uncertainty_is_visible_when_marker_persistence_fails() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_marker BEFORE INSERT ON pr_ci_cleanup_uncertainties
+             BEGIN SELECT RAISE(ABORT, 'private sqlite detail'); END;",
+        )
+        .unwrap();
+        let result = codex_wake::pr_ci::poll(&db, 100, |_| {
+            Err(anyhow::Error::new(
+                codex_wake::pr_ci::ProcessCleanupUncertain,
+            ))
+        });
+        assert_eq!(pr_ci_cleanup_uncertain_count(&result), 1);
+        assert!(!format!("{:#}", result.unwrap_err()).contains("private sqlite detail"));
+    }
 
     const RECOVERY_THREAD: &str = "11111111-1111-4111-8111-111111111111";
 

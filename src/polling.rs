@@ -1475,6 +1475,24 @@ pub fn status(db: &Connection) -> Result<Value> {
         "pr_ci_trackers",
         "SELECT count(*) FROM pr_ci_trackers WHERE active=1 AND error IS NOT NULL",
     )?;
+    let has_cleanup_markers: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_ci_cleanup_uncertainties')",
+        [], |row| row.get(0),
+    )?;
+    let has_ci_trackers: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_ci_trackers')",
+        [],
+        |row| row.get(0),
+    )?;
+    let pr_ci_cleanup_uncertain: i64 = match (has_cleanup_markers, has_ci_trackers) {
+        (true, true) => db.query_row(
+            "SELECT count(*) FROM (SELECT repo,pull_number,thread FROM pr_ci_cleanup_uncertainties UNION SELECT repo,pull_number,thread FROM pr_ci_trackers WHERE error='process_cleanup_uncertain')",
+            [], |row| row.get(0),
+        )?,
+        (true, false) => count("pr_ci_cleanup_uncertainties", "SELECT count(*) FROM pr_ci_cleanup_uncertainties")?,
+        (false, true) => count("pr_ci_trackers", "SELECT count(*) FROM pr_ci_trackers WHERE error='process_cleanup_uncertain'")?,
+        (false, false) => 0,
+    };
     let has_closed_markers: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_ci_auto_closed_trackers')",
         [], |row| row.get(0),
@@ -1507,7 +1525,7 @@ pub fn status(db: &Connection) -> Result<Value> {
         json!({"active":{"waits":waits,"subscriptions":subscriptions,"rules":rules},
         "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention,"identity_pending":automatic_change_identity_pending,"attention_details":automatic_attention_details,"attention_details_truncated":automatic_attention_truncated},
         "condition_identity_pending":condition_identity_pending,
-        "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors,"uncertain_trackers":pr_ci_uncertain_trackers},
+        "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors,"uncertain_trackers":pr_ci_uncertain_trackers,"process_cleanup_uncertain":pr_ci_cleanup_uncertain},
         "last_success_ms":last_success,"errors":errors,"next_poll_ms":next_poll,
         "calls":calls,"cached_pages":pages}),
     )
@@ -10376,6 +10394,98 @@ mod tests {
         crate::conditions::initialize(&db).unwrap();
         initialize(&db).unwrap();
         db
+    }
+    #[test]
+    fn status_counts_cleanup_uncertainty_without_exposing_error_text() {
+        let db = db();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute_batch("DROP TABLE IF EXISTS pr_ci_cleanup_uncertainties")
+            .unwrap();
+        db.execute_batch(
+            "INSERT INTO pr_ci_trackers(repo,pull_number,thread,active,error) VALUES
+             ('owner/repo',1,'active',1,'process_cleanup_uncertain'),
+             ('owner/repo',2,'inactive',0,'process_cleanup_uncertain'),
+             ('owner/repo',3,'other',1,'sensitive diagnostic');",
+        )
+        .unwrap();
+        let first_status = status(&db).unwrap();
+        assert_eq!(
+            first_status["automatic_pr_ci"]["process_cleanup_uncertain"],
+            2
+        );
+        assert_eq!(first_status["automatic_pr_ci"]["errors"], 2);
+        assert!(!first_status.to_string().contains("sensitive diagnostic"));
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pr_ci_cleanup_uncertainties(repo TEXT,pull_number INTEGER,thread TEXT,PRIMARY KEY(repo,pull_number,thread));
+             INSERT INTO pr_ci_cleanup_uncertainties(repo,pull_number,thread) VALUES
+             ('owner/repo',1,'active'),('owner/repo',3,'other');",
+        ).unwrap();
+        db.execute(
+            "UPDATE pr_ci_trackers SET active=0 WHERE thread='other'",
+            [],
+        )
+        .unwrap();
+        let status = status(&db).unwrap();
+        assert_eq!(status["automatic_pr_ci"]["process_cleanup_uncertain"], 3);
+        assert!(!status.to_string().contains("sensitive diagnostic"));
+    }
+    #[test]
+    fn cleanup_uncertainty_survives_telemetry_failure_and_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+        )
+        .unwrap();
+        crate::subscriptions::initialize(&db).unwrap();
+        crate::rules::initialize(&db).unwrap();
+        crate::conditions::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        db.execute(
+            "UPDATE pr_ci_trackers SET error='previous evidence' WHERE thread=?1",
+            [thread],
+        )
+        .unwrap();
+        let report = codex_wake::pr_ci::poll(&db, 100, |_| {
+            codex_wake::pr_ci::unregister(&db, "owner/repo", "7", thread)?;
+            Err(anyhow::Error::new(
+                codex_wake::pr_ci::ProcessCleanupUncertain,
+            ))
+        })
+        .unwrap();
+        assert_eq!(report.cleanup_uncertain, 1);
+        let event = crate::telemetry::Event {
+            trace: "test",
+            parent: None,
+            operation: "poll.pr_ci",
+            outcome: "error",
+            reason: "process_cleanup_uncertain",
+            subject: None,
+            duration_ms: 0,
+            count: 1,
+        };
+        assert!(
+            crate::telemetry::record(
+                &directory.path().join("missing").join("telemetry.sqlite3"),
+                &event
+            )
+            .is_err()
+        );
+        drop(db);
+        let db = Connection::open(&path).unwrap();
+        let status = status(&db).unwrap();
+        assert_eq!(status["automatic_pr_ci"]["process_cleanup_uncertain"], 1);
+        let (active, previous): (i64, String) = db
+            .query_row(
+                "SELECT active,error FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, previous.as_str()), (0, "previous evidence"));
     }
     #[test]
     fn status_counts_inactive_uncertain_trackers_separately_from_deliveries() {

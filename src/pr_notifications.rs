@@ -1835,25 +1835,98 @@ fn dispatch_with_clock(
     Ok(attempted)
 }
 
+// A journal identity is usable only when every case variant agrees on both
+// the event and its parsed provider timestamp. Missing or conflicting evidence
+// is deliberately left ambiguous.
+fn journal_event_time(
+    db: &Connection,
+    notification: &Notification,
+    key: &str,
+    source: &Value,
+) -> Result<Option<(i64, String)>> {
+    let mut statement = db.prepare(
+        "SELECT event,event_at_sec,event_at,source FROM automatic_pr_event_journal
+         WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND event_key=?4",
+    )?;
+    let mut rows = statement.query(params![
+        notification.kind,
+        notification.repo,
+        notification.pr,
+        key
+    ])?;
+    let mut found: Option<(i64, String)> = None;
+    while let Some(row) = rows.next()? {
+        let event: String = row.get(0)?;
+        let second: i64 = row.get(1)?;
+        let at: String = row.get(2)?;
+        let saved_source: String = row.get(3)?;
+        if event != notification.event
+            || timestamp_second(db, &at).ok() != Some(second)
+            || serde_json::from_str::<Value>(&saved_source).ok().as_ref() != Some(source)
+            || found
+                .as_ref()
+                .is_some_and(|(previous, _)| *previous != second)
+        {
+            return Ok(None);
+        }
+        found = Some((second, at));
+    }
+    Ok(found)
+}
+
+fn distinct_journal_events(
+    db: &Connection,
+    notification: &Notification,
+    other_key: &str,
+    other_source: &str,
+) -> Result<bool> {
+    if notification.kind != "pull_request"
+        || !matches!(notification.event.as_str(), "closed" | "merged")
+    {
+        return Ok(false);
+    }
+    let Ok(other_source) = serde_json::from_str::<Value>(other_source) else {
+        return Ok(false);
+    };
+    let current = journal_event_time(
+        db,
+        notification,
+        &notification.event_key,
+        &notification.source,
+    )?;
+    let other = journal_event_time(db, notification, other_key, &other_source)?;
+    Ok(matches!((current,other),(Some((a,_)),Some((b,_))) if a != b))
+}
+
 fn possible_incomplete_key_conflict(db: &Connection, notification: &Notification) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM automatic_pr_notifications WHERE kind=?1
+    let mut statement = db.prepare(
+        "SELECT event_key,source FROM automatic_pr_notifications WHERE kind=?1
          AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4 AND event=?5
          AND id!=?6 AND event_key!=?7
          AND (event_key LIKE 'github-poll-v1:%' OR ?7 LIKE 'github-poll-v1:%')
          AND (state!='pending' OR rowid <
-             (SELECT rowid FROM automatic_pr_notifications WHERE id=?6)))",
-        params![
-            notification.kind,
-            notification.repo,
-            notification.pr,
-            notification.thread,
-            notification.event,
-            notification.id,
-            notification.event_key
-        ],
-        |row| row.get(0),
-    )?)
+             (SELECT rowid FROM automatic_pr_notifications WHERE id=?6))",
+    )?;
+    let keys: Vec<(String, String)> = statement
+        .query_map(
+            params![
+                notification.kind,
+                notification.repo,
+                notification.pr,
+                notification.thread,
+                notification.event,
+                notification.id,
+                notification.event_key
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for (key, source) in keys {
+        if !distinct_journal_events(db, notification, &key, &source)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn possible_historical_duplicate(db: &Connection, notification: &Notification) -> Result<bool> {
@@ -1978,6 +2051,16 @@ fn possible_historical_duplicate(db: &Connection, notification: &Notification) -
             |row| row.get(0),
         )?);
     }
+    let journal_time = if matches!(notification.event.as_str(), "closed" | "merged") {
+        journal_event_time(
+            db,
+            notification,
+            &notification.event_key,
+            &notification.source,
+        )?
+    } else {
+        None
+    };
     let (at, target) = match notification.event.as_str() {
         "closed" => (notification.source.pointer("/pull_request/closed_at"), None),
         "merged" => (notification.source.pointer("/pull_request/merged_at"), None),
@@ -1991,7 +2074,9 @@ fn possible_historical_duplicate(db: &Connection, notification: &Notification) -
         ),
         _ => return Ok(false),
     };
-    let at = at.and_then(Value::as_str);
+    let at = at
+        .and_then(Value::as_str)
+        .or_else(|| journal_time.as_ref().map(|(_, at)| at.as_str()));
     let target = target.and_then(Value::as_str);
     if at.is_none()
         || (matches!(notification.event.as_str(), "synchronize" | "base_changed")
@@ -2031,6 +2116,9 @@ fn possible_historical_duplicate(db: &Connection, notification: &Notification) -
             .collect::<rusqlite::Result<_>>()?
     };
     for (old_repo, old_key, old_source, _state) in rows {
+        if distinct_journal_events(db, notification, &old_key, &old_source)? {
+            continue;
+        }
         let expected = super::stable_source_key(
             &notification.kind,
             &old_repo,
@@ -2174,6 +2262,170 @@ fn claim_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_close_reopen_close_dispatches_both_distinct_closes_once() {
+        let mut db = Connection::open_in_memory().unwrap();
+        super::super::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            timestamp_second(&db, "2099-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let event = |id: i64, kind: &'static str, at: &str| super::super::TimelineLifecycleEvent {
+            event: kind,
+            event_at: at.into(),
+            event_id: id.to_string(),
+            source: json!({"id":id,"event":kind,"created_at":at}),
+        };
+        let c2 = "2099-01-01T00:00:30Z";
+        let batch = super::super::TimelineLifecycleBatch {
+            events: vec![
+                event(1, "closed", "2099-01-01T00:00:10Z"),
+                event(2, "reopened", "2099-01-01T00:00:20Z"),
+                event(3, "closed", c2),
+            ],
+            snapshot: json!({"number":7,"state":"closed","merged":false,"closed_at":c2}),
+            canonical_generation: None,
+            canonical_current: true,
+            updated_at: c2.into(),
+            route: "timeline/test-distinct".into(),
+            calls: 1,
+            pending_reopen_watermark: 0,
+        };
+        super::super::apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 1).unwrap();
+        super::super::apply_timeline_lifecycle_events(&db, "owner/repo", "7", &batch, 2).unwrap();
+        let mut sent = Vec::new();
+        let attempted = dispatch_with_clock(
+            &mut db,
+            |_, message, id, _| {
+                sent.push((message.to_owned(), id.to_owned()));
+                Ok(("queued".into(), None))
+            },
+            || i64::MAX - 1_000_000,
+        )
+        .unwrap();
+        assert_eq!(attempted, 3);
+        assert_eq!(
+            sent.iter()
+                .filter(|(message, _)| message.contains(" closed."))
+                .count(),
+            2
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|(message, _)| message.contains(" reopened."))
+                .count(),
+            1
+        );
+        assert!(needs_attention(&db).unwrap().is_empty());
+        assert_eq!(
+            dispatch_with_clock(
+                &mut db,
+                |_, _, _, _| panic!("unexpected replay"),
+                || i64::MAX - 1_000_000
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn distinct_closes_with_mixed_sources_are_claimed_in_both_orders() {
+        for timeline_first in [true, false] {
+            let db = Connection::open_in_memory().unwrap();
+            let first_at = "2099-01-01T00:00:10Z";
+            let second_at = "2099-01-01T00:00:30Z";
+            register_in_since(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "11111111-1111-4111-8111-111111111111",
+                timestamp_second(&db, first_at).unwrap(),
+            )
+            .unwrap();
+            for (index, at) in [first_at, second_at].iter().enumerate() {
+                let source = if (index == 0) == timeline_first {
+                    json!({"id": index + 1, "event":"closed", "created_at":at})
+                } else {
+                    json!({"action":"closed", "pull_request":{"number":7,"closed_at":at}})
+                };
+                record_event(
+                    &db,
+                    "pull_request",
+                    "owner/repo",
+                    "7",
+                    "closed",
+                    at,
+                    &format!("github-poll-v1:{index}"),
+                    &source,
+                )
+                .unwrap();
+            }
+            let first = claim_next(&db, i64::MAX, &HashSet::new()).unwrap().unwrap();
+            assert!(mark_queued(&db, &first.id).unwrap());
+            assert!(
+                claim_next(&db, i64::MAX, &HashSet::new())
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(needs_attention(&db).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn equal_second_journal_closes_remain_uncertain() {
+        let db = Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let at = "2099-01-01T00:00:20Z";
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            thread,
+            timestamp_second(&db, at).unwrap(),
+        )
+        .unwrap();
+        let first = json!({"id":1,"event":"closed","created_at":at});
+        let second = json!({"id":2,"event":"closed","created_at":at});
+        record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            at,
+            "github-poll-v1:first",
+            &first,
+        )
+        .unwrap();
+        record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            at,
+            "github-poll-v1:second",
+            &second,
+        )
+        .unwrap();
+        let first = claim_next(&db, i64::MAX, &HashSet::new()).unwrap().unwrap();
+        assert!(mark_queued(&db, &first.id).unwrap());
+        assert!(
+            claim_next(&db, i64::MAX, &HashSet::new())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(needs_attention(&db).unwrap().len(), 1);
+    }
 
     // Schema from 17f68ae^, before the event journal existed.
     fn pre_journal_notifications(db: &Connection) {
