@@ -15,6 +15,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{error::Error, fmt, io::Read};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "pr_ci_legacy.rs"]
+mod legacy;
+
 const GH_TIMEOUT: Duration = Duration::from_secs(20);
 const GH_OUTPUT_LIMIT: u64 = 1_048_576;
 const GH_STDERR_LIMIT: u64 = 65_536;
@@ -682,6 +686,15 @@ fn gh_api_with_timeout(
     route: &str,
     timeout: Duration,
 ) -> Result<ApiResponse> {
+    gh_api_with_probe(gh_executable, route, timeout, false)
+}
+
+fn gh_api_with_probe(
+    gh_executable: &Path,
+    route: &str,
+    timeout: Duration,
+    deny_group: bool,
+) -> Result<ApiResponse> {
     let deadline = Instant::now() + timeout;
     let filter = gh_response_filter(route)?;
     ensure!(
@@ -708,13 +721,33 @@ fn gh_api_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let (mut child, group_handle) = spawn_with_group_handle(
+    let started = spawn_with_group_handle(
         &mut command,
         false,
-        false,
+        deny_group,
         deadline.saturating_duration_since(Instant::now()),
-    )
-    .with_context(|| format!("Start {} with safe cleanup", gh_executable.display()))?;
+    );
+    let (mut child, group_handle) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<GroupProbeUnsupported>())
+            {
+                return legacy::gh_api(gh_executable, route, filter, deadline);
+            }
+            #[cfg(target_os = "linux")]
+            if error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<GroupProbeCleanupUncertain>())
+            {
+                return Err(error.into());
+            }
+            return Err(error)
+                .with_context(|| format!("Start {} with safe cleanup", gh_executable.display()));
+        }
+    };
 
     let exceeded = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -818,6 +851,216 @@ type GroupHandle = Option<std::os::fd::OwnedFd>;
 #[cfg(not(target_os = "linux"))]
 type GroupHandle = ();
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct GroupProbeUnsupported;
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for GroupProbeUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("pidfd process-group signaling is unavailable")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for GroupProbeUnsupported {}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct GroupProbeCleanupUncertain(String);
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for GroupProbeCleanupUncertain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for GroupProbeCleanupUncertain {}
+
+#[cfg(target_os = "linux")]
+enum GroupReceipt {
+    Handle(std::os::fd::OwnedFd),
+    ProbeUnsupported(std::os::fd::OwnedFd),
+    ProbeTransferFailed(std::os::fd::OwnedFd, libc::c_int),
+    Invalid,
+}
+
+#[cfg(target_os = "linux")]
+const UNSUPPORTED_GROUP_PROBE: u8 = 0xa5;
+#[cfg(target_os = "linux")]
+const PROBE_REQUEST: i32 = 1;
+#[cfg(target_os = "linux")]
+const PROBE_OPENED: i32 = 2;
+#[cfg(target_os = "linux")]
+const PROBE_CONFIRMED: i32 = 3;
+#[cfg(target_os = "linux")]
+const PROBE_ACCEPTED: i32 = 4;
+#[cfg(target_os = "linux")]
+const PROBE_ABANDONED: i32 = 5;
+
+#[cfg(target_os = "linux")]
+struct ProbeShared {
+    phase: std::sync::atomic::AtomicI32,
+    pid: std::sync::atomic::AtomicI32,
+    error: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(target_os = "linux")]
+struct ProbeMapping(usize);
+
+#[cfg(target_os = "linux")]
+impl ProbeMapping {
+    fn new() -> std::io::Result<Arc<Self>> {
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<ProbeShared>(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        unsafe {
+            address.cast::<ProbeShared>().write(ProbeShared {
+                phase: std::sync::atomic::AtomicI32::new(0),
+                pid: std::sync::atomic::AtomicI32::new(0),
+                error: std::sync::atomic::AtomicI32::new(0),
+            });
+        }
+        Ok(Arc::new(Self(address as usize)))
+    }
+
+    fn state(&self) -> &ProbeShared {
+        // The Arc owns this mapping until both the receiver and Command release it.
+        unsafe { &*(self.0 as *const ProbeShared) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProbeMapping {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(
+                self.0 as *mut libc::c_void,
+                std::mem::size_of::<ProbeShared>(),
+            )
+        };
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static REAP_GROUP_PROBE_IN_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static TRUNCATE_GROUP_PROBE_IN_TEST: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+static PAUSE_AFTER_EMPTY_PROBE_POLL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+unsafe fn exit_unsupported_group_probe(
+    socket: libc::c_int,
+    pidfd: libc::c_int,
+    handshake_ms: libc::c_int,
+    shared: &ProbeShared,
+) -> ! {
+    // Do not return an error through Command's pre-exec pipe: its internal
+    // wait can panic if an embedder has already reaped the child. Transfer the
+    // exact pidfd instead, then let the parent use waitid(P_PIDFD).
+    unsafe {
+        let mut marker = UNSUPPORTED_GROUP_PROBE;
+        let mut iov = libc::iovec {
+            iov_base: (&mut marker as *mut u8).cast(),
+            iov_len: 1,
+        };
+        let mut control = [0_usize; 8];
+        let mut message: libc::msghdr = std::mem::zeroed();
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>(), pidfd);
+        let sent = libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL);
+        let send_error = if sent == 1 {
+            0
+        } else if sent < 0 {
+            *libc::__errno_location()
+        } else {
+            libc::EIO
+        };
+        shared.pid.store(libc::getpid(), Ordering::Relaxed);
+        shared.error.store(send_error, Ordering::Relaxed);
+        if shared
+            .phase
+            .compare_exchange(0, PROBE_REQUEST, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            let mut start: libc::timespec = std::mem::zeroed();
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut start) == 0 {
+                let end_ms = i128::from(start.tv_sec) * 1000
+                    + i128::from(start.tv_nsec) / 1_000_000
+                    + i128::from(handshake_ms);
+                loop {
+                    let phase = shared.phase.load(Ordering::Acquire);
+                    if phase == PROBE_OPENED {
+                        let _ = shared.phase.compare_exchange(
+                            PROBE_OPENED,
+                            PROBE_CONFIRMED,
+                            Ordering::Release,
+                            Ordering::Acquire,
+                        );
+                        break;
+                    }
+                    if phase == PROBE_ACCEPTED || phase == PROBE_ABANDONED {
+                        break;
+                    }
+                    let mut now: libc::timespec = std::mem::zeroed();
+                    if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) != 0
+                        || i128::from(now.tv_sec) * 1000 + i128::from(now.tv_nsec) / 1_000_000
+                            >= end_ms
+                    {
+                        break;
+                    }
+                    libc::poll(std::ptr::null_mut(), 0, 2);
+                }
+            }
+        }
+        libc::close(pidfd);
+        libc::_exit(0)
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn discard_received_rights(message: &libc::msghdr) {
+    // recvmsg installs every descriptor that fits, even when MSG_CTRUNC is set.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let base = u64::from(libc::CMSG_LEN(0));
+                let length = (*header).cmsg_len as u64;
+                if length >= base {
+                    let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
+                    for index in 0..(length - base) / std::mem::size_of::<libc::c_int>() as u64 {
+                        libc::close(std::ptr::read_unaligned(data.add(index as usize)));
+                    }
+                }
+            }
+            header = libc::CMSG_NXTHDR(message, header);
+        }
+    }
+}
+
 // The child opens its own pidfd before exec, so even an external reaper cannot
 // race its acquisition. SCM_RIGHTS keeps that exact descriptor alive in transit.
 #[cfg(target_os = "linux")]
@@ -826,9 +1069,15 @@ fn prepare_group_handle(
     deny_pidfd: bool,
     deny_group: bool,
     handshake_ms: libc::c_int,
-) -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+) -> Option<(
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+    Arc<ProbeMapping>,
+)> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
+    let shared = ProbeMapping::new().ok()?;
+    let child_shared = Arc::clone(&shared);
     let mut sockets = [-1; 2];
     // SAFETY: sockets is writable and a successful socketpair returns two owned descriptors.
     if unsafe {
@@ -878,12 +1127,12 @@ fn prepare_group_handle(
                 return Err(std::io::Error::last_os_error());
             }
             if libc::setpgid(0, 0) != 0 {
+                let error = std::io::Error::last_os_error();
                 libc::close(pidfd);
-                return Err(std::io::Error::last_os_error());
+                return Err(error);
             }
             if deny_group {
-                libc::close(pidfd);
-                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                exit_unsupported_group_probe(send_fd, pidfd, handshake_ms, child_shared.state());
             }
             if libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -894,6 +1143,14 @@ fn prepare_group_handle(
             ) != 0
             {
                 let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    exit_unsupported_group_probe(
+                        send_fd,
+                        pidfd,
+                        handshake_ms,
+                        child_shared.state(),
+                    );
+                }
                 libc::close(pidfd);
                 return Err(error);
             }
@@ -935,59 +1192,198 @@ fn prepare_group_handle(
             Ok(())
         });
     }
-    Some((receiver, sender))
+    Some((receiver, sender, shared))
 }
 
 #[cfg(target_os = "linux")]
-fn receive_group_handle(receiver: std::os::fd::OwnedFd, handshake_ms: libc::c_int) -> GroupHandle {
+fn receive_group_handle(
+    receiver: std::os::fd::OwnedFd,
+    handshake_ms: libc::c_int,
+    shared: Arc<ProbeMapping>,
+) -> GroupReceipt {
     use std::os::fd::{AsRawFd, FromRawFd};
-    let mut pollfd = libc::pollfd {
-        fd: receiver.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut pollfd, 1, handshake_ms) } != 1 {
-        return None;
+    let deadline = Instant::now() + Duration::from_millis(handshake_ms.max(0) as u64);
+    let state = shared.state();
+    let mut invalid_message = false;
+    loop {
+        if Instant::now() >= deadline {
+            state.phase.store(PROBE_ABANDONED, Ordering::Release);
+            return GroupReceipt::Invalid;
+        }
+        // Inspect a queued SCM_RIGHTS message before using shared recovery.
+        let mut pollfd = libc::pollfd {
+            fd: receiver.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        #[cfg(all(test, target_arch = "x86_64"))]
+        if ready == 0 && PAUSE_AFTER_EMPTY_PROBE_POLL.swap(false, Ordering::AcqRel) {
+            while state.phase.load(Ordering::Acquire) != PROBE_REQUEST && Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+        }
+        if ready == 1 && pollfd.revents & libc::POLLIN != 0 {
+            let mut byte = 0_u8;
+            let mut iov = libc::iovec {
+                iov_base: (&mut byte as *mut u8).cast(),
+                iov_len: 1,
+            };
+            let mut control = [0_usize; 8];
+            unsafe {
+                let mut message: libc::msghdr = std::mem::zeroed();
+                message.msg_iov = &mut iov;
+                message.msg_iovlen = 1;
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen = std::mem::size_of_val(&control) as _;
+                #[cfg(target_arch = "x86_64")]
+                #[cfg(test)]
+                if TRUNCATE_GROUP_PROBE_IN_TEST.load(Ordering::Relaxed) {
+                    message.msg_controllen = 0;
+                }
+                let received =
+                    libc::recvmsg(receiver.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC);
+                if received >= 0 {
+                    let cmsg = libc::CMSG_FIRSTHDR(&message);
+                    let valid = received == 1
+                        && message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) == 0
+                        && !cmsg.is_null()
+                        && (byte == 0 || byte == UNSUPPORTED_GROUP_PROBE)
+                        && (*cmsg).cmsg_level == libc::SOL_SOCKET
+                        && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+                        && (*cmsg).cmsg_len as u64
+                            == u64::from(libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32))
+                        && libc::CMSG_NXTHDR(&message, cmsg).is_null();
+                    if valid {
+                        let fd = std::os::fd::OwnedFd::from_raw_fd(std::ptr::read_unaligned(
+                            libc::CMSG_DATA(cmsg).cast::<libc::c_int>(),
+                        ));
+                        if byte == UNSUPPORTED_GROUP_PROBE {
+                            state.phase.store(PROBE_ACCEPTED, Ordering::Release);
+                            return GroupReceipt::ProbeUnsupported(fd);
+                        }
+                        let ack = 1_u8;
+                        if libc::send(
+                            receiver.as_raw_fd(),
+                            (&ack as *const u8).cast(),
+                            1,
+                            libc::MSG_NOSIGNAL,
+                        ) == 1
+                        {
+                            return GroupReceipt::Handle(fd);
+                        }
+                        state.phase.store(PROBE_ABANDONED, Ordering::Release);
+                        return GroupReceipt::Invalid;
+                    }
+                    discard_received_rights(&message);
+                    invalid_message = true;
+                }
+            }
+        }
+        if state.phase.load(Ordering::Acquire) == PROBE_REQUEST {
+            let pid = state.pid.load(Ordering::Relaxed);
+            let send_error = state.error.load(Ordering::Relaxed);
+            // The sender can enqueue SCM_RIGHTS immediately after the empty
+            // poll above. A successful send must be read before recovery is
+            // interpreted as a transfer failure.
+            if send_error == 0 && !invalid_message {
+                continue;
+            }
+            if pid <= 0 || send_error < 0 {
+                state.phase.store(PROBE_ABANDONED, Ordering::Release);
+                return GroupReceipt::Invalid;
+            }
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+            if raw < 0 {
+                state.phase.store(PROBE_ABANDONED, Ordering::Release);
+                return GroupReceipt::Invalid;
+            }
+            // Opening by PID is only provisional: the child must confirm after
+            // this open, while still alive, before the descriptor is used.
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            if state
+                .phase
+                .compare_exchange(
+                    PROBE_REQUEST,
+                    PROBE_OPENED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return GroupReceipt::Invalid;
+            }
+            loop {
+                let phase = state.phase.load(Ordering::Acquire);
+                if phase == PROBE_CONFIRMED {
+                    return GroupReceipt::ProbeTransferFailed(
+                        fd,
+                        if send_error == 0 {
+                            libc::EIO
+                        } else {
+                            send_error
+                        },
+                    );
+                }
+                if Instant::now() >= deadline {
+                    let previous = state.phase.swap(PROBE_ABANDONED, Ordering::AcqRel);
+                    if previous == PROBE_CONFIRMED {
+                        return GroupReceipt::ProbeTransferFailed(
+                            fd,
+                            if send_error == 0 {
+                                libc::EIO
+                            } else {
+                                send_error
+                            },
+                        );
+                    }
+                    return GroupReceipt::Invalid;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            state.phase.store(PROBE_ABANDONED, Ordering::Release);
+            return GroupReceipt::Invalid;
+        }
+        let wait = remaining.min(Duration::from_millis(5));
+        unsafe { libc::poll(&mut pollfd, 1, wait.as_millis().max(1) as libc::c_int) };
     }
-    let mut byte = 0_u8;
-    let mut iov = libc::iovec {
-        iov_base: (&mut byte as *mut u8).cast(),
-        iov_len: 1,
-    };
-    let mut control = [0_usize; 8];
-    // SAFETY: buffers are valid and aligned for recvmsg and ancillary data.
-    unsafe {
-        let mut message: libc::msghdr = std::mem::zeroed();
-        message.msg_iov = &mut iov;
-        message.msg_iovlen = 1;
-        message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = std::mem::size_of_val(&control) as _;
-        if libc::recvmsg(receiver.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) != 1 {
-            return None;
+}
+
+#[cfg(target_os = "linux")]
+fn reap_group_probe(fd: &std::os::fd::OwnedFd, deadline: Instant) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG,
+            )
+        };
+        if result == 0 && info.si_signo == libc::SIGCHLD {
+            return Ok(());
         }
-        let cmsg = libc::CMSG_FIRSTHDR(&message);
-        if cmsg.is_null()
-            || (*cmsg).cmsg_level != libc::SOL_SOCKET
-            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            || (*cmsg).cmsg_len as u64
-                != u64::from(libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32))
-        {
-            return None;
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(std::io::Error::other(GroupProbeCleanupUncertain(format!(
+                    "probe waitid failed: {error}; process cleanup uncertain"
+                ))));
+            }
         }
-        let fd = std::os::fd::OwnedFd::from_raw_fd(std::ptr::read_unaligned(
-            libc::CMSG_DATA(cmsg).cast::<libc::c_int>(),
-        ));
-        let ack = 1_u8;
-        if libc::send(
-            receiver.as_raw_fd(),
-            (&ack as *const u8).cast(),
-            1,
-            libc::MSG_NOSIGNAL,
-        ) != 1
-        {
-            return None;
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(GroupProbeCleanupUncertain(
+                "probe waitid timed out; process cleanup uncertain".into(),
+            )));
         }
-        Some(fd)
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -1001,19 +1397,55 @@ fn spawn_with_group_handle(
     if remaining.is_zero() {
         return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
     }
+    let deadline = Instant::now() + remaining;
     let handshake_ms = remaining.as_millis().clamp(1, 1000) as libc::c_int;
-    let (receiver, sender) = prepare_group_handle(command, deny_pidfd, deny_group, handshake_ms)
-        .ok_or_else(|| std::io::Error::other("cannot prepare safe process cleanup"))?;
-    let receiver_thread =
-        thread::Builder::new().spawn(move || receive_group_handle(receiver, handshake_ms))?;
+    let (receiver, sender, shared) =
+        prepare_group_handle(command, deny_pidfd, deny_group, handshake_ms)
+            .ok_or_else(|| std::io::Error::other("cannot prepare safe process cleanup"))?;
+    let receiver_thread = thread::Builder::new()
+        .spawn(move || receive_group_handle(receiver, handshake_ms, shared))?;
     let child = command.spawn();
     drop(sender);
     let handle = receiver_thread
         .join()
         .map_err(|_| std::io::Error::other("pidfd receiver panicked"))?;
     let child = child?;
-    let handle = handle.ok_or_else(|| std::io::Error::other("pidfd transfer failed"))?;
-    Ok((child, Some(handle)))
+    match handle {
+        GroupReceipt::Handle(handle) => Ok((child, Some(handle))),
+        GroupReceipt::ProbeUnsupported(handle) => {
+            #[cfg(all(test, target_arch = "x86_64"))]
+            if REAP_GROUP_PROBE_IN_TEST.load(Ordering::Relaxed) {
+                let mut status = 0;
+                unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) };
+            }
+            let result = reap_group_probe(&handle, deadline);
+            drop(child);
+            result?;
+            if cfg!(target_arch = "x86_64") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    GroupProbeUnsupported,
+                ))
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+            }
+        }
+        GroupReceipt::ProbeTransferFailed(handle, send_error) => {
+            #[cfg(all(test, target_arch = "x86_64"))]
+            if REAP_GROUP_PROBE_IN_TEST.load(Ordering::Relaxed) {
+                let mut status = 0;
+                unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) };
+            }
+            let result = reap_group_probe(&handle, deadline);
+            drop(child);
+            result?;
+            Err(std::io::Error::from_raw_os_error(send_error))
+        }
+        GroupReceipt::Invalid => Err(std::io::Error::other(GroupProbeCleanupUncertain(
+            "pidfd transfer failed; probe child may remain unreaped; process cleanup uncertain"
+                .into(),
+        ))),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2475,6 +2907,673 @@ esac
             assert!(started.elapsed() < Duration::from_millis(500));
             assert!(!marker.exists());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_einval_is_not_a_group_probe_failure() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("true");
+        unsafe {
+            command.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EINVAL)));
+        }
+        let error = spawn_with_group_handle(&mut command, false, false, Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn group_probe_marker_is_distinct_from_other_errors() {
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+        if pidfd < 0 {
+            let error = std::io::Error::last_os_error();
+            assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+            ));
+            return;
+        }
+        unsafe { libc::close(pidfd as libc::c_int) };
+        let mut command = Command::new("true");
+        let error = spawn_with_group_handle(&mut command, false, true, Duration::from_millis(200))
+            .unwrap_err();
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|error| error.is::<GroupProbeUnsupported>())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn group_probe_marker_rejects_truncated_datagrams() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        sender.send(&[UNSUPPORTED_GROUP_PROBE, 0]).unwrap();
+        assert!(matches!(
+            receive_group_handle(OwnedFd::from(receiver), 200, ProbeMapping::new().unwrap()),
+            GroupReceipt::Invalid
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn probe_sent_after_empty_poll_is_not_treated_as_failed() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::net::UnixDatagram;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_PROBE_POLL_RACE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pr_ci_runtime::tests::probe_sent_after_empty_poll_is_not_treated_as_failed",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let shared = ProbeMapping::new().unwrap();
+        PAUSE_AFTER_EMPTY_PROBE_POLL.store(true, Ordering::Release);
+        let receiver_shared = Arc::clone(&shared);
+        let receiver_thread = thread::spawn(move || {
+            receive_group_handle(OwnedFd::from(receiver), 1000, receiver_shared)
+        });
+        while PAUSE_AFTER_EMPTY_PROBE_POLL.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut byte = UNSUPPORTED_GROUP_PROBE;
+        let mut iov = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        let mut control = [0_usize; 8];
+        unsafe {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen =
+                libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+            std::ptr::write_unaligned(
+                libc::CMSG_DATA(header).cast::<libc::c_int>(),
+                file.as_raw_fd(),
+            );
+            assert_eq!(libc::sendmsg(sender.as_raw_fd(), &message, 0), 1);
+        }
+        shared
+            .state()
+            .pid
+            .store(std::process::id() as i32, Ordering::Relaxed);
+        shared.state().error.store(0, Ordering::Relaxed);
+        shared.state().phase.store(PROBE_REQUEST, Ordering::Release);
+        assert!(matches!(
+            receiver_thread.join().unwrap(),
+            GroupReceipt::ProbeUnsupported(_)
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_runs_gh_once_with_real_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("gh");
+        let args_file = directory.path().join("args");
+        let calls_file = directory.path().join("calls");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'x' >> '{}'\nprintf '{{\"number\":7}}'\n",
+                args_file.display(), calls_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let route = "/repos/owner/project/pulls/7";
+        let result = gh_api_with_probe(&program, route, Duration::from_secs(3), true).unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(result.body["number"], 7);
+        assert_eq!(std::fs::read_to_string(calls_file).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(args_file).unwrap(),
+            format!(
+                "api\n--jq\n{}\n{route}\n",
+                gh_response_filter(route).unwrap()
+            )
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn automatic_group_probe_runs_gh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("gh");
+        std::fs::write(&program, "#!/bin/sh\nprintf '{\"number\":7}'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = gh_api_with_timeout(
+            &program,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert_eq!(result.body["number"], 7);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_preserves_timeout_and_uncertainty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("gh");
+        std::fs::write(&program, "#!/bin/sh\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let error = gh_api_with_probe(
+            &program,
+            "/repos/owner/project/pulls/7",
+            Duration::from_millis(100),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("cleanup uncertain"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_preserves_output_limit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("gh");
+        std::fs::write(&program, "#!/bin/sh\nhead -c 1048577 /dev/zero\nsleep 10\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &program,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output exceeded"));
+        assert!(error.to_string().contains("cleanup uncertain"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn deny_test_syscall(number: libc::c_long) {
+        let filter = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: number as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+                0
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_reports_denied_waitid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_DENIED_WAITID_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pr_ci_runtime::tests::unsupported_group_probe_reports_denied_waitid")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "denied-waitid fixture failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(
+                "test pr_ci_runtime::tests::unsupported_group_probe_reports_denied_waitid ... ok"
+            ));
+            return;
+        }
+        deny_test_syscall(libc::SYS_waitid);
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '{\"number\":7}'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup uncertain"));
+        assert!(error.to_string().contains("waitid"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_reports_external_reaping() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_EXTERNAL_REAP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pr_ci_runtime::tests::unsupported_group_probe_reports_external_reaping")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "external-reaper fixture failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(
+                "test pr_ci_runtime::tests::unsupported_group_probe_reports_external_reaping ... ok"
+            ));
+            return;
+        }
+        assert_ne!(
+            unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) },
+            libc::SIG_ERR
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '{\"number\":7}'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup uncertain"));
+        assert!(error.to_string().contains("waitid"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_reports_concurrent_reaping() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_CONCURRENT_REAP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pr_ci_runtime::tests::unsupported_group_probe_reports_concurrent_reaping")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains(
+                "test pr_ci_runtime::tests::unsupported_group_probe_reports_concurrent_reaping ... ok"
+            ));
+            return;
+        }
+        REAP_GROUP_PROBE_IN_TEST.store(true, Ordering::Relaxed);
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        let marker = directory.path().join("executed");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup uncertain"));
+        assert!(error.to_string().contains("waitid"));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn sendmsg_failure_fixture(test_name: &str, external_reaper: bool, deny_sendto: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_SENDMSG_FAILURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let full_name = format!("pr_ci_runtime::tests::{test_name}");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(&full_name)
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "sendmsg fixture failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("test {full_name} ... ok"))
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        let marker = directory.path().join("executed");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if external_reaper {
+            REAP_GROUP_PROBE_IN_TEST.store(true, Ordering::Relaxed);
+        }
+        deny_test_syscall(libc::SYS_sendmsg);
+        if deny_sendto {
+            deny_test_syscall(libc::SYS_sendto);
+        }
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        if external_reaper {
+            assert!(error.to_string().contains("cleanup uncertain"));
+            assert!(error.to_string().contains("waitid"));
+        } else {
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    == Some(libc::EPERM)
+            }));
+        }
+        assert!(!marker.exists());
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result =
+            unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn failed_probe_sendmsg_is_reaped_without_running_gh() {
+        sendmsg_failure_fixture(
+            "failed_probe_sendmsg_is_reaped_without_running_gh",
+            false,
+            false,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn failed_probe_sendmsg_after_external_reaping_is_uncertain() {
+        sendmsg_failure_fixture(
+            "failed_probe_sendmsg_after_external_reaping_is_uncertain",
+            true,
+            false,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn failed_probe_sends_are_reaped_without_running_gh() {
+        sendmsg_failure_fixture(
+            "failed_probe_sends_are_reaped_without_running_gh",
+            false,
+            true,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn failed_probe_sends_after_external_reaping_are_uncertain() {
+        sendmsg_failure_fixture(
+            "failed_probe_sends_after_external_reaping_are_uncertain",
+            true,
+            true,
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn truncated_probe_transfer_is_reaped_without_running_gh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_TRUNCATED_PROBE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pr_ci_runtime::tests::truncated_probe_transfer_is_reaped_without_running_gh")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(
+                "test pr_ci_runtime::tests::truncated_probe_transfer_is_reaped_without_running_gh ... ok"
+            ));
+            return;
+        }
+        TRUNCATE_GROUP_PROBE_IN_TEST.store(true, Ordering::Relaxed);
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        let marker = directory.path().join("executed");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error)
+                == Some(libc::EIO)
+        }));
+        assert!(!marker.exists());
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_reports_failed_guardian_after_release() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_FAILED_GUARD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pr_ci_runtime::tests::unsupported_group_probe_reports_failed_guardian_after_release")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains(
+                "test pr_ci_runtime::tests::unsupported_group_probe_reports_failed_guardian_after_release ... ok"
+            ));
+            return;
+        }
+        legacy::fail_guard_after_release_for_test();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '{\"number\":7}'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cleanup uncertain"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_group_probe_distinguishes_gh_exit_120() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh");
+        std::fs::write(&executable, "#!/bin/sh\nprintf 'gh exit' >&2\nexit 120\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = gh_api_with_probe(
+            &executable,
+            "/repos/owner/project/pulls/7",
+            Duration::from_secs(3),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("gh exit"));
+        assert!(!error.to_string().contains("cleanup uncertain"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn truncated_group_rights_are_closed() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::os::unix::net::UnixDatagram;
+
+        const CHILD: &str = "CODEX_WAKE_TEST_TRUNCATED_RIGHTS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pr_ci_runtime::tests::truncated_group_rights_are_closed")
+                .arg("--test-threads=1")
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(
+                    "test pr_ci_runtime::tests::truncated_group_rights_are_closed ... ok"
+                )
+            );
+            return;
+        }
+
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let count = || {
+            (3..1024)
+                .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+                .count()
+        };
+        let before = count();
+        let descriptors = [file.as_raw_fd(); 24];
+        let mut control = [0_usize; 32];
+        let mut byte = 0_u8;
+        let mut iov = libc::iovec {
+            iov_base: (&mut byte as *mut u8).cast(),
+            iov_len: 1,
+        };
+        unsafe {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen =
+                libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as u32) as _;
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                descriptors.as_ptr(),
+                libc::CMSG_DATA(header).cast(),
+                descriptors.len(),
+            );
+            assert_eq!(libc::sendmsg(sender.as_raw_fd(), &message, 0), 1);
+        }
+        assert!(matches!(
+            receive_group_handle(OwnedFd::from(receiver), 200, ProbeMapping::new().unwrap()),
+            GroupReceipt::Invalid
+        ));
+        assert_eq!(count() + 1, before);
     }
 
     #[cfg(target_os = "linux")]
