@@ -37,6 +37,7 @@ const DELIVERIES_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_deliveries (
 );";
 const CLOSED_TRACKERS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_auto_closed_trackers (
     repo TEXT NOT NULL, pull_number INTEGER NOT NULL, thread TEXT NOT NULL,
+    trusted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(repo,pull_number,thread)
 );";
 const REOPEN_EVENTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pr_ci_reopen_events (
@@ -106,6 +107,7 @@ struct RunPollIdentity<'a> {
     repo: &'a str,
     pull_request: i64,
     sha: &'a str,
+    thread: &'a str,
 }
 
 /// Create the isolated PR tracking schema. Safe to call on each connection.
@@ -130,6 +132,7 @@ pub fn initialize(db: &Connection) -> Result<()> {
             ON pr_ci_delivery_retry_after(available_at_ms,delivery_id);",
     )?;
     db.execute_batch(CLOSED_TRACKERS_SCHEMA)?;
+    migrate_closed_tracker_trust(db)?;
     db.execute_batch(REOPEN_EVENTS_SCHEMA)?;
     db.execute_batch(PR_OBSERVATIONS_SCHEMA)?;
     migrate_observation_identity(db)?;
@@ -141,6 +144,38 @@ pub fn initialize(db: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_queue ON pr_ci_deliveries(state,id);
          CREATE INDEX IF NOT EXISTS pr_ci_delivery_lease ON pr_ci_deliveries(state,lease_until_ms);",
     )?;
+    Ok(())
+}
+
+fn migrate_closed_tracker_trust(db: &Connection) -> Result<()> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pr_ci_auto_closed_trackers') WHERE name='trusted')",
+        [], |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    if db.is_autocommit() {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        migrate_closed_tracker_trust(&tx)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    let columns: Vec<String> = db
+        .prepare("PRAGMA table_info(pr_ci_auto_closed_trackers)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|column| column == "trusted") {
+        db.execute_batch(
+            "ALTER TABLE pr_ci_auto_closed_trackers ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0",
+        )?;
+        db.execute_batch(
+            "UPDATE pr_ci_trackers SET error=coalesce(error,'uncertain_inactive_run')
+          WHERE active=0 AND EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+            WHERE closed.repo=pr_ci_trackers.repo AND closed.pull_number=pr_ci_trackers.pull_number
+              AND closed.thread=pr_ci_trackers.thread AND closed.trusted=0)",
+        )?;
+    }
     Ok(())
 }
 
@@ -235,7 +270,10 @@ pub fn register_in(db: &Connection, repo: &str, number: &str, thread: &str) -> R
         params![repo, number, thread],
     )? != 0;
     db.execute(
-        "UPDATE pr_ci_trackers SET active=1 WHERE repo=?1 AND pull_number=?2 AND thread=?3",
+        "UPDATE pr_ci_trackers SET next_poll_ms=CASE WHEN active=0 THEN 0 ELSE next_poll_ms END,
+         backoff_ms=CASE WHEN active=0 THEN 60000 ELSE backoff_ms END,
+         error=CASE WHEN active=0 THEN NULL ELSE error END,active=1
+         WHERE repo=?1 AND pull_number=?2 AND thread=?3",
         params![repo, number, thread],
     )?;
     db.execute(
@@ -484,6 +522,18 @@ fn observe_pull_request_state_tx(
             params![repo, number],
         )?;
     }
+    if state == "open" || (identity_changed && observed != 0) {
+        restore_trusted_trackers(db, repo, number, None)?;
+        // Markers from before the upgrade cannot prove continued subscription.
+        db.execute(
+            "UPDATE pr_ci_trackers SET error=coalesce(error,'uncertain_inactive_run')
+             WHERE repo=?1 AND pull_number=?2 AND active=0 AND EXISTS(
+               SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+               WHERE closed.repo=pr_ci_trackers.repo AND closed.pull_number=pr_ci_trackers.pull_number
+                 AND closed.thread=pr_ci_trackers.thread AND closed.trusted=0)",
+            params![repo, number],
+        )?;
+    }
     if state == "open" {
         if previous_state == Some("closed") && observed != 0 {
             db.execute(
@@ -493,33 +543,10 @@ fn observe_pull_request_state_tx(
                 params![observed_at_ms, repo, number],
             )?;
         }
-        db.execute(
-            "UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,
-                 error=NULL,updated_at_ms=?1
-             WHERE repo=?2 AND pull_number=?3 AND active=0 AND EXISTS(
-                 SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
-                 WHERE closed.repo=pr_ci_trackers.repo
-                   AND closed.pull_number=pr_ci_trackers.pull_number
-                   AND closed.thread=pr_ci_trackers.thread)",
-            params![observed_at_ms, repo, number],
-        )?;
-        db.execute(
-            "DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2",
-            params![repo, number],
-        )?;
     } else {
         if identity_changed && observed != 0 {
             db.execute("UPDATE pr_ci_trackers SET next_poll_ms=0,backoff_ms=60000,error=NULL,updated_at_ms=?1
                 WHERE repo=?2 AND pull_number=?3 AND active=1", params![observed_at_ms, repo, number])?;
-            db.execute("UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,error=NULL,updated_at_ms=?1
-                WHERE repo=?2 AND pull_number=?3 AND active=0 AND EXISTS(
-                    SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=pr_ci_trackers.repo
-                    AND closed.pull_number=pr_ci_trackers.pull_number AND closed.thread=pr_ci_trackers.thread)",
-                params![observed_at_ms, repo, number])?;
-            db.execute(
-                "DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2",
-                params![repo, number],
-            )?;
         }
         let pending_runs: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM pr_ci_runs
@@ -529,8 +556,8 @@ fn observe_pull_request_state_tx(
         )?;
         if !pending_runs && identity.is_some() && allow_pause {
             db.execute(
-                "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread)
-                 SELECT tracker.repo,tracker.pull_number,tracker.thread
+                "INSERT OR IGNORE INTO pr_ci_auto_closed_trackers(repo,pull_number,thread,trusted)
+                 SELECT tracker.repo,tracker.pull_number,tracker.thread,1
                  FROM pr_ci_trackers AS tracker
                  JOIN pr_ci_tracker_generations AS generation
                    USING(repo,pull_number,thread)
@@ -554,7 +581,11 @@ fn observe_pull_request_state_tx(
                 params![repo, number],
             )?;
             db.execute(
-                "UPDATE pr_ci_trackers SET active=0,error=NULL,updated_at_ms=?1
+                "UPDATE pr_ci_trackers SET active=0,error=CASE WHEN EXISTS(
+                   SELECT 1 FROM pr_ci_auto_closed_trackers AS uncertain
+                   WHERE uncertain.repo=pr_ci_trackers.repo AND uncertain.pull_number=pr_ci_trackers.pull_number
+                     AND uncertain.thread=pr_ci_trackers.thread AND uncertain.trusted=0)
+                   THEN coalesce(error,'uncertain_inactive_run') ELSE NULL END,updated_at_ms=?1
                  WHERE repo=?2 AND pull_number=?3 AND active=1 AND EXISTS(
                    SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
                    WHERE closed.repo=pr_ci_trackers.repo
@@ -567,11 +598,43 @@ fn observe_pull_request_state_tx(
     Ok(observed != 0)
 }
 
+// Caller holds a write transaction. Only pauses created by this version are
+// trusted; older markers remain ambiguous across the maintenance upgrade.
+fn restore_trusted_trackers(
+    db: &Connection,
+    repo: &str,
+    number: i64,
+    run: Option<(&str, i64, i64)>,
+) -> Result<()> {
+    let (sha, run_id, attempt) =
+        run.map_or((None, 0, 0), |(sha, id, attempt)| (Some(sha), id, attempt));
+    db.execute(
+        "UPDATE pr_ci_trackers SET active=1,next_poll_ms=0,backoff_ms=60000,error=NULL
+         WHERE repo=?1 AND pull_number=?2 AND active=0 AND EXISTS(
+           SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=pr_ci_trackers.repo
+             AND closed.pull_number=pr_ci_trackers.pull_number AND closed.thread=pr_ci_trackers.thread AND closed.trusted=1)
+         AND (?3 IS NULL OR NOT EXISTS(SELECT 1 FROM pr_ci_runs AS run JOIN pr_ci_deliveries AS delivery
+           ON delivery.repo=run.repo AND delivery.pull_number=run.pull_number AND delivery.sha=run.sha
+             AND delivery.run_id=run.run_id AND delivery.attempt=run.attempt
+           WHERE run.repo=pr_ci_trackers.repo AND run.pull_number=pr_ci_trackers.pull_number
+             AND run.sha=?3 AND run.run_id=?4 AND run.attempt=?5 AND run.status='completed'
+             AND delivery.thread=pr_ci_trackers.thread))", params![repo,number,sha,run_id,attempt])?;
+    db.execute("UPDATE pr_ci_tracker_generations SET generation=generation+1,closed_sweep_generation=NULL
+       WHERE repo=?1 AND pull_number=?2 AND EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+         JOIN pr_ci_trackers AS tracker USING(repo,pull_number,thread)
+         WHERE closed.repo=pr_ci_tracker_generations.repo AND closed.pull_number=pr_ci_tracker_generations.pull_number
+           AND closed.thread=pr_ci_tracker_generations.thread AND closed.trusted=1 AND tracker.active=1)", params![repo,number])?;
+    db.execute("DELETE FROM pr_ci_auto_closed_trackers WHERE repo=?1 AND pull_number=?2 AND trusted=1
+       AND EXISTS(SELECT 1 FROM pr_ci_trackers AS tracker WHERE tracker.repo=pr_ci_auto_closed_trackers.repo
+         AND tracker.pull_number=pr_ci_auto_closed_trackers.pull_number AND tracker.thread=pr_ci_auto_closed_trackers.thread
+         AND tracker.active=1)", params![repo,number])?;
+    Ok(())
+}
+
 /// Consume a durable `reopened` notification by its ID after inserting it into
 /// `automatic_pr_notifications`. Call this from the same transaction as the
-/// notification insert when possible. Explicitly unregistered trackers remain
-/// inactive because `observe_pull_request_state_in` only resumes auto-closed
-/// trackers.
+/// notification insert when possible. Inactive trackers remain inactive when
+/// a legacy writer may have manually unregistered them.
 pub fn consume_reopened_notification_in(
     db: &Connection,
     notification_id: &str,
@@ -633,10 +696,14 @@ where
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let mut stmt = tx.prepare(
         "UPDATE pr_ci_trackers SET next_poll_ms=?1
-         WHERE repo=(SELECT repo FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
-           AND pull_number=(SELECT pull_number FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
-           AND thread=(SELECT thread FROM pr_ci_trackers WHERE active=1 AND next_poll_ms<=?2 ORDER BY next_poll_ms,repo,pull_number,thread LIMIT 1)
-           AND active=1 AND next_poll_ms<=?2
+         WHERE rowid=(SELECT tracker.rowid FROM pr_ci_trackers AS tracker
+           WHERE tracker.next_poll_ms<=?2 AND (tracker.active=1 OR
+             (tracker.active=0
+              AND EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+                WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number AND closed.thread=tracker.thread AND closed.trusted=0)
+              AND EXISTS(SELECT 1 FROM pr_ci_runs AS run
+                WHERE run.repo=tracker.repo AND run.pull_number=tracker.pull_number AND run.status!='completed')))
+           ORDER BY tracker.next_poll_ms,tracker.repo,tracker.pull_number,tracker.thread LIMIT 1)
          RETURNING repo,pull_number,thread,head_sha,backoff_ms",
     )?;
     let trackers = stmt
@@ -728,9 +795,12 @@ where
                     )?;
                 }
                 tx.execute(
-                    "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,error=NULL,
+                    "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=60000,
+                     error=CASE WHEN active=1 THEN NULL ELSE error END,
                      updated_at_ms=?2 WHERE repo=?3 AND pull_number=?4 AND thread=?5
-                       AND active=1 AND EXISTS(
+                       AND (active=1 OR (active=0 AND EXISTS(
+                         SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=pr_ci_trackers.repo
+                           AND closed.pull_number=pr_ci_trackers.pull_number AND closed.thread=pr_ci_trackers.thread AND closed.trusted=0))) AND EXISTS(
                          SELECT 1 FROM pr_ci_tracker_generations AS generation
                          WHERE generation.repo=pr_ci_trackers.repo
                            AND generation.pull_number=pr_ci_trackers.pull_number
@@ -751,9 +821,11 @@ where
                 let delay = backoff.clamp(60_000, MAX_BACKOFF_MS);
                 let next = delay.saturating_mul(2).min(MAX_BACKOFF_MS);
                 db.execute(
-                    "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=?2,error=?3,
+                    "UPDATE pr_ci_trackers SET next_poll_ms=?1,backoff_ms=?2,error=CASE WHEN active=1 THEN ?3 ELSE error END,
                      updated_at_ms=?4 WHERE repo=?5 AND pull_number=?6 AND thread=?7
-                       AND active=1 AND EXISTS(
+                       AND (active=1 OR (active=0 AND EXISTS(
+                         SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=pr_ci_trackers.repo
+                           AND closed.pull_number=pr_ci_trackers.pull_number AND closed.thread=pr_ci_trackers.thread AND closed.trusted=0))) AND EXISTS(
                          SELECT 1 FROM pr_ci_tracker_generations AS generation
                          WHERE generation.repo=pr_ci_trackers.repo
                            AND generation.pull_number=pr_ci_trackers.pull_number
@@ -887,15 +959,6 @@ where
                 .is_some_and(|confirmed_sha| same_sha(confirmed_sha, &sha)),
         "PR head changed during CI discovery"
     );
-    let still_active: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pr_ci_trackers
-         WHERE repo=?1 AND pull_number=?2 AND thread=?3 AND active=1)",
-        params![repo, number, thread],
-        |row| row.get(0),
-    )?;
-    if !still_active {
-        return Ok((0, 0, 0, None));
-    }
     let mut discovered = 0;
     let mut queued = 0;
     let mut unlinked = 0;
@@ -931,6 +994,7 @@ where
             repo,
             pull_request: number,
             sha: &run_sha,
+            thread,
         };
         let known_attempts = known_attempts(db, repo, number, &run_sha, run_id)?;
         let mut attempt_runs = Vec::new();
@@ -1096,7 +1160,36 @@ fn process_run_attempt(
         None
     };
     let source = serde_json::to_string(&run)?;
-    let tx = db.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let eligible: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pr_ci_trackers AS tracker
+         WHERE tracker.repo=?1 AND tracker.pull_number=?2 AND tracker.thread=?3
+           AND (tracker.active=1 OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+             WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number
+               AND closed.thread=tracker.thread)))",
+        params![identity.repo, identity.pull_request, identity.thread],
+        |row| row.get(0),
+    )?;
+    if !eligible {
+        tx.commit()?;
+        return Ok(());
+    }
+    restore_trusted_trackers(
+        &tx,
+        identity.repo,
+        identity.pull_request,
+        Some((&run_sha, run_id, attempt)),
+    )?;
+    // Markers created before the maintenance upgrade are ambiguous.
+    tx.execute(
+        "UPDATE pr_ci_trackers SET next_poll_ms=CASE WHEN error IS NULL THEN 0 ELSE next_poll_ms END,
+         error=coalesce(error,'uncertain_inactive_run')
+         WHERE repo=?1 AND pull_number=?2 AND active=0 AND EXISTS(
+           SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
+           WHERE closed.repo=pr_ci_trackers.repo AND closed.pull_number=pr_ci_trackers.pull_number
+             AND closed.thread=pr_ci_trackers.thread AND closed.trusted=0)",
+        params![identity.repo, identity.pull_request],
+    )?;
     let inserted = tx.execute(
             "INSERT INTO pr_ci_runs(repo,pull_number,sha,run_id,attempt,status,conclusion,source_json,updated_at_ms)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -1123,15 +1216,24 @@ fn process_run_attempt(
         ],
     )?;
     // A unique outbox key ensures webhook/poll redelivery and reruns do not collide.
-    if let Some(conclusion) = conclusion {
-        let inserted_delivery = tx.execute(
+    let inserted_delivery = tx.execute(
                 "INSERT OR IGNORE INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
-                 SELECT ?1,?2,?3,?4,?5,thread,?6,?7 FROM pr_ci_trackers
-                 WHERE repo=?1 AND pull_number=?2 AND active=1",
-                params![identity.repo, identity.pull_request, run_sha, run_id, attempt, conclusion, source],
+                 SELECT run.repo,run.pull_number,run.sha,run.run_id,run.attempt,tracker.thread,run.conclusion,run.source_json
+                 FROM pr_ci_runs AS run JOIN pr_ci_trackers AS tracker USING(repo,pull_number)
+                 WHERE run.repo=?1 AND run.pull_number=?2 AND run.sha=?3 AND run.run_id=?4
+                   AND run.attempt=?5 AND run.status='completed' AND tracker.active=1",
+                params![identity.repo, identity.pull_request, run_sha, run_id, attempt],
             )?;
-        *queued += inserted_delivery;
-    }
+    *queued += inserted_delivery;
+    tx.execute(
+        "INSERT OR IGNORE INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json,state)
+         SELECT run.repo,run.pull_number,run.sha,run.run_id,run.attempt,tracker.thread,run.conclusion,run.source_json,'needs_attention'
+         FROM pr_ci_runs AS run JOIN pr_ci_trackers AS tracker USING(repo,pull_number)
+         JOIN pr_ci_auto_closed_trackers AS closed USING(repo,pull_number,thread)
+         WHERE run.repo=?1 AND run.pull_number=?2 AND run.sha=?3 AND run.run_id=?4
+           AND run.attempt=?5 AND run.status='completed' AND tracker.active=0 AND closed.trusted=0",
+        params![identity.repo, identity.pull_request, run_sha, run_id, attempt],
+    )?;
     tx.commit()?;
     *discovered += usize::from(inserted != 0);
     Ok(())
@@ -1405,6 +1507,180 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         initialize(&db).unwrap();
         db
+    }
+
+    #[test]
+    fn concurrent_trust_migration_keeps_old_markers_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(TRACKERS_SCHEMA).unwrap();
+        db.execute("INSERT INTO pr_ci_trackers(repo,pull_number,thread,active) VALUES('owner/project',7,'old',0)", []).unwrap();
+        db.execute_batch("CREATE TABLE pr_ci_auto_closed_trackers(repo TEXT NOT NULL,pull_number INTEGER NOT NULL,thread TEXT NOT NULL,PRIMARY KEY(repo,pull_number,thread)); INSERT INTO pr_ci_auto_closed_trackers VALUES('owner/project',7,'old');").unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        migrate_closed_tracker_trust(&db).unwrap();
+        db.execute_batch("ROLLBACK").unwrap();
+        let before: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('pr_ci_auto_closed_trackers') WHERE name='trusted'", [], |row| row.get(0)).unwrap();
+        assert_eq!(before, 0, "the caller's rollback must undo migration");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = Connection::open(path).unwrap();
+                    db.busy_timeout(Duration::from_secs(5)).unwrap();
+                    barrier.wait();
+                    migrate_closed_tracker_trust(&db).unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let trusted: i64 = db
+            .query_row(
+                "SELECT trusted FROM pr_ci_auto_closed_trackers WHERE thread='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trusted, 0);
+        let error: String = db
+            .query_row(
+                "SELECT error FROM pr_ci_trackers WHERE thread='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "uncertain_inactive_run");
+        migrate_closed_tracker_trust(&db).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT trusted FROM pr_ci_auto_closed_trackers WHERE thread='old'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn late_completed_run_restores_trusted_tracker_only() {
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        register(&mut db, "owner/project", "7", OTHER).unwrap();
+        observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap();
+        db.execute(
+            "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation",
+            [],
+        )
+        .unwrap();
+        observe_fixture(&db, "owner/project", "7", "closed", 11).unwrap();
+        db.execute(
+            "UPDATE pr_ci_auto_closed_trackers SET trusted=0 WHERE thread=?1",
+            [OTHER],
+        )
+        .unwrap();
+        let mut discovered = 0;
+        let mut queued = 0;
+        let completed = run(7, SHA, 93, 1, "success");
+        for thread in [THREAD, OTHER] {
+            process_run_attempt(
+                &db,
+                12,
+                RunPollIdentity {
+                    repo: "owner/project",
+                    pull_request: 7,
+                    sha: SHA,
+                    thread,
+                },
+                completed.clone(),
+                &mut discovered,
+                &mut queued,
+            )
+            .unwrap();
+        }
+        let trusted_state: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ambiguous_state: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [OTHER],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ready: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_deliveries WHERE thread=?1 AND state='pending'",
+                [THREAD],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let attention: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_deliveries WHERE thread=?1 AND state='needs_attention'",
+                [OTHER],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                trusted_state,
+                ambiguous_state,
+                discovered,
+                queued,
+                ready,
+                attention
+            ),
+            (1, 0, 1, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn new_close_identity_restores_only_trusted_and_not_unregistered() {
+        const OLD: &str = "22222222-2222-4222-8222-222222222222";
+        const REMOVED: &str = "33333333-3333-4333-8333-333333333333";
+        let mut db = db();
+        for thread in [THREAD, OLD, REMOVED] {
+            register(&mut db, "owner/project", "7", thread).unwrap();
+        }
+        db.execute("INSERT INTO pr_ci_auto_closed_trackers(repo,pull_number,thread) VALUES('owner/project',7,?1)",[OLD]).unwrap();
+        observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap();
+        db.execute(
+            "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation",
+            [],
+        )
+        .unwrap();
+        observe_fixture(&db, "owner/project", "7", "closed", 11).unwrap();
+        unregister(&db, "owner/project", "7", REMOVED).unwrap();
+        let mut new_close = pull(7, "closed", SHA);
+        new_close["closed_at"] = json!("2026-01-02T00:00:00Z");
+        observe_pull_request_snapshot_in(&db, "owner/project", "7", &new_close, 20).unwrap();
+        let state = |thread: &str| -> i64 {
+            db.query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [thread],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!((state(THREAD), state(OLD), state(REMOVED)), (1, 0, 0));
+        let old: i64 = db
+            .query_row(
+                "SELECT trusted FROM pr_ci_auto_closed_trackers WHERE thread=?1",
+                [OLD],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0);
     }
 
     fn pull(number: i64, state: &str, sha: &str) -> Value {
@@ -2301,6 +2577,303 @@ mod tests {
         assert_eq!(active, 1);
         assert_eq!(certificate, None);
         assert!(generation >= 3);
+    }
+
+    #[test]
+    fn pending_attempt_after_newer_sweep_preserves_uncertainty() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap());
+        let mut newer_sweep = false;
+        let mut response = |route: &str| -> Result<ApiResponse> {
+            if route.contains("/attempts/1") {
+                assert!(!newer_sweep);
+                newer_sweep = true;
+                poll(&db, 60_020, |nested_route| {
+                    Ok(ApiResponse {
+                        status: 200,
+                        body: if nested_route.contains("/pulls/") {
+                            pull(7, "closed", SHA)
+                        } else {
+                            json!({"total_count":0,"workflow_runs":[]})
+                        },
+                    })
+                })?;
+                observe_fixture(&db, "owner/project", "7", "closed", 60_021)?;
+                let active: i64 = db.query_row(
+                    "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                    [THREAD],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(active, 0, "newer sweep pauses before the older run write");
+                db.execute(
+                    "UPDATE pr_ci_auto_closed_trackers SET trusted=0 WHERE thread=?1",
+                    [THREAD],
+                )?;
+                let mut attempt = run(7, SHA, 89, 1, "success");
+                attempt["status"] = json!("in_progress");
+                attempt["conclusion"] = Value::Null;
+                return Ok(ApiResponse {
+                    status: 200,
+                    body: attempt,
+                });
+            }
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "closed", SHA),
+                })
+            } else {
+                let mut attempt = run(7, SHA, 89, 2, "success");
+                attempt["status"] = json!("in_progress");
+                attempt["conclusion"] = Value::Null;
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":1,"workflow_runs":[attempt]}),
+                })
+            }
+        };
+        poll(&db, 20, &mut response).unwrap();
+        assert!(newer_sweep);
+        let (active, pending, marker, error): (i64, i64, i64, String) = db
+            .query_row(
+                "SELECT active,
+               (SELECT count(*) FROM pr_ci_runs WHERE run_id=89 AND status='in_progress'),
+               (SELECT count(*) FROM pr_ci_auto_closed_trackers WHERE thread=?1),error
+             FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (active, pending, marker, error.as_str()),
+            (0, 2, 1, "uncertain_inactive_run")
+        );
+        // A legacy unregister leaves the same inactive row and marker.
+        db.execute(
+            "UPDATE pr_ci_trackers SET active=0,error='network',next_poll_ms=0 WHERE thread=?1",
+            [THREAD],
+        )
+        .unwrap();
+        let report = poll(&db, 60_022, |route| {
+            let body = if route.contains("/pulls/") {
+                pull(7, "closed", SHA)
+            } else if route.contains("/attempts/1") {
+                run(7, SHA, 89, 1, "success")
+            } else {
+                json!({"total_count":1,"workflow_runs":[run(7, SHA, 89, 2, "success")]})
+            };
+            Ok(ApiResponse { status: 200, body })
+        })
+        .unwrap();
+        let (active, pending, attention): (i64, i64, i64) = db.query_row(
+            "SELECT active,(SELECT count(*) FROM pr_ci_runs WHERE run_id=89 AND status!='completed'),
+             (SELECT count(*) FROM pr_ci_deliveries WHERE run_id=89 AND state='needs_attention')
+             FROM pr_ci_trackers WHERE thread=?1", [THREAD], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            (report.checked, report.queued, active, pending, attention),
+            (1, 0, 0, 0, 2)
+        );
+        let saved_error: String = db
+            .query_row(
+                "SELECT error FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_error, "network");
+    }
+
+    #[test]
+    fn run_write_does_not_restore_manually_unregistered_tracker() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(unregister(&db, "owner/project", "7", THREAD).unwrap());
+        let mut pending = run(7, SHA, 89, 1, "success");
+        pending["status"] = json!("in_progress");
+        pending["conclusion"] = Value::Null;
+        let mut discovered = 0;
+        let mut queued = 0;
+        process_run_attempt(
+            &db,
+            20,
+            RunPollIdentity {
+                repo: "owner/project",
+                pull_request: 7,
+                sha: SHA,
+                thread: THREAD,
+            },
+            pending,
+            &mut discovered,
+            &mut queued,
+        )
+        .unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((active, discovered, queued), (0, 0, 0));
+    }
+
+    #[test]
+    fn newly_completed_run_after_auto_pause_needs_attention() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap();
+        db.execute(
+            "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation",
+            [],
+        )
+        .unwrap();
+        observe_fixture(&db, "owner/project", "7", "closed", 11).unwrap();
+        db.execute(
+            "UPDATE pr_ci_auto_closed_trackers SET trusted=0 WHERE thread=?1",
+            [THREAD],
+        )
+        .unwrap();
+        let mut discovered = 0;
+        let mut queued = 0;
+        process_run_attempt(
+            &db,
+            20,
+            RunPollIdentity {
+                repo: "owner/project",
+                pull_request: 7,
+                sha: SHA,
+                thread: THREAD,
+            },
+            run(7, SHA, 90, 1, "success"),
+            &mut discovered,
+            &mut queued,
+        )
+        .unwrap();
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attention: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_deliveries WHERE thread=?1 AND state='needs_attention'",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((active, discovered, queued, attention), (0, 1, 0, 1));
+    }
+
+    #[test]
+    fn completed_run_is_accounted_per_tracker_with_legacy_unregister() {
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        register(&mut db, "owner/project", "7", OTHER).unwrap();
+        db.execute("INSERT INTO pr_ci_auto_closed_trackers(repo,pull_number,thread) VALUES('owner/project',7,?1)", [THREAD]).unwrap();
+        db.execute(
+            "UPDATE pr_ci_trackers SET active=0 WHERE thread=?1",
+            [THREAD],
+        )
+        .unwrap();
+        // The legacy unregister repeats this update but leaves the marker intact.
+        db.execute(
+            "UPDATE pr_ci_trackers SET active=0 WHERE thread=?1",
+            [THREAD],
+        )
+        .unwrap();
+        let completed = run(7, SHA, 91, 1, "success");
+        let mut discovered = 0;
+        let mut queued = 0;
+        for thread in [OTHER, THREAD] {
+            process_run_attempt(
+                &db,
+                20,
+                RunPollIdentity {
+                    repo: "owner/project",
+                    pull_request: 7,
+                    sha: SHA,
+                    thread,
+                },
+                completed.clone(),
+                &mut discovered,
+                &mut queued,
+            )
+            .unwrap();
+        }
+        let active: i64 = db
+            .query_row(
+                "SELECT active FROM pr_ci_trackers WHERE thread=?1",
+                [THREAD],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attention: i64 = db.query_row("SELECT count(*) FROM pr_ci_deliveries WHERE thread=?1 AND run_id=91 AND state='needs_attention'", [THREAD], |row| row.get(0)).unwrap();
+        let pending: i64 = db.query_row("SELECT count(*) FROM pr_ci_deliveries WHERE thread=?1 AND run_id=91 AND state='pending'", [OTHER], |row| row.get(0)).unwrap();
+        assert_eq!(
+            (active, discovered, queued, attention, pending),
+            (0, 1, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn legacy_unregister_remains_inactive_on_reopen_and_new_close() {
+        for late_run in [false, true] {
+            let mut db = db();
+            register(&mut db, "owner/project", "7", THREAD).unwrap();
+            observe_fixture(&db, "owner/project", "7", "closed", 10).unwrap();
+            db.execute(
+                "UPDATE pr_ci_tracker_generations SET closed_sweep_generation=generation",
+                [],
+            )
+            .unwrap();
+            observe_fixture(&db, "owner/project", "7", "closed", 11).unwrap();
+            db.execute(
+                "UPDATE pr_ci_auto_closed_trackers SET trusted=0 WHERE thread=?1",
+                [THREAD],
+            )
+            .unwrap();
+            // b642419's unregister does not delete the automatic-close marker.
+            db.execute(
+                "UPDATE pr_ci_trackers SET active=0 WHERE thread=?1",
+                [THREAD],
+            )
+            .unwrap();
+            if late_run {
+                let mut pending = run(7, SHA, 92, 1, "success");
+                pending["status"] = json!("in_progress");
+                pending["conclusion"] = Value::Null;
+                process_run_attempt(
+                    &db,
+                    12,
+                    RunPollIdentity {
+                        repo: "owner/project",
+                        pull_request: 7,
+                        sha: SHA,
+                        thread: THREAD,
+                    },
+                    pending,
+                    &mut 0,
+                    &mut 0,
+                )
+                .unwrap();
+            }
+            observe_fixture(&db, "owner/project", "7", "open", 20).unwrap();
+            observe_fixture(&db, "owner/project", "7", "closed", 21).unwrap();
+            let (active, error, marker, pending): (i64, String, i64, i64) = db.query_row(
+                "SELECT active,error,(SELECT count(*) FROM pr_ci_auto_closed_trackers WHERE thread=?1),
+                 (SELECT count(*) FROM pr_ci_runs WHERE run_id=92 AND status='in_progress')
+                 FROM pr_ci_trackers WHERE thread=?1", [THREAD], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+            assert_eq!(
+                (active, error.as_str(), marker, pending),
+                (0, "uncertain_inactive_run", 1, i64::from(late_run))
+            );
+        }
     }
 
     #[test]

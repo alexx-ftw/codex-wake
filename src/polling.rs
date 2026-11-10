@@ -400,7 +400,7 @@ where
              WHERE generation.repo=?1 COLLATE NOCASE AND generation.pull_number=?2
                AND tracker.active=1 AND generation.closed_sweep_generation=generation.generation)
              OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers
-               WHERE repo=?1 COLLATE NOCASE AND pull_number=?2)",
+               WHERE repo=?1 COLLATE NOCASE AND pull_number=?2 AND trusted=1)",
             params![resource.repo, number],
             |row| row.get(0),
         )?;
@@ -1439,6 +1439,22 @@ pub fn status(db: &Connection) -> Result<Value> {
         "pr_ci_trackers",
         "SELECT count(*) FROM pr_ci_trackers WHERE active=1 AND error IS NOT NULL",
     )?;
+    let has_closed_markers: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_ci_auto_closed_trackers')",
+        [], |row| row.get(0),
+    )?;
+    let has_trust_column: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pr_ci_auto_closed_trackers') WHERE name='trusted')",
+        [], |row| row.get(0),
+    )?;
+    let uncertain_query = if !has_closed_markers {
+        "SELECT count(*) FROM pr_ci_trackers WHERE active=0 AND error='uncertain_inactive_run'"
+    } else if has_trust_column {
+        "SELECT count(*) FROM pr_ci_trackers AS tracker WHERE active=0 AND (error='uncertain_inactive_run' OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number AND closed.thread=tracker.thread AND closed.trusted=0))"
+    } else {
+        "SELECT count(*) FROM pr_ci_trackers AS tracker WHERE active=0 AND (error='uncertain_inactive_run' OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number AND closed.thread=tracker.thread))"
+    };
+    let pr_ci_uncertain_trackers = count("pr_ci_trackers", uncertain_query)?;
     let (last_success, next_poll, calls): (Option<i64>, Option<i64>, i64) = db.query_row(
         "SELECT max(last_success_ms),min(next_poll_ms),coalesce(sum(calls),0) FROM github_poll_state", [],
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -1454,7 +1470,7 @@ pub fn status(db: &Connection) -> Result<Value> {
     Ok(
         json!({"active":{"waits":waits,"subscriptions":subscriptions,"rules":rules},
         "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention,"identity_pending":automatic_change_identity_pending,"attention_details":automatic_attention_details,"attention_details_truncated":automatic_attention_truncated},
-        "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors},
+        "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors,"uncertain_trackers":pr_ci_uncertain_trackers},
         "last_success_ms":last_success,"errors":errors,"next_poll_ms":next_poll,
         "calls":calls,"cached_pages":pages}),
     )
@@ -1698,7 +1714,7 @@ fn targets(db: &Connection, include_waits: bool) -> Result<Targets> {
     {
         let mut s = db.prepare("SELECT repo,pull_number FROM pr_ci_trackers AS tracker
             WHERE active=1 OR EXISTS(SELECT 1 FROM pr_ci_auto_closed_trackers AS closed
-              WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number AND closed.thread=tracker.thread)")?;
+              WHERE closed.repo=tracker.repo AND closed.pull_number=tracker.pull_number AND closed.thread=tracker.thread AND closed.trusted=1)")?;
         for row in s.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })? {
@@ -5004,6 +5020,65 @@ mod tests {
         db.execute("DELETE FROM subscriptions", []).unwrap();
         codex_wake::pr_ci::unregister(&db, "owner/repo", "7", thread).unwrap();
         assert!(targets(&db, true).unwrap().pull_requests.is_empty());
+    }
+
+    #[test]
+    fn ci_targets_ignore_untrusted_closures_without_hiding_other_consumers() {
+        let db = db();
+        pr_notifications::initialize(&db).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO pr_ci_trackers(repo,pull_number,thread,active) VALUES
+             ('owner/repo',1,'legacy',0),('owner/repo',2,'trusted',0),
+             ('owner/repo',3,'active',1),('owner/repo',4,'listener',0),
+             ('owner/repo',5,'rule',0);
+             INSERT INTO pr_ci_auto_closed_trackers(repo,pull_number,thread,trusted) VALUES
+             ('owner/repo',1,'legacy',0),('owner/repo',2,'trusted',1),
+             ('owner/repo',4,'listener',0),('owner/repo',5,'rule',0);
+             INSERT INTO automatic_pr_notification_listeners(kind,repo,pr,thread)
+             VALUES('pull_request','owner/repo','4','listener');
+             INSERT INTO rules(id,input) VALUES('rule','{\"repo\":\"owner/repo\",\"pr\":5}');",
+        )
+        .unwrap();
+        let targets = targets(&db, true).unwrap();
+        let prs: BTreeSet<_> = targets
+            .pull_requests
+            .iter()
+            .map(|r| r.resource.as_str())
+            .collect();
+        assert_eq!(prs, BTreeSet::from(["2", "3", "4", "5"]));
+    }
+
+    #[test]
+    fn untrusted_ci_marker_does_not_force_timeline_for_listener() {
+        for trusted in [0, 1] {
+            let db = db();
+            pr_notifications::initialize(&db).unwrap();
+            codex_wake::pr_ci::initialize(&db).unwrap();
+            db.execute("INSERT INTO pr_ci_trackers(repo,pull_number,thread,active) VALUES('owner/repo',7,'ci',0)", []).unwrap();
+            db.execute("INSERT INTO pr_ci_auto_closed_trackers(repo,pull_number,thread,trusted) VALUES('owner/repo',7,'ci',?1)", [trusted]).unwrap();
+            db.execute("INSERT INTO automatic_pr_notification_listeners(kind,repo,pr,thread,registered_at_sec) VALUES('pull_request','owner/repo','7','listener',0)", []).unwrap();
+            let pull = json!({"number":7,"state":"closed","merged":false,"merged_at":null,
+                "closed_at":"2098-12-31T23:59:00Z","updated_at":"2099-01-01T00:00:00Z",
+                "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
+            seed_legacy_pr_cursor(&db, Some(&pull));
+            db.execute("INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls) VALUES('/repos/owner/repo/issues/7/timeline',0,?1,0,60000,0)", [json!({"updated_at":"2099-01-01T00:00:00Z"}).to_string()]).unwrap();
+            let mut timeline_calls = 0;
+            tick_with(&db, INTERVAL_MS + 1, |route, _| {
+                if route == "/repos/owner/repo/pulls/7" {
+                    Ok(response(pull.clone(), false))
+                } else {
+                    assert_eq!(
+                        route,
+                        "/repos/owner/repo/issues/7/timeline?per_page=100&page=1"
+                    );
+                    timeline_calls += 1;
+                    Ok(response(json!([]), false))
+                }
+            })
+            .unwrap();
+            assert_eq!(timeline_calls, trusted);
+        }
     }
 
     #[test]
@@ -9114,6 +9189,49 @@ mod tests {
         crate::conditions::initialize(&db).unwrap();
         initialize(&db).unwrap();
         db
+    }
+    #[test]
+    fn status_counts_inactive_uncertain_trackers_separately_from_deliveries() {
+        let db = db();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO pr_ci_trackers(repo,pull_number,thread,active,error) VALUES
+             ('owner/repo',1,'inactive-uncertain',0,'uncertain_inactive_run'),
+             ('owner/repo',2,'active-uncertain',1,'uncertain_inactive_run'),
+             ('owner/repo',3,'inactive-other',0,'other'),
+             ('owner/repo',4,'inactive-clean',0,NULL);
+             INSERT INTO pr_ci_auto_closed_trackers(repo,pull_number,thread,trusted) VALUES
+             ('owner/repo',1,'inactive-uncertain',0),
+             ('owner/repo',3,'inactive-other',0),
+             ('owner/repo',4,'inactive-clean',1);
+             INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json,state)
+             VALUES('owner/repo',1,'sha',1,1,'inactive-uncertain','success','{}','needs_attention');",
+        ).unwrap();
+        let ci = &status(&db).unwrap()["automatic_pr_ci"];
+        assert_eq!(ci["uncertain_trackers"], 2);
+        assert_eq!(ci["active"], 1);
+        assert_eq!(ci["errors"], 1);
+        assert_eq!(ci["needs_attention"], 1, "delivery count is unchanged");
+        assert_eq!(ci["pending"], 0);
+    }
+    #[test]
+    fn status_counts_legacy_markers_without_migrating_them() {
+        let db = db();
+        db.execute_batch("CREATE TABLE pr_ci_trackers(repo TEXT,pull_number INTEGER,thread TEXT,active INTEGER,error TEXT);
+            INSERT INTO pr_ci_trackers VALUES('owner/repo',7,'old',0,'other');").unwrap();
+        assert_eq!(
+            status(&db).unwrap()["automatic_pr_ci"]["uncertain_trackers"],
+            0
+        );
+        db.execute_batch(
+            "CREATE TABLE pr_ci_auto_closed_trackers(repo TEXT,pull_number INTEGER,thread TEXT);
+            INSERT INTO pr_ci_auto_closed_trackers VALUES('owner/repo',7,'old');",
+        )
+        .unwrap();
+        assert_eq!(
+            status(&db).unwrap()["automatic_pr_ci"]["uncertain_trackers"],
+            1
+        );
     }
     fn seed_legacy_pr_cursor(db: &Connection, body: Option<&Value>) -> String {
         let cursor = json!({
