@@ -630,7 +630,20 @@ where
                 let old: Value = cursor
                     .and_then(|raw| serde_json::from_str(raw).ok())
                     .unwrap_or(Value::Null);
-                let prior_sequence = old["poll_seq"].as_i64();
+                // Alpha.2 replaces page 0's cursor; negative pages are not
+                // touched by its cache pruning and keep our condition baseline.
+                let condition_old: Value = db
+                    .query_row(
+                        "SELECT cursor FROM github_poll_state WHERE endpoint=?1 AND page=-2",
+                        [&route],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(|_| Failure::new("database"))?
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_else(|| old.clone());
+                let prior_sequence = condition_old["poll_seq"].as_i64();
                 let head_changed = old["head"]
                     .as_str()
                     .is_some_and(|previous| previous != head);
@@ -638,9 +651,9 @@ where
                     .as_str()
                     .is_some_and(|previous| previous != base);
                 // Older PR cursors omit state; recover it from the cached response.
-                let prior_state = match old["state"].as_str() {
+                let prior_state = match condition_old["state"].as_str() {
                     Some(state @ ("open" | "closed")) => Some(state.to_owned()),
-                    _ if old.is_null() => None,
+                    _ if condition_old.is_null() => None,
                     _ => state(db, &route, 0)
                         .map_err(|_| Failure::new("database"))?
                         .and_then(|cached| cached.body)
@@ -654,7 +667,13 @@ where
                 };
                 let mut accepted = 0u64;
                 let baseline = cursor_number(prior_sequence.unwrap_or(now));
-                let event_cursor = prior_sequence.map(|last| cursor_number(last.saturating_add(1)));
+                let event_sequence = prior_sequence
+                    .unwrap_or(now)
+                    .checked_add(1)
+                    .ok_or_else(|| Failure::new("invalid_baseline"))?;
+                let next_condition_sequence = now.max(event_sequence);
+                let event_cursor = (prior_sequence.is_some() || !condition_old.is_null())
+                    .then(|| cursor_number(event_sequence));
                 let mut condition_observations = Vec::new();
                 if pr["state"] == "closed" {
                     if pr["merged"].as_bool().is_none() {
@@ -683,7 +702,7 @@ where
                         "",
                         &[event_time],
                     );
-                    let ambiguous_baseline = !old.is_null() && prior_state.is_none();
+                    let ambiguous_baseline = !condition_old.is_null() && prior_state.is_none();
                     let ambiguous_event_cursor = ambiguous_baseline
                         .then(|| event_cursor.clone().unwrap_or_else(|| cursor_number(now)));
                     let observation_cursor = if ambiguous_baseline {
@@ -743,26 +762,30 @@ where
                         .len() as u64;
                     }
                 } else {
+                    if condition_old["head"]
+                        .as_str()
+                        .is_some_and(|previous| previous != head)
+                        && let Some(cursor) = event_cursor.as_ref()
+                    {
+                        condition_observations.push(ConditionObservation {
+                            resource: resource.resource.clone(),
+                            event: "synchronize".into(),
+                            outcome: None,
+                            key: stable_source_key(
+                                "pull_request",
+                                &resource.repo,
+                                &resource.resource,
+                                "synchronize",
+                                "",
+                                &[changed_at.unwrap_or_default(), head],
+                            ),
+                            cursor: cursor.clone(),
+                            ci: None,
+                            order_ambiguous: false,
+                            source: full("synchronize", Value::Null),
+                        });
+                    }
                     if head_changed {
-                        if let Some(cursor) = event_cursor.as_ref() {
-                            condition_observations.push(ConditionObservation {
-                                resource: resource.resource.clone(),
-                                event: "synchronize".into(),
-                                outcome: None,
-                                key: stable_source_key(
-                                    "pull_request",
-                                    &resource.repo,
-                                    &resource.resource,
-                                    "synchronize",
-                                    "",
-                                    &[changed_at.unwrap_or_default(), head],
-                                ),
-                                cursor: cursor.clone(),
-                                ci: None,
-                                order_ambiguous: false,
-                                source: full("synchronize", Value::Null),
-                            });
-                        }
                         accepted += scoped_subscription_accept(
                             db,
                             "pull_request",
@@ -772,26 +795,30 @@ where
                             changed_at,
                         )? as u64;
                     }
+                    if condition_old["base"]
+                        .as_str()
+                        .is_some_and(|previous| previous != base)
+                        && let Some(cursor) = event_cursor.as_ref()
+                    {
+                        condition_observations.push(ConditionObservation {
+                            resource: resource.resource.clone(),
+                            event: "base_changed".into(),
+                            outcome: None,
+                            key: stable_source_key(
+                                "pull_request",
+                                &resource.repo,
+                                &resource.resource,
+                                "base_changed",
+                                "",
+                                &[changed_at.unwrap_or_default(), base],
+                            ),
+                            cursor: cursor.clone(),
+                            ci: None,
+                            order_ambiguous: false,
+                            source: full("edited", json!({"base":{"ref":condition_old["base"]}})),
+                        });
+                    }
                     if base_changed {
-                        if let Some(cursor) = event_cursor.as_ref() {
-                            condition_observations.push(ConditionObservation {
-                                resource: resource.resource.clone(),
-                                event: "base_changed".into(),
-                                outcome: None,
-                                key: stable_source_key(
-                                    "pull_request",
-                                    &resource.repo,
-                                    &resource.resource,
-                                    "base_changed",
-                                    "",
-                                    &[changed_at.unwrap_or_default(), base],
-                                ),
-                                cursor: cursor.clone(),
-                                ci: None,
-                                order_ambiguous: false,
-                                source: full("edited", json!({"base":{"ref":old["base"]}})),
-                            });
-                        }
                         accepted += scoped_subscription_accept(
                             db,
                             "pull_request",
@@ -803,13 +830,16 @@ where
                     }
                 }
                 record_automatic_pr_changes(db, resource, pr, &old, automatic_generation.get())?;
-                accepted += observe_conditions(
+                let condition_checkpoint = json!({"head":head,"base":base,"state":pr["state"],
+                    "poll_seq":next_condition_sequence})
+                .to_string();
+                accepted += observe_conditions_with_checkpoint(
                     db,
                     "pull_request",
                     &resource.repo,
                     &resource.resource,
                     &condition_observations,
-                    Some(&baseline),
+                    (Some(&baseline), Some((&route, &condition_checkpoint))),
                     None,
                 )? as u64;
                 Ok((
@@ -1423,6 +1453,12 @@ pub fn status(db: &Connection) -> Result<Value> {
         "automatic_pr_event_journal",
         "SELECT count(*) FROM automatic_pr_event_journal WHERE event IN ('pending_synchronize','pending_base_changed')",
     )?;
+    let condition_identity_pending = count(
+        "condition_identity_candidates",
+        "SELECT count(*) FROM condition_identity_candidates c JOIN condition_members m
+          ON m.group_id=c.group_id AND m.kind=c.kind AND m.repo=c.repo AND m.resource=c.resource AND m.event=c.event AND m.outcome=c.outcome
+         JOIN condition_groups g ON g.id=c.group_id WHERE c.decision='pending' AND m.matched=0 AND g.state='pending'",
+    )?;
     let pr_ci_trackers = count(
         "pr_ci_trackers",
         "SELECT count(*) FROM pr_ci_trackers WHERE active=1",
@@ -1470,6 +1506,7 @@ pub fn status(db: &Connection) -> Result<Value> {
     Ok(
         json!({"active":{"waits":waits,"subscriptions":subscriptions,"rules":rules},
         "automatic_pr_notifications":{"pending":automatic_notifications_pending,"needs_attention":automatic_notifications_attention,"identity_pending":automatic_change_identity_pending,"attention_details":automatic_attention_details,"attention_details_truncated":automatic_attention_truncated},
+        "condition_identity_pending":condition_identity_pending,
         "automatic_pr_ci":{"active":pr_ci_trackers,"pending":pr_ci_pending,"needs_attention":pr_ci_attention,"errors":pr_ci_errors,"uncertain_trackers":pr_ci_uncertain_trackers},
         "last_success_ms":last_success,"errors":errors,"next_poll_ms":next_poll,
         "calls":calls,"cached_pages":pages}),
@@ -1754,6 +1791,19 @@ fn observe_conditions(
     baseline: Option<&str>,
     ci: Option<(&str, i64)>,
 ) -> std::result::Result<usize, Failure> {
+    observe_conditions_with_checkpoint(db, kind, repo, resource, observations, (baseline, None), ci)
+}
+
+fn observe_conditions_with_checkpoint(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    resource: &str,
+    observations: &[ConditionObservation],
+    cursors: (Option<&str>, Option<(&str, &str)>),
+    ci: Option<(&str, i64)>,
+) -> std::result::Result<usize, Failure> {
+    let (baseline, checkpoint) = cursors;
     db.execute_batch("BEGIN IMMEDIATE")
         .map_err(|_| Failure::new("database"))?;
     let result = (|| {
@@ -1787,6 +1837,60 @@ fn observe_conditions(
                 })
         }) {
             if kind == "pull_request" {
+                let identity_pending: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM condition_identity_candidates WHERE group_id=?1
+                     AND kind='pull_request' AND repo=?2 AND resource=?3 AND event=?4 AND outcome=?5 AND decision='pending')",
+                    params![member.group_id,repo,member.selector.resource,member.selector.event,member.selector.outcome.as_deref().unwrap_or("")],
+                    |row| row.get(0),
+                ).map_err(|_| Failure::new("database"))?;
+                if identity_pending {
+                    for observation in observations.iter().filter(|observation| {
+                        observation.event == member.selector.event
+                            && observation.resource == member.selector.resource
+                    }) {
+                        let event = crate::conditions::PublishedEvent {
+                            selector: member.selector.clone(),
+                            source_event_key: observation.key.clone(),
+                            cursor: Some(observation.cursor.clone()),
+                            ci: observation.ci.clone(),
+                            source: observation.source.clone(),
+                        };
+                        crate::conditions::record_polled_condition_event_in(db, &event)
+                            .map_err(|_| Failure::new("database"))?;
+                    }
+                    continue;
+                }
+                if let Some(observation) = observations.iter().find(|observation| {
+                    observation.event == member.selector.event
+                        && observation.resource == member.selector.resource
+                        && matches!(observation.event.as_str(), "synchronize" | "base_changed")
+                }) {
+                    let prior: Option<(String,String,String,String,String)> = db.query_row(
+                        "SELECT kind,repo,resource,event_cursor,source_digest FROM condition_publications WHERE source_event_key=?1 LIMIT 1",
+                        [&observation.key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                    ).optional().map_err(|_| Failure::new("database"))?;
+                    let source = serde_json::to_string(&observation.source)
+                        .map_err(|_| Failure::new("invalid_response"))?;
+                    let digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+                    if prior.is_some_and(|(kind, prior_repo, resource, cursor, prior_digest)| {
+                        kind != "pull_request"
+                            || prior_repo != repo
+                            || resource != member.selector.resource
+                            || cursor != observation.cursor
+                            || (!prior_digest.is_empty() && prior_digest != digest)
+                    }) {
+                        let event = crate::conditions::PublishedEvent {
+                            selector: member.selector.clone(),
+                            source_event_key: observation.key.clone(),
+                            cursor: Some(observation.cursor.clone()),
+                            ci: observation.ci.clone(),
+                            source: observation.source.clone(),
+                        };
+                        crate::conditions::record_polled_condition_event_in(db, &event)
+                            .map_err(|_| Failure::new("database"))?;
+                        continue;
+                    }
+                }
                 let uncertain: bool = db
                     .query_row(
                         "SELECT order_uncertain FROM condition_members
@@ -1811,7 +1915,10 @@ fn observe_conditions(
                             })
                     });
                 let order_unknown = if let Some(observation) = observation {
-                    if observation.order_ambiguous {
+                    if observation.order_ambiguous
+                        || (!member.armed
+                            && matches!(observation.event.as_str(), "synchronize" | "base_changed"))
+                    {
                         true
                     } else if member.armed {
                         false
@@ -1902,6 +2009,25 @@ fn observe_conditions(
                                 observation.outcome.as_deref() == Some(expected)
                             })
                     }) {
+                        if matches!(observation.event.as_str(), "synchronize" | "base_changed") {
+                            let candidate = crate::conditions::PublishedEvent {
+                                selector: member.selector.clone(),
+                                source_event_key: observation.key.clone(),
+                                cursor: Some(observation.cursor.clone()),
+                                ci: observation.ci.clone(),
+                                source: observation.source.clone(),
+                            };
+                            crate::conditions::record_polled_condition_event_in(db, &candidate)
+                                .map_err(|_| Failure::new("database"))?;
+                            let collision: bool = db.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM condition_identity_candidates WHERE group_id=?1
+                                  AND kind='pull_request' AND repo=?2 AND resource=?3 AND event=?4 AND outcome=?5 AND decision='pending')",
+                                params![member.group_id,repo,member.selector.resource,member.selector.event,member.selector.outcome.as_deref().unwrap_or("")], |row| row.get(0),
+                            ).map_err(|_| Failure::new("database"))?;
+                            if collision {
+                                continue;
+                            }
+                        }
                         let source = serde_json::to_string(&observation.source)
                             .map_err(|_| Failure::new("invalid_response"))?;
                         if source.len() > MAX_OUTPUT {
@@ -2061,12 +2187,24 @@ fn observe_conditions(
                     ci: observation.ci.clone(),
                     source: observation.source.clone(),
                 };
-                let recorded = crate::conditions::record_published_event_in(db, &published)
-                    .map_err(|_| Failure::new("database"))?;
+                let recorded = if kind == "pull_request" {
+                    crate::conditions::record_polled_condition_event_in(db, &published)
+                } else {
+                    crate::conditions::record_published_event_in(db, &published)
+                }
+                .map_err(|_| Failure::new("database"))?;
                 if recorded.payload_collision {
                     return Err(Failure::new("identity_mismatch"));
                 }
                 count += recorded.ready_groups;
+            }
+            if kind == "pull_request" && db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM condition_identity_candidates WHERE group_id=?1
+                 AND kind='pull_request' AND repo=?2 AND resource=?3 AND event=?4 AND outcome=?5 AND decision='pending')",
+                params![member.group_id,repo,member.selector.resource,member.selector.event,member.selector.outcome.as_deref().unwrap_or("")],
+                |row| row.get::<_, bool>(0),
+            ).map_err(|_| Failure::new("database"))? {
+                continue;
             }
             if !member.armed {
                 crate::conditions::arm_observed_member_in(
@@ -2077,6 +2215,15 @@ fn observe_conditions(
                 )
                 .map_err(|_| Failure::new("database"))?;
             }
+        }
+        if let Some((endpoint, cursor)) = checkpoint {
+            db.execute(
+                "INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls)
+                 VALUES(?1,-2,?2,?3,60000,0)
+                 ON CONFLICT(endpoint,page) DO UPDATE SET cursor=excluded.cursor",
+                params![endpoint, cursor, i64::MAX],
+            )
+            .map_err(|_| Failure::new("database"))?;
         }
         Ok(count)
     })();
@@ -2095,6 +2242,163 @@ fn observe_conditions(
     }
 }
 
+fn identity_resource<'a>(resource: &'a str, event: &str) -> Result<(Option<&'a str>, &'a str)> {
+    anyhow::ensure!(
+        matches!(event, "synchronize" | "base_changed"),
+        "Unsupported PR identity event"
+    );
+    match resource.split_once('#') {
+        Some((repo, number)) => {
+            anyhow::ensure!(
+                valid_repo(repo) && positive_text(number),
+                "Invalid PR resource"
+            );
+            Ok((Some(repo), number))
+        }
+        None => {
+            anyhow::ensure!(positive_text(resource), "Invalid PR resource");
+            Ok((None, resource))
+        }
+    }
+}
+
+/// List pending identity evidence globally, one bounded item per page.
+pub fn list_pr_condition_identity_pending(db: &Connection, after: Option<&str>) -> Result<Value> {
+    crate::conditions::initialize(db)?;
+    let after = after.map(str::parse::<i64>).transpose()?.unwrap_or(0);
+    anyhow::ensure!(after >= 0, "Invalid candidate cursor");
+    let mut stmt = db.prepare(
+        "SELECT c.id,c.group_id,c.repo,c.resource,c.event,c.candidate_id,c.provenance
+        FROM condition_identity_candidates c JOIN condition_members m
+          ON m.group_id=c.group_id AND m.kind=c.kind AND m.repo=c.repo AND m.resource=c.resource AND m.event=c.event AND m.outcome=c.outcome
+        JOIN condition_groups g ON g.id=c.group_id
+        WHERE c.decision='pending' AND m.matched=0 AND g.state='pending' AND c.id>?1 ORDER BY c.id LIMIT 2",
+    )?;
+    let mut rows = stmt
+        .query_map([after], |row| {
+            let repo: String = row.get(2)?;
+            let resource: String = row.get(3)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                json!({"group_id":row.get::<_,String>(1)?,
+            "resource":format!("{repo}#{resource}"),"event":row.get::<_,String>(4)?,
+            "candidate_id":row.get::<_,String>(5)?,"provenance":row.get::<_,String>(6)?}),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = rows.len() > 1;
+    rows.truncate(1);
+    let next_cursor = has_more.then(|| rows[0].0.to_string());
+    let candidates: Vec<Value> = rows.into_iter().map(|(_, candidate)| candidate).collect();
+    Ok(json!({"candidates":candidates,"has_more":has_more,"next_cursor":next_cursor}))
+}
+
+/// Inspect internal candidates. Their IDs do not assert GitHub event identity.
+pub fn list_pr_condition_identity_candidates(
+    db: &Connection,
+    group_id: &str,
+    resource: &str,
+    event: &str,
+    after: Option<&str>,
+) -> Result<Value> {
+    crate::conditions::initialize(db)?;
+    let (repo, number) = identity_resource(resource, event)?;
+    let after = after.map(str::parse::<i64>).transpose()?.unwrap_or(0);
+    anyhow::ensure!(after >= 0, "Invalid candidate cursor");
+    let mut stmt = db.prepare("SELECT c.candidate_id,c.repo,c.resource,c.event,c.outcome,c.original_key,c.event_cursor,c.source_json,c.provenance,c.decision,c.id,
+          (c.decision='pending' AND m.matched=0 AND g.state='pending')
+        FROM condition_identity_candidates c JOIN condition_members m
+          ON m.group_id=c.group_id AND m.kind=c.kind AND m.repo=c.repo AND m.resource=c.resource AND m.event=c.event AND m.outcome=c.outcome
+        JOIN condition_groups g ON g.id=c.group_id
+        WHERE c.group_id=?1 AND c.resource=?2 AND c.event=?3
+          AND (?4 IS NULL OR c.repo=?4) AND c.id>?5 ORDER BY c.id LIMIT 2")?;
+    let mut rows = stmt
+        .query_map(params![group_id, number, event, repo, after], |row| {
+            let raw: String = row.get(7)?;
+            let source: Value = serde_json::from_str(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok((
+                row.get::<_, i64>(10)?,
+                json!({"candidate_id":row.get::<_,String>(0)?,"repo":row.get::<_,String>(1)?,
+            "resource":row.get::<_,String>(2)?,"event":row.get::<_,String>(3)?,
+            "outcome":row.get::<_,String>(4)?,"original_key":row.get::<_,String>(5)?,
+            "cursor":row.get::<_,String>(6)?,"source":source,
+            "provenance":row.get::<_,String>(8)?,"decision":row.get::<_,String>(9)?,
+            "actionable":row.get::<_,bool>(11)?}),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_more = rows.len() > 1;
+    rows.truncate(1);
+    let next_cursor = has_more.then(|| rows[0].0.to_string());
+    let candidates: Vec<Value> = rows.into_iter().map(|(_, candidate)| candidate).collect();
+    Ok(json!({"candidates":candidates,"has_more":has_more,"next_cursor":next_cursor}))
+}
+
+/// Decide one retained candidate without deleting other evidence.
+pub fn resolve_pr_condition_identity(
+    db: &Connection,
+    group_id: &str,
+    resource: &str,
+    event: &str,
+    candidate_id: &str,
+    accept: bool,
+) -> Result<bool> {
+    crate::conditions::initialize(db)?;
+    let (repo, number) = identity_resource(resource, event)?;
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let candidate: Option<(String,String,String,String,String)> = tx.query_row(
+        "SELECT repo,outcome,event_cursor,source_json,decision FROM condition_identity_candidates
+         WHERE group_id=?1 AND resource=?2 AND event=?3 AND candidate_id=?4 AND (?5 IS NULL OR repo=?5)",
+        params![group_id,number,event,candidate_id,repo],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).optional()?;
+    let Some((repo, outcome, cursor, source, decision)) = candidate else {
+        anyhow::bail!("Unknown condition identity candidate");
+    };
+    if decision != "pending" {
+        anyhow::ensure!(
+            decision == if accept { "accepted" } else { "rejected" },
+            "Candidate already has a different decision"
+        );
+        tx.commit()?;
+        return Ok(false);
+    }
+    if accept {
+        anyhow::ensure!(tx.execute("UPDATE condition_members SET matched=1,armed=1,source_json=?1,matched_event_key=?2,
+            last_cursor=CASE WHEN ?3='' THEN last_cursor ELSE ?3 END
+            WHERE group_id=?4 AND kind='pull_request' AND repo=?5 AND resource=?6 AND event=?7 AND outcome=?8 AND matched=0
+              AND EXISTS(SELECT 1 FROM condition_groups g WHERE g.id=condition_members.group_id AND g.state='pending')",
+            params![source,candidate_id,cursor,group_id,repo,number,event,outcome])? == 1,
+            "Condition is no longer pending");
+    }
+    tx.execute("UPDATE condition_identity_candidates SET decision=?1 WHERE group_id=?2 AND candidate_id=?3 AND decision='pending'",
+        params![if accept {"accepted"} else {"rejected"},group_id,candidate_id])?;
+    if !accept {
+        let pending: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM condition_identity_candidates
+            WHERE group_id=?1 AND kind='pull_request' AND repo=?2 AND resource=?3 AND event=?4 AND outcome=?5 AND decision='pending')",
+            params![group_id,repo,number,event,outcome], |row| row.get(0))?;
+        if !pending {
+            let last: Option<String> = tx.query_row("SELECT max(event_cursor) FROM condition_identity_candidates
+                WHERE group_id=?1 AND kind='pull_request' AND repo=?2 AND resource=?3 AND event=?4 AND outcome=?5 AND provenance='poll' AND event_cursor!=''",
+                params![group_id,repo,number,event,outcome], |row| row.get(0))?;
+            tx.execute("UPDATE condition_members SET
+                baseline_cursor=CASE WHEN ?1 IS NULL OR baseline_cursor>=?1 THEN baseline_cursor ELSE ?1 END,
+                armed=CASE WHEN order_uncertain=0 THEN 1 ELSE armed END
+                WHERE group_id=?2 AND kind='pull_request' AND repo=?3 AND resource=?4 AND event=?5 AND outcome=?6 AND matched=0",
+                params![last,group_id,repo,number,event,outcome])?;
+        }
+    }
+    crate::conditions::refresh_ready_in(&tx)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 pub fn resolve_pr_condition_order(
     db: &Connection,
     group_id: &str,
@@ -2102,7 +2406,10 @@ pub fn resolve_pr_condition_order(
     event: &str,
     accept: bool,
 ) -> Result<bool> {
-    anyhow::ensure!(matches!(event, "closed" | "merged"), "Unsupported PR event");
+    anyhow::ensure!(
+        matches!(event, "closed" | "merged" | "synchronize" | "base_changed"),
+        "Unsupported PR event"
+    );
     let (repo, resource) = match resource.split_once('#') {
         Some((repo, number)) => {
             anyhow::ensure!(
@@ -8430,6 +8737,858 @@ mod tests {
                 .unwrap();
             assert_ne!(automatic_key, stored, "automatic key should be independent");
         }
+    }
+
+    #[test]
+    fn alpha2_pr_cursor_cannot_hide_condition_changes() {
+        for (event, alpha_observed_change) in [
+            ("synchronize", false),
+            ("synchronize", true),
+            ("base_changed", false),
+            ("base_changed", true),
+        ] {
+            let db = db();
+            subscribe(&db, "pull_request", "7", "closed");
+            let selector = crate::conditions::Selector {
+                kind: "pull_request".into(),
+                repo: "owner/repo".into(),
+                resource: "7".into(),
+                event: event.into(),
+                outcome: None,
+            };
+            let member = crate::conditions::MemberRegistration::polling(selector, None);
+            let group = crate::conditions::register_group_with_members(
+                &db,
+                crate::conditions::Mode::Or,
+                std::slice::from_ref(&member),
+                "11111111-1111-4111-8111-111111111111",
+                None,
+                None,
+            )
+            .unwrap();
+            let snapshot = |changed: bool| {
+                let head = if changed && event == "synchronize" {
+                    "b"
+                } else {
+                    "a"
+                };
+                let base = if changed && event == "base_changed" {
+                    "release"
+                } else {
+                    "main"
+                };
+                json!({"number":7,"state":"open","merged":false,
+                "merged_at":null,"closed_at":null,"updated_at":"2099-01-01T00:00:01Z",
+                "head":{"sha":head.repeat(40)},"base":{"ref":base}})
+            };
+            tick_with(&db, INTERVAL_MS, |_, _| {
+                Ok(response(snapshot(false), false))
+            })
+            .unwrap();
+            assert!(
+                crate::conditions::pending_polling_members(&db, Some(&group)).unwrap()[0].armed
+            );
+            let alpha_body = snapshot(alpha_observed_change);
+            let alpha_cursor =
+                json!({"head":alpha_body["head"]["sha"],"base":alpha_body["base"]["ref"],
+                "updated_at":alpha_body["updated_at"]})
+                .to_string();
+            db.execute("UPDATE github_poll_state SET cursor=?1,body=?2,etag='\"legacy\"',next_poll_ms=0 WHERE endpoint='/repos/owner/repo/pulls/7' AND page=0",
+                params![alpha_cursor, alpha_body.to_string()]).unwrap();
+            let result = tick_with(&db, INTERVAL_MS * 2, |route, etag| {
+                assert_eq!(route, "/repos/owner/repo/pulls/7");
+                if alpha_observed_change {
+                    assert_eq!(etag, Some("\"legacy\""));
+                    Ok(HttpResponse {
+                        status: 304,
+                        headers: BTreeMap::new(),
+                        body: Vec::new(),
+                    })
+                } else {
+                    Ok(response(snapshot(true), false))
+                }
+            })
+            .unwrap();
+            assert_eq!(result["errors"], json!({}), "{result}");
+            let ready = crate::conditions::claim_ready(&db).unwrap().unwrap();
+            assert_eq!(ready.group_id, group);
+            let mut calls = 0;
+            tick_with(&db, INTERVAL_MS * 3 + 1, |_, _| {
+                calls += 1;
+                Ok(response(snapshot(true), false))
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn condition_checkpoint_and_observation_roll_back_together() {
+        let db = db();
+        let selector = crate::conditions::Selector {
+            kind: "pull_request".into(),
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+        };
+        let member = crate::conditions::MemberRegistration::polling(selector, None);
+        let group = crate::conditions::register_group_with_members(
+            &db,
+            crate::conditions::Mode::Or,
+            std::slice::from_ref(&member),
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::conditions::arm_observed_member(&db, &group, &member, Some(&cursor_number(1)))
+            .unwrap();
+        let observations = [ConditionObservation {
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+            key: "event-key".into(),
+            cursor: cursor_number(2),
+            ci: None,
+            order_ambiguous: false,
+            source: json!({"pull_request":{"updated_at":"2099-01-01T00:00:01Z"}}),
+        }];
+        db.execute_batch(
+            "CREATE TRIGGER fail_condition_checkpoint BEFORE INSERT ON github_poll_state
+            WHEN NEW.page=-2 BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+        assert!(
+            observe_conditions_with_checkpoint(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                &observations,
+                (
+                    Some(&cursor_number(1)),
+                    Some(("/repos/owner/repo/pulls/7", "{}"))
+                ),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM github_poll_state WHERE page=-2",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        db.execute_batch("DROP TRIGGER fail_condition_checkpoint")
+            .unwrap();
+        observe_conditions_with_checkpoint(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            &observations,
+            (
+                Some(&cursor_number(1)),
+                Some(("/repos/owner/repo/pulls/7", "{}")),
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            group
+        );
+    }
+
+    #[test]
+    fn first_condition_poll_preserves_unknown_change_order_after_alpha2() {
+        for event in ["synchronize", "base_changed"] {
+            for (accept, alpha_before_registration) in
+                [(false, true), (true, true), (false, false), (true, false)]
+            {
+                let db = db();
+                subscribe(&db, "pull_request", "7", "closed");
+                let snapshot = |changed: bool| {
+                    json!({"number":7,"state":"open","merged":false,
+                    "merged_at":null,"closed_at":null,"updated_at":if changed {"2099-01-01T00:00:02Z"} else {"2026-01-01T00:00:00Z"},
+                    "head":{"sha":if changed && event == "synchronize" {"b".repeat(40)} else {"a".repeat(40)}},
+                    "base":{"ref":if changed && event == "base_changed" {"release"} else {"main"}}})
+                };
+                tick_with(&db, INTERVAL_MS, |_, _| {
+                    Ok(response(snapshot(false), false))
+                })
+                .unwrap();
+                let changed = snapshot(true);
+                let cursor = json!({"head":changed["head"]["sha"],"base":changed["base"]["ref"],"updated_at":"2026-01-01T00:00:01Z"});
+                let save_alpha = || {
+                    db.execute("UPDATE github_poll_state SET cursor=?1,body=?2,next_poll_ms=0 WHERE endpoint='/repos/owner/repo/pulls/7' AND page=0", params![cursor.to_string(),changed.to_string()]).unwrap()
+                };
+                if alpha_before_registration {
+                    save_alpha();
+                }
+                let selector = crate::conditions::Selector {
+                    kind: "pull_request".into(),
+                    repo: "owner/repo".into(),
+                    resource: "7".into(),
+                    event: event.into(),
+                    outcome: None,
+                };
+                let member = crate::conditions::MemberRegistration::polling(selector, None);
+                let group = crate::conditions::register_group_with_members(
+                    &db,
+                    crate::conditions::Mode::Or,
+                    std::slice::from_ref(&member),
+                    "11111111-1111-4111-8111-111111111111",
+                    None,
+                    None,
+                )
+                .unwrap();
+                db.execute(
+                    "UPDATE condition_groups SET created='2026-01-01 00:00:01' WHERE id=?1",
+                    [&group],
+                )
+                .unwrap();
+                if !alpha_before_registration {
+                    save_alpha();
+                }
+                tick_with(&db, INTERVAL_MS * 2, |_, _| {
+                    Ok(response(changed.clone(), false))
+                })
+                .unwrap();
+                let uncertain: i64 = db
+                    .query_row(
+                        "SELECT order_uncertain FROM condition_members WHERE group_id=?1",
+                        [&group],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(uncertain, 1);
+                assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+                assert!(resolve_pr_condition_order(&db, &group, "7", event, accept).unwrap());
+                assert_eq!(
+                    crate::conditions::claim_ready(&db).unwrap().is_some(),
+                    accept
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_condition_poll_retains_change_from_alpha2_cursor_without_sequence() {
+        for event in ["synchronize", "base_changed"] {
+            for accept in [false, true] {
+                let db = db();
+                let snapshot = |changed: bool| {
+                    json!({"number":7,"state":"open","merged":false,
+                    "merged_at":null,"closed_at":null,"updated_at":"2099-01-01T00:00:01Z",
+                    "head":{"sha":if changed && event == "synchronize" {"b".repeat(40)} else {"a".repeat(40)}},
+                    "base":{"ref":if changed && event == "base_changed" {"release"} else {"main"}}})
+                };
+                let old = snapshot(false);
+                let legacy = json!({"head":old["head"]["sha"],"base":old["base"]["ref"],"updated_at":old["updated_at"]});
+                db.execute("INSERT INTO github_poll_state(endpoint,page,cursor,body,next_poll_ms,backoff_ms,calls) VALUES('/repos/owner/repo/pulls/7',0,?1,?2,0,60000,0)", params![legacy.to_string(), old.to_string()]).unwrap();
+                let selector = crate::conditions::Selector {
+                    kind: "pull_request".into(),
+                    repo: "owner/repo".into(),
+                    resource: "7".into(),
+                    event: event.into(),
+                    outcome: None,
+                };
+                let member = crate::conditions::MemberRegistration::polling(selector, None);
+                let group = crate::conditions::register_group_with_members(
+                    &db,
+                    crate::conditions::Mode::Or,
+                    std::slice::from_ref(&member),
+                    "11111111-1111-4111-8111-111111111111",
+                    None,
+                    None,
+                )
+                .unwrap();
+                let result =
+                    tick_with(&db, INTERVAL_MS, |_, _| Ok(response(snapshot(true), false)))
+                        .unwrap();
+                assert_eq!(result["errors"], json!({}), "{result}");
+                let uncertain: i64 = db
+                    .query_row(
+                        "SELECT order_uncertain FROM condition_members WHERE group_id=?1",
+                        [&group],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(uncertain, 1);
+                assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+                assert!(resolve_pr_condition_order(&db, &group, "7", event, accept).unwrap());
+                assert_eq!(
+                    crate::conditions::claim_ready(&db).unwrap().is_some(),
+                    accept
+                );
+                if !accept {
+                    // The clock can repeat or move backwards between polls.
+                    db.execute("UPDATE github_poll_state SET next_poll_ms=0 WHERE endpoint='/repos/owner/repo/pulls/7' AND page=0", []).unwrap();
+                    let mut later = snapshot(true);
+                    if event == "synchronize" {
+                        later["head"]["sha"] = json!("c".repeat(40));
+                    } else {
+                        later["base"]["ref"] = json!("next");
+                    }
+                    let report =
+                        tick_with(&db, INTERVAL_MS, |_, _| Ok(response(later.clone(), false)))
+                            .unwrap();
+                    assert_eq!(report["errors"], json!({}), "{report}");
+                    assert_eq!(
+                        crate::conditions::claim_ready(&db)
+                            .unwrap()
+                            .unwrap()
+                            .group_id,
+                        group
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_condition_sequence_preserves_checkpoint() {
+        let db = db();
+        subscribe(&db, "pull_request", "7", "closed");
+        let exhausted =
+            json!({"head":"a".repeat(40),"base":"main","state":"open","poll_seq":i64::MAX})
+                .to_string();
+        db.execute("INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls) VALUES('/repos/owner/repo/pulls/7',-2,?1,0,60000,0)", [&exhausted]).unwrap();
+        let changed = json!({"number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,
+            "updated_at":"2099-01-01T00:00:01Z","head":{"sha":"b".repeat(40)},"base":{"ref":"main"}});
+        let report = tick_with(&db, INTERVAL_MS, |_, _| {
+            Ok(response(changed.clone(), false))
+        })
+        .unwrap();
+        assert_eq!(report["errors"]["invalid_baseline"], 1);
+        let saved: String = db
+            .query_row(
+                "SELECT cursor FROM github_poll_state WHERE page=-2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, exhausted);
+    }
+
+    #[test]
+    fn identity_collision_retains_each_group_and_publication_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conditions.sqlite");
+        let db = Connection::open(&path).unwrap();
+        crate::conditions::initialize(&db).unwrap();
+        initialize(&db).unwrap();
+        let selector = crate::conditions::Selector {
+            kind: "pull_request".into(),
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+        };
+        let member = crate::conditions::MemberRegistration::polling(selector.clone(), None);
+        let register = |db: &Connection, baseline: i64| {
+            let group = crate::conditions::register_group_with_members(
+                db,
+                crate::conditions::Mode::Or,
+                std::slice::from_ref(&member),
+                "11111111-1111-4111-8111-111111111111",
+                None,
+                None,
+            )
+            .unwrap();
+            crate::conditions::arm_observed_member(
+                db,
+                &group,
+                &member,
+                Some(&cursor_number(baseline)),
+            )
+            .unwrap();
+            group
+        };
+        let old_group = register(&db, 0);
+        let source =
+            json!({"pull_request":{"updated_at":"2099-01-01T00:00:01Z","head":{"sha":"b"}}});
+        let old = ConditionObservation {
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+            key: "legacy-b".into(),
+            cursor: cursor_number(1),
+            ci: None,
+            order_ambiguous: false,
+            source: source.clone(),
+        };
+        observe_conditions(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            &[old],
+            Some(&cursor_number(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            old_group
+        );
+        let third = crate::conditions::register_group_with_members(
+            &db,
+            crate::conditions::Mode::Or,
+            std::slice::from_ref(&member),
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            None,
+        )
+        .unwrap();
+        let webhook = crate::conditions::PublishedEvent {
+            selector: selector.clone(),
+            source_event_key: "signed-webhook".into(),
+            cursor: None,
+            ci: None,
+            source: json!({"action":"synchronize","head":"b"}),
+        };
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        crate::conditions::record_published_event_in(&tx, &webhook).unwrap();
+        tx.commit().unwrap();
+        let first = register(&db, 1);
+        let second = register(&db, 1);
+        let collision = || ConditionObservation {
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+            key: "legacy-b".into(),
+            cursor: cursor_number(2),
+            ci: None,
+            order_ambiguous: false,
+            source: source.clone(),
+        };
+        observe_conditions_with_checkpoint(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            &[collision()],
+            (
+                Some(&cursor_number(1)),
+                Some(("/repos/owner/repo/pulls/7", "{\"poll_seq\":2}")),
+            ),
+            None,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+            crate::conditions::record_published_event_in(&tx, &webhook).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(db);
+        let db = Connection::open(&path).unwrap();
+        let inspect = |group: &str| {
+            let mut after = None;
+            let mut candidates = Vec::new();
+            loop {
+                let page = list_pr_condition_identity_candidates(
+                    &db,
+                    group,
+                    "7",
+                    "synchronize",
+                    after.as_deref(),
+                )
+                .unwrap();
+                candidates.extend(page["candidates"].as_array().unwrap().iter().cloned());
+                after = page["next_cursor"].as_str().map(str::to_owned);
+                if after.is_none() {
+                    break;
+                }
+            }
+            candidates
+        };
+        for group in [&first, &second, &third] {
+            let candidates = inspect(group);
+            assert_eq!(candidates.len(), 2);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate["provenance"] == "poll")
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate["provenance"] == "publication")
+            );
+        }
+        assert_eq!(status(&db).unwrap()["condition_identity_pending"], 6);
+        let mut global_after = None;
+        let mut global = Vec::new();
+        loop {
+            let page = list_pr_condition_identity_pending(&db, global_after.as_deref()).unwrap();
+            global.extend(page["candidates"].as_array().unwrap().iter().cloned());
+            global_after = page["next_cursor"].as_str().map(str::to_owned);
+            if global_after.is_none() {
+                break;
+            }
+        }
+        assert_eq!(global.len(), 6);
+        assert_eq!(
+            global
+                .iter()
+                .filter_map(|item| item["group_id"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first.as_str(), second.as_str(), third.as_str()])
+        );
+        let first_candidates = inspect(&first);
+        let rejected = first_candidates
+            .iter()
+            .find(|candidate| candidate["provenance"] == "poll")
+            .unwrap()["candidate_id"]
+            .as_str()
+            .unwrap();
+        let accepted = first_candidates
+            .iter()
+            .find(|candidate| candidate["provenance"] == "publication")
+            .unwrap()["candidate_id"]
+            .as_str()
+            .unwrap();
+        db.execute(
+            "INSERT INTO condition_identity_candidates
+             (group_id,kind,repo,resource,event,outcome,candidate_id,original_key,event_cursor,source_json,provenance,decision)
+             SELECT group_id,kind,repo,resource,event,outcome,'other-evidence',original_key,event_cursor,source_json,provenance,'pending'
+             FROM condition_identity_candidates WHERE group_id=?1 AND candidate_id=?2",
+            params![first, accepted],
+        )
+        .unwrap();
+        assert!(
+            resolve_pr_condition_identity(&db, &first, "7", "synchronize", rejected, false)
+                .unwrap()
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        assert!(
+            resolve_pr_condition_identity(&db, &first, "7", "synchronize", accepted, true).unwrap()
+        );
+        assert!(
+            !resolve_pr_condition_identity(&db, &first, "7", "synchronize", accepted, true)
+                .unwrap()
+        );
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            first
+        );
+        let retained = inspect(&first);
+        assert_eq!(retained.len(), 3);
+        let other = retained
+            .iter()
+            .find(|candidate| candidate["candidate_id"] == "other-evidence")
+            .unwrap();
+        assert_eq!(other["decision"], "pending");
+        assert_eq!(other["actionable"], false);
+        assert_eq!(status(&db).unwrap()["condition_identity_pending"], 4);
+        for candidate in inspect(&second) {
+            assert!(
+                resolve_pr_condition_identity(
+                    &db,
+                    &second,
+                    "7",
+                    "synchronize",
+                    candidate["candidate_id"].as_str().unwrap(),
+                    false
+                )
+                .unwrap()
+            );
+        }
+        let later = ConditionObservation {
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+            key: "later-change".into(),
+            cursor: cursor_number(3),
+            ci: None,
+            order_ambiguous: false,
+            source,
+        };
+        observe_conditions(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            &[later],
+            Some(&cursor_number(2)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            second
+        );
+        assert_eq!(inspect(&second).len(), 2);
+    }
+
+    #[test]
+    fn identity_candidates_keep_and_group_pending_until_all_members_match() {
+        let db = db();
+        let member = |event: &str| {
+            crate::conditions::MemberRegistration::polling(
+                crate::conditions::Selector {
+                    kind: "pull_request".into(),
+                    repo: "owner/repo".into(),
+                    resource: "7".into(),
+                    event: event.into(),
+                    outcome: None,
+                },
+                None,
+            )
+        };
+        let group = crate::conditions::register_group_with_members(
+            &db,
+            crate::conditions::Mode::And,
+            &[member("synchronize"), member("base_changed")],
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            None,
+        )
+        .unwrap();
+        for (event, id) in [
+            ("synchronize", "head-1"),
+            ("synchronize", "head-2"),
+            ("base_changed", "base-1"),
+        ] {
+            db.execute(
+                "INSERT INTO condition_identity_candidates
+                 (group_id,kind,repo,resource,event,outcome,candidate_id,original_key,event_cursor,source_json,provenance,decision)
+                 VALUES (?1,'pull_request','owner/repo','7',?2,'',?3,'key','1','{}','poll','pending')",
+                params![group, event, id],
+            ).unwrap();
+        }
+        assert!(
+            resolve_pr_condition_identity(&db, &group, "7", "synchronize", "head-1", true).unwrap()
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        assert_eq!(status(&db).unwrap()["condition_identity_pending"], 1);
+        let first =
+            list_pr_condition_identity_candidates(&db, &group, "7", "synchronize", None).unwrap();
+        let head = list_pr_condition_identity_candidates(
+            &db,
+            &group,
+            "7",
+            "synchronize",
+            first["next_cursor"].as_str(),
+        )
+        .unwrap();
+        assert_eq!(head["candidates"][0]["candidate_id"], "head-2");
+        assert_eq!(head["candidates"][0]["decision"], "pending");
+        assert_eq!(head["candidates"][0]["actionable"], false);
+        let base = list_pr_condition_identity_pending(&db, None).unwrap();
+        assert_eq!(base["candidates"][0]["candidate_id"], "base-1");
+        assert!(
+            resolve_pr_condition_identity(&db, &group, "7", "base_changed", "base-1", true)
+                .unwrap()
+        );
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            group
+        );
+        let count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM condition_identity_candidates WHERE group_id=?1",
+                [&group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn distinct_reopen_webhooks_retain_same_second_condition_collision() {
+        let db = db();
+        subscribe(&db, "pull_request", "7", "closed");
+        let selector = crate::conditions::Selector {
+            kind: "pull_request".into(),
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+        };
+        let member = crate::conditions::MemberRegistration::polling(selector, None);
+        let register = || {
+            crate::conditions::register_group_with_members(
+                &db,
+                crate::conditions::Mode::Or,
+                std::slice::from_ref(&member),
+                "11111111-1111-4111-8111-111111111111",
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let first = register();
+        let snapshot = |head: &str| {
+            json!({"number":7,"state":"open","merged":false,"merged_at":null,
+            "closed_at":null,"updated_at":"2099-01-01T00:00:01Z","head":{"sha":head.repeat(40)},"base":{"ref":"main"}})
+        };
+        tick_with(&db, 1_000, |_, _| Ok(response(snapshot("a"), false))).unwrap();
+        let webhook = json!({"action":"reopened","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"state":"open","updated_at":"2099-01-01T00:00:01Z"}});
+        let force = |now, delivery: &str, head: &str| {
+            accept_authenticated_pr_webhook_with_fetch_at(
+                &db,
+                now,
+                "pull_request",
+                Some(delivery),
+                &webhook,
+                |route, _| match route {
+                    "/repos/owner/repo/pulls/7" => Ok(response(snapshot(head), false)),
+                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                        Ok(response(json!([]), false))
+                    }
+                    _ => panic!("unexpected route {route}"),
+                },
+            )
+            .unwrap();
+        };
+        force(1_001, "delivery-1", "b");
+        assert_eq!(
+            crate::conditions::claim_ready(&db)
+                .unwrap()
+                .unwrap()
+                .group_id,
+            first
+        );
+        force(1_002, "delivery-2", "a");
+        let second = register();
+        force(1_003, "delivery-3", "a");
+        assert!(crate::conditions::pending_polling_members(&db, Some(&second)).unwrap()[0].armed);
+        force(1_004, "delivery-4", "b");
+        let page =
+            list_pr_condition_identity_candidates(&db, &second, "7", "synchronize", None).unwrap();
+        assert_eq!(page["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(page["candidates"][0]["decision"], "pending");
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+    }
+
+    #[test]
+    fn identity_collision_and_condition_checkpoint_are_atomic() {
+        let db = db();
+        let selector = crate::conditions::Selector {
+            kind: "pull_request".into(),
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+        };
+        let source = json!({"pull_request":{"updated_at":"2099-01-01T00:00:01Z"}});
+        crate::conditions::record_published_event(
+            &db,
+            &crate::conditions::PublishedEvent {
+                selector: selector.clone(),
+                source_event_key: "legacy-collision".into(),
+                cursor: Some(cursor_number(1)),
+                ci: None,
+                source: source.clone(),
+            },
+        )
+        .unwrap();
+        let member = crate::conditions::MemberRegistration::polling(selector, None);
+        let group = crate::conditions::register_group_with_members(
+            &db,
+            crate::conditions::Mode::Or,
+            std::slice::from_ref(&member),
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::conditions::arm_observed_member(&db, &group, &member, Some(&cursor_number(1)))
+            .unwrap();
+        let observation = || ConditionObservation {
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+            key: "legacy-collision".into(),
+            cursor: cursor_number(2),
+            ci: None,
+            order_ambiguous: false,
+            source: source.clone(),
+        };
+        db.execute_batch(
+            "CREATE TRIGGER fail_identity_candidate BEFORE INSERT ON condition_identity_candidates
+            BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+        assert!(
+            observe_conditions_with_checkpoint(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                &[observation()],
+                (
+                    Some(&cursor_number(1)),
+                    Some(("/repos/owner/repo/pulls/7", "{\"poll_seq\":2}"))
+                ),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM condition_identity_candidates",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM github_poll_state WHERE page=-2",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(crate::conditions::claim_ready(&db).unwrap().is_none());
+        db.execute_batch("DROP TRIGGER fail_identity_candidate")
+            .unwrap();
+        observe_conditions_with_checkpoint(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            &[observation()],
+            (
+                Some(&cursor_number(1)),
+                Some(("/repos/owner/repo/pulls/7", "{\"poll_seq\":2}")),
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(status(&db).unwrap()["condition_identity_pending"], 1);
     }
 
     #[test]

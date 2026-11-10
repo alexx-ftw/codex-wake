@@ -456,6 +456,17 @@ pub fn initialize(db: &Connection) -> Result<()> {
             recorded TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(source_event_key)
         );
+        CREATE TABLE IF NOT EXISTS condition_identity_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL REFERENCES condition_groups(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL, repo TEXT NOT NULL, resource TEXT NOT NULL,
+            event TEXT NOT NULL, outcome TEXT NOT NULL DEFAULT '',
+            candidate_id TEXT NOT NULL, original_key TEXT NOT NULL,
+            event_cursor TEXT NOT NULL, source_json TEXT NOT NULL,
+            provenance TEXT NOT NULL CHECK(provenance IN ('poll','publication','buffered')),
+            decision TEXT NOT NULL DEFAULT 'pending' CHECK(decision IN ('observed','pending','accepted','rejected')),
+            UNIQUE(group_id,candidate_id)
+        );
         CREATE TABLE IF NOT EXISTS condition_completions (
             group_id TEXT PRIMARY KEY REFERENCES condition_groups(id),
             kind TEXT NOT NULL,
@@ -662,6 +673,16 @@ pub fn arm_observed_member_in(
     let selector = &member.selector;
     validate_selector(selector)?;
     validate_ci(selector, member.ci.as_ref())?;
+    let identity_pending: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM condition_identity_candidates WHERE group_id=?1
+         AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5 AND outcome=?6 AND decision='pending')",
+        params![group_id,selector.kind,selector.repo,selector.resource,selector.event,outcome_value(selector.outcome.as_deref())],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !identity_pending,
+        "Condition identity requires explicit resolution"
+    );
     ensure!(
         member.observation == ObservationMode::Polling,
         "Only polling members need arming"
@@ -810,10 +831,15 @@ fn reconcile_member_pending_in(
     let selector = &member.selector;
     let pending = {
         let mut statement = db.prepare(
-            "SELECT event_cursor,source_event_key,source_json FROM condition_pending_events
-             WHERE group_id=?1 AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5 AND outcome=?6
-               AND ci_repo=?7 AND ci_run_id=?8 AND ci_attempt=?9 AND ci_sha=?10
-             ORDER BY event_cursor,recorded,source_event_key",
+            "SELECT p.event_cursor,p.source_event_key,p.source_json FROM condition_pending_events p
+             WHERE p.group_id=?1 AND p.kind=?2 AND p.repo=?3 AND p.resource=?4 AND p.event=?5 AND p.outcome=?6
+               AND p.ci_repo=?7 AND p.ci_run_id=?8 AND p.ci_attempt=?9 AND p.ci_sha=?10
+               AND NOT EXISTS(SELECT 1 FROM condition_identity_candidates c WHERE c.group_id=p.group_id
+                 AND c.kind=p.kind AND c.repo=p.repo AND c.resource=p.resource AND c.event=p.event
+                 AND c.outcome=p.outcome AND c.original_key=p.source_event_key AND c.event_cursor=p.event_cursor
+                 AND c.source_json=p.source_json AND c.provenance IN ('buffered','publication')
+                 AND c.decision IN ('pending','accepted','rejected'))
+             ORDER BY p.event_cursor,p.recorded,p.source_event_key",
         )?;
         statement
             .query_map(
@@ -984,13 +1010,99 @@ fn record_native_member_event_in(
         |row| row.get(0),
     )?;
     ensure!(registered, "Native event has no armed group member");
-    record_published_event_scoped_in(db, event, Some(group_id), native_poll_provenance)
+    record_published_event_scoped_in(
+        db,
+        event,
+        Some(group_id),
+        native_poll_provenance,
+        "publication",
+    )
 }
 
 /// Transaction-aware form for publishers that already update subscriptions in
 /// a transaction; this keeps condition matching atomic with the Wake publish.
 pub fn record_published_event_in(db: &Connection, event: &PublishedEvent) -> Result<EventRecord> {
-    record_published_event_scoped_in(db, event, None, false)
+    record_published_event_scoped_in(db, event, None, false, "publication")
+}
+
+pub(crate) fn record_polled_condition_event_in(
+    db: &Connection,
+    event: &PublishedEvent,
+) -> Result<EventRecord> {
+    record_published_event_scoped_in(db, event, None, false, "poll")
+}
+
+fn retain_identity_candidates_in(
+    db: &Connection,
+    event: &PublishedEvent,
+    provenance: &str,
+    all: bool,
+) -> Result<usize> {
+    let selector = &event.selector;
+    let source = serde_json::to_string(&event.source)?;
+    let cursor = event.cursor.as_deref().unwrap_or("");
+    let groups: Vec<(String, String, bool)> = db.prepare(
+        "SELECT m.group_id,m.outcome,EXISTS(SELECT 1 FROM condition_identity_candidates c
+             WHERE c.group_id=m.group_id AND c.kind=m.kind AND c.repo=m.repo AND c.resource=m.resource
+               AND c.event=m.event AND c.outcome=m.outcome AND c.decision='pending')
+         FROM condition_members m JOIN condition_groups g ON g.id=m.group_id
+         WHERE g.state='pending' AND m.matched=0 AND m.kind=?1 AND m.repo=?2 AND m.resource=?3
+           AND m.event=?4 AND (m.outcome='' OR m.outcome=?5)
+           AND (?6 OR EXISTS(SELECT 1 FROM condition_identity_candidates c
+             WHERE c.group_id=m.group_id AND c.kind=m.kind AND c.repo=m.repo AND c.resource=m.resource
+               AND c.event=m.event AND c.outcome=m.outcome AND c.decision='pending')
+             OR (?7='publication' AND m.armed=0))"
+    )?.query_map(params![selector.kind,selector.repo,selector.resource,selector.event,
+        outcome_value(selector.outcome.as_deref()), all, provenance], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (group, outcome, pending) in &groups {
+        if all {
+            db.execute("UPDATE condition_identity_candidates SET decision='pending'
+                WHERE group_id=?1 AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5 AND outcome=?6 AND decision='observed'",
+                params![group,selector.kind,selector.repo,selector.resource,selector.event,outcome])?;
+        }
+        // Keep earlier buffered publications separately addressable before
+        // freezing this member; they may have come from a webhook.
+        if all || *pending {
+            db.execute("INSERT OR IGNORE INTO condition_identity_candidates
+          (group_id,kind,repo,resource,event,outcome,candidate_id,original_key,event_cursor,source_json,provenance)
+          SELECT p.group_id,p.kind,p.repo,p.resource,p.event,p.outcome,
+             'candidate:buffer:'||hex(p.kind||char(0)||p.repo||char(0)||p.resource||char(0)||p.event||char(0)||p.outcome||char(0)||p.source_event_key),
+             p.source_event_key,p.event_cursor,p.source_json,'buffered'
+          FROM condition_pending_events p WHERE p.group_id=?1 AND p.kind=?2 AND p.repo=?3
+             AND p.resource=?4 AND p.event=?5 AND p.outcome=?6 AND NOT EXISTS (
+               SELECT 1 FROM condition_identity_candidates c WHERE c.group_id=p.group_id
+                 AND c.kind=p.kind AND c.repo=p.repo AND c.resource=p.resource AND c.event=p.event
+                 AND c.outcome=p.outcome AND c.original_key=p.source_event_key AND c.event_cursor=p.event_cursor
+                 AND c.source_json=p.source_json AND c.provenance='publication')",
+          params![group,selector.kind,selector.repo,selector.resource,selector.event,outcome])?;
+        }
+        let mut digest = Sha256::new();
+        for field in [
+            group.as_str(),
+            selector.kind.as_str(),
+            selector.repo.as_str(),
+            selector.resource.as_str(),
+            selector.event.as_str(),
+            outcome.as_str(),
+            provenance,
+            event.source_event_key.as_str(),
+            cursor,
+            source.as_str(),
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field.as_bytes());
+        }
+        let id = format!("candidate:{:x}", digest.finalize());
+        db.execute("INSERT OR IGNORE INTO condition_identity_candidates
+           (group_id,kind,repo,resource,event,outcome,candidate_id,original_key,event_cursor,source_json,provenance,decision)
+           SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 WHERE NOT EXISTS (
+             SELECT 1 FROM condition_identity_candidates c WHERE c.group_id=?1 AND c.kind=?2
+              AND c.repo=?3 AND c.resource=?4 AND c.event=?5 AND c.outcome=?6
+              AND c.original_key=?8 AND c.event_cursor=?9 AND c.source_json=?10 AND c.provenance=?11)",
+           params![group,selector.kind,selector.repo,selector.resource,selector.event,outcome,id,event.source_event_key,cursor,source,provenance,if all || *pending {"pending"} else {"observed"}])?;
+    }
+    Ok(groups.len())
 }
 
 fn record_published_event_scoped_in(
@@ -998,6 +1110,7 @@ fn record_published_event_scoped_in(
     event: &PublishedEvent,
     native_group_id: Option<&str>,
     native_poll_provenance: bool,
+    provenance: &str,
 ) -> Result<EventRecord> {
     validate_selector(&event.selector)?;
     ensure!(
@@ -1030,6 +1143,11 @@ fn record_published_event_scoped_in(
     let (ci_repo, ci_run_id, ci_attempt, ci_sha) = ci_parts(event.ci.as_ref());
     let cursor = event.cursor.as_deref().unwrap_or("");
     let digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let pr_change = selector.kind == "pull_request"
+        && matches!(selector.event.as_str(), "synchronize" | "base_changed");
+    if pr_change {
+        retain_identity_candidates_in(db, event, provenance, false)?;
+    }
     type PriorContext = (String, String, String, String, i64, i64, String, String);
     let prior_context: Option<PriorContext> = db
         .query_row(
@@ -1053,6 +1171,9 @@ fn record_published_event_scoped_in(
             )
     }) {
         save_event_collision(db, event, &digest, None, "identity_reused")?;
+        if pr_change && retain_identity_candidates_in(db, event, provenance, true)? > 0 {
+            return Ok(EventRecord::default());
+        }
         return Ok(EventRecord {
             ready_groups: 0,
             new_members: 0,
@@ -1107,6 +1228,9 @@ fn record_published_event_scoped_in(
     if let Some(prior) = prior_digest {
         if prior != digest {
             save_event_collision(db, event, &digest, Some(&prior), "payload_changed")?;
+            if pr_change && retain_identity_candidates_in(db, event, provenance, true)? > 0 {
+                return Ok(EventRecord::default());
+            }
             return Ok(EventRecord {
                 ready_groups: 0,
                 new_members: 0,
@@ -1219,6 +1343,9 @@ fn record_published_event_scoped_in(
          SELECT group_id,kind,repo,resource,event,outcome,ci_repo,ci_run_id,ci_attempt,ci_sha,
                 ?1,?7,?12,?13
          FROM condition_members m WHERE m.matched=0 AND m.armed=0 AND m.polling=1
+           AND NOT EXISTS(SELECT 1 FROM condition_identity_candidates c
+             WHERE c.group_id=m.group_id AND c.kind=m.kind AND c.repo=m.repo AND c.resource=m.resource
+               AND c.event=m.event AND c.outcome=m.outcome AND c.decision='pending')
            AND ?7!=''
            AND m.kind=?2 AND m.repo=?3 AND m.resource=?4 AND m.event=?5
            AND (m.outcome='' OR m.outcome=?6)
@@ -1259,6 +1386,9 @@ fn record_published_event_scoped_in(
             "UPDATE condition_members AS m
              SET buffer_overflow=1,buffer_overflow_count=buffer_overflow_count+1
              WHERE matched=0 AND armed=0 AND polling=1
+               AND NOT EXISTS(SELECT 1 FROM condition_identity_candidates c
+                 WHERE c.group_id=m.group_id AND c.kind=m.kind AND c.repo=m.repo AND c.resource=m.resource
+                   AND c.event=m.event AND c.outcome=m.outcome AND c.decision='pending')
                AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5
                AND (outcome='' OR outcome=?6)
                AND (ci_run_id=0 OR (ci_repo=?8 AND ci_run_id=?9 AND ci_attempt=?10 AND ci_sha=?11))
@@ -1294,6 +1424,10 @@ fn record_published_event_scoped_in(
         "UPDATE condition_members SET matched=1,source_json=?1,matched_event_key=?12,
              last_cursor=CASE WHEN polling=1 THEN ?7 ELSE last_cursor END
          WHERE matched=0 AND kind=?2 AND repo=?3 AND resource=?4 AND event=?5
+           AND NOT EXISTS(SELECT 1 FROM condition_identity_candidates c
+             WHERE c.group_id=condition_members.group_id AND c.kind=condition_members.kind
+               AND c.repo=condition_members.repo AND c.resource=condition_members.resource
+               AND c.event=condition_members.event AND c.outcome=condition_members.outcome AND c.decision='pending')
            AND (outcome='' OR outcome=?6) AND armed=1
            AND (ci_run_id=0 OR (ci_repo=?8 AND ci_run_id=?9 AND ci_attempt=?10 AND ci_sha=?11))
            AND (

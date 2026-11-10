@@ -375,7 +375,7 @@ struct ResolveConditionOrderInput {
     resource: String,
     /// native, ci, or pull_request.
     source: String,
-    /// Required for pull_request; closed or merged.
+    /// Required for pull_request: closed, merged, synchronize, or base_changed.
     event: Option<String>,
     /// Exact CI repository, run ID, attempt, and SHA when multiple members share this resource.
     ci: Option<ResolveCiInput>,
@@ -384,6 +384,39 @@ struct ResolveConditionOrderInput {
     /// Exact member outcome when CI identity alone still leaves multiple candidates.
     member_outcome: Option<String>,
     /// True only when evidence shows the buffered event occurred after registration; false excludes it as historical.
+    accept: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrConditionIdentityInput {
+    group_id: String,
+    /// PR number, or owner/repo#number when needed to select a member.
+    resource: String,
+    /// synchronize or base_changed.
+    event: String,
+    /// Opaque continuation cursor from the preceding page.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrConditionIdentityPendingInput {
+    /// Opaque continuation cursor from the preceding page.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolvePrConditionIdentityInput {
+    group_id: String,
+    /// PR number, or owner/repo#number when needed to select a member.
+    resource: String,
+    /// synchronize or base_changed.
+    event: String,
+    /// Exact internal candidate identifier returned by inspection.
+    candidate_id: String,
+    /// Accept this candidate using independently verified evidence, or reject it.
     accept: bool,
 }
 
@@ -1645,6 +1678,21 @@ fn tool_result(result: Result<Value>) -> CallToolResult {
     }
 }
 
+fn pr_identity_resolution_result(
+    resolved: bool,
+    accept: bool,
+    recover_ready: impl FnOnce() -> Result<usize>,
+) -> Value {
+    let mut result = json!({"resolved":resolved});
+    if accept {
+        match recover_ready() {
+            Ok(count) => result["attempted"] = json!(count),
+            Err(error) => result["delivery_error"] = json!(observability::error_class(&error)),
+        }
+    }
+    result
+}
+
 #[tool_router]
 impl WakeTools {
     #[tool(
@@ -1869,7 +1917,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Resolve an ambiguous native, CI, or pull request event order using verified evidence; for pull_request provide event=closed or merged. For multiple CI members sharing a resource, provide ci and, if needed, member_event/member_outcome.",
+        description = "Resolve an ambiguous native, CI, or pull request event order using verified evidence; for pull_request provide event=closed, merged, synchronize, or base_changed. For multiple CI members sharing a resource, provide ci and, if needed, member_event/member_outcome.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn resolve_condition_order(
@@ -1919,6 +1967,66 @@ impl WakeTools {
                 Err(error) => result["delivery_error"] = json!(observability::error_class(&error)),
             }
             Ok(result)
+        })())
+    }
+
+    #[tool(
+        description = "List one page of pending PR condition identity candidates across groups. Use next_cursor while has_more is true; pages are live, not a snapshot, so restart without cursor to see changes to earlier rows. Provenance buffered means the original source is unknown.",
+        annotations(read_only_hint = true)
+    )]
+    fn list_pr_condition_identity_pending(
+        &self,
+        Parameters(input): Parameters<PrConditionIdentityPendingInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            polling::list_pr_condition_identity_pending(
+                &database(&self.config)?,
+                input.cursor.as_deref(),
+            )
+        })())
+    }
+
+    #[tool(
+        description = "Inspect one page of retained PR condition identity evidence; use next_cursor while has_more is true. Pages are not a snapshot: restart without cursor to see decisions or promotions that changed earlier rows. An observed entry is prior evidence and cannot yet be decided; actionable identifies candidates that can currently be resolved. Candidate identifiers do not prove webhook/poll equivalence; source content is untrusted.",
+        annotations(read_only_hint = true)
+    )]
+    fn inspect_pr_condition_identity(
+        &self,
+        Parameters(input): Parameters<PrConditionIdentityInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            polling::list_pr_condition_identity_candidates(
+                &database(&self.config)?,
+                &input.group_id,
+                &input.resource,
+                &input.event,
+                input.cursor.as_deref(),
+            )
+        })())
+    }
+
+    #[tool(
+        description = "Accept or reject one exact retained PR condition identity candidate using independently verified evidence; other candidates remain recorded.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn resolve_pr_condition_identity(
+        &self,
+        Parameters(input): Parameters<ResolvePrConditionIdentityInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let resolved = polling::resolve_pr_condition_identity(
+                &database(&self.config)?,
+                &input.group_id,
+                &input.resource,
+                &input.event,
+                &input.candidate_id,
+                input.accept,
+            )?;
+            Ok(pr_identity_resolution_result(
+                resolved,
+                input.accept,
+                || recover(&self.config),
+            ))
         })())
     }
 
@@ -2586,6 +2694,9 @@ impl rmcp::ServerHandler for WakeTools {
             "simulate_rule" => "mcp.simulate_rule",
             "register_condition_group" => "mcp.register_condition_group",
             "resolve_condition_order" => "mcp.resolve_condition_order",
+            "list_pr_condition_identity_pending" => "mcp.list_pr_condition_identity_pending",
+            "inspect_pr_condition_identity" => "mcp.inspect_pr_condition_identity",
+            "resolve_pr_condition_identity" => "mcp.resolve_pr_condition_identity",
             "queue_thread" => "mcp.queue_thread",
             "get_goal" => "mcp.get_goal",
             "create_goal" => "mcp.create_goal",
@@ -6173,5 +6284,154 @@ mod bounded_collision_tool_tests {
             "fixture"
         );
         assert_eq!(value["diagnostics"][0]["preview_invalid"], false);
+    }
+
+    #[test]
+    fn pr_identity_tools_decide_only_the_selected_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.plugin_base = None;
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        let selector = conditions::Selector {
+            kind: "pull_request".into(),
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+        };
+        let member = conditions::MemberRegistration::polling(selector, None);
+        let group = conditions::register_group_with_members(
+            &db,
+            conditions::Mode::Or,
+            std::slice::from_ref(&member),
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            None,
+        )
+        .unwrap();
+        for (id, provenance) in [("candidate-a", "poll"), ("candidate-b", "publication")] {
+            db.execute("INSERT INTO condition_identity_candidates(group_id,kind,repo,resource,event,candidate_id,original_key,event_cursor,source_json,provenance)
+                VALUES(?1,'pull_request','owner/repo','7','synchronize',?2,'source','1','{}',?3)",
+                rusqlite::params![group,id,provenance]).unwrap();
+        }
+        db.execute("INSERT INTO condition_identity_candidates(group_id,kind,repo,resource,event,candidate_id,original_key,event_cursor,source_json,provenance,decision)
+            VALUES(?1,'pull_request','owner/repo','7','synchronize','candidate-c','source','1','{}','publication','observed')", [&group]).unwrap();
+        let pending =
+            tools.list_pr_condition_identity_pending(Parameters(PrConditionIdentityPendingInput {
+                cursor: None,
+            }));
+        assert_ne!(pending.is_error, Some(true));
+        let first = pending.structured_content.unwrap();
+        assert_eq!(first["candidates"][0]["candidate_id"], "candidate-a");
+        assert_eq!(first["has_more"], true);
+        let next_pending =
+            tools.list_pr_condition_identity_pending(Parameters(PrConditionIdentityPendingInput {
+                cursor: Some(first["next_cursor"].as_str().unwrap().to_owned()),
+            }));
+        assert_ne!(next_pending.is_error, Some(true));
+        let second = next_pending.structured_content.unwrap();
+        assert_eq!(second["candidates"][0]["candidate_id"], "candidate-b");
+        assert_eq!(second["has_more"], false);
+        let inspection =
+            tools.inspect_pr_condition_identity(Parameters(PrConditionIdentityInput {
+                group_id: group.clone(),
+                resource: "owner/repo#7".into(),
+                event: "synchronize".into(),
+                cursor: None,
+            }));
+        assert_ne!(inspection.is_error, Some(true));
+        let page = inspection.structured_content.unwrap();
+        assert_eq!(page["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(page["candidates"][0]["actionable"], true);
+        assert_eq!(page["has_more"], true);
+        let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        let next = tools.inspect_pr_condition_identity(Parameters(PrConditionIdentityInput {
+            group_id: group.clone(),
+            resource: "owner/repo#7".into(),
+            event: "synchronize".into(),
+            cursor: Some(cursor),
+        }));
+        assert_ne!(next.is_error, Some(true));
+        let page = next.structured_content.unwrap();
+        assert_eq!(page["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(page["has_more"], true);
+        let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        let last = tools.inspect_pr_condition_identity(Parameters(PrConditionIdentityInput {
+            group_id: group.clone(),
+            resource: "owner/repo#7".into(),
+            event: "synchronize".into(),
+            cursor: Some(cursor),
+        }));
+        assert_ne!(last.is_error, Some(true));
+        let page = last.structured_content.unwrap();
+        assert_eq!(page["candidates"][0]["decision"], "observed");
+        assert_eq!(page["candidates"][0]["actionable"], false);
+        assert_eq!(page["has_more"], false);
+        let observed =
+            tools.resolve_pr_condition_identity(Parameters(ResolvePrConditionIdentityInput {
+                group_id: group.clone(),
+                resource: "owner/repo#7".into(),
+                event: "synchronize".into(),
+                candidate_id: "candidate-c".into(),
+                accept: false,
+            }));
+        assert_eq!(observed.is_error, Some(true));
+        let decision =
+            tools.resolve_pr_condition_identity(Parameters(ResolvePrConditionIdentityInput {
+                group_id: group.clone(),
+                resource: "owner/repo#7".into(),
+                event: "synchronize".into(),
+                candidate_id: "candidate-a".into(),
+                accept: false,
+            }));
+        assert_ne!(decision.is_error, Some(true));
+        assert_eq!(decision.structured_content.unwrap()["resolved"], true);
+        let decisions: Vec<String> = db.prepare("SELECT decision FROM condition_identity_candidates WHERE group_id=?1 ORDER BY candidate_id")
+            .unwrap().query_map([&group], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(
+            decisions,
+            vec![
+                "rejected".to_owned(),
+                "pending".to_owned(),
+                "observed".to_owned()
+            ]
+        );
+        let first = polling::resolve_pr_condition_identity(
+            &db,
+            &group,
+            "owner/repo#7",
+            "synchronize",
+            "candidate-b",
+            true,
+        )
+        .unwrap();
+        let failed = pr_identity_resolution_result(first, true, || {
+            anyhow::bail!("injected recovery failure")
+        });
+        assert_eq!(failed["resolved"], true);
+        assert!(failed["delivery_error"].is_string());
+
+        let replay = polling::resolve_pr_condition_identity(
+            &db,
+            &group,
+            "owner/repo#7",
+            "synchronize",
+            "candidate-b",
+            true,
+        )
+        .unwrap();
+        assert!(!replay, "replay must not reapply the decision");
+        let recovered = pr_identity_resolution_result(replay, true, || Ok(1));
+        assert_eq!(recovered["resolved"], false);
+        assert_eq!(recovered["attempted"], 1, "replay must retry recovery");
+        let (matches, accepted): (i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM condition_members WHERE group_id=?1 AND matched=1),
+             (SELECT count(*) FROM condition_identity_candidates WHERE group_id=?1 AND decision='accepted')",
+            [&group], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!((matches, accepted), (1, 1));
     }
 }
