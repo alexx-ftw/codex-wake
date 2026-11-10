@@ -798,6 +798,9 @@ where
             |row| row.get(0),
         )?;
         let recovered = std::cell::RefCell::new(BTreeMap::<String, String>::new());
+        let unresolved = std::cell::RefCell::new(BTreeMap::<String, i64>::new());
+        let submitted_versions = std::cell::RefCell::new(BTreeMap::<String, String>::new());
+        let ambiguous_ids = std::cell::RefCell::new(BTreeSet::<String>::new());
         let review_page = std::cell::Cell::new(0_usize);
         let timeline_calls = std::cell::Cell::new(0_u64);
         let recovery_route = format!("{route}/dismissal-recovery");
@@ -814,10 +817,18 @@ where
             if !matches!(response.status, 200 | 304) {
                 return Ok(response);
             }
+            let cached = if response.status == 304 {
+                state(db, &route, page).map_err(|_| Failure::new("database"))?
+            } else {
+                None
+            };
+            let has_next = if response.status == 304 {
+                cached.as_ref().is_some_and(|saved| saved.has_next)
+            } else {
+                response.has_next()
+            };
             let body = if response.status == 304 {
-                state(db, &route, page)
-                    .map_err(|_| Failure::new("database"))?
-                    .and_then(|saved| saved.body)
+                cached.and_then(|saved| saved.body)
             } else {
                 std::str::from_utf8(&response.body).ok().map(str::to_owned)
             };
@@ -828,17 +839,30 @@ where
             else {
                 return Ok(response);
             };
-            let mut unresolved = BTreeMap::new();
-            let mut floor = None::<i64>;
-            for review in reviews
-                .iter()
-                .filter(|review| review["state"] == "DISMISSED")
-            {
+            for review in &reviews {
                 let (Some(id), Some(submitted)) =
                     (positive_id(&review["id"]), review["submitted_at"].as_str())
                 else {
                     continue;
                 };
+                if ambiguous_ids.borrow().contains(&id) {
+                    continue;
+                }
+                let previous = submitted_versions
+                    .borrow_mut()
+                    .insert(id.clone(), submitted.to_owned());
+                if previous
+                    .as_deref()
+                    .is_some_and(|previous| previous != submitted)
+                {
+                    ambiguous_ids.borrow_mut().insert(id.clone());
+                    unresolved.borrow_mut().remove(&id);
+                    recovered.borrow_mut().remove(&id);
+                    continue;
+                }
+                if review["state"] != "DISMISSED" {
+                    continue;
+                }
                 let submitted_sec = pr_notifications::timestamp_second(db, submitted)
                     .map_err(|_| Failure::new("invalid_response"))?;
                 if submitted_sec < earliest_listener {
@@ -847,14 +871,16 @@ where
                 if let Some(normalized) =
                     known_automatic_review_state(db, &repo, number, &id, submitted)?
                 {
+                    unresolved.borrow_mut().remove(&id);
                     recovered.borrow_mut().insert(id, normalized.to_owned());
                     continue;
                 }
-                floor = Some(floor.map_or(submitted_sec, |old| old.min(submitted_sec)));
-                unresolved.insert(id, submitted_sec);
+                unresolved.borrow_mut().insert(id, submitted_sec);
             }
             let can_recover = recovery_error.borrow().is_none();
-            if let Some(floor) = floor
+            let floor = unresolved.borrow().values().copied().min();
+            if !has_next
+                && let Some(floor) = floor
                 && recovery_due
                 && can_recover
             {
@@ -864,7 +890,7 @@ where
                     &repo,
                     number,
                     floor,
-                    &unresolved,
+                    &unresolved.borrow(),
                     &timeline_calls,
                 ) {
                     Ok(states) => recovered.borrow_mut().extend(states),
@@ -982,6 +1008,19 @@ where
                     ),
                     None,
                 )? as u64;
+                // Apply the timeline retry state while poll_endpoint still holds
+                // its generation-checked commit guard. A stale concurrent poll
+                // must not replace a newer retry decision.
+                if let Some(error) = recovery_error.borrow().as_ref() {
+                    record_failure(db, &recovery_route, 0, now, error, 0)
+                        .map_err(|_| Failure::new("database"))?;
+                } else if timeline_calls.get() > 0 {
+                    db.execute(
+                        "DELETE FROM github_poll_state WHERE endpoint=?1 AND page=0",
+                        [&recovery_route],
+                    )
+                    .map_err(|_| Failure::new("database"))?;
+                }
                 Ok((
                     Some(
                         serde_json::to_string(&seen)
@@ -992,14 +1031,11 @@ where
             },
         )?;
         outcome.calls = outcome.calls.saturating_add(timeline_calls.get());
-        if let Some(error) = recovery_error.into_inner() {
-            record_failure(db, &recovery_route, 0, now, &error, 0)?;
+        if !outcome.skipped
+            && outcome.error.is_none()
+            && let Some(error) = recovery_error.into_inner()
+        {
             report.record_error(error.category);
-        } else if timeline_calls.get() > 0 {
-            db.execute(
-                "DELETE FROM github_poll_state WHERE endpoint=?1 AND page=0",
-                [&recovery_route],
-            )?;
         }
         report.record(outcome);
     }
@@ -9174,6 +9210,265 @@ mod tests {
             .unwrap();
             assert_eq!(second["errors"], json!({}), "{second}");
             assert_eq!(pr_notifications::pending(&db).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn dismissed_reviews_across_cached_pages_share_one_timeline_and_retry_after_failure() {
+        let db = db();
+        pr_notifications::register_in_since(
+            &db,
+            "review",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let page1 = json!([{"id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:00:00Z"},
+            {"id":33,"state":"APPROVED","submitted_at":"2026-01-02T00:02:00Z"}]);
+        let page2 = json!([{"id":32,"state":"DISMISSED","submitted_at":"2026-01-02T00:01:00Z"},
+            {"id":34,"state":"COMMENTED","submitted_at":"2026-01-02T00:03:00Z"}]);
+        let mut first_timeline_calls = 0;
+        let first = tick_with(&db, 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => {
+                Ok(response(page1.clone(), true))
+            }
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=2" => {
+                Ok(response(page2.clone(), false))
+            }
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                first_timeline_calls += 1;
+                Ok(HttpResponse {
+                    status: 503,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            }
+            _ => panic!("unexpected route {route}"),
+        })
+        .unwrap();
+        assert_eq!(first["errors"]["server_error"], 1);
+        assert_eq!(first_timeline_calls, 1);
+        assert_eq!(
+            state(
+                &db,
+                "/repos/owner/repo/pulls/7/reviews/dismissal-recovery",
+                0
+            )
+            .unwrap()
+            .unwrap()
+            .next_poll,
+            INTERVAL_MS + 1
+        );
+        assert_eq!(
+            pr_notifications::pending(&db).unwrap().len(),
+            2,
+            "other reviews must still be recorded"
+        );
+        let mut timeline_calls = 0;
+        let retry = tick_with(&db, INTERVAL_MS + 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" |
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=2" => Ok(HttpResponse {status:304,headers:BTreeMap::new(),body:vec![]}),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                timeline_calls += 1;
+                Ok(response(json!([
+                    {"event":"review_dismissed","created_at":"2026-01-02T00:04:00Z","dismissed_review":{"review_id":"31","state":"approved"}},
+                    {"event":"review_dismissed","created_at":"2026-01-02T00:05:00Z","dismissed_review":{"review_id":"32","state":"changes_requested"}}
+                ]), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        }).unwrap();
+        assert_eq!(retry["errors"], json!({}));
+        assert_eq!(timeline_calls, 1);
+        let notices = pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 4);
+        for (id, submitted, state) in [
+            ("31", "2026-01-02T00:00:00Z", "approved"),
+            ("32", "2026-01-02T00:01:00Z", "changes_requested"),
+        ] {
+            let key = automatic_review_event_key("owner/repo", "7", &[id, submitted], state);
+            assert!(notices.iter().any(|notice| notice.event_key == key));
+        }
+        tick_with(&db, 2 * INTERVAL_MS + 1, |route, _| {
+            assert!(
+                !route.contains("/timeline"),
+                "known reviews must not be scanned again"
+            );
+            Ok(HttpResponse {
+                status: 304,
+                headers: BTreeMap::new(),
+                body: vec![],
+            })
+        })
+        .unwrap();
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn stale_review_timeline_result_cannot_change_newer_recovery_backoff() {
+        for timeline_status in [200, 503] {
+            let db = db();
+            pr_notifications::register_in_since(
+                &db,
+                "review",
+                "owner/repo",
+                "7",
+                "11111111-1111-4111-8111-111111111111",
+                pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+            )
+            .unwrap();
+            let route = "/repos/owner/repo/pulls/7/reviews";
+            let recovery_route = format!("{route}/dismissal-recovery");
+            let result = tick_with(&db, 1, |requested, _| {
+                if requested.contains("/reviews?") {
+                    return Ok(response(json!([{"id":31,"state":"DISMISSED",
+                        "submitted_at":"2026-01-02T00:00:00Z"}]), false));
+                }
+                assert!(requested.contains("/timeline?"));
+                // A newer poll commits while this request is in flight.
+                db.execute("INSERT INTO github_poll_generation(endpoint,generation) VALUES(?1,1)", [route]).unwrap();
+                db.execute("INSERT INTO github_poll_state(endpoint,page,next_poll_ms,backoff_ms,error_category,calls)
+                    VALUES(?1,0,777,120000,'server_error',0)", [&recovery_route]).unwrap();
+                Ok(HttpResponse {
+                    status: timeline_status,
+                    headers: BTreeMap::new(),
+                    body: if timeline_status == 200 { b"[]".to_vec() } else { vec![] },
+                })
+            }).unwrap();
+            let saved = state(&db, &recovery_route, 0).unwrap().unwrap();
+            assert_eq!((saved.next_poll, saved.backoff), (777, 120000));
+            assert_eq!(result["errors"], json!({}));
+        }
+    }
+
+    #[test]
+    fn failed_review_page_does_not_commit_partial_batch_or_lose_dismissed_reviews() {
+        let db = db();
+        pr_notifications::register_in_since(
+            &db,
+            "review",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let page =
+            |id| json!([{"id":id,"state":"DISMISSED","submitted_at":"2026-01-02T00:00:00Z"}]);
+        let mut timeline_calls = 0;
+        let first = tick_with(&db, 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(response(page(31), true)),
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=2" => Ok(HttpResponse {
+                status: 503,
+                headers: BTreeMap::new(),
+                body: vec![],
+            }),
+            _ => {
+                timeline_calls += 1;
+                panic!("unexpected timeline {route}")
+            }
+        })
+        .unwrap();
+        assert_eq!(first["errors"]["server_error"], 1);
+        assert_eq!(timeline_calls, 0);
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+        let retry = tick_with(&db, MAX_BACKOFF_MS + 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(response(page(31), true)),
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=2" => Ok(response(page(32), false)),
+            "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => {
+                timeline_calls += 1;
+                Ok(response(json!([
+                    {"event":"review_dismissed","created_at":"2026-01-02T00:01:00Z","dismissed_review":{"review_id":"31","state":"approved"}},
+                    {"event":"review_dismissed","created_at":"2026-01-02T00:01:00Z","dismissed_review":{"review_id":"32","state":"commented"}}
+                ]), false))
+            }
+            _ => panic!("unexpected route {route}"),
+        }).unwrap();
+        assert_eq!(retry["errors"], json!({}));
+        assert_eq!(timeline_calls, 1);
+        assert_eq!(pr_notifications::pending(&db).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn conflicting_review_versions_are_not_correlated_by_id_alone() {
+        let db = db();
+        pr_notifications::register_in_since(
+            &db,
+            "review",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+            pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+        )
+        .unwrap();
+        let result = tick_with(&db, 1, |route, _| match route {
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(response(
+                json!([
+                {"id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:00:00Z"}]),
+                true,
+            )),
+            "/repos/owner/repo/pulls/7/reviews?per_page=10&page=2" => Ok(response(
+                json!([
+                {"id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:01:00Z"}]),
+                false,
+            )),
+            _ => panic!("ambiguous review identity must not be guessed: {route}"),
+        })
+        .unwrap();
+        assert_eq!(result["errors"], json!({}));
+        assert!(pr_notifications::pending(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dismissed_review_conflicting_with_an_approved_version_is_not_correlated() {
+        for approved_first in [false, true] {
+            let db = db();
+            pr_notifications::register_in_since(
+                &db,
+                "review",
+                "owner/repo",
+                "7",
+                "11111111-1111-4111-8111-111111111111",
+                pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+            )
+            .unwrap();
+            let approved =
+                json!([{"id":31,"state":"APPROVED","submitted_at":"2026-01-02T00:00:00Z"}]);
+            let dismissed =
+                json!([{"id":31,"state":"DISMISSED","submitted_at":"2026-01-02T00:01:00Z"}]);
+            let result = tick_with(&db, 1, |route, _| match route {
+                "/repos/owner/repo/pulls/7/reviews?per_page=10&page=1" => Ok(response(
+                    if approved_first {
+                        approved.clone()
+                    } else {
+                        dismissed.clone()
+                    },
+                    true,
+                )),
+                "/repos/owner/repo/pulls/7/reviews?per_page=10&page=2" => Ok(response(
+                    if approved_first {
+                        dismissed.clone()
+                    } else {
+                        approved.clone()
+                    },
+                    false,
+                )),
+                _ => panic!("conflicting review must not use timeline identity: {route}"),
+            })
+            .unwrap();
+            assert_eq!(result["errors"], json!({}));
+            let notices = pr_notifications::pending(&db).unwrap();
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0].event_key,
+                automatic_review_event_key(
+                    "owner/repo",
+                    "7",
+                    &["31", "2026-01-02T00:00:00Z"],
+                    "approved"
+                )
+            );
         }
     }
 
