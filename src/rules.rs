@@ -407,7 +407,10 @@ pub fn status(db: &Connection) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     let mut deliveries = db.prepare("SELECT rule_id,event_header,comment_id,state,thread_id,reason,event_identity_verified FROM rule_deliveries ORDER BY rule_id,event_header,comment_id")?;
-    let deliveries = deliveries.query_map([], |r| Ok(json!({"rule_id":r.get::<_,String>(0)?,"event_header":r.get::<_,String>(1)?,"comment_id":r.get::<_,String>(2)?,"state":r.get::<_,String>(3)?,"thread_id":r.get::<_,Option<String>>(4)?,"reason":r.get::<_,Option<String>>(5)?,"event_identity_verified":r.get::<_,bool>(6)?,"receipt_coverage":if r.get::<_,bool>(6)? {"unknown"} else {"unknown_source_identity"}})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let deliveries = deliveries.query_map([], |r| {
+        let state: String = r.get(3)?;
+        Ok(json!({"rule_id":r.get::<_,String>(0)?,"event_header":r.get::<_,String>(1)?,"comment_id":r.get::<_,String>(2)?,"outcome_may_be_uncertain":matches!(state.as_str(),"creating" | "needs_attention"),"state":state,"thread_id":r.get::<_,Option<String>>(4)?,"reason":r.get::<_,Option<String>>(5)?,"event_identity_verified":r.get::<_,bool>(6)?,"receipt_coverage":if r.get::<_,bool>(6)? {"unknown"} else {"unknown_source_identity"}}))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!({"rules":rules,"deliveries":deliveries}))
 }
 
@@ -1129,6 +1132,61 @@ mod tests {
         let stored_ids: Value = serde_json::from_str(&raw_ids).unwrap();
         assert_eq!(stored_ids["client_ids"], json!([expected_client_id]));
         assert_eq!(stored_ids["unattributed"], false);
+    }
+
+    #[test]
+    fn accepted_without_identity_remains_visible_and_is_not_resent_after_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rules.sqlite3");
+        let mut db = Connection::open(&path).unwrap();
+        let mut rule = input();
+        rule.target_thread = Some(THREAD.into());
+        configure(&db, rule).unwrap();
+        accept(&db, "issue_comment", &payload()).unwrap();
+        db.execute(
+            "UPDATE rule_deliveries SET event_identity_verified=0,source_event_key=NULL",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            status(&db).unwrap()["deliveries"][0]["outcome_may_be_uncertain"],
+            false
+        );
+        db.execute_batch("CREATE TRIGGER fail_accepted_rule BEFORE UPDATE ON rule_deliveries WHEN NEW.state='queued' BEGIN SELECT RAISE(ABORT,'persistence failed'); END;").unwrap();
+        let mut sends = 0;
+        let result = dispatch_with_identity(
+            &mut db,
+            directory.path(),
+            &mut |_, _| unreachable!(),
+            &mut |_, _, _, event_key, client_id| {
+                assert!(event_key.is_none());
+                assert!(client_id.is_none());
+                sends += 1;
+                Ok(("queued".into(), None))
+            },
+            &mut |_| Ok(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(sends, 1);
+        drop(db);
+        let mut db = Connection::open(&path).unwrap();
+        let status = status(&db).unwrap();
+        let delivery = &status["deliveries"][0];
+        assert_eq!(delivery["state"], "creating");
+        assert_eq!(delivery["outcome_may_be_uncertain"], true);
+        assert_eq!(delivery["event_identity_verified"], false);
+        assert_eq!(delivery["receipt_coverage"], "unknown_source_identity");
+        assert_eq!(
+            dispatch_with_identity(
+                &mut db,
+                directory.path(),
+                &mut |_, _| unreachable!(),
+                &mut |_, _, _, _, _| panic!("uncertain delivery must not be resent"),
+                &mut |_| Ok(())
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
