@@ -144,6 +144,10 @@ fn gh_pr_option_takes_value(option: &str) -> bool {
             | "-m"
             | "--milestone"
             | "--project"
+            | "-p"
+            | "-T"
+            | "--template"
+            | "--attach"
             | "-r"
             | "--reviewer"
             | "--recover"
@@ -815,6 +819,17 @@ mod tests {
             "https://github.com/acme/widget/pull/42\n",
         );
         assert_eq!(parse_pr_candidate(&event).unwrap().number, 42);
+    }
+
+    #[test]
+    fn create_option_values_are_not_treated_as_flags() {
+        for option in ["--template", "-T", "--attach", "-p"] {
+            for value in ["--dry-run", "--repo=other/repo", "-R"] {
+                let command = format!("gh pr create {option} '{value}' --repo acme/widget");
+                let event = bash(&command, "https://github.com/acme/widget/pull/42");
+                assert_eq!(parse_pr_candidate(&event).unwrap().number, 42, "{command}");
+            }
+        }
     }
 
     #[test]
