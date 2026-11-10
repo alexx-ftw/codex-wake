@@ -230,9 +230,223 @@ fn insert_listener(
         )?;
     }
     if registered_at_sec.is_some() {
+        let effective_boundary: i64 = db.query_row(
+            "SELECT registered_at_sec FROM automatic_pr_notification_listeners
+             WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4",
+            params![kind, repo, pr, thread],
+            |row| row.get(0),
+        )?;
+        backfill_historical_pr_changes_in(db, kind, repo, pr, thread, effective_boundary)?;
         replay_listener_events_in(db, kind, repo, pr, thread)?;
     }
     Ok(inserted != 0)
+}
+
+// Called in the listener registration transaction. Only the pre-journal polling
+// identity can establish both the event time and the historical source identity.
+fn backfill_historical_pr_changes_in(
+    db: &Connection,
+    kind: &str,
+    repo: &str,
+    pr: &str,
+    thread: &str,
+    registered_at_sec: i64,
+) -> Result<()> {
+    if !matches!(kind, "pull_request" | "review") {
+        return Ok(());
+    }
+    let rows: Vec<(String, String, String, String)> = {
+        let mut statement = db.prepare(
+            "SELECT repo,event,event_key,source FROM automatic_pr_notifications
+             WHERE kind=?3 AND repo=?1 COLLATE NOCASE AND pr=?2
+               AND ((kind='pull_request' AND event IN ('synchronize','base_changed'))
+                 OR (kind='review' AND event IN ('submitted','approved','changes_requested')))
+             ORDER BY created_at,rowid",
+        )?;
+        let rows = statement
+            .query_map(params![repo, pr, kind], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    for (old_repo, event, key, source) in rows {
+        let already_journaled: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+             WHERE kind=?6 AND repo=?1 COLLATE NOCASE AND pr=?2
+               AND event=?3 AND event_key=?4 AND source=?5)",
+            params![repo, pr, event, key, source, kind],
+            |row| row.get(0),
+        )?;
+        if already_journaled {
+            continue;
+        }
+        let uncertain = || -> Result<()> {
+            db.execute(
+                "INSERT OR IGNORE INTO automatic_pr_notifications
+                 (id,kind,repo,pr,thread,event,event_key,source,state)
+                 SELECT ?1,?8,?2,?3,?4,?5,?6,?7,'needs_attention'
+                 WHERE NOT EXISTS(SELECT 1 FROM automatic_pr_notifications
+                   WHERE kind=?8 AND repo=?2 COLLATE NOCASE AND pr=?3
+                     AND thread=?4 AND event_key=?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    repo,
+                    pr,
+                    thread,
+                    event,
+                    key,
+                    source,
+                    kind
+                ],
+            )?;
+            Ok(())
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&source) else {
+            uncertain()?;
+            continue;
+        };
+        let (time_path, target_path, time_json_path, target_json_path) = if kind == "review" {
+            (
+                "/review/submitted_at",
+                "/review/id",
+                "$.review.submitted_at",
+                "$.review.id",
+            )
+        } else if event == "synchronize" {
+            (
+                "/pull_request/updated_at",
+                "/pull_request/head/sha",
+                "$.pull_request.updated_at",
+                "$.pull_request.head.sha",
+            )
+        } else {
+            (
+                "/pull_request/updated_at",
+                "/pull_request/base/ref",
+                "$.pull_request.updated_at",
+                "$.pull_request.base.ref",
+            )
+        };
+        let Some(at) = payload.pointer(time_path).and_then(Value::as_str) else {
+            uncertain()?;
+            continue;
+        };
+        let Ok(second) = timestamp_second(db, at) else {
+            uncertain()?;
+            continue;
+        };
+        let target = if kind == "review" {
+            payload
+                .pointer(target_path)
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .map(|id| id.to_string())
+        } else {
+            payload
+                .pointer(target_path)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let Some(target) = target else {
+            uncertain()?;
+            continue;
+        };
+        let state = if kind == "review" {
+            let Some(state) = payload.pointer("/review/state").and_then(Value::as_str) else {
+                uncertain()?;
+                continue;
+            };
+            let state = state.to_ascii_lowercase();
+            let expected_event = match state.as_str() {
+                "approved" | "changes_requested" => state.as_str(),
+                "commented" => "submitted",
+                _ => {
+                    uncertain()?;
+                    continue;
+                }
+            };
+            if event != expected_event {
+                uncertain()?;
+                continue;
+            }
+            state
+        } else {
+            String::new()
+        };
+        if payload
+            .pointer("/repository/full_name")
+            .and_then(Value::as_str)
+            != Some(old_repo.as_str())
+            || payload
+                .pointer("/pull_request/number")
+                .and_then(Value::as_i64)
+                .map(|n| n.to_string())
+                .as_deref()
+                != Some(pr)
+            || key
+                != super::stable_source_key(
+                    kind,
+                    &old_repo,
+                    pr,
+                    &event,
+                    &state,
+                    if kind == "review" {
+                        &[target.as_str(), at]
+                    } else {
+                        &[at, target.as_str()]
+                    },
+                )
+        {
+            uncertain()?;
+            continue;
+        }
+        if second < registered_at_sec {
+            continue;
+        }
+        let conflicting: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_pr_notifications
+              WHERE kind=?9 AND repo=?1 COLLATE NOCASE AND pr=?2 AND event_key=?3
+                AND (event!=?4 OR source!=?5))
+              OR EXISTS(SELECT 1 FROM automatic_pr_notifications
+              WHERE kind=?9 AND repo=?1 COLLATE NOCASE AND pr=?2 AND event=?4
+                AND event_key!=?3 AND CASE WHEN json_valid(source) THEN
+                    CAST(strftime('%s',json_extract(source,?10)) AS INTEGER)=?6
+                    AND CAST(json_extract(source,?8) AS TEXT)=?7 ELSE 0 END)
+              OR EXISTS(SELECT 1 FROM automatic_pr_event_journal
+              WHERE kind=?9 AND repo=?1 COLLATE NOCASE AND pr=?2 AND event=?4
+                AND ((event_at_sec=?6 AND event_key!=?3 AND CASE WHEN json_valid(source)
+                    THEN CAST(json_extract(source,?8) AS TEXT)=?7 ELSE 1 END)
+                    OR (event_key=?3 AND source!=?5)))",
+            params![
+                repo,
+                pr,
+                key,
+                event,
+                source,
+                second,
+                target,
+                target_json_path,
+                kind,
+                time_json_path
+            ],
+            |row| row.get(0),
+        )?;
+        if conflicting {
+            uncertain()?;
+            continue;
+        }
+        db.execute(
+            "INSERT OR IGNORE INTO automatic_pr_event_journal
+             (kind,repo,pr,event,event_key,event_at_sec,event_at,source)
+             SELECT ?8,?1,?2,?3,?4,?5,?6,?7
+             WHERE NOT EXISTS(SELECT 1 FROM automatic_pr_event_journal
+               WHERE kind=?8 AND repo=?1 COLLATE NOCASE AND pr=?2 AND event_key=?4)",
+            params![old_repo, pr, event, key, second, at, source, kind],
+        )?;
+    }
+    Ok(())
 }
 
 /// Replay journaled events into a newly registered destination, preserving provider identity.
@@ -1629,13 +1843,267 @@ fn dispatch_with_clock(
     Ok(attempted)
 }
 
+fn possible_incomplete_key_conflict(db: &Connection, notification: &Notification) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automatic_pr_notifications WHERE kind=?1
+         AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4 AND event=?5
+         AND id!=?6 AND event_key!=?7
+         AND (event_key LIKE 'github-poll-v1:%' OR ?7 LIKE 'github-poll-v1:%')
+         AND (state!='pending' OR rowid <
+             (SELECT rowid FROM automatic_pr_notifications WHERE id=?6)))",
+        params![
+            notification.kind,
+            notification.repo,
+            notification.pr,
+            notification.thread,
+            notification.event,
+            notification.id,
+            notification.event_key
+        ],
+        |row| row.get(0),
+    )?)
+}
+
+fn possible_historical_duplicate(db: &Connection, notification: &Notification) -> Result<bool> {
+    if notification.kind == "review" {
+        let review = &notification.source["review"];
+        let Some(id) = review["id"].as_u64().filter(|id| *id > 0) else {
+            return possible_incomplete_key_conflict(db, notification);
+        };
+        let Some(at) = review["submitted_at"].as_str() else {
+            return possible_incomplete_key_conflict(db, notification);
+        };
+        let state = review["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(
+            state.as_str(),
+            "approved" | "changes_requested" | "commented"
+        ) {
+            return possible_incomplete_key_conflict(db, notification);
+        }
+        let id = id.to_string();
+        let candidate_key = super::stable_source_key(
+            "review",
+            &notification.repo,
+            &notification.pr,
+            &notification.event,
+            &state,
+            &[&id, at],
+        );
+        let mut statement = db.prepare(
+            "SELECT repo,event_key,source FROM automatic_pr_notifications
+            WHERE kind='review' AND repo=?1 COLLATE NOCASE AND pr=?2 AND thread=?3
+              AND event=?4 AND id!=?5 AND (state!='pending' OR rowid <
+                 (SELECT rowid FROM automatic_pr_notifications WHERE id=?5))",
+        )?;
+        let rows = statement.query_map(
+            params![
+                notification.repo,
+                notification.pr,
+                notification.thread,
+                notification.event,
+                notification.id
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (repo, key, source) = row?;
+            let old_value = serde_json::from_str::<Value>(&source).ok();
+            let incomplete = old_value.as_ref().is_none_or(|value| {
+                value["review"]["id"].as_u64().is_none_or(|id| id == 0)
+                    || value["review"]["submitted_at"].as_str().is_none()
+                    || value["review"]["state"].as_str().is_none_or(|state| {
+                        !["approved", "changes_requested", "commented"]
+                            .iter()
+                            .any(|valid| state.eq_ignore_ascii_case(valid))
+                    })
+            });
+            if key != notification.event_key
+                && incomplete
+                && (key.starts_with("github-poll-v1:")
+                    || notification.event_key.starts_with("github-poll-v1:"))
+            {
+                return Ok(true);
+            }
+            let matches_source = old_value.as_ref().is_some_and(|value| {
+                value["review"]["id"].as_u64() == Some(id.parse::<u64>().unwrap_or(0))
+                    && value["review"]["submitted_at"].as_str() == Some(at)
+                    && value["review"]["state"]
+                        .as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(&state))
+            });
+            if key != notification.event_key
+                && (key
+                    == super::stable_source_key(
+                        "review",
+                        &repo,
+                        &notification.pr,
+                        &notification.event,
+                        &state,
+                        &[&id, at],
+                    )
+                    || (matches_source && notification.event_key == candidate_key))
+            {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if notification.kind != "pull_request" {
+        return Ok(false);
+    }
+    if notification.event == "reopened" {
+        return Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM automatic_pr_notifications AS old
+             LEFT JOIN automatic_pr_lifecycle AS lifecycle
+               ON old.repo=lifecycle.repo COLLATE NOCASE AND old.pr=lifecycle.pr
+             WHERE old.repo=?1 COLLATE NOCASE AND old.pr=?2
+               AND old.kind='pull_request' AND old.thread=?4 AND old.event='reopened'
+               AND old.event_key!=?3
+               AND ((old.event_key='reopened:' || CAST(substr(old.event_key,10) AS INTEGER)
+                    AND CAST(substr(old.event_key,10) AS INTEGER)>0
+                    AND (lifecycle.epoch IS NULL OR CAST(substr(old.event_key,10) AS INTEGER)<=lifecycle.epoch))
+                 OR (?3='reopened:' || CAST(substr(?3,10) AS INTEGER)
+                    AND CAST(substr(?3,10) AS INTEGER)>0
+                    AND (lifecycle.epoch IS NULL OR CAST(substr(?3,10) AS INTEGER)<=lifecycle.epoch)))
+               AND old.id!=?5 AND (old.state!='pending' OR old.rowid <
+                    (SELECT rowid FROM automatic_pr_notifications WHERE id=?5)))",
+            params![
+                notification.repo,
+                notification.pr,
+                notification.event_key,
+                notification.thread,
+                notification.id
+            ],
+            |row| row.get(0),
+        )?);
+    }
+    let (at, target) = match notification.event.as_str() {
+        "closed" => (notification.source.pointer("/pull_request/closed_at"), None),
+        "merged" => (notification.source.pointer("/pull_request/merged_at"), None),
+        "synchronize" => (
+            notification.source.pointer("/pull_request/updated_at"),
+            notification.source.pointer("/pull_request/head/sha"),
+        ),
+        "base_changed" => (
+            notification.source.pointer("/pull_request/updated_at"),
+            notification.source.pointer("/pull_request/base/ref"),
+        ),
+        _ => return Ok(false),
+    };
+    let at = at.and_then(Value::as_str);
+    let target = target.and_then(Value::as_str);
+    if at.is_none()
+        || (matches!(notification.event.as_str(), "synchronize" | "base_changed")
+            && target.is_none())
+    {
+        return possible_incomplete_key_conflict(db, notification);
+    }
+    let at = at.expect("event timestamp was checked above");
+    let identity: Vec<&str> = std::iter::once(at).chain(target).collect();
+    let candidate_legacy = super::stable_source_key(
+        &notification.kind,
+        &notification.repo,
+        &notification.pr,
+        &notification.event,
+        "",
+        &identity,
+    );
+    let rows: Vec<(String, String, String, String)> = {
+        let mut statement = db.prepare(
+            "SELECT repo,event_key,source,state FROM automatic_pr_notifications
+             WHERE kind=?1 AND repo=?2 COLLATE NOCASE AND pr=?3 AND thread=?4
+               AND event=?5 AND id!=?6 AND (state!='pending' OR rowid <
+                 (SELECT rowid FROM automatic_pr_notifications WHERE id=?6))",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    notification.kind,
+                    notification.repo,
+                    notification.pr,
+                    notification.thread,
+                    notification.event,
+                    notification.id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    for (old_repo, old_key, old_source, _state) in rows {
+        let expected = super::stable_source_key(
+            &notification.kind,
+            &old_repo,
+            &notification.pr,
+            &notification.event,
+            "",
+            &identity,
+        );
+        let old_value = serde_json::from_str::<Value>(&old_source).ok();
+        let incomplete = old_value.as_ref().is_none_or(|value| {
+            let old_at = match notification.event.as_str() {
+                "closed" => value.pointer("/pull_request/closed_at"),
+                "merged" => value.pointer("/pull_request/merged_at"),
+                _ => value.pointer("/pull_request/updated_at"),
+            }
+            .and_then(Value::as_str);
+            let old_target = match notification.event.as_str() {
+                "synchronize" => value
+                    .pointer("/pull_request/head/sha")
+                    .and_then(Value::as_str),
+                "base_changed" => value
+                    .pointer("/pull_request/base/ref")
+                    .and_then(Value::as_str),
+                _ => Some("not-needed"),
+            };
+            old_at.is_none() || old_target.is_none()
+        });
+        if old_key != notification.event_key
+            && incomplete
+            && (old_key.starts_with("github-poll-v1:")
+                || notification.event_key.starts_with("github-poll-v1:"))
+        {
+            return Ok(true);
+        }
+        let same_source = old_value.as_ref().is_some_and(|value| {
+            let old_at = match notification.event.as_str() {
+                "closed" => value.pointer("/pull_request/closed_at"),
+                "merged" => value.pointer("/pull_request/merged_at"),
+                _ => value.pointer("/pull_request/updated_at"),
+            }
+            .and_then(Value::as_str);
+            let old_target = match notification.event.as_str() {
+                "synchronize" => value.pointer("/pull_request/head/sha"),
+                "base_changed" => value.pointer("/pull_request/base/ref"),
+                _ => None,
+            }
+            .and_then(Value::as_str);
+            old_at == Some(at) && old_target == target
+        });
+        if old_key != notification.event_key
+            && (old_key == expected || (same_source && notification.event_key == candidate_legacy))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn claim_next(
     db: &Connection,
     now_ms: i64,
     excluded_ids: &HashSet<String>,
 ) -> Result<Option<Notification>> {
     initialize(db)?;
-    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     let exclusion = if excluded_ids.is_empty() {
         String::new()
     } else {
@@ -1660,45 +2128,913 @@ fn claim_next(
             .cloned()
             .map(rusqlite::types::Value::Text),
     );
-    let row = tx
-        .query_row(&sql, rusqlite::params_from_iter(values), |row| {
-            let source: String = row.get(7)?;
-            Ok(Notification {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                repo: row.get(2)?,
-                pr: row.get(3)?,
-                thread: row.get(4)?,
-                event: row.get(5)?,
-                event_key: row.get(6)?,
-                source: serde_json::from_str(&source).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        7,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                state: "sending".into(),
-            })
-        })
-        .optional()?;
-    let Some(notification) = row else {
-        tx.commit()?;
-        return Ok(None);
-    };
-    let changed = tx.execute(
-        "UPDATE automatic_pr_notifications SET state='sending'
+    loop {
+        let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+        for _ in 0..16 {
+            let row = tx
+                .query_row(&sql, rusqlite::params_from_iter(values.iter()), |row| {
+                    let source: String = row.get(7)?;
+                    Ok(Notification {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        repo: row.get(2)?,
+                        pr: row.get(3)?,
+                        thread: row.get(4)?,
+                        event: row.get(5)?,
+                        event_key: row.get(6)?,
+                        source: serde_json::from_str(&source).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        state: "sending".into(),
+                    })
+                })
+                .optional()?;
+            let Some(notification) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            if possible_historical_duplicate(&tx, &notification)? {
+                let changed = tx.execute(
+                    "UPDATE automatic_pr_notifications SET state='needs_attention'
+             WHERE id=?1 AND state='pending'",
+                    [&notification.id],
+                )?;
+                ensure!(changed == 1, "Could not retain ambiguous PR notification");
+                continue;
+            }
+            let changed = tx.execute(
+                "UPDATE automatic_pr_notifications SET state='sending'
          WHERE id=?1 AND state='pending'",
-        [&notification.id],
-    )?;
-    ensure!(changed == 1, "Could not claim pending PR notification");
-    tx.commit()?;
-    Ok(Some(notification))
+                [&notification.id],
+            )?;
+            ensure!(changed == 1, "Could not claim pending PR notification");
+            tx.commit()?;
+            return Ok(Some(notification));
+        }
+        // Bound each writer transaction while continuing to the next eligible row.
+        tx.commit()?;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Schema from 17f68ae^, before the event journal existed.
+    fn pre_journal_notifications(db: &Connection) {
+        db.execute_batch(
+            "CREATE TABLE automatic_pr_notifications (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('pull_request','review')),
+                repo TEXT NOT NULL, pr TEXT NOT NULL, thread TEXT NOT NULL,
+                event TEXT NOT NULL, event_key TEXT NOT NULL, source TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(state IN ('pending','sending','queued','needs_attention')),
+                available_at_ms INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(kind,repo,pr,thread,event_key));",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn historical_backfill_uses_existing_earlier_listener_boundary() {
+        let db = Connection::open_in_memory().unwrap();
+        pre_journal_notifications(&db);
+        let thread = "22222222-2222-4222-8222-222222222222";
+        let event_at = "2099-01-01T00:00:20Z";
+        let second = timestamp_second(&db, event_at).unwrap();
+        register_in_since(&db, "pull_request", "owner/repo", "7", thread, second - 10).unwrap();
+        let source = json!({"action":"synchronize","number":7,
+            "repository":{"full_name":"Owner/Repo"},"pull_request":{"number":7,
+            "updated_at":event_at,"head":{"sha":"b".repeat(40)}}});
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('old','pull_request','Owner/Repo','7',?1,'synchronize',?2,?3,'queued')",
+            params![
+                "11111111-1111-4111-8111-111111111111",
+                "github-poll-v1:3e2ec3ae29e97517cef87acca2b48ff2b3e0f6505755d5020148d957d83846ef",
+                source.to_string()
+            ],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            register_in_since(&db, "pull_request", "owner/repo", "7", thread, second + 10).unwrap();
+        }
+        let (boundary,count): (i64,i64) = db.query_row(
+            "SELECT registered_at_sec,(SELECT count(*) FROM automatic_pr_notifications WHERE thread=?1 AND state='pending')
+             FROM automatic_pr_notification_listeners WHERE thread=?1",[thread],
+            |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((boundary, count), (second - 10, 1));
+    }
+
+    #[test]
+    fn historical_review_replays_once_without_a_rest_response() {
+        let db = Connection::open_in_memory().unwrap();
+        pre_journal_notifications(&db);
+        let at = "2099-01-01T00:00:20Z";
+        let source = json!({"action":"submitted","pull_request":{"number":7},
+            "repository":{"full_name":"Owner/Repo"},
+            "review":{"id":42,"state":"approved","submitted_at":at}});
+        let key = "github-poll-v1:65ee56249b630070b5ce0c9c0a502b075cc031616843edf717c0655e5f7adafe";
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('old','review','Owner/Repo','7',?1,'approved',?2,?3,'queued')",
+            params![
+                "11111111-1111-4111-8111-111111111111",
+                key,
+                source.to_string()
+            ],
+        )
+        .unwrap();
+        let thread = "22222222-2222-4222-8222-222222222222";
+        for _ in 0..2 {
+            register_in_since(
+                &db,
+                "review",
+                "owner/repo",
+                "7",
+                thread,
+                timestamp_second(&db, at).unwrap() - 1,
+            )
+            .unwrap();
+        }
+        let (old,journal,new): (String,i64,i64) = db.query_row(
+            "SELECT (SELECT state FROM automatic_pr_notifications WHERE id='old'),
+                    (SELECT count(*) FROM automatic_pr_event_journal WHERE kind='review' AND event_key=?1),
+                    (SELECT count(*) FROM automatic_pr_notifications WHERE thread=?2 AND state='pending' AND event_key=?1)",
+            params![key,thread],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!((old, journal, new), ("queued".to_owned(), 1, 1));
+    }
+
+    #[test]
+    fn invalid_historical_review_is_retained_as_attention() {
+        let db = Connection::open_in_memory().unwrap();
+        pre_journal_notifications(&db);
+        let source = json!({"action":"submitted","pull_request":{"number":7},
+            "repository":{"full_name":"Owner/Repo"},
+            "review":{"id":0,"state":"approved","submitted_at":"2099-01-01T00:00:20Z"}});
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('old','review','Owner/Repo','7',?1,'approved','unknown-key',?2,'queued')",
+            params!["11111111-1111-4111-8111-111111111111", source.to_string()],
+        )
+        .unwrap();
+        let thread = "22222222-2222-4222-8222-222222222222";
+        register_in_since(&db, "review", "owner/repo", "7", thread, 0).unwrap();
+        let (state,journal): (String,i64) = db.query_row(
+            "SELECT state,(SELECT count(*) FROM automatic_pr_event_journal) FROM automatic_pr_notifications WHERE thread=?1",
+            [thread],|row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!((state, journal), ("needs_attention".to_owned(), 0));
+    }
+
+    #[test]
+    fn historical_unverifiable_sources_remain_visible_without_replay() {
+        let at = "2099-01-01T00:00:20Z";
+        let sources = [
+            json!({"action":"synchronize","pull_request":{"number":7}}),
+            json!({"action":"synchronize","number":7,"repository":{"full_name":"other/repo"},
+                "pull_request":{"number":7,"updated_at":at,"head":{"sha":"b".repeat(40)}}}),
+        ];
+        for source in sources {
+            let db = Connection::open_in_memory().unwrap();
+            pre_journal_notifications(&db);
+            let source = source.to_string();
+            db.execute("INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state)
+                VALUES('old','pull_request','Owner/Repo','7',?1,'synchronize','unknown-key',?2,'needs_attention')",
+                params!["11111111-1111-4111-8111-111111111111",source]).unwrap();
+            let thread = "22222222-2222-4222-8222-222222222222";
+            register_in_since(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                thread,
+                timestamp_second(&db, at).unwrap() + 10,
+            )
+            .unwrap();
+            let old: (String, String) = db
+                .query_row(
+                    "SELECT state,source FROM automatic_pr_notifications WHERE id='old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(old, ("needs_attention".to_owned(), source));
+            let (journal, late): (i64, String) = db
+                .query_row(
+                    "SELECT (SELECT count(*) FROM automatic_pr_event_journal),state
+                 FROM automatic_pr_notifications WHERE thread=?1",
+                    [thread],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((journal, late), (0, "needs_attention".to_owned()));
+            assert!(
+                claim_next(&db, i64::MAX, &HashSet::new())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_preserves_distinct_historical_heads_in_the_same_second() {
+        let db = Connection::open_in_memory().unwrap();
+        pre_journal_notifications(&db);
+        let at = "2099-01-01T00:00:20Z";
+        for (id, head, key) in [
+            (
+                "old-b",
+                "b",
+                "github-poll-v1:3e2ec3ae29e97517cef87acca2b48ff2b3e0f6505755d5020148d957d83846ef",
+            ),
+            (
+                "old-c",
+                "c",
+                "github-poll-v1:13bf4761de8d6e5711c952dba8a346066a1648555e7ca36305132c6a7bd22186",
+            ),
+        ] {
+            let source = json!({"action":"synchronize","number":7,
+                "repository":{"full_name":"Owner/Repo"},
+                "pull_request":{"number":7,"updated_at":at,"head":{"sha":head.repeat(40)}}});
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state)
+                VALUES(?1,'pull_request','Owner/Repo','7',?2,'synchronize',?3,?4,'queued')",
+                params![
+                    id,
+                    "11111111-1111-4111-8111-111111111111",
+                    key,
+                    source.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        register_in_since(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "22222222-2222-4222-8222-222222222222",
+            timestamp_second(&db, at).unwrap(),
+        )
+        .unwrap();
+        let (journal, pending): (i64, i64) = db
+            .query_row(
+                "SELECT (SELECT count(*) FROM automatic_pr_event_journal),
+                    (SELECT count(*) FROM automatic_pr_notifications WHERE state='pending')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((journal, pending), (2, 2));
+    }
+
+    #[test]
+    fn ambiguous_historical_case_aliases_are_visible_to_late_listener() {
+        let db = Connection::open_in_memory().unwrap();
+        pre_journal_notifications(&db);
+        let at = "2099-01-01T00:00:20Z";
+        for (id, repo, key) in [
+            (
+                "upper",
+                "Owner/Repo",
+                "github-poll-v1:3e2ec3ae29e97517cef87acca2b48ff2b3e0f6505755d5020148d957d83846ef",
+            ),
+            (
+                "lower",
+                "owner/repo",
+                "github-poll-v1:197290511767b98f87a5f44345105335bb6c71b2e1f44a02711a2ae673460093",
+            ),
+        ] {
+            let source = json!({"action":"synchronize","number":7,
+                "repository":{"full_name":repo},"pull_request":{"number":7,
+                    "updated_at":at,"head":{"sha":"b".repeat(40)}}});
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state)
+                VALUES(?1,'pull_request',?2,'7',?3,'synchronize',?4,?5,'queued')",
+                params![
+                    id,
+                    repo,
+                    "11111111-1111-4111-8111-111111111111",
+                    key,
+                    source.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let thread = "22222222-2222-4222-8222-222222222222";
+        for _ in 0..2 {
+            register_in_since(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                thread,
+                timestamp_second(&db, at).unwrap(),
+            )
+            .unwrap();
+        }
+        let (journal,attention,pending): (i64,i64,i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM automatic_pr_event_journal),
+             (SELECT count(*) FROM automatic_pr_notifications WHERE thread=?1 AND state='needs_attention'),
+             (SELECT count(*) FROM automatic_pr_notifications WHERE thread=?1 AND state='pending')",
+             [thread],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!((journal, attention, pending), (0, 2, 0));
+    }
+
+    #[test]
+    fn existing_journal_event_still_replays_normally_to_another_listener() {
+        let db = Connection::open_in_memory().unwrap();
+        let at = "2099-01-01T00:00:20Z";
+        let boundary = timestamp_second(&db, at).unwrap();
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        register_in_since(&db, "pull_request", "owner/repo", "7", first, boundary).unwrap();
+        let source = json!({"action":"synchronize","number":7,
+            "repository":{"full_name":"owner/repo"},"pull_request":{"number":7,
+            "updated_at":at,"head":{"sha":"b".repeat(40)}}});
+        record_event(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "synchronize",
+            at,
+            "current-event",
+            &source,
+        )
+        .unwrap();
+        register_in_since(&db, "pull_request", "owner/repo", "7", second, boundary).unwrap();
+        let state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE thread=?1",
+                [second],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
+    #[test]
+    fn historical_backfill_failure_rolls_back_listener_registration() {
+        let db = Connection::open_in_memory().unwrap();
+        pre_journal_notifications(&db);
+        initialize(&db).unwrap();
+        let at = "2099-01-01T00:00:20Z";
+        let source = json!({"action":"synchronize","number":7,
+            "repository":{"full_name":"Owner/Repo"},
+            "pull_request":{"number":7,"updated_at":at,"head":{"sha":"b".repeat(40)}}});
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('old','pull_request','Owner/Repo','7',?1,'synchronize',?2,?3,'queued')",
+            params![
+                "11111111-1111-4111-8111-111111111111",
+                "github-poll-v1:3e2ec3ae29e97517cef87acca2b48ff2b3e0f6505755d5020148d957d83846ef",
+                source.to_string()
+            ],
+        )
+        .unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_backfill BEFORE INSERT ON automatic_pr_event_journal
+            BEGIN SELECT RAISE(ABORT,'fixture failure'); END;",
+        )
+        .unwrap();
+        assert!(
+            register_in_since(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "22222222-2222-4222-8222-222222222222",
+                timestamp_second(&db, at).unwrap()
+            )
+            .is_err()
+        );
+        let (listeners, journal, state): (i64, i64, String) = db
+            .query_row(
+                "SELECT (SELECT count(*) FROM automatic_pr_notification_listeners),
+                    (SELECT count(*) FROM automatic_pr_event_journal),
+                    (SELECT state FROM automatic_pr_notifications WHERE id='old')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((listeners, journal, state), (0, 0, "queued".to_owned()));
+    }
+
+    #[test]
+    fn historical_mixed_case_close_never_claims_a_duplicate() {
+        for prior_state in ["queued", "needs_attention", "sending"] {
+            let db = Connection::open_in_memory().unwrap();
+            pre_journal_notifications(&db);
+            let thread = "11111111-1111-4111-8111-111111111111";
+            let at = "2099-01-01T00:00:20Z";
+            let old_key =
+                "github-poll-v1:de6660a7969bc4790af100ce4495f301983b265d12862fb122515ef711434ee0";
+            let new_key = super::super::stable_source_key(
+                "pull_request",
+                "owner/repo",
+                "7",
+                "closed",
+                "",
+                &[at],
+            );
+            assert_ne!(old_key, new_key);
+            let source = json!({"action":"closed","number":7,"repository":{"full_name":"Owner/Repo"},
+                "pull_request":{"number":7,"closed_at":at,"merged":false}});
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                 (id,kind,repo,pr,thread,event,event_key,source,state)
+                 VALUES('old','pull_request','Owner/Repo','7',?1,'closed',?2,?3,?4)",
+                params![thread, old_key, source.to_string(), prior_state],
+            )
+            .unwrap();
+            register_in_since(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                thread,
+                timestamp_second(&db, at).unwrap(),
+            )
+            .unwrap();
+            record_event(
+                &db,
+                "pull_request",
+                "owner/repo",
+                "7",
+                "closed",
+                at,
+                &new_key,
+                &source,
+            )
+            .unwrap();
+            let expected_old_state = if prior_state == "sending" {
+                // The original is accepted after the duplicate is recorded, before its claim.
+                assert!(mark_queued(&db, "old").unwrap());
+                "queued"
+            } else {
+                prior_state
+            };
+            assert!(
+                claim_next(&db, i64::MAX, &HashSet::new())
+                    .unwrap()
+                    .is_none(),
+                "a possible duplicate must not be claimed"
+            );
+            let old_state: String = db
+                .query_row(
+                    "SELECT state FROM automatic_pr_notifications WHERE id='old'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(old_state, expected_old_state);
+            let new_state: String = db
+                .query_row(
+                    "SELECT state FROM automatic_pr_notifications WHERE event_key=?1 AND id!='old'",
+                    [&new_key],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(new_state, "needs_attention");
+        }
+    }
+
+    #[test]
+    fn legacy_inserted_after_queued_canonical_close_is_not_claimed() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let at = "2099-01-01T00:00:20Z";
+        let source = json!({"action":"closed","number":7,
+            "repository":{"full_name":"Owner/Repo"},
+            "pull_request":{"number":7,"closed_at":at,"merged":false}})
+        .to_string();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        for (id, repo, state) in [
+            ("canonical", "owner/repo", "queued"),
+            ("legacy", "Owner/Repo", "pending"),
+        ] {
+            let key =
+                super::super::stable_source_key("pull_request", repo, "7", "closed", "", &[at]);
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state)
+                VALUES(?1,'pull_request',?2,'7',?3,'closed',?4,?5,?6)",
+                params![id, repo, thread, key, source, state],
+            )
+            .unwrap();
+        }
+        assert!(
+            claim_next(&db, i64::MAX, &HashSet::new())
+                .unwrap()
+                .is_none()
+        );
+        let states: Vec<String> = db
+            .prepare("SELECT state FROM automatic_pr_notifications ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(states, ["queued", "needs_attention"]);
+    }
+
+    #[test]
+    fn incomplete_poll_and_other_identity_stays_uncertain_in_both_orders() {
+        for state in ["queued", "sending"] {
+            let legacy =
+                "github-poll-v1:de6660a7969bc4790af100ce4495f301983b265d12862fb122515ef711434ee0";
+            for (first_key, second_key) in [(legacy, "webhook-key"), ("webhook-key", legacy)] {
+                let db = Connection::open_in_memory().unwrap();
+                initialize(&db).unwrap();
+                let thread = "11111111-1111-4111-8111-111111111111";
+                for (id, key, row_state) in [
+                    ("original", first_key, state),
+                    ("new", second_key, "pending"),
+                ] {
+                    db.execute(
+                        "INSERT INTO automatic_pr_notifications
+                        (id,kind,repo,pr,thread,event,event_key,source,state)
+                        VALUES(?1,'pull_request','owner/repo','7',?2,'closed',?3,'{}',?4)",
+                        params![id, thread, key, row_state],
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    claim_next(&db, i64::MAX, &HashSet::new())
+                        .unwrap()
+                        .is_none()
+                );
+                let states: Vec<String> = db
+                    .prepare("SELECT state FROM automatic_pr_notifications ORDER BY rowid")
+                    .unwrap()
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(states, [state, "needs_attention"]);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_source_on_either_side_keeps_possible_duplicate_uncertain() {
+        let cases = [
+            (
+                "pull_request",
+                "closed",
+                json!({"pull_request":{"closed_at":"2099-01-01T00:00:20Z"}}),
+            ),
+            (
+                "review",
+                "approved",
+                json!({"review":{"id":42,"state":"approved","submitted_at":"2099-01-01T00:00:20Z"}}),
+            ),
+        ];
+        for (kind, event, complete) in cases {
+            for old_incomplete in [true, false] {
+                for old_state in ["queued", "sending"] {
+                    let db = Connection::open_in_memory().unwrap();
+                    initialize(&db).unwrap();
+                    let thread = "11111111-1111-4111-8111-111111111111";
+                    for (id, repo, key, source, state) in [
+                        (
+                            "old",
+                            "Owner/Repo",
+                            "github-poll-v1:old",
+                            if old_incomplete {
+                                json!({})
+                            } else {
+                                complete.clone()
+                            },
+                            old_state,
+                        ),
+                        (
+                            "new",
+                            "owner/repo",
+                            "github-poll-v1:new",
+                            if old_incomplete {
+                                complete.clone()
+                            } else {
+                                json!({})
+                            },
+                            "pending",
+                        ),
+                    ] {
+                        db.execute(
+                            "INSERT INTO automatic_pr_notifications
+                            (id,kind,repo,pr,thread,event,event_key,source,state)
+                            VALUES(?1,?2,?3,'7',?4,?5,?6,?7,?8)",
+                            params![
+                                id,
+                                kind,
+                                repo,
+                                thread,
+                                event,
+                                key,
+                                source.to_string(),
+                                state
+                            ],
+                        )
+                        .unwrap();
+                    }
+                    assert!(
+                        claim_next(&db, i64::MAX, &HashSet::new())
+                            .unwrap()
+                            .is_none()
+                    );
+                    let (old, new): (String, String) = db
+                        .query_row(
+                            "SELECT (SELECT state FROM automatic_pr_notifications WHERE id='old'),
+                                (SELECT state FROM automatic_pr_notifications WHERE id='new')",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        (old, new),
+                        (old_state.to_owned(), "needs_attention".to_owned())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_historical_review_identity_stays_uncertain() {
+        let at = "2099-01-01T00:00:20Z";
+        for (old_id, old_state) in [(0, "approved"), (42, "unknown")] {
+            let db = Connection::open_in_memory().unwrap();
+            initialize(&db).unwrap();
+            let thread = "11111111-1111-4111-8111-111111111111";
+            for (id, review_id, review_state, state) in [
+                ("old", old_id, old_state, "queued"),
+                ("new", 42, "approved", "pending"),
+            ] {
+                let source =
+                    json!({"review":{"id":review_id,"state":review_state,"submitted_at":at}});
+                db.execute(
+                    "INSERT INTO automatic_pr_notifications
+                    (id,kind,repo,pr,thread,event,event_key,source,state)
+                    VALUES(?1,'review','owner/repo','7',?2,'approved',?3,?4,?5)",
+                    params![
+                        id,
+                        thread,
+                        format!("github-poll-v1:{id}"),
+                        source.to_string(),
+                        state
+                    ],
+                )
+                .unwrap();
+            }
+            assert!(
+                claim_next(&db, i64::MAX, &HashSet::new())
+                    .unwrap()
+                    .is_none()
+            );
+            let state: String = db
+                .query_row(
+                    "SELECT state FROM automatic_pr_notifications WHERE id='new'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "needs_attention");
+        }
+    }
+
+    #[test]
+    fn proven_distinct_historical_events_are_still_claimable() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        for (id, repo, at, state) in [
+            ("old", "Owner/Repo", "2099-01-01T00:00:20Z", "queued"),
+            ("new", "owner/repo", "2099-01-01T00:00:21Z", "pending"),
+        ] {
+            let key =
+                super::super::stable_source_key("pull_request", repo, "7", "closed", "", &[at]);
+            let source = json!({"pull_request":{"closed_at":at}});
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state)
+                VALUES(?1,'pull_request',?2,'7',?3,'closed',?4,?5,?6)",
+                params![id, repo, thread, key, source.to_string(), state],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            claim_next(&db, i64::MAX, &HashSet::new())
+                .unwrap()
+                .unwrap()
+                .id,
+            "new"
+        );
+
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let at = "2099-01-01T00:00:20Z";
+        for (id, repo, review_id, state) in [
+            ("old", "Owner/Repo", 42, "queued"),
+            ("new", "owner/repo", 43, "pending"),
+        ] {
+            let key = super::super::stable_source_key(
+                "review",
+                repo,
+                "7",
+                "approved",
+                "approved",
+                &[&review_id.to_string(), at],
+            );
+            let source = json!({"review":{"id":review_id,"state":"approved","submitted_at":at}});
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state)
+                VALUES(?1,'review',?2,'7',?3,'approved',?4,?5,?6)",
+                params![id, repo, thread, key, source.to_string(), state],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            claim_next(&db, i64::MAX, &HashSet::new())
+                .unwrap()
+                .unwrap()
+                .id,
+            "new"
+        );
+    }
+
+    #[test]
+    fn ambiguous_backlog_does_not_hide_unrelated_notification() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let at = "2099-01-01T00:00:20Z";
+        let thread = "11111111-1111-4111-8111-111111111111";
+        for n in 1..=17 {
+            let pr = n.to_string();
+            let source = json!({"action":"closed","number":n,
+                "repository":{"full_name":"Owner/Repo"},
+                "pull_request":{"number":n,"closed_at":at,"merged":false}})
+            .to_string();
+            for (prefix, repo, state) in [
+                ("old", "Owner/Repo", "queued"),
+                ("new", "owner/repo", "pending"),
+            ] {
+                let key =
+                    super::super::stable_source_key("pull_request", repo, &pr, "closed", "", &[at]);
+                db.execute(
+                    "INSERT INTO automatic_pr_notifications
+                    (id,kind,repo,pr,thread,event,event_key,source,state)
+                    VALUES(?1,'pull_request',?2,?3,?4,'closed',?5,?6,?7)",
+                    params![
+                        format!("{prefix}-{n}"),
+                        repo,
+                        pr,
+                        thread,
+                        key,
+                        source,
+                        state
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        db.execute("INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('unrelated','pull_request','owner/other','99',?1,'closed','unrelated','{}','pending')", [thread]).unwrap();
+        let claimed = claim_next(&db, i64::MAX, &HashSet::new()).unwrap().unwrap();
+        assert_eq!(claimed.id, "unrelated");
+        let count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM automatic_pr_notifications WHERE state='needs_attention'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 17);
+    }
+
+    #[test]
+    fn historical_epoch_reopen_never_claims_a_duplicate() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let at = "2099-01-01T00:00:20Z";
+        let closed = timestamp_second(&db, "2099-01-01T00:00:10Z").unwrap();
+        register_in_since(&db, "pull_request", "owner/repo", "7", thread, closed).unwrap();
+        // e01c08d wrote epoch keys; the 17f68ae migration skipped reopened lifecycles.
+        db.execute(
+            "INSERT INTO automatic_pr_lifecycle
+            (repo,pr,epoch,state,closed_at_sec,reopened_at_sec,poll_reopen_source_id)
+            VALUES('owner/repo','7',1,'reopened',?1,?2,'timeline:4')",
+            params![closed, timestamp_second(&db, at).unwrap()],
+        )
+        .unwrap();
+        let source = json!({"action":"reopened","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":at}});
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('old','pull_request','owner/repo','7',?1,'reopened','reopened:1',?2,'queued')",
+            params![thread, source.to_string()],
+        )
+        .unwrap();
+        record_reopened_event_with_id(&db, "owner/repo", "7", "poll", at, "timeline:4").unwrap();
+        assert!(
+            claim_next(&db, i64::MAX, &HashSet::new())
+                .unwrap()
+                .is_none(),
+            "a possible duplicate must not be claimed"
+        );
+        let old_state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id='old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_state, "queued");
+        let new_state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE event_key=?1 AND id!='old'",
+                [format!("reopened:{closed}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_state, "needs_attention");
+    }
+
+    #[test]
+    fn earlier_payload_time_alone_does_not_prove_a_distinct_reopen() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let close = timestamp_second(&db, "2099-01-01T00:00:10Z").unwrap();
+        db.execute(
+            "INSERT INTO automatic_pr_lifecycle
+            (repo,pr,epoch,state,closed_at_sec,reopened_at_sec)
+            VALUES('owner/repo','7',2,'reopened',?1,?2)",
+            params![close, close + 10],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO automatic_pr_closed_cycles(repo,pr,closed_at_sec)
+            VALUES('owner/repo','7',?1)",
+            [close],
+        )
+        .unwrap();
+        let old_source = json!({"pull_request":{"updated_at":"2099-01-01T00:00:05Z"}}).to_string();
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('old','pull_request','owner/repo','7',?1,'reopened','reopened:1',?2,'queued')",
+            params![thread, old_source],
+        )
+        .unwrap();
+        let new_key = format!("reopened:{close}");
+        db.execute(
+            "INSERT INTO automatic_pr_notifications
+            (id,kind,repo,pr,thread,event,event_key,source,state)
+            VALUES('later','pull_request','owner/repo','7',?1,'reopened',?2,'{}','pending')",
+            params![thread, new_key],
+        )
+        .unwrap();
+        assert!(
+            claim_next(&db, i64::MAX, &HashSet::new())
+                .unwrap()
+                .is_none()
+        );
+        let new_state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id='later'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_state, "needs_attention");
+        let old_state: String = db
+            .query_row(
+                "SELECT state FROM automatic_pr_notifications WHERE id='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_state, "queued");
+    }
 
     #[test]
     fn legacy_notification_columns_are_added_without_losing_rows() {
