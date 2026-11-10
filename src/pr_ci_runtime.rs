@@ -1063,7 +1063,7 @@ fn terminate_process_group_with(
         } else {
             None
         };
-        if group_error.is_some() {
+        if let Some(ref group_error) = group_error {
             // A failed group signal must still address the exact leader, never
             // its reusable numeric PID. Group cleanup remains uncertain.
             let result = unsafe {
@@ -1078,7 +1078,7 @@ fn terminate_process_group_with(
             if result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
                 return Err(std::io::Error::other(format!(
                     "group signal failed: {}; leader signal failed: {}",
-                    group_error.unwrap(),
+                    group_error,
                     std::io::Error::last_os_error()
                 )));
             }
