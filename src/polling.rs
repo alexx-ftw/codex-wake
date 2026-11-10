@@ -9343,6 +9343,126 @@ mod tests {
     }
 
     #[test]
+    fn stale_review_timeline_from_another_process_preserves_newer_backoff() {
+        use std::{process::Command, thread};
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn wait_for(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {}",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn review_response(route: &str, timeline_status: u16) -> HttpResponse {
+            if route.contains("/reviews?") {
+                response(
+                    json!([{"id":31,"state":"DISMISSED",
+                    "submitted_at":"2026-01-02T00:00:00Z"}]),
+                    false,
+                )
+            } else {
+                assert!(route.contains("/timeline?"));
+                HttpResponse {
+                    status: timeline_status,
+                    headers: BTreeMap::new(),
+                    body: if timeline_status == 200 {
+                        b"[]".to_vec()
+                    } else {
+                        vec![]
+                    },
+                }
+            }
+        }
+        if let Some(directory) = std::env::var_os("WAKE_REVIEW_BACKOFF_TEST_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            let db = Connection::open(directory.join("state.sqlite")).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let status: u16 = std::env::var("WAKE_REVIEW_BACKOFF_TEST_STATUS")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let result = tick_with(&db, 1, |route, _| {
+                if route.contains("/timeline?") {
+                    std::fs::write(directory.join("started"), b"").unwrap();
+                    wait_for(&directory.join("release"));
+                }
+                Ok(review_response(route, status))
+            })
+            .unwrap();
+            assert_eq!(result["skipped"], 1);
+            return;
+        }
+        for (older_status, newer_status) in [(503, 200), (200, 503)] {
+            let directory = tempfile::tempdir().unwrap();
+            let db = Connection::open(directory.path().join("state.sqlite")).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            db.execute_batch(
+                "CREATE TABLE waits(repo TEXT,run_id INTEGER,attempt INTEGER,sha TEXT,state TEXT)",
+            )
+            .unwrap();
+            crate::subscriptions::initialize(&db).unwrap();
+            crate::rules::initialize(&db).unwrap();
+            crate::conditions::initialize(&db).unwrap();
+            initialize(&db).unwrap();
+            pr_notifications::register_in_since(
+                &db,
+                "review",
+                "owner/repo",
+                "7",
+                "11111111-1111-4111-8111-111111111111",
+                pr_notifications::timestamp_second(&db, "2026-01-01T00:00:00Z").unwrap(),
+            )
+            .unwrap();
+            let mut child = ChildGuard(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "polling::tests::stale_review_timeline_from_another_process_preserves_newer_backoff", "--nocapture"])
+                .env("WAKE_REVIEW_BACKOFF_TEST_DIR", directory.path())
+                .env("WAKE_REVIEW_BACKOFF_TEST_STATUS", older_status.to_string())
+                .spawn().unwrap());
+            wait_for(&directory.path().join("started"));
+            tick_with(&db, 1, |route, _| Ok(review_response(route, newer_status))).unwrap();
+            std::fs::write(directory.path().join("release"), b"").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for poll child"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let saved = state(
+                &db,
+                "/repos/owner/repo/pulls/7/reviews/dismissal-recovery",
+                0,
+            )
+            .unwrap();
+            if newer_status == 200 {
+                assert!(saved.is_none(), "stale failure must not install a backoff");
+            } else {
+                assert_eq!(
+                    saved.unwrap().next_poll,
+                    INTERVAL_MS + 1,
+                    "stale success must not clear a newer backoff"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn failed_review_page_does_not_commit_partial_batch_or_lose_dismissed_reviews() {
         let db = db();
         pr_notifications::register_in_since(

@@ -7,6 +7,40 @@ use std::{
 
 pub const DATABASE_ID: i32 = 0x43574b45;
 
+// SQLite stores the original CREATE INDEX definition (without IF NOT EXISTS).
+// Unknown definitions are preserved, even when their names resemble Wake's.
+const OWN_INDEXES: &[&str] = &[
+    "CREATE UNIQUE INDEX circular_active_wait ON circular_waits(thread,waits_for) WHERE active=1",
+    "CREATE INDEX condition_alerts_thread ON condition_alerts(target_thread,created,id)",
+    "CREATE INDEX condition_groups_ready ON condition_groups(state,created,id)",
+    "CREATE INDEX condition_members_matched_event ON condition_members(matched_event_key) WHERE matched_event_key IS NOT NULL",
+    "CREATE INDEX condition_members_waiting ON condition_members(kind,repo,resource,event,outcome) WHERE matched=0",
+    "CREATE INDEX delivery_evidence_pending ON delivery_evidence(identity_verified,coverage_state,target_thread)",
+    "CREATE INDEX native_condition_observers_due ON native_condition_observers(next_poll_ms)",
+    "CREATE INDEX native_observers_due ON native_observers(next_poll_ms)",
+    "CREATE UNIQUE INDEX obligation_transfers_confirmation_code ON obligation_transfers(confirmation_code_hash) WHERE confirmation_code_hash IS NOT NULL",
+    "CREATE UNIQUE INDEX obligation_transfers_pending ON obligation_transfers(obligation_id) WHERE state='pending'",
+    "CREATE INDEX obligation_transfers_target ON obligation_transfers(target_thread, state)",
+    "CREATE INDEX obligations_pending ON obligations(thread, resolved)",
+    "CREATE INDEX obligations_publication ON obligations(kind, repo, resource, outcome, resolved)",
+    "CREATE INDEX observers_due ON observers(next_poll)",
+    "CREATE INDEX pr_ci_delivery_lease ON pr_ci_deliveries(state,lease_until_ms)",
+    "CREATE INDEX pr_ci_delivery_queue ON pr_ci_deliveries(state,id)",
+    "CREATE INDEX pr_ci_delivery_retry_due ON pr_ci_delivery_retry_after(available_at_ms,delivery_id)",
+    "CREATE INDEX pr_ci_due ON pr_ci_trackers(active,next_poll_ms)",
+    "CREATE INDEX pr_hook_candidate_state ON pr_hook_candidates(state, updated_at_ms)",
+    "CREATE UNIQUE INDEX pr_hook_pre_call_identity ON pr_hook_pre_observations(session_id, turn_id, tool_use_id) WHERE session_id IS NOT NULL AND turn_id IS NOT NULL AND tool_use_id IS NOT NULL",
+    "CREATE INDEX subscriptions_expiry_due ON subscriptions(state,expires_at_ms) WHERE expires_at_ms IS NOT NULL",
+    "CREATE INDEX subscriptions_goal_reconcile ON subscriptions(state,goal_stage,COALESCE(goal_sender_next_check,0),id)",
+    "CREATE INDEX subscriptions_ready ON subscriptions(state,updated)",
+    "CREATE INDEX user_message_observations_identity ON user_message_observations(client_user_message_id,item_id)",
+];
+
+fn known_index_definition(sql: &str) -> bool {
+    let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    OWN_INDEXES.contains(&normalized.as_str())
+}
+
 pub fn validate_external_database(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -27,8 +61,15 @@ pub fn validate_external_database(path: &Path) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
+    let mut indexes =
+        db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")?;
+    let definitions = indexes.query_map([], |row| row.get::<_, String>(0))?;
+    let mut unrelated_index = false;
+    for definition in definitions {
+        unrelated_index |= !known_index_definition(&definition?);
+    }
     ensure!(
-        id == DATABASE_ID && unrelated == 0 && unrelated_schema == 0,
+        id == DATABASE_ID && unrelated == 0 && unrelated_schema == 0 && !unrelated_index,
         "Database ownership could not be verified; unrelated data was preserved"
     );
     Ok(())
@@ -260,6 +301,44 @@ mod tests {
     }
 
     #[test]
+    fn external_cleanup_preserves_unknown_and_impostor_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "application_id", DATABASE_ID)
+            .unwrap();
+        db.execute_batch(
+            "CREATE TABLE waits(value TEXT); INSERT INTO waits VALUES('keep');
+             CREATE TABLE observers(next_poll INTEGER);
+             CREATE INDEX observers_due ON observers(next_poll);
+             CREATE INDEX personal_index ON waits(value);",
+        )
+        .unwrap();
+        drop(db);
+        assert!(validate_external_database(&path).is_err());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DROP INDEX personal_index; DROP INDEX observers_due;
+            CREATE INDEX observers_due ON waits(value);",
+        )
+        .unwrap();
+        drop(db);
+        assert!(validate_external_database(&path).is_err());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT value FROM waits", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "keep"
+        );
+        db.execute_batch(
+            "DROP INDEX observers_due; CREATE INDEX observers_due ON observers(next_poll);",
+        )
+        .unwrap();
+        drop(db);
+        assert!(validate_external_database(&path).is_ok());
+    }
+
+    #[test]
     fn evidence_named_foreign_table_does_not_acquire_ownership() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
@@ -295,6 +374,8 @@ mod tests {
         crate::obligations::initialize(&db).unwrap();
         crate::validation_obligations::initialize(&db).unwrap();
         crate::circular_waits::initialize(&db).unwrap();
+        crate::delivery_evidence::initialize(&db).unwrap();
+        crate::pr_observation::initialize(&db).unwrap();
         crate::polling::pr_notifications::initialize(&db).unwrap();
         codex_wake::pr_ci::initialize(&db).unwrap();
         let application_id: i32 = db
