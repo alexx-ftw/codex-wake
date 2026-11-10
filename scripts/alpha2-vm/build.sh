@@ -22,7 +22,7 @@ for option in BPF_LSM DEBUG_INFO_BTF CGROUPS SECURITY SECURITY_PATH DEVTMPFS BLK
 done
 sh /deps/extract-vmlinux /output/kernel > /deps/vmlinux
 bpftool btf dump file /deps/vmlinux format c > "$lab/vmlinux.h"
-clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wno-missing-declarations -I "$lab" \
+clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wno-missing-declarations -Werror=pass-failed -I "$lab" \
   -c "$lab/fence.bpf.c" -o /deps/fence.bpf.o
 tar -xzf /deps/legacy.tar.gz -C /deps codex-wake-0.2.0-alpha.2/bin/codex-wake
 tar -xzf /deps/codex.tgz -C /deps package/vendor/x86_64-unknown-linux-musl/bin/codex
