@@ -1865,14 +1865,9 @@ fn retry_ci_before_send(
 }
 
 fn known_before_send_failure(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<BeforeSendFailure>().is_some()
-            || matches!(
-                cause.to_string().as_str(),
-                "Target unavailable during preparation; input was not sent"
-                    | "Target thread has an active writer; input was not sent"
-            )
-    })
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<BeforeSendFailure>().is_some())
 }
 
 /// Dispatch from an independent worker and independent database connection.
@@ -2426,31 +2421,13 @@ esac
 
     #[test]
     fn known_before_send_errors_retry_but_unknown_errors_stay_uncertain() {
-        use std::{error::Error, fmt};
-
-        #[derive(Clone, Copy, Debug)]
-        enum BeforeSend {
-            Unavailable,
-            Busy,
-        }
-
-        impl fmt::Display for BeforeSend {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(match self {
-                    Self::Unavailable => {
-                        "Target unavailable during preparation; input was not sent"
-                    }
-                    Self::Busy => "Target thread has an active writer; input was not sent",
-                })
-            }
-        }
-
-        impl Error for BeforeSend {}
-
-        for marker in [BeforeSend::Unavailable, BeforeSend::Busy] {
+        for marker in [
+            "Target unavailable during preparation; input was not sent",
+            "Target thread has an active writer; input was not sent",
+        ] {
             let mut db = database();
             let report = dispatch_at(&mut db, 1_000, |_, _, _| {
-                Err(anyhow::anyhow!("preparation failed").context(marker))
+                Err(before_send_failure(anyhow::anyhow!(marker)))
             })
             .unwrap();
             assert_eq!((report.retried_before_send, report.uncertain), (1, 0));
@@ -2479,6 +2456,20 @@ esac
         .unwrap();
         assert_eq!((report.retried_before_send, report.uncertain), (0, 1));
         assert_eq!(pr_ci::uncertain_deliveries(&uncertain_db).unwrap().len(), 1);
+
+        let mut misleading_db = database();
+        let report = dispatch(&mut misleading_db, 3_000, |_, _, _| {
+            Err(anyhow::anyhow!(
+                "Target unavailable during preparation; input was not sent"
+            ))
+        })
+        .unwrap();
+        assert_eq!((report.retried_before_send, report.uncertain), (0, 1));
+        assert!(
+            pr_ci::claim_deliveries(&mut misleading_db, 10_000, 10, DELIVERY_LEASE)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut unknown_state_db = database();
         let report = dispatch(&mut unknown_state_db, 4_000, |_, _, _| {

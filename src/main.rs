@@ -6173,6 +6173,38 @@ mod pr_hook_registration_integration_tests {
     }
 
     #[test]
+    fn ci_queue_unavailable_retries_but_uncertain_result_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.plugin_base = None;
+        let mut db = database(&config).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        db.execute(
+            "INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',7,1,?1,'failure','{}')",
+            [thread],
+        ).unwrap();
+        let first = dispatch_ci_with_queue(&mut db, &config, 1_000, |_, _, _, _| {
+            Err(execution::TargetUnavailableBeforeSend.into())
+        })
+        .unwrap();
+        assert_eq!((first.retried_before_send, first.uncertain), (1, 0));
+        let second = dispatch_ci_with_queue(&mut db, &config, 120_000, |_, _, _, _| {
+            Ok(("needs_attention".into(), None))
+        })
+        .unwrap();
+        assert_eq!((second.retried_before_send, second.uncertain), (0, 1));
+        let third = dispatch_ci_with_queue(&mut db, &config, 240_000, |_, _, _, _| {
+            panic!("uncertain delivery must not be resent")
+        })
+        .unwrap();
+        assert_eq!(third.claimed, 0);
+    }
+
+    #[test]
     fn recover_retries_pr_ci_when_evidence_cannot_be_prepared_before_queueing() {
         use std::os::unix::fs::PermissionsExt;
 
