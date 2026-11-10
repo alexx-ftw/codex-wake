@@ -425,6 +425,68 @@ fn real_webhook_preserves_signed_raw_body_and_dispatches_once() {
 
 #[test]
 #[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
+fn real_webhook_preserves_subscription_when_automatic_capture_fails() {
+    let temp = TempDir::new().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let db = temp.path().join("state.sqlite3");
+    let codex = temp.path().join("fake-codex");
+    fs::write(&codex, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let subscribed = cli(
+        &db,
+        &codex,
+        &[
+            "subscribe",
+            "--kind",
+            "pull_request",
+            "--repo",
+            "owner/repo",
+            "--resource",
+            "7",
+            "--event",
+            "closed",
+            "--thread",
+            THREAD,
+        ],
+    );
+    assert!(
+        subscribed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&subscribed.stderr)
+    );
+
+    let (receiver, addr) = start_receiver(&temp, &db, &codex, true);
+    let payload = serde_json::to_vec(&json!({"action":"closed","number":7,
+        "repository":{"full_name":"owner/repo"},
+        "pull_request":{"number":7,"merged":false}}))
+    .unwrap();
+    let signature = signed(&payload, SECRET.as_bytes());
+    for _ in 0..2 {
+        assert_status(
+            &receiver,
+            request(
+                addr,
+                "POST",
+                &payload,
+                Some("pull_request"),
+                Some(&signature),
+            ),
+            200,
+            "signed pull request event should be accepted",
+        );
+    }
+    let db = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let (count, state): (i64, String) = db.query_row(
+        "SELECT COUNT(*), MIN(state) FROM subscriptions WHERE kind='pull_request' AND repo='owner/repo' AND resource='7' AND event='closed'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!((count, state.as_str()), (1, "ready"));
+}
+
+#[test]
+#[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
 fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
     let temp = TempDir::new().unwrap();
     #[cfg(unix)]

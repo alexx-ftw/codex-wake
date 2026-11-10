@@ -3099,6 +3099,7 @@ mod hook_output_tests {
     #[test]
     fn automatic_capture_failure_does_not_skip_existing_subscription() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
+        subscriptions::initialize(&db).unwrap();
         subscriptions::subscribe(
             &db,
             "pull_request",
