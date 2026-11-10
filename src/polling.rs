@@ -501,7 +501,8 @@ where
                     || pending_reopen_needs_close
                     || timeline_has_error
                     || timeline_checkpoint.as_deref() != Some(updated_at);
-                let changed_pending_snapshot = pending_close_floor.is_some()
+                let changed_pending_snapshot = (pending_close_floor.is_some()
+                    || pending_reopen_needs_close)
                     && !timeline_blocked
                     && !timeline_has_error
                     && timeline_checkpoint.as_deref() != Some(updated_at);
@@ -7060,8 +7061,8 @@ mod tests {
                     }
                     "/repos/owner/repo/issues/7/timeline?per_page=100&page=1" => Ok(response(
                         json!([
-                            {"id":7001,"event":"closed","created_at":"2098-12-31T23:59:00Z"},
-                            {"id":7002,"event":"reopened","created_at":"2099-01-01T00:00:00Z"}
+                            {"id":7000,"event":"closed","created_at":"2098-12-31T23:59:00Z"},
+                            {"id":7001,"event":"reopened","created_at":"2099-01-01T00:00:00Z"}
                         ]),
                         false,
                     )),
@@ -7070,13 +7071,22 @@ mod tests {
             })
             .unwrap();
             assert!(report["errors"].as_object().unwrap().is_empty(), "{report}");
-            assert_eq!(
-                requested,
-                vec![
-                    "/repos/owner/repo/pulls/7",
-                    "/repos/owner/repo/issues/7/timeline?per_page=100&page=1"
-                ]
-            );
+            if now == INTERVAL_MS + 1 {
+                assert_eq!(
+                    requested,
+                    vec![
+                        "/repos/owner/repo/pulls/7",
+                        "/repos/owner/repo/issues/7/timeline?per_page=100&page=1"
+                    ],
+                    "a changed snapshot must prompt reconciliation"
+                );
+            } else {
+                assert_eq!(
+                    requested,
+                    vec!["/repos/owner/repo/pulls/7"],
+                    "an unchanged snapshot must respect ambiguity backoff"
+                );
+            }
             let notices = pr_notifications::pending(&db).unwrap();
             assert_eq!(notices.len(), 2);
             let reopened: Vec<_> = notices
