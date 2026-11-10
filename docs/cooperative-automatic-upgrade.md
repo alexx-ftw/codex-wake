@@ -98,6 +98,12 @@ consumption of active hook output, arbitrary schema migrations, or a real active
 model turn across the new systemd automatic transition. The independent native
 socket test and systemd lifecycle tests must not be described as that proof.
 
+The fixture freezes the old receiver only when the updater's pending journal
+proves its health preflight passed, at the next manager query before gate closure.
+Freezing before preflight could age its heartbeat or strand that read-only check.
+A local subprocess regression checks that ready state stays running and pending
+state freezes only once; production freshness checks remain unchanged.
+
 The freshness tests cover old successful heartbeats, PID reuse across invocations,
 a newer heartbeat failure, and a worker error after a successful heartbeat.
 A socket-preflight regression checks that a healthy generation is not closed.

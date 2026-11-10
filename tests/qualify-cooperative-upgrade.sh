@@ -66,6 +66,23 @@ child=
 wait "$release"
 exec {reader_input}>&- {reader_output}<&-
 printf 'freezing excludes existing SQLite readers before stopping the receiver\n'
+eval "$(sed -n '/^freeze_pending_receiver() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
+sleep 30 & child=$!
+printf '{"phase":"ready"}' > "$journal"
+freeze_pending_receiver "$child"
+[[ ! -e $root/receiver-frozen ]]
+if grep -q '^State:.*T' "/proc/$child/status"; then exit 1; fi
+printf '{"phase":"pending"}' > "$journal"
+freeze_pending_receiver "$child"
+[[ -f $root/receiver-frozen ]]
+grep -q '^State:.*T' "/proc/$child/status"
+kill -CONT "$child"
+freeze_pending_receiver "$child"
+if grep -q '^State:.*T' "/proc/$child/status"; then exit 1; fi
+kill "$child"
+wait "$child" 2>/dev/null || true
+child=
+printf 'freezing follows health preflight and happens only once per transition\n'
 eval "$(sed -n '/^wait_cgroup_empty() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
 mkdir "$scratch/group"
 printf 'populated 1\n' > "$scratch/group/cgroup.events"

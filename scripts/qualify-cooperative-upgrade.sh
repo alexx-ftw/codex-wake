@@ -36,6 +36,13 @@ SQL
   )
   grep -q '^State:.*T' "/proc/$pid/status"
 }
+freeze_pending_receiver() {
+  # ensure writes pending only after validating the old receiver's fresh health.
+  if [[ ! -e $root/receiver-frozen && $(jq -r .phase "$journal") == pending ]]; then
+    freeze_receiver "$1"
+    touch "$root/receiver-frozen"
+  fi
+}
 wait_cgroup_empty() {
   local dir=$1 i
   [[ -d ${dir%/*} && ! -L $dir ]] || return 1
@@ -218,21 +225,30 @@ stage=descendant
 helper=$(ctl show wake-upgrade-helper.service -p MainPID --value)
 [[ $helper =~ ^[1-9][0-9]*$ ]]
 printf '%s\n' "$helper" > "/sys/fs/cgroup$old_group/cgroup.procs"
-freeze_receiver "$old_pid"
 stage=closure
 mkdir "$root/delayed"
-cat > "$root/delayed/systemctl" <<'DELAY'
-#!/bin/bash
+{
+printf '#!/bin/bash\nset -euo pipefail\n'
+declare -f freeze_receiver freeze_pending_receiver
+cat <<'DELAY'
+root=${HOME%/h}
+state=$XDG_STATE_HOME/codex-wake
+db=$state/state.sqlite3
+journal=$state/cooperative-upgrade.json
 /usr/bin/systemctl "$@" || exit $?
+if [[ $1 == --user && $2 == show ]]; then freeze_pending_receiver "$WAKE_QUALIFICATION_RECEIVER_PID"; fi
 if [[ $1 == --user && $2 == start ]]; then sleep 18; fi
 DELAY
+} > "$root/delayed/systemctl"
 chmod 700 "$root/delayed/systemctl"
-PATH="$root/delayed:/usr/bin:/bin" CODEX_WAKE_CODEX=/usr/bin/false "$wake" --codex "$codex" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
+stopped=$old_pid
+PATH="$root/delayed:/usr/bin:/bin" WAKE_QUALIFICATION_RECEIVER_PID="$old_pid" CODEX_WAKE_CODEX=/usr/bin/false "$wake" --codex "$codex" ensure > "$root/second" 2> "$root/upgrade-error" & upgrader=$!
 for ((i=0;i<300;i++)); do
   [[ $(sqlite3 -readonly "$db" 'SELECT is_open FROM wake_delivery_claim_gate') == 0 ]] && break
   kill -0 "$upgrader"
   sleep .05
 done
+[[ -f $root/receiver-frozen ]]
 [[ $(sqlite3 -readonly "$db" 'SELECT is_open || ":" || owner || ":" || generation FROM wake_delivery_claim_gate') == "0:$old_owner:1" ]]
 # Ordinary gate commands cannot bypass this live/draining invocation.
 if "$wake" cooperative-gate transfer --owner "$old_owner" --generation 1 --next-owner bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb >/dev/null 2>&1; then exit 1; fi
