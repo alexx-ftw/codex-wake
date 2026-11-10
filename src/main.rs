@@ -580,6 +580,43 @@ fn capture_authenticated_pr_notification(
     }
 }
 
+fn accept_webhook_events(
+    db: &rusqlite::Connection,
+    gh: &Path,
+    event: &str,
+    payload: &Value,
+    authenticated: bool,
+    delivery_id: Option<&str>,
+) -> Result<(usize, Value, Option<usize>)> {
+    let matched_rules = rules::accept(db, event, payload)?;
+    let result = if event == "workflow_run" {
+        json!(bridge::accept(db, payload)?)
+    } else if matches!(event, "issue_comment" | "pull_request_review_comment") {
+        json!({"matched":0})
+    } else {
+        json!({"matched":subscriptions::accept(db,event,payload)?})
+    };
+    let automatic = if authenticated {
+        match capture_authenticated_pr_notification(db, gh, event, delivery_id, payload) {
+            Ok(count) => Some(count),
+            Err(error) => {
+                observability::emit(
+                    "pr_notification.capture",
+                    "error",
+                    observability::error_class(&error),
+                    None,
+                    Duration::ZERO,
+                    1,
+                );
+                None
+            }
+        }
+    } else {
+        Some(0)
+    };
+    Ok((matched_rules, result, automatic))
+}
+
 fn recover(config: &manager::Config) -> Result<usize> {
     recover_with_queue(config, |thread, message, id, resume| {
         execution::queue_with_identity(
@@ -3013,7 +3050,6 @@ async fn run_command(
                 Err(error) => return Err(error.into()),
             };
             let db = database(&config)?;
-            let matched_rules = rules::accept(&db, &event, &payload)?;
             let delivery_id = if authenticated_webhook {
                 env::var("CODEX_WAKE_DELIVERY")
                     .ok()
@@ -3021,27 +3057,14 @@ async fn run_command(
             } else {
                 None
             };
-            let automatic_pr_notifications = if authenticated_webhook {
-                capture_authenticated_pr_notification(
-                    &db,
-                    &config.gh,
-                    &event,
-                    delivery_id.as_deref(),
-                    &payload,
-                )?
-            } else {
-                0
-            };
-            let result = if event == "workflow_run" {
-                json!(bridge::accept(&db, &payload)?)
-            } else if matches!(
-                event.as_str(),
-                "issue_comment" | "pull_request_review_comment"
-            ) {
-                json!({"matched":0})
-            } else {
-                json!({"matched":subscriptions::accept(&db,&event,&payload)?})
-            };
+            let (matched_rules, result, automatic_pr_notifications) = accept_webhook_events(
+                &db,
+                &config.gh,
+                &event,
+                &payload,
+                authenticated_webhook,
+                delivery_id.as_deref(),
+            )?;
             drop(db);
             if env::var("CODEX_WAKE_DEFER").as_deref() != Ok("1") {
                 recover(&config)?;
@@ -3072,6 +3095,44 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn automatic_capture_failure_does_not_skip_existing_subscription() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        subscriptions::subscribe(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let payload = json!({"action":"closed","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false}});
+        let (_, result, automatic) = accept_webhook_events(
+            &db,
+            Path::new("/unused-gh"),
+            "pull_request",
+            &payload,
+            true,
+            Some("delivery"),
+        )
+        .unwrap();
+        assert_eq!(result["matched"], 1);
+        assert_eq!(automatic, None);
+        let (_, replay, _) = accept_webhook_events(
+            &db,
+            Path::new("/unused-gh"),
+            "pull_request",
+            &payload,
+            true,
+            Some("delivery"),
+        )
+        .unwrap();
+        assert_eq!(replay["matched"], 0);
+    }
 
     #[test]
     fn ci_delivery_identity_distinguishes_pull_requests_sharing_a_run() {
