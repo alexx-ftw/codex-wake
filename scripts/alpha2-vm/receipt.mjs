@@ -43,7 +43,12 @@ export function evidence(dir, expectedSha) {
   assert.equal(result.production_migration_qualified, false);
   assert.equal(result.transition.passed, true);
   assert.equal(result.transition.production_migration_qualified, false);
-  assert(lines.indexOf(`VM_RESULT=${JSON.stringify(result)}`) < lines.indexOf('VM_EXIT=0'), 'result after exit');
+  assert.equal(result.transition.uncertain_delivery_attempts_measured, true);
+  assert.equal(result.transition.uncertain_delivery_attempts, 1);
+  assert.equal(result.transition.uncertain_delivery_retries, 0);
+  assert.equal(result.transition.uncertain_response_loss_exercised, true);
+  assert.equal(result.transition.delivery_positive_controls, 2);
+  assert(lines.findIndex(line => line.startsWith('VM_RESULT=')) < lines.findIndex(line => line.startsWith('VM_EXIT=')), 'result after exit');
   const accelerator = read(dir, 'accelerator.txt').toString().trim();
   assert(['kvm', 'tcg'].includes(accelerator));
   return {schema: 1, source, accelerator, artifacts: hashes, console_sha256: hash(dir, 'console.log'),

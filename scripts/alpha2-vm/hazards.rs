@@ -299,7 +299,8 @@ pub fn restore_baseline() -> Result<()> {
         .args(["load", &std::process::id().to_string()])
         .spawn()?;
     wait("load", || Path::new("/lab/policy-ready").exists())?;
-    arm(2)?;
+    let armed_mask = 2;
+    arm(armed_mask)?;
     let r = restore_attempt()?;
     ensure!(
         r["setresuid_rc"] == 0 && r["write_rc"] == 0 && &fs::read(SIDE)?[..3] == b"bad",
@@ -307,7 +308,7 @@ pub fn restore_baseline() -> Result<()> {
     );
     loader.kill()?;
     loader.wait()?;
-    let report = json!({"phase":"credential restoration baseline, vulnerable by design","bypass_reproduced":true,"result":r,"production_migration_qualified":false});
+    let report = json!({"phase":"credential restoration baseline, vulnerable by design","baseline_type":"current BPF with credential-restore protection disabled","bpf_armed_mask":armed_mask,"credential_restore_protection_bit":16,"historical_binary":false,"bypass_reproduced":true,"result":r,"production_migration_qualified":false});
     save("restore-baseline", report.clone())?;
     println!("VM_RESULT={report}");
     Ok(())
@@ -331,8 +332,9 @@ pub fn suite() -> Result<()> {
         "side owner"
     );
     let (ws, native_pid) = crate::transition::start()?;
+    let delivery = crate::transition::seed_uncertain()?;
     let d = db()?;
-    d.execute_batch("CREATE TABLE fixture_writes(label TEXT);UPDATE subscriptions SET state='sending',reason='fixture outcome unknown - never retry',source_json='{\"fixture\":true}',source_event_key='uncertain-one' WHERE resource='sentinel'")?;
+    d.execute_batch("CREATE TABLE fixture_writes(label TEXT)")?;
     drop(d);
     let mut held = child("held")?;
     let mut mapper = child("mmap")?;
@@ -609,7 +611,7 @@ pub fn suite() -> Result<()> {
         .gid(UID)
         .status()?;
     ensure!(status.success(), "real enumeration error regression");
-    crate::transition::finish(ws, native_pid, loader)?;
+    crate::transition::finish(ws, native_pid, loader, delivery)?;
     let _ = held.wait();
     let _ = mapper.wait();
     ensure!(

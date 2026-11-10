@@ -49,6 +49,12 @@ guest executable hashes, console/stderr hashes, selected accelerator and a fresh
 nonce echoed by the guest. Creation requires one successful final result for the
 corrected suite and one `VM_EXIT=0`, after the result. Failed or timed-out guests
 retain diagnostic evidence but do not produce a success receipt.
+Ordering uses the marker line positions, including when valid JSON has spaces.
+The v2 synthetic RPC counter observes a deliberately lost reply and all RPCs
+targeting that uncertain thread, including unknown methods and notifications.
+The receipt requires one accepted uncertain delivery, zero measured retries and
+two delivered positive controls. This measures the laboratory fixture and its
+synthetic server; it does not qualify production delivery semantics.
 
 After an authorized run, download its exact artifact and verify it using this
 script from the tested commit, in a repository containing that commit:

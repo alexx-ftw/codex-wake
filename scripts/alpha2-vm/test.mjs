@@ -10,7 +10,9 @@ import {artifacts, digest, evidence, sourcePaths} from './receipt.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const sha = '1'.repeat(40);
 const result = {passed:true, phase:'corrected hazards and integrated systemd transaction', systemd_pid1:true,
-  production_migration_qualified:false, transition:{passed:true,production_migration_qualified:false}};
+  production_migration_qualified:false, transition:{passed:true,production_migration_qualified:false,
+    uncertain_delivery_attempts_measured:true,uncertain_delivery_attempts:1,uncertain_delivery_retries:0,
+    uncertain_response_loss_exercised:true,delivery_positive_controls:2}};
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-lab-test-'));
   t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
@@ -31,6 +33,8 @@ test('receipt rejects changed inputs, wrong SHA, stale nonce and incomplete gues
   for (const bad of [good.replace('VM_EXIT=0','VM_EXIT=1'), good+'VM_EXIT=0\n',
     good.replace('12345678-1234','87654321-4321'), good.replace('"passed":true','"passed":false'),
     good.replace(/^VM_RESULT=.*\n/m,''), good.replace('"production_migration_qualified":false','"production_migration_qualified":true'),
+    good.replace('"uncertain_delivery_attempts_measured":true','"uncertain_delivery_attempts_measured":false'),
+    good.replace('"uncertain_delivery_retries":0','"uncertain_delivery_retries":1'),
     good.replace('VM_EXIT=0\n','').replace('VM_RESULT=', 'VM_EXIT=0\nVM_RESULT=')]) {
     fs.writeFileSync(consoleFile,bad);
     assert.throws(() => evidence(dir,sha));
@@ -57,6 +61,15 @@ test('CLI verifier checks source hashes against actual Git objects, beyond the c
   source.files[files[0]]='0'.repeat(64);
   create();
   assert.notEqual(spawnSync(process.execPath,[path.join(here,'receipt.mjs'),'verify',dir,exact]).status,0);
+});
+test('spaced JSON is accepted before exit and rejected after exit', t => {
+  const dir=fixture(t), file=path.join(dir,'console.log');
+  const spaced=JSON.stringify(result).replaceAll(':', ': ').replaceAll(',', ', ');
+  const before=fs.readFileSync(file,'utf8').replace(JSON.stringify(result),spaced);
+  fs.writeFileSync(file,before);
+  assert.equal(evidence(dir,sha).result.passed,true);
+  fs.writeFileSync(file,before.replace(`VM_RESULT=${spaced}\nVM_EXIT=0`, `VM_EXIT=0\nVM_RESULT=${spaced}`));
+  assert.throws(()=>evidence(dir,sha), /result after exit/);
 });
 test('real shell launcher uses isolated TCG/KVM arguments and fails closed on timeout', t => {
   const dir = fixture(t), bin=path.join(dir,'bin');

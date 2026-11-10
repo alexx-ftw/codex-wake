@@ -2,9 +2,227 @@ use super::*;
 use anyhow::Context;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Mutex};
 const OLD: &str = "a2lab-old.service";
 const NEW: &str = "a2lab-new.service";
 const SCOPE: &str = "a2lab-controller.scope";
+const DELIVERY_SOCKET: &str = "/lab/delivery.sock";
+const UNCERTAIN_THREAD: &str = "22222222-2222-4222-8222-222222222222";
+const CONTROL_THREAD: &str = "33333333-3333-4333-8333-333333333333";
+
+#[derive(Default)]
+struct DeliveryState {
+    attempts: Vec<Value>,
+    requests: Vec<Value>,
+    response_dropped: bool,
+}
+fn targets_uncertain(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s == UNCERTAIN_THREAD,
+        Value::Array(values) => values.iter().any(targets_uncertain),
+        Value::Object(values) => values.values().any(targets_uncertain),
+        _ => false,
+    }
+}
+impl DeliveryState {
+    fn uncertain_rpcs(&self) -> usize {
+        self.requests
+            .iter()
+            .filter(|r| targets_uncertain(&r["params"]))
+            .count()
+    }
+    fn uncertain_non_read_rpcs(&self) -> usize {
+        self.requests
+            .iter()
+            .filter(|r| {
+                targets_uncertain(&r["params"])
+                    && !matches!(
+                        r["method"].as_str(),
+                        Some("thread/read" | "thread/turns/list")
+                    )
+            })
+            .count()
+    }
+    fn uncertain_attempts(&self) -> usize {
+        self.attempts
+            .iter()
+            .filter(|a| a["thread"] == UNCERTAIN_THREAD)
+            .count()
+    }
+    fn no_replay(&self) -> Result<()> {
+        ensure!(
+            self.response_dropped
+                && self.uncertain_attempts() == 1
+                && self.uncertain_non_read_rpcs() == 1,
+            "uncertain delivery repeated, unknown RPC, or loss not exercised: {} attempts, {} non-read RPCs, dropped={}",
+            self.uncertain_attempts(),
+            self.uncertain_non_read_rpcs(),
+            self.response_dropped
+        );
+        Ok(())
+    }
+}
+pub struct DeliveryFixture {
+    state: Arc<Mutex<DeliveryState>>,
+    server: thread::JoinHandle<()>,
+}
+fn record_rpc(text: &str, state: &Mutex<DeliveryState>) -> Result<Value> {
+    let request: Value = serde_json::from_str(text)?;
+    state.lock().unwrap().requests.push(request.clone());
+    println!("VM_DELIVERY_RPC={request}");
+    Ok(request)
+}
+// Record every RPC before routing, including unknown methods and notifications without IDs.
+fn delivery_connection(stream: UnixStream, state: &Mutex<DeliveryState>) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut ws = tungstenite::accept(stream).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    loop {
+        let Message::Text(text) = ws.read()? else {
+            continue;
+        };
+        let request = record_rpc(&text, state)?;
+        let Some(id) = request.get("id") else {
+            continue;
+        };
+        let result = match request["method"].as_str() {
+            Some("initialize") => json!({}),
+            Some("thread/loaded/list") => json!({"data":[]}),
+            Some("thread/read") => json!({"thread":{"status":{"type":"idle"},"turns":[]}}),
+            Some("thread/turns/list") => json!({"data":[],"nextCursor":null}),
+            Some("thread/queue/add" | "turn/start") => {
+                let mut s = state.lock().unwrap();
+                let first = request["params"]["threadId"] == UNCERTAIN_THREAD
+                    && s.uncertain_attempts() == 0;
+                s.attempts.push(json!({"method":request["method"],"thread":request["params"]["threadId"],"client_id":request["params"]["clientUserMessageId"]}));
+                drop(s);
+                if first {
+                    // Require sender disconnection, not a timeout, before recording response loss.
+                    ws.get_mut()
+                        .set_read_timeout(Some(Duration::from_secs(30)))?;
+                    loop {
+                        match ws.read() {
+                            Ok(Message::Text(text)) => {
+                                record_rpc(&text, state)?;
+                            }
+                            Ok(_) => continue,
+                            Err(
+                                tungstenite::Error::Protocol(
+                                    tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                                )
+                                | tungstenite::Error::ConnectionClosed,
+                            ) => break,
+                            Err(e) => bail!("sender did not disconnect after acceptance: {e}"),
+                        }
+                    }
+                    state.lock().unwrap().response_dropped = true;
+                    return Ok(());
+                }
+                json!({"queuedSubmission":{"id":"fixture-accepted"},"turn":{"id":"fixture-turn"}})
+            }
+            _ => {
+                ws.send(Message::Text(
+                    json!({"id":id,"error":{"code":-32601,"message":"unsupported fixture method"}})
+                        .to_string()
+                        .into(),
+                ))?;
+                continue;
+            }
+        };
+        ws.send(Message::Text(
+            json!({"id":id,"result":result}).to_string().into(),
+        ))?;
+    }
+}
+impl DeliveryFixture {
+    fn start() -> Result<Self> {
+        let listener = UnixListener::bind(DELIVERY_SOCKET)?;
+        fs::set_permissions(DELIVERY_SOCKET, fs::Permissions::from_mode(0o666))?;
+        let state = Arc::new(Mutex::new(DeliveryState::default()));
+        let shared = Arc::clone(&state);
+        let server = thread::spawn(move || {
+            for stream in listener.incoming() {
+                // Clients also probe the Unix endpoint without a WebSocket handshake.
+                let _ = delivery_connection(stream.expect("fixture accept"), &shared);
+            }
+        });
+        Ok(Self { state, server })
+    }
+    fn check(&self, stage: &str) -> Result<Value> {
+        ensure!(
+            !self.server.is_finished(),
+            "delivery counter server stopped"
+        );
+        let s = self.state.lock().unwrap();
+        s.no_replay()?;
+        Ok(
+            json!({"stage":stage,"uncertain_attempts":s.uncertain_attempts(),"uncertain_rpcs":s.uncertain_rpcs(),"uncertain_non_read_rpcs":s.uncertain_non_read_rpcs(),"uncertain_read_rpcs":s.uncertain_rpcs()-s.uncertain_non_read_rpcs(),"uncertain_retries":s.uncertain_non_read_rpcs()-1,"response_dropped":s.response_dropped,"total_attempts":s.attempts.len()}),
+        )
+    }
+}
+pub fn seed_uncertain() -> Result<DeliveryFixture> {
+    // Keep the original receiver from winning the deliberately-ready row.
+    let parent: u32 = show(OLD)?["MainPID"]
+        .as_str()
+        .context("legacy PID")?
+        .parse()?;
+    let fd = persistent::pidfd(parent)?;
+    persistent::signal(&fd, libc::SIGSTOP)?;
+    wait("legacy receiver stopped", || {
+        persistent::ids_in(Path::new(&format!("/proc/{parent}/task"))).is_ok_and(|tids| {
+            tids.iter().all(|tid| {
+                persistent::status_at(Path::new(&format!("/proc/{parent}/task/{tid}/status")))
+                    .is_ok_and(|(_, s)| matches!(s, 'T' | 't'))
+            })
+        })
+    })?;
+    let fixture = DeliveryFixture::start()?;
+    let d = db()?;
+    ensure!(d.execute("UPDATE subscriptions SET thread=?1,state='ready',source_json='{\"fixture\":true}',source_event_key='uncertain-one' WHERE resource='sentinel' AND state='waiting'", [UNCERTAIN_THREAD])? == 1, "uncertain seed missing");
+    let mut sender = wake("/guest/legacy", &["recover"])
+        .env("CODEX_WAKE_RPC_SOCKET", DELIVERY_SOCKET)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create("/lab/uncertain-sender.stderr")?))
+        .spawn()?;
+    wait("server accepted uncertain delivery", || {
+        fixture.state.lock().unwrap().uncertain_attempts() == 1
+    })?;
+    ensure!(
+        sender.try_wait()?.is_none(),
+        "sender exited before response-loss interruption"
+    );
+    let before = persistent::uncertain(&d)?;
+    ensure!(
+        serde_json::from_str::<Value>(&before)?["state"] == "sending",
+        "not an in-flight delivery"
+    );
+    sender.kill()?;
+    use std::os::unix::process::ExitStatusExt;
+    ensure!(
+        sender.wait()?.signal() == Some(libc::SIGKILL),
+        "sender not killed"
+    );
+    wait("server lost response", || {
+        fixture.state.lock().unwrap().response_dropped
+    })?;
+    ensure!(
+        persistent::uncertain(&d)? == before,
+        "sending row changed after lost response"
+    );
+    save(
+        "uncertain-loss",
+        json!({"before":serde_json::from_str::<Value>(&before)?,"sender_sigkill":true,"server":fixture.check("before-transition")?}),
+    )?;
+    ensure!(
+        subscribe("/guest/legacy", "transition-control")
+            .status
+            .success(),
+        "seed control"
+    );
+    ensure!(d.execute("UPDATE subscriptions SET thread=?1,state='ready',source_event_key='transition-control' WHERE resource='transition-control' AND state='waiting'", [CONTROL_THREAD])? == 1, "control seed missing");
+    Ok(fixture)
+}
 fn show(unit: &str) -> Result<Value> {
     let s = integrated::ctl(&[
         "show",
@@ -53,6 +271,8 @@ fn service(
         if let Some(v) = v {
             let value = if k == "CODEX_WAKE_RPC_SOCKET" && internal_socket {
                 "/lab/state/codex-wake/app-server.sock".into()
+            } else if k == "CODEX_WAKE_RPC_SOCKET" && name == NEW {
+                DELIVERY_SOCKET.into()
             } else if k == "CODEX_HOME" && uid == persistent::NEW_UID {
                 "/lab/new-codex".into()
             } else {
@@ -500,6 +720,7 @@ pub fn finish(
     mut ws: WebSocket<UnixStream>,
     pid: u32,
     mut loader: std::process::Child,
+    delivery: DeliveryFixture,
 ) -> Result<()> {
     let d = db()?;
     let uncertain = persistent::uncertain(&d)?;
@@ -561,7 +782,7 @@ pub fn finish(
                 .is_array(),
             "WS lost at interruption"
         );
-        cuts.push(json!({"stage":cut,"coordinator_sigkill":true,"same_websocket":true,"activation_absent":true,"expected_owner":if (cut == "ownership-transferred" || cut.starts_with("successor-")) {persistent::NEW_UID} else {UID}}));
+        cuts.push(json!({"stage":cut,"coordinator_sigkill":true,"same_websocket":true,"activation_absent":true,"delivery_counter":delivery.check(cut)?,"expected_owner":if (cut == "ownership-transferred" || cut.starts_with("successor-")) {persistent::NEW_UID} else {UID}}));
     }
     let status = Command::new("/guest/vm-probe")
         .args(["role", "transition", "none"])
@@ -619,6 +840,26 @@ pub fn finish(
         "successor-identity",
         json!({"pid":successor_pid,"all_four_credentials":persistent::NEW_UID,"expected_image_inode":expected.ino(),"same_invocation_on_repeated_resume":true,"controller_identity_negative_checks":3}),
     )?;
+    wait("successor dispatched positive control", || {
+        delivery
+            .state
+            .lock()
+            .unwrap()
+            .attempts
+            .iter()
+            .any(|a| a["thread"] == CONTROL_THREAD)
+    })?;
+    wait("positive control queued", || {
+        db().is_ok_and(|d| {
+            d.query_row(
+                "SELECT state FROM subscriptions WHERE resource='transition-control'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .is_ok_and(|s| s == "queued")
+        })
+    })?;
+    delivery.check("successor-control-delivered")?;
     let mut command = wake(
         "/guest/new-wake",
         &[
@@ -644,6 +885,60 @@ pub fn finish(
         "new write: {}",
         String::from_utf8_lossy(&o.stderr)
     );
+    ensure!(db()?.execute("UPDATE subscriptions SET state='ready',source_event_key='post-transition-control' WHERE resource='approved-new' AND state='waiting'", [])? == 1, "post-transition seed");
+    let mut recovery_receipts = vec![];
+    for expected_attempted in [1, 0, 0] {
+        let o = wake("/guest/new-wake", &["recover"])
+            .env("CODEX_HOME", "/lab/new-codex")
+            .env("CODEX_WAKE_RPC_SOCKET", DELIVERY_SOCKET)
+            .uid(persistent::NEW_UID)
+            .gid(persistent::NEW_UID)
+            .output()?;
+        ensure!(
+            o.status.success(),
+            "recovery failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&o.stdout)?;
+        // The active receiver may claim the positive control before this explicit recovery.
+        ensure!(
+            receipt["attempted"]
+                .as_u64()
+                .is_some_and(|n| n <= expected_attempted),
+            "unexpected recovery: {receipt}"
+        );
+        recovery_receipts.push(receipt);
+        delivery.check("explicit-recover")?;
+    }
+    wait("post-transition control queued", || {
+        db().is_ok_and(|d| {
+            d.query_row(
+                "SELECT state FROM subscriptions WHERE resource='approved-new'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .is_ok_and(|s| s == "queued")
+        })
+    })?;
+    // Cross several receiver dispatch intervals while the server remains available.
+    thread::sleep(Duration::from_secs(3));
+    let counter = delivery.check("after-recovery-and-observation")?;
+    let attempts = delivery.state.lock().unwrap().attempts.clone();
+    let requests = delivery.state.lock().unwrap().requests.clone();
+    ensure!(
+        attempts.len() == 3
+            && attempts
+                .iter()
+                .filter(|a| a["thread"] == CONTROL_THREAD)
+                .count()
+                == 1
+            && attempts.iter().filter(|a| a["thread"] == THREAD).count() == 1,
+        "positive controls missing or repeated: {attempts:?}"
+    );
+    save(
+        "uncertain-delivery-counter",
+        json!({"counter":counter,"attempts":attempts,"requests":requests,"recovery_receipts":recovery_receipts,"receiver_observation_seconds":3,"synthetic_server_acceptance_only":true}),
+    )?;
     let o = Command::new("/guest/vm-probe")
         .args(["actor", "persistent-new-rpc"])
         .uid(persistent::NEW_UID)
@@ -697,9 +992,162 @@ pub fn finish(
         "old unit active"
     );
     persistent::ready(pid)?;
+    let final_counter = delivery.check("final-transition")?;
+    ensure!(
+        final_counter["total_attempts"] == counter["total_attempts"],
+        "late delivery attempt"
+    );
     save(
         "transition-result",
-        json!({"passed":true,"systemd_pid1":true,"old_unit":old,"scope":show(SCOPE)?,"new_unit":show(NEW)?,"same_controller_pid":pid,"same_controller_start":persistent::start_tick(pid)?,"same_open_websocket":true,"retained_readers_after_old_parent_death":true,"pipe_bytes_each_minimum":262144,"interruptions":cuts,"known_admitted_response_drained":true,"uncertain_sending_row_unchanged":true,"uncertain_delivery_attempts_measured":false,"new_uid":persistent::NEW_UID,"successor_write_and_rpc":true,"legacy_exec_denied_after_loader_death":true,"integrity":integrity,"denial_counters":persistent::counts()?,"production_migration_qualified":false}),
+        json!({"passed":true,"systemd_pid1":true,"old_unit":old,"scope":show(SCOPE)?,"new_unit":show(NEW)?,"same_controller_pid":pid,"same_controller_start":persistent::start_tick(pid)?,"same_open_websocket":true,"retained_readers_after_old_parent_death":true,"pipe_bytes_each_minimum":262144,"interruptions":cuts,"known_admitted_response_drained":true,"uncertain_sending_row_unchanged":true,"uncertain_delivery_attempts_measured":true,"uncertain_delivery_attempts":final_counter["uncertain_attempts"],"uncertain_thread_rpcs":final_counter["uncertain_rpcs"],"uncertain_delivery_retries":final_counter["uncertain_retries"],"uncertain_response_loss_exercised":true,"delivery_positive_controls":2,"new_uid":persistent::NEW_UID,"successor_write_and_rpc":true,"legacy_exec_denied_after_loader_death":true,"integrity":integrity,"denial_counters":persistent::counts()?,"production_migration_qualified":false}),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn records_rpc_while_first_response_is_withheld() -> Result<()> {
+        let state = Arc::new(Mutex::new(DeliveryState::default()));
+        let (client, server) = UnixStream::pair()?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let shared = Arc::clone(&state);
+        let handle = thread::spawn(move || delivery_connection(server, &shared));
+        let (mut ws, _) = tungstenite::client("ws://localhost/", client)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let first =
+            json!({"id":1,"method":"thread/queue/add","params":{"threadId":UNCERTAIN_THREAD}});
+        let unknown = json!({"id":2,"method":"future/retry","params":{"threadId":UNCERTAIN_THREAD,"keep":"full request"}});
+        for request in [&first, &unknown] {
+            ws.send(Message::Text(request.to_string().into()))?;
+        }
+        drop(ws);
+        handle.join().unwrap()?;
+        let s = state.lock().unwrap();
+        ensure!(
+            s.requests == [first, unknown] && s.response_dropped,
+            "RPC lost while withholding reply"
+        );
+        ensure!(
+            s.uncertain_attempts() == 1 && s.uncertain_rpcs() == 2 && s.no_replay().is_err(),
+            "in-connection retry escaped"
+        );
+        Ok(())
+    }
+    #[test]
+    fn records_unknown_read_and_notification_rpcs_before_dispatch() -> Result<()> {
+        for request in [
+            json!({"id":7,"method":"future/input/retry","params":{"threadId":UNCERTAIN_THREAD,"opaque":{"keep":true}}}),
+            json!({"id":8,"method":"thread/read","params":{"threadId":UNCERTAIN_THREAD}}),
+            json!({"id":9,"method":"thread/turns/list","params":{"threadId":UNCERTAIN_THREAD}}),
+            json!({"method":"future/notification","params":{"target":{"thread_id":UNCERTAIN_THREAD}}}),
+        ] {
+            let state = Arc::new(Mutex::new(DeliveryState {
+                attempts: vec![json!({"thread":UNCERTAIN_THREAD})],
+                requests: vec![
+                    json!({"method":"thread/queue/add","params":{"threadId":UNCERTAIN_THREAD}}),
+                ],
+                response_dropped: true,
+            }));
+            state.lock().unwrap().no_replay()?;
+            let (client, server) = UnixStream::pair()?;
+            client.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let shared = Arc::clone(&state);
+            let handle = thread::spawn(move || delivery_connection(server, &shared));
+            let (mut ws, _) = tungstenite::client("ws://localhost/", client)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            ws.send(Message::Text(request.to_string().into()))?;
+            if request.get("id").is_some() {
+                let Message::Text(reply) = ws.read()? else {
+                    bail!("missing response")
+                };
+                let reply: Value = serde_json::from_str(&reply)?;
+                if request["method"] == "future/input/retry" {
+                    ensure!(
+                        reply["error"]["code"] == -32601,
+                        "unknown method not rejected"
+                    );
+                }
+            } else {
+                wait("notification recorded", || {
+                    state.lock().unwrap().requests.len() == 2
+                })?;
+            }
+            drop(ws);
+            let _ = handle.join().unwrap();
+            let s = state.lock().unwrap();
+            ensure!(
+                s.requests.last() == Some(&request),
+                "full RPC was discarded"
+            );
+            ensure!(
+                s.uncertain_attempts() == 1 && s.uncertain_rpcs() == 2,
+                "additional RPC was not recorded"
+            );
+            if matches!(
+                request["method"].as_str(),
+                Some("thread/read" | "thread/turns/list")
+            ) {
+                s.no_replay()?;
+            } else {
+                ensure!(
+                    s.no_replay().is_err(),
+                    "unknown RPC bypassed no-replay guard"
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn server_counts_duplicate_ids_and_no_replay_check_rejects_them() -> Result<()> {
+        let state = Arc::new(Mutex::new(DeliveryState::default()));
+        for attempt in 1..=2 {
+            let (client, server) = UnixStream::pair()?;
+            client.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let shared = Arc::clone(&state);
+            let handle = thread::spawn(move || delivery_connection(server, &shared));
+            let (mut ws, _) = tungstenite::client("ws://localhost/", client)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            ws.send(Message::Text(
+                json!({"id":1,"method":"initialize"}).to_string().into(),
+            ))?;
+            ensure!(
+                matches!(ws.read()?, Message::Text(_)),
+                "initialize response"
+            );
+            ws.send(Message::Text(json!({"id":2,"method":"thread/queue/add","params":{"threadId":UNCERTAIN_THREAD,"clientUserMessageId":"same-client-id"}}).to_string().into()))?;
+            if attempt == 1 {
+                ws.get_mut()
+                    .set_read_timeout(Some(Duration::from_millis(100)))?;
+            }
+            let reply = ws.read();
+            if attempt == 1 {
+                ensure!(
+                    matches!(reply, Err(tungstenite::Error::Io(ref e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+                    "first response was not withheld"
+                );
+                ensure!(
+                    state.lock().unwrap().no_replay().is_err(),
+                    "missing response loss accepted"
+                );
+                drop(ws);
+                handle.join().unwrap()?;
+                state.lock().unwrap().no_replay()?;
+            } else {
+                ensure!(
+                    matches!(reply, Ok(Message::Text(_))),
+                    "positive response missing"
+                );
+                drop(ws);
+                let _ = handle.join().unwrap();
+                let s = state.lock().unwrap();
+                ensure!(
+                    s.uncertain_attempts() == 2 && s.no_replay().is_err(),
+                    "duplicate attempt went undetected"
+                );
+            }
+        }
+        Ok(())
+    }
 }
