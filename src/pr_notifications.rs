@@ -375,6 +375,11 @@ fn backfill_historical_pr_changes_in(
         } else {
             String::new()
         };
+        let identity = if kind == "review" {
+            [target.as_str(), at]
+        } else {
+            [at, target.as_str()]
+        };
         if payload
             .pointer("/repository/full_name")
             .and_then(Value::as_str)
@@ -385,19 +390,7 @@ fn backfill_historical_pr_changes_in(
                 .map(|n| n.to_string())
                 .as_deref()
                 != Some(pr)
-            || key
-                != super::stable_source_key(
-                    kind,
-                    &old_repo,
-                    pr,
-                    &event,
-                    &state,
-                    if kind == "review" {
-                        &[target.as_str(), at]
-                    } else {
-                        &[at, target.as_str()]
-                    },
-                )
+            || key != super::stable_source_key(kind, &old_repo, pr, &event, &state, &identity)
         {
             uncertain()?;
             continue;
