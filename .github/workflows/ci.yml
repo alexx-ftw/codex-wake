@@ -41,14 +41,6 @@ jobs:
           tar -xzf .tools/webhook.tar.gz -C .tools webhook-linux-amd64/webhook
       - name: Install Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
-      - name: Resolve new dependency for validation
-        run: cargo metadata --format-version 1 > /dev/null
-      - name: Preserve resolved lockfile
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: resolved-cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
       - name: Format and lint
         run: |
           cargo fmt --check
@@ -80,9 +72,7 @@ jobs:
       - name: Build Linux x86_64 binary
         env:
           CC: musl-gcc
-        run: |
-          rustup run 1.98.0 cargo metadata --format-version 1 > /dev/null
-          rustup run 1.98.0 cargo build --locked --release --target x86_64-unknown-linux-musl
+        run: rustup run 1.98.0 cargo build --locked --release --target x86_64-unknown-linux-musl
       - name: Package and verify repeatability
         run: |
           sh scripts/package-release.sh target/x86_64-unknown-linux-musl/release/codex-wake .test-results/release-one
