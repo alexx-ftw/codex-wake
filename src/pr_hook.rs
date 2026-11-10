@@ -63,8 +63,8 @@ fn parse_bash_candidate(event: &Value) -> Option<PrCandidate> {
     if args.first().map(String::as_str) == Some("gh")
         && args.get(1).map(String::as_str) == Some("api")
     {
-        let expected_repo = parse_gh_api_create(&args)?;
-        return parse_api_pr_response(response, &expected_repo);
+        let (expected_repo, include) = parse_gh_api_create_options(&args)?;
+        return parse_api_pr_response(response, &expected_repo, include);
     }
     None
 }
@@ -153,9 +153,14 @@ fn gh_pr_option_takes_value(option: &str) -> bool {
 }
 
 pub(crate) fn parse_gh_api_create(args: &[String]) -> Option<String> {
+    parse_gh_api_create_options(args).map(|(repo, _)| repo)
+}
+
+fn parse_gh_api_create_options(args: &[String]) -> Option<(String, bool)> {
     let mut endpoint = None;
     let mut method = None;
     let mut has_field = false;
+    let mut include = false;
     let mut i = 2;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -200,13 +205,8 @@ pub(crate) fn parse_gh_api_create(args: &[String]) -> Option<String> {
                     args.get(i)?;
                 }
             }
-            "--paginate"
-            | "--silent"
-            | "--slurp"
-            | "-i"
-            | "--include"
-            | "--verbose"
-            | "--allow-escape-sequences" => {}
+            "-i" | "--include" => include = true,
+            "--paginate" | "--silent" | "--slurp" | "--verbose" | "--allow-escape-sequences" => {}
             _ if arg.starts_with('-') => return None,
             _ => {
                 if endpoint.replace(arg).is_some() {
@@ -246,7 +246,7 @@ pub(crate) fn parse_gh_api_create(args: &[String]) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{owner}/{repo}"))
+    Some((format!("{owner}/{repo}"), include))
 }
 
 /// Deliberately accepts only a simple argv-like command. Shell composition,
@@ -302,7 +302,27 @@ fn shell_words(command: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
-fn parse_api_pr_response(body: &str, expected_repo: &str) -> Option<PrCandidate> {
+fn parse_api_pr_response(body: &str, expected_repo: &str, include: bool) -> Option<PrCandidate> {
+    let body = if include && body.starts_with("HTTP/") {
+        let (headers, body) = body
+            .split_once("\r\n\r\n")
+            .or_else(|| body.split_once("\n\n"))?;
+        let mut lines = headers.lines();
+        let mut status = lines.next()?.split_whitespace();
+        let version = status.next()?.strip_prefix("HTTP/")?;
+        let code = status.next()?;
+        if version.is_empty()
+            || code.len() != 3
+            || !code.bytes().all(|b| b.is_ascii_digit())
+            || !code.starts_with('2')
+            || lines.any(|line| !line.contains(':'))
+        {
+            return None;
+        }
+        body
+    } else {
+        body
+    };
     let snapshot: Value = serde_json::from_str(body).ok()?;
     parse_pr_snapshot(&snapshot, expected_repo)
 }
@@ -872,6 +892,46 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn gh_api_include_extracts_only_successful_matching_pr_response() {
+        let body = r#"{"number":42,"html_url":"https://github.com/acme/widget/pull/42"}"#;
+        for (flag, headers) in [
+            (
+                "--include",
+                "HTTP/2.0 201 Created\r\nContent-Type: application/json\r\n\r\n",
+            ),
+            (
+                "-i",
+                "HTTP/1.1 201 Created\nContent-Type: application/json\n\n",
+            ),
+        ] {
+            let command = format!("gh api {flag} -X POST repos/acme/widget/pulls");
+            assert_eq!(
+                parse_pr_candidate(&bash(&command, &format!("{headers}{body}")))
+                    .unwrap()
+                    .number,
+                42
+            );
+        }
+
+        let command = "gh api --include -X POST repos/acme/widget/pulls";
+        for response in [
+            format!("HTTP/2.0 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{body}"),
+            format!("HTTP/2.0 201 Created\ninvalid header\n\n{body}"),
+            "HTTP/2.0 201 Created\n\n{\"number\":42,\"html_url\":\"https://github.com/acme/other/pull/42\"}".into(),
+        ] {
+            assert!(parse_pr_candidate(&bash(command, &response)).is_none());
+        }
+        let response = format!("HTTP/2.0 201 Created\n\n{body}");
+        assert!(
+            parse_pr_candidate(&bash(
+                "gh api -H --include -X POST repos/acme/widget/pulls",
+                &response
+            ))
+            .is_none()
+        );
     }
 
     #[test]
