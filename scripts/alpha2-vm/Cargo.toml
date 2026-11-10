@@ -1,0 +1,15 @@
+[package]
+name = "alpha2-systemd-qualification"
+version = "0.0.0"
+edition = "2024"
+
+[[bin]]
+name = "alpha2-vm-probe"
+path = "vm.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde_json = "1"
+tungstenite = "0.30.0"
