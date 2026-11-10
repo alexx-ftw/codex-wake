@@ -2370,12 +2370,15 @@ mod tests {
             }
             let first = claim_next(&db, i64::MAX, &HashSet::new()).unwrap().unwrap();
             assert!(mark_queued(&db, &first.id).unwrap());
+            let second = claim_next(&db, i64::MAX, &HashSet::new()).unwrap().unwrap();
+            assert_ne!(first.id, second.id);
+            assert!(mark_queued(&db, &second.id).unwrap());
+            assert!(needs_attention(&db).unwrap().is_empty());
             assert!(
                 claim_next(&db, i64::MAX, &HashSet::new())
                     .unwrap()
-                    .is_some()
+                    .is_none()
             );
-            assert!(needs_attention(&db).unwrap().is_empty());
         }
     }
 
