@@ -263,12 +263,11 @@ fn backfill_historical_pr_changes_in(
                  OR (kind='review' AND event IN ('submitted','approved','changes_requested')))
              ORDER BY created_at,rowid",
         )?;
-        let rows = statement
+        statement
             .query_map(params![repo, pr, kind], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
+            .collect::<rusqlite::Result<_>>()?
     };
     for (old_repo, event, key, source) in rows {
         let already_journaled: bool = db.query_row(
@@ -2017,7 +2016,7 @@ fn possible_historical_duplicate(db: &Connection, notification: &Notification) -
                AND event=?5 AND id!=?6 AND (state!='pending' OR rowid <
                  (SELECT rowid FROM automatic_pr_notifications WHERE id=?6))",
         )?;
-        let rows = statement
+        statement
             .query_map(
                 params![
                     notification.kind,
@@ -2029,8 +2028,7 @@ fn possible_historical_duplicate(db: &Connection, notification: &Notification) -
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
+            .collect::<rusqlite::Result<_>>()?
     };
     for (old_repo, old_key, old_source, _state) in rows {
         let expected = super::stable_source_key(
