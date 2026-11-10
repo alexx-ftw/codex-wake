@@ -443,20 +443,19 @@ where
             .and_then(|saved| saved.cursor.as_deref())
             .and_then(|cursor| serde_json::from_str::<Value>(cursor).ok())
             .unwrap_or(Value::Null);
-        let timeline_checkpoint = timeline_cursor["updated_at"].as_str().map(str::to_owned);
-        let cached_updated_at = cached
+        let timeline_checkpoint = timeline_cursor.get("snapshot").cloned();
+        let cached_snapshot = cached
             .as_ref()
             .and_then(|saved| saved.body.as_deref())
             .and_then(|body| serde_json::from_str::<Value>(body).ok())
-            .and_then(|pull| pull["updated_at"].as_str().map(str::to_owned));
+            .map(|pull| timeline_snapshot_identity(&pull));
         let timeline_retry_due = timeline_due
             && timeline_floor.is_some()
             && (ci_needs_timeline
-                || pending_close_floor.is_some()
                 || timeline_has_error
                 || pending_reopen_needs_close
                 || timeline_checkpoint.is_none()
-                || timeline_checkpoint.as_deref() != cached_updated_at.as_deref());
+                || timeline_checkpoint != cached_snapshot);
         let lifecycle_events = std::cell::RefCell::new(None::<TimelineLifecycleBatch>);
         let timeline_error = std::cell::Cell::new(None::<&'static str>);
         let timeline_calls = std::cell::Cell::new(0_u64);
@@ -496,16 +495,17 @@ where
                 let updated_at = pull["updated_at"]
                     .as_str()
                     .ok_or_else(|| Failure::new("invalid_response"))?;
+                let snapshot_changed =
+                    timeline_checkpoint.as_ref() != Some(&timeline_snapshot_identity(&pull));
                 let needs_scan = (ci_needs_timeline && pull["state"] == "closed")
-                    || pending_close_floor.is_some()
                     || pending_reopen_needs_close
                     || timeline_has_error
-                    || timeline_checkpoint.as_deref() != Some(updated_at);
+                    || snapshot_changed;
                 let changed_pending_snapshot = (pending_close_floor.is_some()
                     || pending_reopen_needs_close)
                     && !timeline_blocked
                     && !timeline_has_error
-                    && timeline_checkpoint.as_deref() != Some(updated_at);
+                    && snapshot_changed;
                 if (timeline_due || changed_pending_snapshot) && needs_scan {
                     match fetch_reopened_timeline(
                         db,
@@ -3190,6 +3190,17 @@ struct TimelineLifecycleBatch {
     pending_reopen_watermark: i64,
 }
 
+fn timeline_snapshot_identity(pull: &Value) -> Value {
+    json!({
+        "updated_at": pull["updated_at"],
+        "state": pull["state"],
+        "merged": pull["merged"],
+        "closed_at": pull["closed_at"],
+        "merged_at": pull["merged_at"],
+        "head_sha": pull.pointer("/head/sha"),
+    })
+}
+
 type PendingTimelineClose = (String, i64, String, String);
 
 fn reconcile_timeline_closes(
@@ -3436,7 +3447,11 @@ fn apply_timeline_lifecycle_events(
            error_category=NULL,calls=github_poll_state.calls+excluded.calls",
         params![
             batch.route,
-            Some(json!({"updated_at":batch.updated_at}).to_string()),
+            Some(
+                json!({"updated_at":batch.updated_at,
+                "snapshot":timeline_snapshot_identity(&batch.snapshot)})
+                .to_string()
+            ),
             now.saturating_add(delay),
             delay,
             now,
@@ -5369,7 +5384,7 @@ mod tests {
                 "closed_at":"2098-12-31T23:59:00Z","updated_at":"2099-01-01T00:00:00Z",
                 "head":{"sha":"a".repeat(40)},"base":{"ref":"main"}});
             seed_legacy_pr_cursor(&db, Some(&pull));
-            db.execute("INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls) VALUES('/repos/owner/repo/issues/7/timeline',0,?1,0,60000,0)", [json!({"updated_at":"2099-01-01T00:00:00Z"}).to_string()]).unwrap();
+            db.execute("INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,calls) VALUES('/repos/owner/repo/issues/7/timeline',0,?1,0,60000,0)", [json!({"updated_at":pull["updated_at"],"snapshot":timeline_snapshot_identity(&pull)}).to_string()]).unwrap();
             let mut timeline_calls = 0;
             tick_with(&db, INTERVAL_MS + 1, |route, _| {
                 if route == "/repos/owner/repo/pulls/7" {
@@ -6607,7 +6622,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_closed_timeline_retries_after_restart_with_unchanged_snapshot() {
+    fn ambiguous_closed_timeline_waits_for_new_snapshot_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let db = Connection::open(&path).unwrap();
@@ -6669,8 +6684,26 @@ mod tests {
         assert_eq!(middle["errors"], json!({}));
         drop(db);
         let db = Connection::open(&path).unwrap();
+        for now in [2 * INTERVAL_MS + 1, 4 * MAX_BACKOFF_MS + 1] {
+            let unchanged = tick_with(&db, now, |route, _| {
+                assert!(
+                    !route.contains("/timeline"),
+                    "unchanged evidence must not rescan"
+                );
+                Ok(HttpResponse {
+                    status: 304,
+                    headers: BTreeMap::new(),
+                    body: vec![],
+                })
+            })
+            .unwrap();
+            assert_eq!(unchanged["errors"], json!({}));
+            assert_eq!(pending_count(&db, "pending_timeline_closed"), 2);
+        }
+        let mut changed_snapshot = snapshot.clone();
+        changed_snapshot["updated_at"] = json!("2099-01-01T00:00:31Z");
         let mut scanned = false;
-        let retry = tick_with(&db, 2 * INTERVAL_MS + 1, |route, _| {
+        let retry = tick_with(&db, 4 * MAX_BACKOFF_MS + INTERVAL_MS + 1, |route, _| {
             if route.contains("/timeline") {
                 scanned = true;
                 Ok(response(
@@ -6680,19 +6713,12 @@ mod tests {
                     false,
                 ))
             } else {
-                Ok(HttpResponse {
-                    status: 304,
-                    headers: BTreeMap::new(),
-                    body: vec![],
-                })
+                Ok(response(changed_snapshot.clone(), false))
             }
         })
         .unwrap();
         assert_eq!(retry["errors"], json!({}));
-        assert!(
-            scanned,
-            "unchanged snapshot cannot prove the timeline complete"
-        );
+        assert!(scanned, "new snapshot must trigger timeline reconciliation");
         assert_eq!(pending_count(&db, "pending_timeline_closed"), 2);
         let reopens: i64 = db
             .query_row(
@@ -6714,7 +6740,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_snapshot_retries_pending_close_before_backoff_expires() {
+    fn changed_close_with_same_updated_at_retries_before_backoff_expires() {
         let db = db();
         let thread = "11111111-1111-4111-8111-111111111111";
         pr_notifications::register_in_since(
@@ -6745,7 +6771,6 @@ mod tests {
         snapshot["merged"] = json!(true);
         snapshot["closed_at"] = json!(at);
         snapshot["merged_at"] = json!(at);
-        snapshot["updated_at"] = json!("2099-01-01T00:00:31Z");
         let mut scanned = false;
         let second = tick_with(&db, INTERVAL_MS + 1, |route, _| {
             Ok(response(
@@ -7747,7 +7772,10 @@ mod tests {
             "INSERT INTO github_poll_state(endpoint,page,cursor,next_poll_ms,backoff_ms,
              last_success_ms,error_category,calls)
              VALUES('/repos/owner/repo/issues/7/timeline',0,?1,0,60000,0,'server_error',1)",
-            [json!({"updated_at":updated_at}).to_string()],
+            [
+                json!({"updated_at":updated_at,"snapshot":timeline_snapshot_identity(&current)})
+                    .to_string(),
+            ],
         )
         .unwrap();
         let mut scanned = false;

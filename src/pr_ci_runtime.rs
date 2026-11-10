@@ -682,6 +682,7 @@ fn gh_api_with_timeout(
     route: &str,
     timeout: Duration,
 ) -> Result<ApiResponse> {
+    let deadline = Instant::now() + timeout;
     let filter = gh_response_filter(route)?;
     ensure!(
         route.starts_with("/repos/")
@@ -698,22 +699,22 @@ fn gh_api_with_timeout(
         command.process_group(0);
     }
     #[cfg(target_os = "linux")]
-    let group_socket = prepare_group_handle(&mut command);
-    let mut child = command
+    command
         .arg("api")
         .arg("--jq")
         .arg(filter)
         .arg(route)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Start {}", gh_executable.display()))?;
+        .stderr(Stdio::piped());
 
-    #[cfg(target_os = "linux")]
-    let group_handle = receive_group_handle(group_socket);
-    #[cfg(not(target_os = "linux"))]
-    let group_handle = ();
+    let (mut child, group_handle) = spawn_with_group_handle(
+        &mut command,
+        false,
+        false,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .with_context(|| format!("Start {} with safe cleanup", gh_executable.display()))?;
 
     let exceeded = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -738,7 +739,6 @@ fn gh_api_with_timeout(
     }));
     let mut output = None;
     let mut diagnostics = None;
-    let deadline = Instant::now() + timeout;
     let mut status = None;
     let mut timed_out = false;
     let mut cleanup_error = None;
@@ -823,6 +823,9 @@ type GroupHandle = ();
 #[cfg(target_os = "linux")]
 fn prepare_group_handle(
     command: &mut Command,
+    deny_pidfd: bool,
+    deny_group: bool,
+    handshake_ms: libc::c_int,
 ) -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
@@ -867,8 +870,34 @@ fn prepare_group_handle(
     unsafe {
         command.pre_exec(move || {
             libc::close(receive_fd);
+            if deny_pidfd {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
             let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as libc::c_int;
-            if pidfd >= 0 {
+            if pidfd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setpgid(0, 0) != 0 {
+                libc::close(pidfd);
+                return Err(std::io::Error::last_os_error());
+            }
+            if deny_group {
+                libc::close(pidfd);
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            if libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                1_u32 << 2,
+            ) != 0
+            {
+                let error = std::io::Error::last_os_error();
+                libc::close(pidfd);
+                return Err(error);
+            }
+            {
                 let mut byte = 0_u8;
                 let mut iov = libc::iovec {
                     iov_base: (&mut byte as *mut u8).cast(),
@@ -880,15 +909,28 @@ fn prepare_group_handle(
                 message.msg_iovlen = 1;
                 message.msg_control = control.as_mut_ptr().cast();
                 message.msg_controllen =
-                    libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as usize;
+                    libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as _;
                 let cmsg = libc::CMSG_FIRSTHDR(&message);
                 (*cmsg).cmsg_level = libc::SOL_SOCKET;
                 (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-                (*cmsg).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as usize;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
                 std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), pidfd);
-                libc::sendmsg(send_fd, &message, libc::MSG_NOSIGNAL);
+                let sent = libc::sendmsg(send_fd, &message, libc::MSG_NOSIGNAL);
                 libc::close(pidfd);
+                if sent != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut pollfd = libc::pollfd {
+                    fd: send_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut pollfd, 1, handshake_ms) != 1 {
+                    return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                }
+                if libc::recv(send_fd, (&mut byte as *mut u8).cast(), 1, 0) != 1 || byte != 1 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
             }
             Ok(())
         });
@@ -897,12 +939,16 @@ fn prepare_group_handle(
 }
 
 #[cfg(target_os = "linux")]
-fn receive_group_handle(
-    sockets: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
-) -> GroupHandle {
+fn receive_group_handle(receiver: std::os::fd::OwnedFd, handshake_ms: libc::c_int) -> GroupHandle {
     use std::os::fd::{AsRawFd, FromRawFd};
-    let (receiver, sender) = sockets?;
-    drop(sender);
+    let mut pollfd = libc::pollfd {
+        fd: receiver.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut pollfd, 1, handshake_ms) } != 1 {
+        return None;
+    }
     let mut byte = 0_u8;
     let mut iov = libc::iovec {
         iov_base: (&mut byte as *mut u8).cast(),
@@ -915,7 +961,7 @@ fn receive_group_handle(
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = std::mem::size_of_val(&control);
+        message.msg_controllen = std::mem::size_of_val(&control) as _;
         if libc::recvmsg(receiver.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) != 1 {
             return None;
         }
@@ -923,20 +969,75 @@ fn receive_group_handle(
         if cmsg.is_null()
             || (*cmsg).cmsg_level != libc::SOL_SOCKET
             || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            || (*cmsg).cmsg_len
-                != libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as usize
+            || (*cmsg).cmsg_len != libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _
         {
             return None;
         }
-        Some(std::os::fd::OwnedFd::from_raw_fd(std::ptr::read_unaligned(
+        let fd = std::os::fd::OwnedFd::from_raw_fd(std::ptr::read_unaligned(
             libc::CMSG_DATA(cmsg).cast::<libc::c_int>(),
-        )))
+        ));
+        let ack = 1_u8;
+        if libc::send(
+            receiver.as_raw_fd(),
+            (&ack as *const u8).cast(),
+            1,
+            libc::MSG_NOSIGNAL,
+        ) != 1
+        {
+            return None;
+        }
+        Some(fd)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_with_group_handle(
+    command: &mut Command,
+    deny_pidfd: bool,
+    deny_group: bool,
+    remaining: Duration,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    if remaining.is_zero() {
+        return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+    }
+    let handshake_ms = remaining.as_millis().clamp(1, 1000) as libc::c_int;
+    let (receiver, sender) = prepare_group_handle(command, deny_pidfd, deny_group, handshake_ms)
+        .ok_or_else(|| std::io::Error::other("cannot prepare safe process cleanup"))?;
+    let receiver_thread =
+        thread::Builder::new().spawn(move || receive_group_handle(receiver, handshake_ms))?;
+    let child = command.spawn();
+    drop(sender);
+    let handle = receiver_thread
+        .join()
+        .map_err(|_| std::io::Error::other("pidfd receiver panicked"))?;
+    let child = child?;
+    let handle = handle.ok_or_else(|| std::io::Error::other("pidfd transfer failed"))?;
+    Ok((child, Some(handle)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_with_group_handle(
+    _: &mut Command,
+    _: bool,
+    _: bool,
+    _: Duration,
+) -> std::io::Result<(std::process::Child, GroupHandle)> {
+    Err(std::io::Error::other(
+        "safe process cleanup unavailable on this platform",
+    ))
 }
 
 fn terminate_process_group(
     child: &mut std::process::Child,
     handle: &GroupHandle,
+) -> std::io::Result<()> {
+    terminate_process_group_with(child, handle, false)
+}
+
+fn terminate_process_group_with(
+    child: &mut std::process::Child,
+    handle: &GroupHandle,
+    reject_group_signal: bool,
 ) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -945,7 +1046,9 @@ fn terminate_process_group(
             .as_ref()
             .ok_or_else(|| std::io::Error::other("process group pidfd unavailable"))?;
         // SAFETY: the descriptor was opened by the child before exec and held by the parent.
-        if unsafe {
+        let group_error = if reject_group_signal {
+            Some(std::io::Error::from_raw_os_error(libc::EINVAL))
+        } else if unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
                 fd.as_raw_fd(),
@@ -955,14 +1058,46 @@ fn terminate_process_group(
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error());
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        if group_error.is_some() {
+            // A failed group signal must still address the exact leader, never
+            // its reusable numeric PID. Group cleanup remains uncertain.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(std::io::Error::other(format!(
+                    "group signal failed: {}; leader signal failed: {}",
+                    group_error.unwrap(),
+                    std::io::Error::last_os_error()
+                )));
+            }
         }
         // SIGKILL is asynchronous and an uninterruptible child may not exit.
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Ok(()),
+                Ok(Some(_)) => {
+                    return match group_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    };
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                    return match group_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    };
+                }
                 Err(error) => return Err(error),
                 Ok(None) if Instant::now() >= deadline => {
                     return Err(std::io::Error::other(
@@ -975,7 +1110,7 @@ fn terminate_process_group(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (child, handle);
+        let _ = (child, handle, reject_group_signal);
         Err(std::io::Error::other(
             "safe process group cleanup unavailable",
         ))
@@ -2259,9 +2394,8 @@ esac
             .arg("-c")
             .arg("sleep 10 & echo $!; exit")
             .stdout(Stdio::piped());
-        let sockets = prepare_group_handle(&mut command);
-        let mut child = command.spawn().unwrap();
-        let handle = receive_group_handle(sockets);
+        let (mut child, handle) =
+            spawn_with_group_handle(&mut command, false, false, Duration::from_secs(2)).unwrap();
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut line)
@@ -2317,6 +2451,41 @@ esac
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn denied_pidfd_or_group_probe_never_executes_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("executed");
+        for (deny_pidfd, deny_group) in [(true, false), (false, true)] {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("touch \"$1\"").arg("sh").arg(&marker);
+            let started = Instant::now();
+            assert!(
+                spawn_with_group_handle(
+                    &mut command,
+                    deny_pidfd,
+                    deny_group,
+                    Duration::from_millis(40)
+                )
+                .is_err()
+            );
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(!marker.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejected_group_signal_stops_exact_leader_and_reports_incomplete() {
+        let mut command = Command::new("sleep");
+        command.arg("10");
+        let (mut child, handle) =
+            spawn_with_group_handle(&mut command, false, false, Duration::from_secs(2)).unwrap();
+        let error = terminate_process_group_with(&mut child, &handle, true).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[cfg(target_os = "linux")]
