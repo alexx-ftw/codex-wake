@@ -66,6 +66,22 @@ fn signature(secret: &str, body: &[u8]) -> String {
     format!("sha256={:x}", mac.finalize().into_bytes())
 }
 
+fn prepare_webhook_config(db: &Path, secret: &str) -> Result<std::path::PathBuf> {
+    let root = db.parent().context("Missing isolated probe directory")?;
+    let config_home = root.join("config");
+    let config = config_home.join("codex-wake");
+    crate::manager::private_dir(&config_home)?;
+    crate::manager::private_dir(&config)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(config.join("webhook.secret"))?;
+    file.write_all(secret.as_bytes())?;
+    file.sync_all()?;
+    Ok(config_home)
+}
+
 fn launch_receiver(
     webhook: &Path,
     hooks: &Path,
@@ -76,6 +92,7 @@ fn launch_receiver(
 ) -> Result<Child> {
     let exe = env::current_exe()?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config_home = prepare_webhook_config(db, secret)?;
     let mut command = Command::new(webhook);
     command
         .args(["-ip", "127.0.0.1", "-port"])
@@ -85,6 +102,7 @@ fn launch_receiver(
         .env("CODEX_WAKE_EXECUTABLE", exe)
         .env("CODEX_WAKE_DIR", root)
         .env("CODEX_WAKE_DB", db)
+        .env("XDG_CONFIG_HOME", config_home)
         .env("GITHUB_WEBHOOK_SECRET", secret)
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log.try_clone()?));
@@ -579,6 +597,26 @@ fn valid_repo(repo: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn isolated_webhook_secret_is_private_and_matches_receiver_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_home =
+            prepare_webhook_config(&dir.path().join("state.sqlite3"), "probe-secret").unwrap();
+        let config = config_home.join("codex-wake");
+        let secret = config.join("webhook.secret");
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "probe-secret");
+        assert_eq!(
+            fs::metadata(config).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn signatures_and_delivery_identity_are_exact() {
         assert_eq!(

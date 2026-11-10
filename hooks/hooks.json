@@ -1,5 +1,6 @@
 {
   "hooks": {
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run-mcp.sh\" hook", "timeout": 30}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run-mcp.sh\" hook", "timeout": 30, "additionalContextLimit": 0}]}],
     "SessionStart": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/run-mcp.sh\" hook", "timeout": 150}]}],
     "Interrupt": [{"hooks": [{"type": "command", "command": "sh \"${PLUGIN_ROOT}/scripts/interrupt.sh\"", "timeout": 3}]}],

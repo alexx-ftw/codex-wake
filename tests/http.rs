@@ -21,6 +21,7 @@ type HmacSha256 = Hmac<Sha256>;
 const SECRET: &str = "local-http-test-secret";
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const THREAD: &str = "11111111-1111-4111-8111-111111111111";
+const DELIVERY_ID: &str = "11111111-2222-4333-8444-555555555555";
 
 struct Receiver {
     child: Child,
@@ -54,6 +55,7 @@ fn cli(db: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
     let state = root.join("codex-wake");
     fs::create_dir_all(&state).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    prepare_webhook_config(root);
     Command::new(env!("CARGO_BIN_EXE_codex-wake"))
         .args([
             "--db",
@@ -63,11 +65,30 @@ fn cli(db: &Path, codex: &Path, args: &[&str]) -> std::process::Output {
         ])
         .args(args)
         .env("XDG_STATE_HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
         .env("CODEX_HOME", root.join("codex-home"))
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
         .output()
         .unwrap()
+}
+
+fn prepare_webhook_config(root: &Path) {
+    let config = root.join("config/codex-wake");
+    fs::create_dir_all(&config).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+    let secret = config.join("webhook.secret");
+    fs::write(&secret, SECRET).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn assert_status(receiver: &Receiver, actual: u16, expected: u16, context: &str) {
+    assert_eq!(
+        actual,
+        expected,
+        "{context}; webhook receiver log:\n{}",
+        fs::read_to_string(&receiver.log).unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    );
 }
 
 fn request(
@@ -76,6 +97,17 @@ fn request(
     body: &[u8],
     event: Option<&str>,
     signature: Option<&str>,
+) -> u16 {
+    request_with_delivery(addr, method, body, event, signature, Some(DELIVERY_ID))
+}
+
+fn request_with_delivery(
+    addr: std::net::SocketAddr,
+    method: &str,
+    body: &[u8],
+    event: Option<&str>,
+    signature: Option<&str>,
+    delivery_id: Option<&str>,
 ) -> u16 {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
     stream
@@ -101,6 +133,9 @@ fn request(
         }
         if let Some(signature) = signature {
             write!(stream, "X-Hub-Signature-256: {signature}\r\n").unwrap();
+        }
+        if let Some(delivery_id) = delivery_id {
+            write!(stream, "X-GitHub-Delivery: {delivery_id}\r\n").unwrap();
         }
     }
     stream.write_all(b"\r\n").unwrap();
@@ -152,6 +187,23 @@ fn start_receiver(
     codex: &Path,
     defer: bool,
 ) -> (Receiver, std::net::SocketAddr) {
+    start_receiver_with_executable(
+        temp,
+        db,
+        codex,
+        defer,
+        Path::new(env!("CARGO_BIN_EXE_codex-wake")),
+    )
+}
+
+fn start_receiver_with_executable(
+    temp: &TempDir,
+    db: &Path,
+    codex: &Path,
+    defer: bool,
+    executable: &Path,
+) -> (Receiver, std::net::SocketAddr) {
+    prepare_webhook_config(temp.path());
     let webhook = receiver_path().expect(
         "set CODEX_WAKE_WEBHOOK to a verified webhook executable or install the verified local binary",
     );
@@ -171,13 +223,14 @@ fn start_receiver(
             "-hooks",
             "hooks.json.tmpl",
         ])
-        .env("CODEX_WAKE_EXECUTABLE", env!("CARGO_BIN_EXE_codex-wake"))
+        .env("CODEX_WAKE_EXECUTABLE", executable)
         .env("CODEX_WAKE_DB", db)
         .env("CODEX_WAKE_CODEX", codex)
         .env("CAPTURE", temp.path().join("codex-calls"))
         .env("GITHUB_WEBHOOK_SECRET", SECRET)
         .env("CODEX_WAKE_DEFER", if defer { "1" } else { "0" })
         .env("XDG_STATE_HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("CODEX_HOME", temp.path().join("codex-home"))
         .env_remove("CODEX_WAKE_PLUGIN_BASE")
         .env_remove("CODEX_WAKE_PLUGIN_ROOT")
@@ -213,7 +266,47 @@ fn start_receiver(
 
 #[test]
 #[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
-fn real_webhook_authenticates_and_dispatches_once() {
+fn real_webhook_passes_delivery_id_and_exact_request_bytes_to_command() {
+    let temp = TempDir::new().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let db = temp.path().join("state.sqlite3");
+    let codex = temp.path().join("unused-codex");
+    let capture = temp.path().join("codex-calls");
+    let delivery_capture = temp.path().join("codex-calls.delivery");
+    let recorder = temp.path().join("record-webhook-input");
+    fs::write(
+        &recorder,
+        "#!/bin/sh\ncat \"$CODEX_WAKE_PAYLOAD\" > \"$CAPTURE\"\nprintf '%s' \"$CODEX_WAKE_DELIVERY\" > \"$CAPTURE.delivery\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&recorder, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let (_receiver, addr) = start_receiver_with_executable(&temp, &db, &codex, true, &recorder);
+    let body = br#"{
+  "workflow_run": { "conclusion": "success", "status": "completed", "id": 123 },
+  "repository": { "full_name": "owner/repo" },
+  "action": "completed"
+}"#;
+    let delivery_id = DELIVERY_ID;
+    assert_eq!(
+        request_with_delivery(
+            addr,
+            "POST",
+            body,
+            Some("workflow_run"),
+            Some(&signed(body, SECRET.as_bytes())),
+            Some(delivery_id),
+        ),
+        200
+    );
+    assert_eq!(fs::read(capture).unwrap(), body);
+    assert_eq!(fs::read_to_string(delivery_capture).unwrap(), delivery_id);
+}
+
+#[test]
+#[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
+fn real_webhook_preserves_signed_raw_body_and_dispatches_once() {
     let temp = TempDir::new().unwrap();
     #[cfg(unix)]
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -245,17 +338,34 @@ fn real_webhook_authenticates_and_dispatches_once() {
         String::from_utf8_lossy(&registered.stderr)
     );
 
-    let (_receiver, addr) = start_receiver(&temp, &db, &codex, false);
+    let (receiver, addr) = start_receiver(&temp, &db, &codex, false);
 
-    let body = payload("completed", SHA, "completed");
+    // The real webhook must pass these exact bytes to `handle`: JSON re-encoding
+    // changes both the deliberate key order and whitespace covered by this HMAC.
+    let body = br#"{
+  "workflow_run": {
+    "status": "completed",
+    "conclusion": "success",
+    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "run_attempt": 1,
+    "id": 123
+  },
+  "repository": { "full_name": "owner/repo" },
+  "action": "completed"
+}"#
+    .to_vec();
     let signature = signed(&body, SECRET.as_bytes());
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &body, Some("workflow_run"), Some(&signature)),
-        200
+        200,
+        "completed workflow_run should be accepted",
     );
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &body, Some("workflow_run"), Some(&signature)),
-        200
+        200,
+        "duplicate workflow_run should be accepted idempotently",
     );
     assert_eq!(
         fs::read_to_string(&capture).unwrap().lines().count(),
@@ -315,6 +425,68 @@ fn real_webhook_authenticates_and_dispatches_once() {
 
 #[test]
 #[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
+fn real_webhook_preserves_subscription_when_automatic_capture_fails() {
+    let temp = TempDir::new().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let db = temp.path().join("state.sqlite3");
+    let codex = temp.path().join("fake-codex");
+    fs::write(&codex, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let subscribed = cli(
+        &db,
+        &codex,
+        &[
+            "subscribe",
+            "--kind",
+            "pull_request",
+            "--repo",
+            "owner/repo",
+            "--resource",
+            "7",
+            "--event",
+            "closed",
+            "--thread",
+            THREAD,
+        ],
+    );
+    assert!(
+        subscribed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&subscribed.stderr)
+    );
+
+    let (receiver, addr) = start_receiver(&temp, &db, &codex, true);
+    let payload = serde_json::to_vec(&json!({"action":"closed","number":7,
+        "repository":{"full_name":"owner/repo"},
+        "pull_request":{"number":7,"merged":false}}))
+    .unwrap();
+    let signature = signed(&payload, SECRET.as_bytes());
+    for _ in 0..2 {
+        assert_status(
+            &receiver,
+            request(
+                addr,
+                "POST",
+                &payload,
+                Some("pull_request"),
+                Some(&signature),
+            ),
+            200,
+            "signed pull request event should be accepted",
+        );
+    }
+    let db = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let (count, state): (i64, String) = db.query_row(
+        "SELECT COUNT(*), MIN(state) FROM subscriptions WHERE kind='pull_request' AND repo='owner/repo' AND resource='7' AND event='closed'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!((count, state.as_str()), (1, "ready"));
+}
+
+#[test]
+#[ignore = "requires verified webhook binary; run with CODEX_WAKE_WEBHOOK and --include-ignored"]
 fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
     let temp = TempDir::new().unwrap();
     #[cfg(unix)]
@@ -370,7 +542,7 @@ fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
         String::from_utf8_lossy(&subscribed.stderr)
     );
 
-    let (_receiver, addr) = start_receiver(&temp, &db, &codex, true);
+    let (receiver, addr) = start_receiver(&temp, &db, &codex, true);
     let comment = serde_json::to_vec(&json!({
         "action":"created", "repository":{"full_name":"owner/repo"},
         "issue":{"number":123,"pull_request":{"url":"https://example.invalid/pull/123"}},
@@ -378,25 +550,29 @@ fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
     }))
     .unwrap();
     let signature = signed(&comment, SECRET.as_bytes());
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(
             addr,
             "POST",
             &comment,
             Some("issue_comment"),
-            Some(&signature)
+            Some(&signature),
         ),
-        200
+        200,
+        "issue_comment should be accepted",
     );
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(
             addr,
             "POST",
             &comment,
             Some("issue_comment"),
-            Some(&signature)
+            Some(&signature),
         ),
-        200
+        200,
+        "duplicate issue_comment should be accepted",
     );
 
     let custom = serde_json::to_vec(&json!({
@@ -405,13 +581,17 @@ fn real_webhook_routes_comment_and_custom_events_without_dispatching() {
     }))
     .unwrap();
     let signature = signed(&custom, SECRET.as_bytes());
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &custom, Some("codex_wake"), Some(&signature)),
-        200
+        200,
+        "codex_wake event should be accepted",
     );
-    assert_eq!(
+    assert_status(
+        &receiver,
         request(addr, "POST", &custom, Some("codex_wake"), Some(&signature)),
-        200
+        200,
+        "duplicate codex_wake event should be accepted idempotently",
     );
 
     let db = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();

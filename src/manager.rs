@@ -3,6 +3,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -178,6 +179,7 @@ pub(crate) fn source_digest() -> String {
     for source in [
         include_bytes!("main.rs").as_slice(),
         include_bytes!("manager.rs").as_slice(),
+        include_bytes!("lib.rs").as_slice(),
         include_bytes!("coordination_view.rs").as_slice(),
         include_bytes!("conditions.rs").as_slice(),
         include_bytes!("condition_alerts.rs").as_slice(),
@@ -192,6 +194,17 @@ pub(crate) fn source_digest() -> String {
         include_bytes!("templates.rs").as_slice(),
         include_bytes!("execution.rs").as_slice(),
         include_bytes!("rules.rs").as_slice(),
+        include_bytes!("pr_ci.rs").as_slice(),
+        include_bytes!("pr_ci_runtime.rs").as_slice(),
+        include_bytes!("pr_ci_legacy.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/fds.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/guard.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/start.rs").as_slice(),
+        include_bytes!("pr_ci_legacy/supervisor.rs").as_slice(),
+        include_bytes!("pr_notifications.rs").as_slice(),
+        include_bytes!("pr_hook.rs").as_slice(),
+        include_bytes!("pr_observation.rs").as_slice(),
+        include_bytes!("pr_registration.rs").as_slice(),
         include_bytes!("uninstall.rs").as_slice(),
         include_bytes!("host_cleanup.rs").as_slice(),
         include_bytes!("observability.rs").as_slice(),
@@ -869,6 +882,17 @@ fn remove_stale_socket_in(path: &Path, temp: &Path) -> Result<()> {
     Ok(())
 }
 
+fn pr_ci_cleanup_uncertain_count(result: &Result<codex_wake::pr_ci::PollReport>) -> usize {
+    match result {
+        Ok(report) => report.cleanup_uncertain,
+        Err(error) => usize::from(
+            error
+                .chain()
+                .any(|cause| cause.is::<codex_wake::pr_ci::ProcessCleanupUncertain>()),
+        ),
+    }
+}
+
 pub fn run_receiver(config: &Config) -> Result<()> {
     require_installed(config)?;
     let root = env::current_exe()?
@@ -944,7 +968,16 @@ pub fn run_receiver(config: &Config) -> Result<()> {
     }
     crate::observability::emit("receiver.start", "ok", "", None, Duration::ZERO, 1);
     // Observation must keep running while accepted deliveries wait on a busy Codex thread.
-    for source in ["github", "external", "native", "delivery"] {
+    for source in [
+        "github",
+        "external",
+        "native",
+        "delivery",
+        "pr-ci",
+        "pr-ci-delivery",
+        "native-wake-recovery",
+        "pr-registration",
+    ] {
         let poll_config = config.clone();
         thread::spawn(move || {
             let mut history_scans = std::collections::HashMap::new();
@@ -966,6 +999,130 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                 &poll_config.codex,
                                 &mut history_scans,
                             )?;
+                        }
+                        "pr-ci" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            let result = codex_wake::pr_ci_runtime::poll_one_with_gh(
+                                &db,
+                                &poll_config.gh,
+                                now,
+                            );
+                            let cleanup_uncertain = pr_ci_cleanup_uncertain_count(&result);
+                            if cleanup_uncertain > 0 {
+                                crate::observability::emit(
+                                    "poll.pr_ci",
+                                    "error",
+                                    "process_cleanup_uncertain",
+                                    None,
+                                    Duration::ZERO,
+                                    cleanup_uncertain as u64,
+                                );
+                            }
+                            let report = result?;
+                            if !report.errors.is_empty() {
+                                bail!("PR CI polling failed; see tracking status");
+                            }
+                            if report.unlinked_runs > 0 {
+                                crate::observability::emit(
+                                    "poll.pr_ci",
+                                    "partial",
+                                    "unlinked_runs",
+                                    None,
+                                    Duration::ZERO,
+                                    report.unlinked_runs as u64,
+                                );
+                            }
+                        }
+                        "pr-ci-delivery" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            crate::dispatch_ci_with_queue(
+                                &mut db,
+                                &poll_config,
+                                now,
+                                |thread, message, id, resume| {
+                                    crate::execution::queue_with_identity(
+                                        &poll_config.codex,
+                                        thread,
+                                        message,
+                                        id,
+                                        resume,
+                                        Duration::from_secs(120),
+                                    )
+                                },
+                            )?;
+                        }
+                        "native-wake-recovery" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            let mut wake = |thread: &str, accepted_ids: &[String]| {
+                                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                                let remaining = || {
+                                    deadline
+                                        .checked_duration_since(std::time::Instant::now())
+                                        .filter(|timeout| !timeout.is_zero())
+                                        .context("Native wake recovery deadline expired")
+                                };
+                                let accepted_ids = accepted_ids.iter().cloned().collect();
+                                let result = start_accepted_native_message(
+                                    &db,
+                                    thread,
+                                    &accepted_ids,
+                                    &mut |method, params| {
+                                        crate::goals::rpc_with_timeout(
+                                            &poll_config.codex,
+                                            method,
+                                            params,
+                                            remaining()?,
+                                        )
+                                    },
+                                );
+                                if result.is_err() {
+                                    crate::observability::emit(
+                                        "native_wake.recovery",
+                                        "needs_attention",
+                                        "queue_reconciliation_deferred",
+                                        None,
+                                        Duration::ZERO,
+                                        1,
+                                    );
+                                }
+                                result
+                            };
+                            let recovered = codex_wake::pr_ci_runtime::recover_native_wake_intents(
+                                &db, now, &mut wake,
+                            )?
+                                + codex_wake::pr_ci_runtime::recover_native_wake_retries(
+                                    &db, now, &mut wake,
+                                )?;
+                            if recovered > 0 {
+                                crate::observability::emit(
+                                    "native_wake.recovery",
+                                    "ok",
+                                    "recovery_rows_cleared",
+                                    None,
+                                    Duration::ZERO,
+                                    recovered as u64,
+                                );
+                            }
+                        }
+                        "pr-registration" => {
+                            let now = i64::try_from(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_millis(),
+                            )?;
+                            crate::pr_registration::reconcile(&mut db, &poll_config, now)?;
                         }
                         _ => {
                             crate::native_poll::tick(&db, &poll_config.codex)?;
@@ -1016,6 +1173,11 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                 crate::process_interrupts(&config, &db)?;
                 crate::bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
                 crate::subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+                crate::polling::pr_notifications::dispatch(
+                    &mut db,
+                    &config.codex,
+                    Duration::from_secs(120),
+                )?;
                 crate::conditions::initialize(&db)?;
                 crate::dispatch_conditions(&db, &config.codex)?;
                 crate::obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
@@ -1491,9 +1653,576 @@ pub fn remove_service(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn list_thread_queue(
+    thread: &str,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<Vec<Value>> {
+    let mut cursor: Option<String> = None;
+    let mut items = Vec::new();
+    for _ in 0..100 {
+        let mut params = json!({"threadId":thread,"limit":100});
+        if let Some(cursor) = cursor.take() {
+            params["cursor"] = json!(cursor);
+        }
+        let response = call("thread/queue/list", params)?;
+        items.extend(
+            response
+                .get("data")
+                .and_then(Value::as_array)
+                .context("Queue list response has no data array")?
+                .iter()
+                .cloned(),
+        );
+        match response
+            .get("nextCursor")
+            .context("Queue list response has no nextCursor")?
+        {
+            Value::Null => return Ok(items),
+            Value::String(next) if !next.is_empty() => cursor = Some(next.clone()),
+            _ => bail!("Queue list returned an invalid cursor"),
+        }
+    }
+    bail!("Queue list exceeded the recovery page limit")
+}
+
+fn has_execution_evidence(
+    db: &rusqlite::Connection,
+    thread: &str,
+    client_id: &str,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<bool> {
+    crate::delivery_evidence::initialize(db)?;
+    let observed: bool = db.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM user_message_observations
+             WHERE target_thread=?1 AND client_user_message_id=?2
+         )",
+        rusqlite::params![thread, client_id],
+        |row| row.get(0),
+    )?;
+    if observed {
+        return Ok(true);
+    }
+
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..100 {
+        let mut params = json!({
+            "threadId":thread,
+            "limit":50,
+            "sortDirection":"desc",
+            "itemsView":"full"
+        });
+        if let Some(cursor) = cursor.take() {
+            params["cursor"] = json!(cursor);
+        }
+        let page = call("thread/turns/list", params)?;
+        let turns = page["data"]
+            .as_array()
+            .context("History response has no data array")?;
+        if turns.iter().any(|turn| {
+            turn["items"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["type"] == "userMessage" && item["clientId"].as_str() == Some(client_id)
+                })
+            })
+        }) {
+            return Ok(true);
+        }
+        match &page["nextCursor"] {
+            Value::Null => return Ok(false),
+            Value::String(next)
+                if !next.is_empty() && next.len() <= 2048 && seen_cursors.insert(next.clone()) =>
+            {
+                cursor = Some(next.clone());
+            }
+            _ => anyhow::bail!("History returned an invalid or repeated cursor"),
+        }
+    }
+    anyhow::bail!("History exceeded the recovery page limit")
+}
+
+fn start_accepted_native_message(
+    db: &rusqlite::Connection,
+    thread: &str,
+    accepted_ids: &HashSet<String>,
+    call: &mut impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<()> {
+    let initial_items = list_thread_queue(thread, call)?;
+    for item in &initial_items {
+        let client_id = item
+            .get("clientUserMessageId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context(
+                "Queue item has no attributable client identity; preserving recovery uncertainty",
+            )?;
+        if accepted_ids.contains(client_id) {
+            let observed = has_execution_evidence(db, thread, client_id, call)?;
+            if observed {
+                bail!(
+                    "Accepted queue item remains listed despite exact execution evidence; preserving recovery uncertainty"
+                );
+            }
+            bail!(
+                "Accepted queue item remains listed without atomic start evidence; preserving recovery uncertainty"
+            );
+        }
+    }
+    ensure!(
+        !accepted_ids.is_empty()
+            && accepted_ids
+                .iter()
+                .try_fold(true, |all_observed, client_id| -> Result<bool> {
+                    Ok(all_observed && has_execution_evidence(db, thread, client_id, call)?)
+                })?,
+        "Accepted notification is absent from the queue without exact execution evidence; preserving recovery uncertainty"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_uncertainty_is_visible_when_marker_persistence_fails() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        codex_wake::pr_ci::register(&mut db, "owner/repo", "7", thread).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_marker BEFORE INSERT ON pr_ci_cleanup_uncertainties
+             BEGIN SELECT RAISE(ABORT, 'private sqlite detail'); END;",
+        )
+        .unwrap();
+        let result = codex_wake::pr_ci::poll(&db, 100, |_| {
+            Err(anyhow::Error::new(
+                codex_wake::pr_ci::ProcessCleanupUncertain,
+            ))
+        });
+        assert_eq!(pr_ci_cleanup_uncertain_count(&result), 1);
+        assert!(!format!("{:#}", result.unwrap_err()).contains("private sqlite detail"));
+    }
+
+    const RECOVERY_THREAD: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn recovery_row_count(db: &rusqlite::Connection) -> i64 {
+        db.query_row("SELECT COUNT(*) FROM native_wake_recovery", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    fn record_exact_user_message(db: &mut rusqlite::Connection, client_id: &str) {
+        crate::delivery_evidence::initialize(db).unwrap();
+        let event_key = format!("event-{client_id}");
+        db.execute(
+            "INSERT INTO delivery_evidence
+             (event_key,target_thread,client_user_message_id,coverage_state,identity_verified,updated_ms)
+             VALUES(?1,?2,?3,'unknown',1,0)",
+            rusqlite::params![event_key, RECOVERY_THREAD, client_id],
+        )
+        .unwrap();
+        crate::delivery_evidence::record_notifications(
+            db,
+            &event_key,
+            RECOVERY_THREAD,
+            client_id,
+            &[json!({
+                "method":"item/started",
+                "params":{
+                    "threadId":RECOVERY_THREAD,
+                    "turnId":"turn-exact",
+                    "item":{"type":"userMessage","id":"item-exact","clientId":client_id}
+                }
+            })],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_wake_recovery_uses_exact_warning_id_not_old_uncertain_delivery() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        let event = crate::delivery_evidence::source_fields_identity(
+            "github.pr_ci.workflow_run.completed",
+            &["owner/repo", "42", "124", "1"],
+        )
+        .unwrap();
+        let current_id =
+            crate::delivery_evidence::client_user_message_id(&event, RECOVERY_THREAD).unwrap();
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            RECOVERY_THREAD,
+            "native_queue_resume_warning",
+            &current_id,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_deliveries
+             (id,repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json,state)
+             VALUES(2,'owner/repo',42,?1,124,1,?2,'success','{}','delivered')",
+            rusqlite::params!["b".repeat(40), RECOVERY_THREAD],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_deliveries
+             (id,repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json,state)
+             VALUES(1,'owner/repo',42,?1,123,1,?2,'success','{}','needs_attention')",
+            rusqlite::params!["a".repeat(40), RECOVERY_THREAD],
+        )
+        .unwrap();
+        let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
+            &db,
+            1_001,
+            |thread, ids| {
+                assert_eq!(ids, std::slice::from_ref(&current_id));
+                let accepted_ids = ids.iter().cloned().collect();
+                start_accepted_native_message(
+                    &db,
+                    thread,
+                    &accepted_ids,
+                    &mut |method, _| match method {
+                        "thread/queue/list" => Ok(json!({"data":[{"id":"current-item","clientUserMessageId":current_id}],"nextCursor":null})),
+                        "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
+                        other => panic!("unexpected recovery RPC {other}"),
+                    },
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
+        let states: Vec<(i64, String)> = db
+            .prepare("SELECT id,state FROM pr_ci_deliveries ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            [(1, "needs_attention".into()), (2, "delivered".into())]
+        );
+    }
+
+    #[test]
+    fn native_wake_recovery_clears_only_with_exact_execution_evidence_when_queue_item_is_gone() {
+        for record_second in [false, true] {
+            let mut db = rusqlite::Connection::open_in_memory().unwrap();
+            codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                &db,
+                RECOVERY_THREAD,
+                "native_queue_resume_warning",
+                "10000000-0000-4000-8000-000000000011",
+            )
+            .unwrap();
+            codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                &db,
+                RECOVERY_THREAD,
+                "native_queue_resume_warning",
+                "10000000-0000-4000-8000-000000000012",
+            )
+            .unwrap();
+            record_exact_user_message(&mut db, "10000000-0000-4000-8000-000000000011");
+            if record_second {
+                record_exact_user_message(&mut db, "10000000-0000-4000-8000-000000000012");
+            }
+
+            let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
+                &db,
+                1_001,
+                |thread, ids| {
+                    let accepted_ids = ids.iter().cloned().collect();
+                    start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, _| {
+                        match method {
+                            "thread/queue/list" | "thread/turns/list" => {
+                                Ok(json!({"data":[],"nextCursor":null}))
+                            }
+                            other => panic!("unexpected recovery RPC {other}"),
+                        }
+                    })
+                },
+            )
+            .unwrap();
+
+            assert_eq!(recovered, if record_second { 1 } else { 0 });
+            assert_eq!(recovery_row_count(&db), if record_second { 0 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn native_wake_recovery_uses_exact_paged_history_evidence_for_pr_messages() {
+        for has_exact_id in [false, true] {
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            crate::polling::pr_notifications::initialize(&db).unwrap();
+            codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                &db,
+                RECOVERY_THREAD,
+                "native_queue_resume_warning",
+                "10000000-0000-4000-8000-000000000021",
+            )
+            .unwrap();
+            let accepted_id = "10000000-0000-4000-8000-000000000021";
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                 (id,kind,repo,pr,thread,event,event_key,source,state)
+                 VALUES(?1,'pull_request','owner/repo','42',?2,'closed','event-42','{}','queued')",
+                rusqlite::params![accepted_id, RECOVERY_THREAD],
+            )
+            .unwrap();
+            crate::delivery_evidence::initialize(&db).unwrap();
+            let evidence_count: i64 = db
+                .query_row("SELECT count(*) FROM delivery_evidence", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(evidence_count, 0);
+            let mut history_calls = 0;
+            let recovered =
+                codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                    let accepted_ids = ids.iter().cloned().collect();
+                    start_accepted_native_message(
+                        &db,
+                        thread,
+                        &accepted_ids,
+                        &mut |method, params| match method {
+                            "thread/queue/list" => {
+                                assert_eq!(params["threadId"], RECOVERY_THREAD);
+                                Ok(json!({"data":[],"nextCursor":null}))
+                            }
+                            "thread/turns/list" => {
+                                assert_eq!(params["threadId"], RECOVERY_THREAD);
+                                history_calls += 1;
+                                if history_calls == 1 {
+                                    Ok(json!({
+                                        "data":[{"id":"newer-turn","items":[{
+                                            "type":"userMessage",
+                                            "id":"unrelated-item",
+                                            "clientId":"different-client-id"
+                                        }]}],
+                                        "nextCursor":"older-page"
+                                    }))
+                                } else {
+                                    Ok(json!({
+                                        "data":[{"id":"older-turn","items":[{
+                                            "type":"userMessage",
+                                            "id":"executed-pr-message",
+                                            "clientId":if has_exact_id { accepted_id } else { "different-client-id" }
+                                        }]}],
+                                        "nextCursor":null
+                                    }))
+                                }
+                            }
+                            other => panic!("unexpected recovery RPC {other}"),
+                        },
+                    )
+                })
+                .unwrap();
+
+            assert_eq!(recovered, if has_exact_id { 1 } else { 0 });
+            assert_eq!(recovery_row_count(&db), if has_exact_id { 0 } else { 1 });
+            assert_eq!(history_calls, 2);
+        }
+    }
+
+    #[test]
+    fn native_wake_recovery_never_starts_or_resumes_a_listed_item() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            RECOVERY_THREAD,
+            "native_queue_resume_warning",
+            "10000000-0000-4000-8000-000000000031",
+        )
+        .unwrap();
+        let accepted_id = "10000000-0000-4000-8000-000000000031";
+        let mut methods = Vec::new();
+        let recovered =
+            codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                assert_eq!(ids, &[accepted_id.to_owned()]);
+                let accepted_ids = ids.iter().cloned().collect();
+                start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, _| {
+                    methods.push(method.to_owned());
+                    match method {
+                        "thread/queue/list" => Ok(json!({"data":[
+                            {"id":"queue-item-1","clientUserMessageId":accepted_id},
+                            {"id":"queue-item-2","clientUserMessageId":"unrelated-client-id"}
+                        ],"nextCursor":null})),
+                        "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
+                        other => panic!("unexpected recovery RPC {other}"),
+                    }
+                })
+            })
+            .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
+        assert_eq!(
+            methods.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["thread/queue/list", "thread/turns/list"]
+        );
+        assert!(!methods.iter().any(|method| matches!(
+            method.as_str(),
+            "thread/queue/add" | "thread/queue/start" | "thread/resume"
+        )));
+    }
+
+    #[test]
+    fn native_wake_recovery_keeps_both_listed_items() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let first_id = "10000000-0000-4000-8000-000000000051";
+        let second_id = "10000000-0000-4000-8000-000000000052";
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            RECOVERY_THREAD,
+            "native_queue_resume_warning",
+            first_id,
+        )
+        .unwrap();
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            RECOVERY_THREAD,
+            "native_queue_resume_warning",
+            second_id,
+        )
+        .unwrap();
+        let recovered =
+            codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                assert_eq!(ids, &[first_id.to_owned(), second_id.to_owned()]);
+                let accepted_ids = ids.iter().cloned().collect();
+                start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, _| {
+                    match method {
+                        "thread/queue/list" => Ok(json!({"data":[
+                            {"id":"queue-first","clientUserMessageId":first_id},
+                            {"id":"queue-second","clientUserMessageId":second_id}
+                        ],"nextCursor":null})),
+                        "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
+                        other => panic!("unexpected recovery RPC {other}"),
+                    }
+                })
+            })
+            .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
+    }
+
+    #[test]
+    fn recovery_retains_executed_item_still_queued_across_overlapping_callbacks_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        let id = "10000000-0000-4000-8000-000000000061";
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            RECOVERY_THREAD,
+            "native_queue_resume_warning",
+            id,
+        )
+        .unwrap();
+        record_exact_user_message(&mut db, id);
+        let calls = std::cell::Cell::new(0);
+        let observe = |thread: &str, ids: &[String]| -> Result<()> {
+            let accepted = ids.iter().cloned().collect();
+            start_accepted_native_message(&db, thread, &accepted, &mut |method, _| {
+                assert_eq!(
+                    method, "thread/queue/list",
+                    "must not start, resume or resend"
+                );
+                calls.set(calls.get() + 1);
+                Ok(
+                    json!({"data":[{"id":"still-queued","clientUserMessageId":id}],"nextCursor":null}),
+                )
+            })
+        };
+        let recovered =
+            codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                let nested =
+                    codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 2_002, &observe)?;
+                assert_eq!(nested, 0);
+                observe(thread, ids)
+            })
+            .unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(recovery_row_count(&db), 1);
+        drop(db);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 5_000, |thread, ids| {
+            let accepted = ids.iter().cloned().collect();
+            start_accepted_native_message(&db, thread, &accepted, &mut |method, _| {
+                assert_eq!(method, "thread/queue/list");
+                Ok(json!({"data":[{"id":"still-queued","clientUserMessageId":id}],"nextCursor":null}))
+            })
+        }).unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
+    }
+
+    #[test]
+    fn recovery_does_not_clear_when_queue_identity_is_missing() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        let id = "10000000-0000-4000-8000-000000000062";
+        record_exact_user_message(&mut db, id);
+        let accepted = HashSet::from([id.to_owned()]);
+        let result =
+            start_accepted_native_message(&db, RECOVERY_THREAD, &accepted, &mut |method, _| {
+                assert_eq!(method, "thread/queue/list");
+                Ok(json!({"data":[{"id":"unknown-identity"}],"nextCursor":null}))
+            });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn native_wake_recovery_keeps_uncertainty_when_accepted_item_is_missing_or_thread_busy() {
+        let accepted_id = "10000000-0000-4000-8000-000000000041";
+        for (status, listed) in [
+            (
+                "idle",
+                json!({"data":[{"id":"other-item","clientUserMessageId":"other-client-id"}],"nextCursor":null}),
+            ),
+            (
+                "active",
+                json!({"data":[{"id":"queue-item-1","clientUserMessageId":accepted_id}],"nextCursor":null}),
+            ),
+        ] {
+            let db = rusqlite::Connection::open_in_memory().unwrap();
+            codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                &db,
+                RECOVERY_THREAD,
+                "native_queue_resume_warning",
+                accepted_id,
+            )
+            .unwrap();
+            let accepted_ids = HashSet::from([accepted_id.to_owned()]);
+            let mut methods = Vec::new();
+            let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
+                &db,
+                1_001,
+                |thread, ids| {
+                    assert_eq!(ids, &[accepted_id.to_owned()]);
+                    start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, _| {
+                        methods.push(method.to_owned());
+                        match method {
+                            "thread/queue/list" => Ok(listed.clone()),
+                            "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
+                            "thread/read" => Ok(json!({"thread":{"status":{"type":status}}})),
+                            other => panic!("unexpected recovery RPC {other}"),
+                        }
+                    })
+                },
+            )
+            .unwrap();
+
+            assert_eq!(recovered, 0);
+            assert_eq!(recovery_row_count(&db), 1);
+            assert!(!methods.iter().any(|method| {
+                matches!(method.as_str(), "thread/queue/add" | "thread/queue/start")
+            }));
+        }
+    }
 
     #[test]
     fn funnel_cleanup_removes_only_unchanged_owned_path() {

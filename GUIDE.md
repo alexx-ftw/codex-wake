@@ -583,6 +583,16 @@ completed` when the task itself is done. Consumers must verify the source's
 result before acting. Interruptions, closing a window, and idle status aren't
 treated as task success. Self-subscription to a thread's own stop is rejected.
 
+`PreToolUse` and `PostToolUse` can register follow-up tracking when a chat creates
+a GitHub pull request. Wake correlates the tool call and verifies the PR with
+GitHub before registering its destination, reviews, comments and Actions runs.
+Ambiguous results are retained for investigation rather than attributed to a
+chat. The hook recognizes direct `gh pr create`, `gh api` pull request creation
+and the GitHub connector; composed shell commands are not recognized. GitHub
+polling requires access to the repository and cannot recover every intermediate
+change between reads. Actions runs without a verifiable PR association are not
+attributed by SHA alone.
+
 Hook stdout follows Codex's JSON contract. `SessionStart` reports receiver and
 controller readiness through `systemMessage`. `Stop` and `SubagentStop` report
 newly matched subscriptions and current delivery states for that source; no new

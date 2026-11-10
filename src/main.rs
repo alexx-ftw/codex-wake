@@ -13,6 +13,9 @@ mod obligations;
 mod observability;
 mod observers;
 mod polling;
+mod pr_hook;
+mod pr_observation;
+mod pr_registration;
 mod probe;
 mod producers;
 mod result_conflicts;
@@ -26,25 +29,34 @@ mod uninstall;
 mod validation_obligations;
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, Mac};
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
     tool_router,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
     io::{self, Read},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::PathBuf,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 #[derive(Clone)]
 struct WakeTools {
     config: manager::Config,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrCreationAttentionInput {
+    /// Optional next_cursor returned by the previous page.
+    cursor: Option<i64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -305,6 +317,13 @@ struct CatalogInput {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct PrNotificationAttentionInput {
+    /// Cursor returned by the previous page; omit for the first page.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CoordinationViewInput {
     /// Zero-based chat offset from a previous response.
     offset: Option<u32>,
@@ -363,7 +382,7 @@ struct ResolveConditionOrderInput {
     resource: String,
     /// native, ci, or pull_request.
     source: String,
-    /// Required for pull_request; closed or merged.
+    /// Required for pull_request: closed, merged, synchronize, or base_changed.
     event: Option<String>,
     /// Exact CI repository, run ID, attempt, and SHA when multiple members share this resource.
     ci: Option<ResolveCiInput>,
@@ -372,6 +391,39 @@ struct ResolveConditionOrderInput {
     /// Exact member outcome when CI identity alone still leaves multiple candidates.
     member_outcome: Option<String>,
     /// True only when evidence shows the buffered event occurred after registration; false excludes it as historical.
+    accept: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrConditionIdentityInput {
+    group_id: String,
+    /// PR number, or owner/repo#number when needed to select a member.
+    resource: String,
+    /// synchronize or base_changed.
+    event: String,
+    /// Opaque continuation cursor from the preceding page.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrConditionIdentityPendingInput {
+    /// Opaque continuation cursor from the preceding page.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResolvePrConditionIdentityInput {
+    group_id: String,
+    /// PR number, or owner/repo#number when needed to select a member.
+    resource: String,
+    /// synchronize or base_changed.
+    event: String,
+    /// Exact internal candidate identifier returned by inspection.
+    candidate_id: String,
+    /// Accept this candidate using independently verified evidence, or reject it.
     accept: bool,
 }
 
@@ -488,21 +540,318 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     Ok(db)
 }
 
+fn pr_creation_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("post provenance capture incomplete") => "capture_incomplete",
+        Some("creation host provenance is unavailable") => "creation_host_unverified",
+        Some(
+            "GitHub verification host provenance is unavailable"
+            | "GitHub verification host provenance changed",
+        ) => "verification_host_unverified",
+        Some("gh api output uses jq/template formatting") => "filtered_output",
+        Some(
+            "no PreToolUse matches session, turn, tool and input digest"
+            | "PostToolUse lacks session, turn, or input digest"
+            | "multiple PreToolUse entries match session and input digest"
+            | "tool_use_id matched but PreToolUse and PostToolUse input digests differ",
+        ) => "correlation_unavailable",
+        _ => "other",
+    }
+}
+
+// Read-only diagnostics: do not log payloads, credentials, or unfiltered errors.
+fn pr_creation_attention(db: &rusqlite::Connection, cursor: Option<i64>) -> Result<Value> {
+    anyhow::ensure!(cursor.is_none_or(|id| id > 0), "Invalid candidate cursor");
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_hook_candidates')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(json!({"count":0,"candidates":[],"next_cursor":null}));
+    }
+    let mut stmt = db.prepare(
+        "SELECT id,number,url,COUNT(*) OVER (),reason,session_id FROM pr_hook_candidates WHERE state='ambiguous' AND consumed_at_ms IS NULL AND (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT 21",
+    )?;
+    let rows = stmt.query_map([cursor], |row| {
+        let reason: Option<String> = row.get(4)?;
+        let session: Option<String> = row.get(5)?;
+        let thread_link = session.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(|id| format!("codex://threads/{id}"));
+        Ok((
+            json!({"id":row.get::<_, i64>(0)?,"number":row.get::<_, i64>(1)?,"url":row.get::<_, String>(2)?,"reason":pr_creation_reason(reason.as_deref()),"thread_link":thread_link}),
+            row.get::<_, i64>(3)?,
+        ))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let count = rows.first().map_or(0, |row| row.1);
+    let has_more = rows.len() > 20;
+    let candidates: Vec<_> = rows.into_iter().take(20).map(|row| row.0).collect();
+    let next_cursor = has_more
+        .then(|| candidates.last().and_then(|row| row["id"].as_i64()))
+        .flatten();
+    Ok(json!({"count":count,"next_cursor":next_cursor,"candidates":candidates}))
+}
+
+fn add_pr_creation_notice(actionable: &mut Value, attention: &Value) {
+    if attention["count"].as_i64().unwrap_or_default() > 0 {
+        actionable.as_array_mut().unwrap().push(json!({
+            "source":"pr_creation",
+            "evidence":{"state":"needs_attention","count":attention["count"]},
+            "next_action":"Inspect unverified PR creations in pr_creation_attention; use get_pr_creation_attention to read further pages. They were not registered automatically."
+        }));
+    }
+}
+
+fn verify_webhook_signature(config: &manager::Config, raw: &[u8], signature: &str) -> Result<()> {
+    let signature = signature
+        .strip_prefix("sha256=")
+        .context("Webhook signature header must use sha256")?;
+    anyhow::ensure!(
+        signature.len() == 64 && signature.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Invalid webhook signature encoding"
+    );
+    let supplied = (0..32)
+        .map(|index| u8::from_str_radix(&signature[index * 2..index * 2 + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let secret_path = config.config.join("webhook.secret");
+    let owner = fs::metadata("/proc/self")?.uid();
+    let directory = fs::symlink_metadata(&config.config)?;
+    anyhow::ensure!(
+        directory.is_dir()
+            && directory.uid() == owner
+            && directory.permissions().mode() & 0o077 == 0,
+        "Webhook secret directory is not private"
+    );
+    let metadata = fs::symlink_metadata(&secret_path)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.uid() == owner && metadata.permissions().mode() & 0o077 == 0,
+        "Webhook secret must be a private file owned by this user"
+    );
+    let secret = fs::read_to_string(secret_path)?.trim().to_owned();
+    anyhow::ensure!(!secret.is_empty(), "Webhook secret is empty");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+    mac.update(raw);
+    mac.verify_slice(&supplied)
+        .context("Webhook signature does not match payload")
+}
+
+fn verified_webhook_payload(
+    config: &manager::Config,
+    raw: &[u8],
+    signature: &str,
+) -> Result<Value> {
+    verify_webhook_signature(config, raw, signature)?;
+    Ok(serde_json::from_slice(raw)?)
+}
+
+fn capture_authenticated_pr_notification(
+    db: &rusqlite::Connection,
+    gh: &Path,
+    event: &str,
+    delivery_id: Option<&str>,
+    payload: &Value,
+) -> Result<usize> {
+    if event == "pull_request" && payload["action"] == "reopened" {
+        return polling::accept_authenticated_pr_webhook_with_rest(
+            db,
+            gh,
+            event,
+            delivery_id,
+            payload,
+        );
+    }
+    let is_supported = (event == "pull_request"
+        && matches!(
+            payload["action"].as_str(),
+            Some("closed" | "synchronize" | "edited")
+        ))
+        || (event == "pull_request_review" && payload["action"] == "submitted");
+    if is_supported {
+        if let Some(delivery_id) = delivery_id.filter(|id| !id.is_empty()) {
+            polling::pr_notifications::accept_authenticated_webhook_with_delivery_id(
+                db,
+                event,
+                delivery_id,
+                payload,
+            )
+        } else {
+            polling::pr_notifications::accept_authenticated_webhook(db, event, payload)
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+fn accept_webhook_events(
+    db: &rusqlite::Connection,
+    gh: &Path,
+    event: &str,
+    payload: &Value,
+    authenticated: bool,
+    delivery_id: Option<&str>,
+) -> Result<(usize, Value, Option<usize>)> {
+    let matched_rules = rules::accept(db, event, payload)?;
+    let result = if event == "workflow_run" {
+        json!(bridge::accept(db, payload)?)
+    } else if matches!(event, "issue_comment" | "pull_request_review_comment") {
+        json!({"matched":0})
+    } else {
+        json!({"matched":subscriptions::accept(db,event,payload)?})
+    };
+    let automatic = if authenticated {
+        match capture_authenticated_pr_notification(db, gh, event, delivery_id, payload) {
+            Ok(count) => Some(count),
+            Err(error) => {
+                observability::emit(
+                    "pr_notification.capture",
+                    "error",
+                    observability::error_class(&error),
+                    None,
+                    Duration::ZERO,
+                    1,
+                );
+                None
+            }
+        }
+    } else {
+        Some(0)
+    };
+    Ok((matched_rules, result, automatic))
+}
+
 fn recover(config: &manager::Config) -> Result<usize> {
-    let mut db = database(config)?;
-    Ok(
-        bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + dispatch_conditions(&db, &config.codex)?
-            + obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + obligations::dispatch_coordinator_alerts(
-                &mut db,
-                &config.codex,
-                Duration::from_secs(30),
-            )?
-            + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
-            + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?,
+    recover_with_queue(config, |thread, message, id, resume| {
+        execution::queue_with_identity(
+            &config.codex,
+            thread,
+            message,
+            id,
+            resume,
+            Duration::from_secs(120),
+        )
+    })
+}
+
+pub(crate) fn prepare_ci_delivery_identity(
+    db_path: &Path,
+    event_key: &str,
+    thread: &str,
+) -> Result<String> {
+    let evidence_db =
+        bridge::connect(db_path).map_err(codex_wake::pr_ci_runtime::before_send_failure)?;
+    let (id, _) = delivery_evidence::begin(&evidence_db, event_key, thread, true)
+        .map_err(codex_wake::pr_ci_runtime::before_send_failure)?;
+    Ok(id)
+}
+
+pub(crate) fn ci_delivery_event_identity(delivery: &codex_wake::pr_ci::Delivery) -> Result<String> {
+    delivery_evidence::source_fields_identity(
+        "github.pr_ci.workflow_run.completed",
+        &[
+            &delivery.repo,
+            &delivery.pull_request.to_string(),
+            &delivery.run_id.to_string(),
+            &delivery.attempt.to_string(),
+        ],
     )
+}
+
+fn recover_with_queue(
+    config: &manager::Config,
+    mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
+) -> Result<usize> {
+    let mut db = database(config)?;
+    polling::pr_notifications::initialize(&db)?;
+    codex_wake::pr_ci::initialize(&db)?;
+    let mut attempted = bridge::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + subscriptions::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + dispatch_conditions(&db, &config.codex)?
+        + obligations::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + obligations::dispatch_coordinator_alerts(
+            &mut db,
+            &config.codex,
+            Duration::from_secs(30),
+        )?
+        + circular_waits::dispatch(&mut db, &config.codex, Duration::from_secs(120))?
+        + rules::dispatch(&mut db, &config.codex, &config.state.join("workspaces"))?;
+    attempted +=
+        polling::pr_notifications::dispatch(&mut db, &config.codex, Duration::from_secs(120))?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    attempted += dispatch_ci_with_queue(&mut db, config, now, &mut queue)?.claimed;
+    Ok(attempted)
+}
+
+pub(crate) fn dispatch_ci_with_queue(
+    db: &mut rusqlite::Connection,
+    config: &manager::Config,
+    now: i64,
+    mut queue: impl FnMut(&str, &str, &str, bool) -> Result<(String, Option<String>)>,
+) -> Result<codex_wake::pr_ci_runtime::DispatchReport> {
+    let mut ci_lock = None;
+    let mut ci_intent = None;
+    let ci_report =
+        codex_wake::pr_ci_runtime::dispatch(db, now, |dispatch_db, delivery, message| {
+            let key = ci_delivery_event_identity(delivery)?;
+            let id = prepare_ci_delivery_identity(&config.db, &key, &delivery.thread)?;
+            ci_lock = Some(
+                codex_wake::pr_ci_runtime::try_native_wake_lock(dispatch_db, &id)
+                    .map_err(codex_wake::pr_ci_runtime::before_send_failure)?
+                    .ok_or_else(|| {
+                        codex_wake::pr_ci_runtime::before_send_failure(anyhow::anyhow!(
+                            "Native delivery lock is busy"
+                        ))
+                    })?,
+            );
+            let token = codex_wake::pr_ci_runtime::begin_native_wake_intent(
+                dispatch_db,
+                &delivery.thread,
+                &id,
+                codex_wake::pr_ci_runtime::NativeWakeOrigin::Ci { id: delivery.id },
+                now.saturating_add(codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS),
+            )
+            .map_err(|error| {
+                if codex_wake::pr_ci_runtime::native_wake_intent_exists(&error) {
+                    error
+                } else {
+                    codex_wake::pr_ci_runtime::before_send_failure(error)
+                }
+            })?;
+            ci_intent = Some((delivery.thread.clone(), token.clone()));
+            let (state, reason) = match queue(&delivery.thread, message, &id, true) {
+                Err(error) if execution::before_send_retry_reason(&error).is_some() => {
+                    return Err(codex_wake::pr_ci_runtime::before_send_failure_with_intent(
+                        error, &token,
+                    ));
+                }
+                other => other?,
+            };
+            if state == "ready" {
+                return Err(codex_wake::pr_ci_runtime::before_send_failure_with_intent(
+                    anyhow::anyhow!("Native delivery was not sent"),
+                    &token,
+                ));
+            }
+            if state == "queued" && reason.as_deref() == Some("native_queue_resume_warning") {
+                codex_wake::pr_ci_runtime::record_native_wake_recovery(
+                    dispatch_db,
+                    &delivery.thread,
+                    "native_queue_resume_warning",
+                    &id,
+                )?;
+            }
+            Ok((state, reason))
+        })?;
+    if ci_report.accepted > 0
+        && let Some((thread, token)) = ci_intent
+    {
+        codex_wake::pr_ci_runtime::finish_native_wake_intent(db, &thread, &token)?;
+    }
+    drop(ci_lock);
+    Ok(ci_report)
 }
 
 pub(crate) fn dispatch_conditions(
@@ -1094,6 +1443,7 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
         Some("Stop") => "hook.stop",
         Some("SubagentStop") => "hook.subagent_stop",
         Some("PostToolUse") => "hook.post_tool_use",
+        Some("PreToolUse") => "hook.pre_tool_use",
         _ => "hook.unsupported",
     };
     let span = observability::Span::new(
@@ -1108,8 +1458,39 @@ fn run_hook(config: &manager::Config, payload: &Value) -> Result<Value> {
 }
 
 fn run_hook_inner(config: &manager::Config, payload: &Value) -> Result<Value> {
+    if payload["hook_event_name"] == "PreToolUse" {
+        if !pr_observation::is_relevant_pre_tool_use(payload) {
+            return Ok(json!({}));
+        }
+        let mut db = database(config)?;
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        pr_observation::record_pre_tool_use(&mut db, payload, now, 3_600_000)?;
+        return Ok(json!({}));
+    }
     if payload["hook_event_name"] == "PostToolUse" {
-        return steer::take(&mut database(config)?, payload);
+        let mut db = database(config)?;
+        let transport = pr_observation::GhCliPullRequestGet::from_config(config);
+        if let Err(error) = pr_observation::handle_post_tool_use(
+            &mut db,
+            payload,
+            &transport,
+            Duration::from_secs(20),
+            3_600_000,
+        ) {
+            observability::emit(
+                "pr_observation.post_tool_use",
+                "error",
+                observability::error_class(&error),
+                None,
+                Duration::ZERO,
+                1,
+            );
+        }
+        return steer::take(&mut db, payload);
     }
     if payload["hook_event_name"] == "SessionStart" {
         let status = manager::ensure_receiver(config)?;
@@ -1366,6 +1747,21 @@ fn tool_result(result: Result<Value>) -> CallToolResult {
     }
 }
 
+fn pr_identity_resolution_result(
+    resolved: bool,
+    accept: bool,
+    recover_ready: impl FnOnce() -> Result<usize>,
+) -> Value {
+    let mut result = json!({"resolved":resolved});
+    if accept {
+        match recover_ready() {
+            Ok(count) => result["attempted"] = json!(count),
+            Err(error) => result["delivery_error"] = json!(observability::error_class(&error)),
+        }
+    }
+    result
+}
+
 #[tool_router]
 impl WakeTools {
     #[tool(
@@ -1590,7 +1986,7 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Resolve an ambiguous native, CI, or pull request event order using verified evidence; for pull_request provide event=closed or merged. For multiple CI members sharing a resource, provide ci and, if needed, member_event/member_outcome.",
+        description = "Resolve an ambiguous native, CI, or pull request event order using verified evidence; for pull_request provide event=closed, merged, synchronize, or base_changed. For multiple CI members sharing a resource, provide ci and, if needed, member_event/member_outcome.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     fn resolve_condition_order(
@@ -1640,6 +2036,66 @@ impl WakeTools {
                 Err(error) => result["delivery_error"] = json!(observability::error_class(&error)),
             }
             Ok(result)
+        })())
+    }
+
+    #[tool(
+        description = "List one page of pending PR condition identity candidates across groups. Use next_cursor while has_more is true; pages are live, not a snapshot, so restart without cursor to see changes to earlier rows. Provenance buffered means the original source is unknown.",
+        annotations(read_only_hint = true)
+    )]
+    fn list_pr_condition_identity_pending(
+        &self,
+        Parameters(input): Parameters<PrConditionIdentityPendingInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            polling::list_pr_condition_identity_pending(
+                &database(&self.config)?,
+                input.cursor.as_deref(),
+            )
+        })())
+    }
+
+    #[tool(
+        description = "Inspect one page of retained PR condition identity evidence; use next_cursor while has_more is true. Pages are not a snapshot: restart without cursor to see decisions or promotions that changed earlier rows. An observed entry is prior evidence and cannot yet be decided; actionable identifies candidates that can currently be resolved. Candidate identifiers do not prove webhook/poll equivalence; source content is untrusted.",
+        annotations(read_only_hint = true)
+    )]
+    fn inspect_pr_condition_identity(
+        &self,
+        Parameters(input): Parameters<PrConditionIdentityInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            polling::list_pr_condition_identity_candidates(
+                &database(&self.config)?,
+                &input.group_id,
+                &input.resource,
+                &input.event,
+                input.cursor.as_deref(),
+            )
+        })())
+    }
+
+    #[tool(
+        description = "Accept or reject one exact retained PR condition identity candidate using independently verified evidence; other candidates remain recorded.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    fn resolve_pr_condition_identity(
+        &self,
+        Parameters(input): Parameters<ResolvePrConditionIdentityInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            let resolved = polling::resolve_pr_condition_identity(
+                &database(&self.config)?,
+                &input.group_id,
+                &input.resource,
+                &input.event,
+                &input.candidate_id,
+                input.accept,
+            )?;
+            Ok(pr_identity_resolution_result(
+                resolved,
+                input.accept,
+                || recover(&self.config),
+            ))
         })())
     }
 
@@ -2230,7 +2686,43 @@ impl WakeTools {
     }
 
     #[tool(
-        description = "Read local receiver health, supported events and delivery states. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
+        description = "Read a page of uncertain automatic PR deliveries without payloads. Pass next_cursor to continue. This is a live view; restart to see changes made before the cursor.",
+        annotations(read_only_hint = true)
+    )]
+    fn get_pr_notification_attention(
+        &self,
+        Parameters(input): Parameters<PrNotificationAttentionInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            manager::require_installed(&self.config)?;
+            let db = rusqlite::Connection::open_with_flags(
+                &self.config.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            polling::pr_notifications::attention_page(&db, input.cursor.as_deref())
+        })())
+    }
+
+    #[tool(
+        description = "Read a page of unverified PR creations. Pass next_cursor to inspect older candidates; count is remaining from the cursor, and this is a live view. Results contain PR URLs, not tool input or credentials.",
+        annotations(read_only_hint = true)
+    )]
+    fn get_pr_creation_attention(
+        &self,
+        Parameters(input): Parameters<PrCreationAttentionInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            manager::require_installed(&self.config)?;
+            let db = rusqlite::Connection::open_with_flags(
+                &self.config.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            pr_creation_attention(&db, input.cursor)
+        })())
+    }
+
+    #[tool(
+        description = "Read local receiver health, supported events and delivery states. Use get_pr_notification_attention to page through uncertain PR deliveries. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
         annotations(read_only_hint = true)
     )]
     fn get_status(&self) -> CallToolResult {
@@ -2242,6 +2734,8 @@ impl WakeTools {
             let delivery_evidence = delivery_evidence::status(&db)?;
             let mut actionable = status_view::actionable(&waits, &subscriptions, &rules);
             let circular = circular_waits::status(&db)?;
+            let pr_creation_attention = pr_creation_attention(&db, None)?;
+            add_pr_creation_notice(&mut actionable, &pr_creation_attention);
             actionable
                 .as_array_mut()
                 .unwrap()
@@ -2253,6 +2747,7 @@ impl WakeTools {
                 "subscriptions":subscriptions,
                 "rules":rules,
                 "delivery_evidence":delivery_evidence,
+                "pr_creation_attention":pr_creation_attention,
                 "steers":steer::status(&db)?,
                 "circular_waits":circular,
                 "coordinator_alerts":obligations::coordinator_alerts_status(&db)?,
@@ -2275,6 +2770,50 @@ impl WakeTools {
     }
 }
 
+fn mcp_tool_operation(name: &str) -> &'static str {
+    match name {
+        "list_models" => "mcp.list_models",
+        "list_projects" => "mcp.list_projects",
+        "configure_rule" => "mcp.configure_rule",
+        "simulate_rule" => "mcp.simulate_rule",
+        "register_condition_group" => "mcp.register_condition_group",
+        "resolve_condition_order" => "mcp.resolve_condition_order",
+        "list_pr_condition_identity_pending" => "mcp.list_pr_condition_identity_pending",
+        "inspect_pr_condition_identity" => "mcp.inspect_pr_condition_identity",
+        "resolve_pr_condition_identity" => "mcp.resolve_pr_condition_identity",
+        "queue_thread" => "mcp.queue_thread",
+        "get_goal" => "mcp.get_goal",
+        "create_goal" => "mcp.create_goal",
+        "edit_goal" => "mcp.edit_goal",
+        "resume_goal" => "mcp.resume_goal",
+        "subscribe" => "mcp.subscribe",
+        "cancel_subscription" => "mcp.cancel_subscription",
+        "publish_result" => "mcp.publish_result",
+        "register_obligation" => "mcp.register_obligation",
+        "register_circular_wait" => "mcp.register_circular_wait",
+        "register_resource_wait" => "mcp.register_resource_wait",
+        "update_wait_continuation" => "mcp.update_wait_continuation",
+        "resolve_circular_wait" => "mcp.resolve_circular_wait",
+        "list_obligations" => "mcp.list_obligations",
+        "acknowledge_obligation_review" => "mcp.acknowledge_obligation_review",
+        "inspect_legacy_alert_collisions" => "mcp.inspect_legacy_alert_collisions",
+        "resolve_obligation" => "mcp.resolve_obligation",
+        "propose_obligation_transfer" => "mcp.propose_obligation_transfer",
+        "list_obligation_transfers" => "mcp.list_obligation_transfers",
+        "accept_obligation_transfer" => "mcp.accept_obligation_transfer",
+        "register_validation" => "mcp.register_validation",
+        "resolve_validation" => "mcp.resolve_validation",
+        "get_result_conflicts" => "mcp.get_result_conflicts",
+        "register_wait" => "mcp.register_wait",
+        "get_status" => "mcp.get_status",
+        "get_pr_notification_attention" => "mcp.get_pr_notification_attention",
+        "get_pr_creation_attention" => "mcp.get_pr_creation_attention",
+        "get_coordination" => "mcp.get_coordination",
+        "recover_ready" => "mcp.recover_ready",
+        _ => "mcp.unknown_tool",
+    }
+}
+
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl rmcp::ServerHandler for WakeTools {
     async fn call_tool(
@@ -2282,42 +2821,7 @@ impl rmcp::ServerHandler for WakeTools {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        let operation = match request.name.as_ref() {
-            "list_models" => "mcp.list_models",
-            "list_projects" => "mcp.list_projects",
-            "configure_rule" => "mcp.configure_rule",
-            "simulate_rule" => "mcp.simulate_rule",
-            "register_condition_group" => "mcp.register_condition_group",
-            "resolve_condition_order" => "mcp.resolve_condition_order",
-            "queue_thread" => "mcp.queue_thread",
-            "get_goal" => "mcp.get_goal",
-            "create_goal" => "mcp.create_goal",
-            "edit_goal" => "mcp.edit_goal",
-            "resume_goal" => "mcp.resume_goal",
-            "subscribe" => "mcp.subscribe",
-            "cancel_subscription" => "mcp.cancel_subscription",
-            "publish_result" => "mcp.publish_result",
-            "register_obligation" => "mcp.register_obligation",
-            "register_circular_wait" => "mcp.register_circular_wait",
-            "register_resource_wait" => "mcp.register_resource_wait",
-            "update_wait_continuation" => "mcp.update_wait_continuation",
-            "resolve_circular_wait" => "mcp.resolve_circular_wait",
-            "list_obligations" => "mcp.list_obligations",
-            "acknowledge_obligation_review" => "mcp.acknowledge_obligation_review",
-            "inspect_legacy_alert_collisions" => "mcp.inspect_legacy_alert_collisions",
-            "resolve_obligation" => "mcp.resolve_obligation",
-            "propose_obligation_transfer" => "mcp.propose_obligation_transfer",
-            "list_obligation_transfers" => "mcp.list_obligation_transfers",
-            "accept_obligation_transfer" => "mcp.accept_obligation_transfer",
-            "register_validation" => "mcp.register_validation",
-            "resolve_validation" => "mcp.resolve_validation",
-            "get_result_conflicts" => "mcp.get_result_conflicts",
-            "register_wait" => "mcp.register_wait",
-            "get_status" => "mcp.get_status",
-            "get_coordination" => "mcp.get_coordination",
-            "recover_ready" => "mcp.recover_ready",
-            _ => "mcp.unknown_tool",
-        };
+        let operation = mcp_tool_operation(request.name.as_ref());
         observability::TRACE
             .scope(uuid::Uuid::new_v4().to_string(), async {
                 let span = observability::Span::new(operation, None);
@@ -2746,24 +3250,35 @@ async fn run_command(
             let mut raw = Vec::new();
             reader.take(1024 * 1024 + 1).read_to_end(&mut raw)?;
             anyhow::ensure!(raw.len() <= 1024 * 1024, "Payload exceeds 1 MiB");
-            let db = database(&config)?;
-            let payload: Value = serde_json::from_slice(&raw)?;
-            let matched_rules = rules::accept(&db, &event, &payload)?;
-            let result = if event == "workflow_run" {
-                json!(bridge::accept(&db, &payload)?)
-            } else if matches!(
-                event.as_str(),
-                "issue_comment" | "pull_request_review_comment"
-            ) {
-                json!({"matched":0})
-            } else {
-                json!({"matched":subscriptions::accept(&db,&event,&payload)?})
+            let (payload, authenticated_webhook) = match env::var("CODEX_WAKE_SIGNATURE") {
+                Ok(signature) => (verified_webhook_payload(&config, &raw, &signature)?, true),
+                Err(env::VarError::NotPresent) => (serde_json::from_slice(&raw)?, false),
+                Err(error) => return Err(error.into()),
             };
+            let db = database(&config)?;
+            let delivery_id = if authenticated_webhook {
+                env::var("CODEX_WAKE_DELIVERY")
+                    .ok()
+                    .filter(|id| !id.is_empty())
+            } else {
+                None
+            };
+            let (matched_rules, result, automatic_pr_notifications) = accept_webhook_events(
+                &db,
+                &config.gh,
+                &event,
+                &payload,
+                authenticated_webhook,
+                delivery_id.as_deref(),
+            )?;
             drop(db);
             if env::var("CODEX_WAKE_DEFER").as_deref() != Ok("1") {
                 recover(&config)?;
             }
-            println!("{}", json!({"result":result,"matched_rules":matched_rules}));
+            println!(
+                "{}",
+                json!({"result":result,"matched_rules":matched_rules,"automatic_pr_notifications":automatic_pr_notifications})
+            );
         }
         "status" | "subscriptions" | "recover" => {
             anyhow::ensure!(args.is_empty(), "Unexpected arguments");
@@ -2786,6 +3301,380 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn creation_attention_tool_has_its_own_telemetry_operation() {
+        assert_eq!(
+            mcp_tool_operation("get_pr_creation_attention"),
+            "mcp.get_pr_creation_attention"
+        );
+        assert_eq!(mcp_tool_operation("unknown_tool"), "mcp.unknown_tool");
+    }
+
+    #[test]
+    fn creation_attention_supports_read_only_database_without_observation_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        drop(rusqlite::Connection::open(&path).unwrap());
+        let db = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(pr_creation_attention(&db, None).unwrap()["count"], 0);
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='pr_hook_candidates')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
+
+    #[test]
+    fn ambiguous_observation_is_visible_in_creation_attention_status() {
+        struct NoNetwork;
+        impl pr_observation::PullRequestGetTransport for NoNetwork {
+            fn get_pull_request(
+                &self,
+                _: &str,
+                _: u64,
+                _: Duration,
+            ) -> std::result::Result<
+                pr_observation::GetPullRequestResponse,
+                pr_observation::TransportFailure,
+            > {
+                panic!("ambiguous candidate must not perform a GET")
+            }
+        }
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        assert_eq!(pr_creation_attention(&db, None).unwrap()["count"], 0);
+        let event = json!({
+            "hook_event_name":"PostToolUse",
+            "session_id":"11111111-1111-4111-8111-111111111111", "turn_id":"turn", "tool_use_id":"call",
+            "tool_name":"mcp__codex_apps__github_create_pull_request",
+            "tool_input":{"repository_full_name":"acme/widget","title":"private test payload"},
+            "tool_response":{"structuredContent":{"number":42,"html_url":"https://github.com/acme/widget/pull/42"}}
+        });
+        let result = pr_observation::handle_post_tool_use(
+            &mut db,
+            &event,
+            &NoNetwork,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        let pr_observation::HandleResult::Candidate { record, .. } = result else {
+            panic!("candidate missing")
+        };
+        assert_eq!(record.state, pr_observation::CandidateState::Ambiguous);
+        let status = pr_creation_attention(&db, None).unwrap();
+        assert_eq!(status["count"], 1);
+        let mut actionable = json!([]);
+        add_pr_creation_notice(&mut actionable, &status);
+        assert_eq!(actionable[0]["source"], "pr_creation");
+        assert_eq!(actionable[0]["evidence"]["count"], 1);
+        assert_eq!(status["candidates"][0]["id"], record.id);
+        assert_eq!(status["candidates"][0]["reason"], "correlation_unavailable");
+        assert_eq!(
+            status["candidates"][0]["thread_link"],
+            "codex://threads/11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(pr_creation_reason(Some("sensitive unknown error")), "other");
+        assert_eq!(
+            status["candidates"][0]["url"],
+            "https://github.com/acme/widget/pull/42"
+        );
+        assert!(!status.to_string().contains("private test payload"));
+        assert!(status["next_cursor"].is_null());
+        for index in 0..21 {
+            db.execute("INSERT INTO pr_hook_candidates(session_id,turn_id,tool_use_id,tool_name,input_digest,number,url,invocation_key,state,created_at_ms,updated_at_ms) SELECT session_id,turn_id,tool_use_id,tool_name,input_digest,number,url,'copy-' || ?1,'ambiguous',created_at_ms,updated_at_ms FROM pr_hook_candidates WHERE id=?2", rusqlite::params![index, record.id]).unwrap();
+        }
+        let first = pr_creation_attention(&db, None).unwrap();
+        assert_eq!(first["count"], 22);
+        assert_eq!(first["candidates"].as_array().unwrap().len(), 20);
+        let second = pr_creation_attention(&db, first["next_cursor"].as_i64()).unwrap();
+        assert_eq!(second["candidates"].as_array().unwrap().len(), 2);
+        assert!(
+            second["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == record.id)
+        );
+        assert!(second["next_cursor"].is_null());
+    }
+
+    #[test]
+    fn automatic_capture_failure_does_not_skip_existing_subscription() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        subscriptions::initialize(&db).unwrap();
+        subscriptions::subscribe(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "closed",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let payload = json!({"action":"closed","number":7,
+            "repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"merged":false}});
+        let (_, result, automatic) = accept_webhook_events(
+            &db,
+            Path::new("/unused-gh"),
+            "pull_request",
+            &payload,
+            true,
+            Some("delivery"),
+        )
+        .unwrap();
+        assert_eq!(result["matched"], 1);
+        assert_eq!(automatic, None);
+        let (_, replay, _) = accept_webhook_events(
+            &db,
+            Path::new("/unused-gh"),
+            "pull_request",
+            &payload,
+            true,
+            Some("delivery"),
+        )
+        .unwrap();
+        assert_eq!(replay["matched"], 0);
+    }
+
+    #[test]
+    fn ci_delivery_identity_distinguishes_pull_requests_sharing_a_run() {
+        let mut delivery = codex_wake::pr_ci::Delivery {
+            id: 1,
+            thread: "11111111-1111-4111-8111-111111111111".into(),
+            repo: "owner/repo".into(),
+            pull_request: 7,
+            sha: "a".repeat(40),
+            run_id: 42,
+            attempt: 1,
+            conclusion: "success".into(),
+            source: json!({}),
+        };
+        let first = ci_delivery_event_identity(&delivery).unwrap();
+        let ordinary = delivery_evidence::source_fields_identity(
+            "github.workflow_run.completed",
+            &["owner/repo", "42", "1"],
+        )
+        .unwrap();
+        assert_ne!(first, ordinary);
+        assert_eq!(
+            delivery_evidence::client_user_message_id(&first, &delivery.thread).unwrap(),
+            delivery_evidence::client_user_message_id(
+                &ci_delivery_event_identity(&delivery).unwrap(),
+                &delivery.thread,
+            )
+            .unwrap()
+        );
+        delivery.pull_request = 8;
+        assert_ne!(first, ci_delivery_event_identity(&delivery).unwrap());
+    }
+
+    #[test]
+    fn webhook_signature_verification_binds_the_exact_raw_body() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config_dir = root.join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state: root.join("state"),
+            runtime: root.join("runtime"),
+            config: config_dir,
+            unit: root.join("unit"),
+            db: root.join("state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: true,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let secret = manager::load_secret(&config.config.join("webhook.secret")).unwrap();
+        let body = br#"{"action":"closed"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let signature = format!("sha256={:x}", mac.finalize().into_bytes());
+
+        assert_eq!(
+            verified_webhook_payload(&config, body, &signature).unwrap(),
+            json!({"action":"closed"})
+        );
+        assert!(
+            verified_webhook_payload(&config, br#"{"action":"reopened"}"#, &signature).is_err()
+        );
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        polling::pr_notifications::register(
+            &db,
+            "pull_request",
+            "owner/repo",
+            "7",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .unwrap();
+        let change = json!({"action":"synchronize","number":7,"repository":{"full_name":"owner/repo"},
+            "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z","head":{"sha":"b"}}});
+        let raw = serde_json::to_vec(&change).unwrap();
+        assert!(verified_webhook_payload(&config, &raw, &signature).is_err());
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(&raw);
+        let signed = format!("sha256={:x}", mac.finalize().into_bytes());
+        let parsed = verified_webhook_payload(&config, &raw, &signed).unwrap();
+        assert_eq!(
+            capture_authenticated_pr_notification(
+                &db,
+                &config.gh,
+                "pull_request",
+                Some("delivery"),
+                &parsed
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            capture_authenticated_pr_notification(
+                &db,
+                &config.gh,
+                "pull_request",
+                Some("delivery"),
+                &parsed
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn signed_reopened_webhook_uses_durable_cycle_and_deduplicates_replay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config_dir = root.join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state: root.join("state"),
+            runtime: root.join("runtime"),
+            config: config_dir,
+            unit: root.join("unit"),
+            db: root.join("state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: true,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let secret = manager::load_secret(&config.config.join("webhook.secret")).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        std::fs::write(
+            &config.gh,
+            r##"#!/bin/sh
+for route do :; done
+printf '%s\n' "$route" >> "$(dirname "$0")/gh-routes"
+case "$route" in
+  /repos/owner/repo/pulls/7)
+    body='{"number":7,"state":"open","merged":false,"merged_at":null,"closed_at":null,"updated_at":"2099-01-01T00:00:00Z","head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"ref":"main"}}' ;;
+  '/repos/owner/repo/issues/7/timeline?per_page=100&page=1')
+    body='[{"id":7001,"event":"closed","created_at":"2098-12-31T23:59:00Z"},{"id":7002,"event":"reopened","created_at":"2099-01-01T00:00:00Z"}]' ;;
+  *) exit 1 ;;
+esac
+printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n%s' "$body"
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&config.gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        polling::pr_notifications::register(&db, "pull_request", "owner/repo", "7", thread)
+            .unwrap();
+        let events = [
+            (
+                "closed",
+                json!({
+                    "action":"closed","number":7,
+                    "repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"merged":false,
+                        "closed_at":"2098-12-31T23:59:00Z"}
+                }),
+            ),
+            (
+                "reopened",
+                json!({
+                    "action":"reopened","number":7,
+                    "repository":{"full_name":"owner/repo"},
+                    "pull_request":{"number":7,"updated_at":"2099-01-01T00:00:00Z"}
+                }),
+            ),
+        ];
+
+        for (action, payload) in &events {
+            let raw = serde_json::to_vec(payload).unwrap();
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+            mac.update(&raw);
+            let signature = format!("sha256={:x}", mac.finalize().into_bytes());
+            let parsed = verified_webhook_payload(&config, &raw, &signature).unwrap();
+            assert_eq!(
+                capture_authenticated_pr_notification(
+                    &db,
+                    &config.gh,
+                    "pull_request",
+                    Some(*action),
+                    &parsed
+                )
+                .unwrap(),
+                1,
+                "signed {action} webhook should enqueue once"
+            );
+            if *action == "reopened" {
+                let routes = std::fs::read_to_string(root.join("gh-routes")).unwrap();
+                assert!(routes.contains("/repos/owner/repo/pulls/7\n"));
+                assert!(
+                    routes.contains("/repos/owner/repo/issues/7/timeline?per_page=100&page=1\n")
+                );
+                let replay = verified_webhook_payload(&config, &raw, &signature).unwrap();
+                assert_eq!(
+                    capture_authenticated_pr_notification(
+                        &db,
+                        &config.gh,
+                        "pull_request",
+                        Some(*action),
+                        &replay,
+                    )
+                    .unwrap(),
+                    0
+                );
+            } else {
+                assert!(!root.join("gh-routes").exists());
+            }
+        }
+        let notices = polling::pr_notifications::pending(&db).unwrap();
+        assert_eq!(notices.len(), 2);
+        let reopened = notices
+            .iter()
+            .find(|notification| notification.event == "reopened")
+            .unwrap();
+        let closed_cycle_epoch: i64 = db
+            .query_row(
+                "SELECT closed_at_sec FROM automatic_pr_lifecycle
+                 WHERE repo='owner/repo' AND pr='7'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reopened.event_key, format!("reopened:{closed_cycle_epoch}"));
+    }
 
     #[test]
     fn synthetic_turn_completion_and_stop_share_claim_only_with_a_common_turn_id() {
@@ -2978,6 +3867,182 @@ mod hook_output_tests {
         let output = response.structured_content.unwrap();
         assert_eq!(output["chats"][0]["obligations"]["total"], 1);
         assert!(!output.to_string().contains("private"));
+    }
+
+    #[test]
+    fn attention_tool_pages_without_exposing_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        polling::pr_notifications::initialize(&db).unwrap();
+        for index in 0..51 {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state,created_at)
+                VALUES(?1,'pull_request','owner/repo','7','thread','closed',?1,
+                '{\"secret\":\"private-payload\"}','needs_attention','2000-01-01 00:00:00')",
+                [format!("id-{index:02}")],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let first = tools.get_pr_notification_attention(Parameters(PrNotificationAttentionInput {
+            cursor: None,
+        }));
+        assert_ne!(first.is_error, Some(true));
+        let first = first.structured_content.unwrap();
+        assert_eq!(first["items"].as_array().unwrap().len(), 50);
+        let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+        let second =
+            tools.get_pr_notification_attention(Parameters(PrNotificationAttentionInput {
+                cursor: Some(cursor),
+            }));
+        assert_ne!(second.is_error, Some(true));
+        let second = second.structured_content.unwrap();
+        assert_eq!(second["items"][0]["queue_identity"], "id-50");
+        assert_eq!(second["has_more"], false);
+        assert!(!first.to_string().contains("private-payload"));
+        assert!(!second.to_string().contains("private-payload"));
+    }
+
+    #[tokio::test]
+    async fn attention_tool_pages_over_real_mcp_transport() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn send(writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>, message: Value) {
+            writer
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        async fn receive(
+            reader: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+            id: i64,
+        ) -> Value {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        reader.read_line(&mut line).await.unwrap(),
+                        0,
+                        "MCP transport closed"
+                    );
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    if message["id"] == id {
+                        return message;
+                    }
+                }
+            })
+            .await
+            .expect("MCP response timed out")
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        polling::pr_notifications::initialize(&db).unwrap();
+        for index in 0..51 {
+            db.execute(
+                "INSERT INTO automatic_pr_notifications
+                (id,kind,repo,pr,thread,event,event_key,source,state,created_at)
+                VALUES(?1,'pull_request','owner/repo','7','thread','closed',?1,
+                '{\"secret\":\"private-payload\"}','needs_attention','2000-01-01 00:00:00')",
+                [format!("id-{index:02}")],
+            )
+            .unwrap();
+        }
+        let snapshot_sql = "SELECT json_group_array(json_array(id,kind,repo,pr,thread,event,event_key,source,state,available_at_ms,created_at)) FROM (SELECT * FROM automatic_pr_notifications ORDER BY id)";
+        let before: String = db.query_row(snapshot_sql, [], |row| row.get(0)).unwrap();
+        drop(db);
+        let db_path = config.db.clone();
+        let (server_io, client_io) = tokio::io::duplex(65_536);
+        let server = tokio::spawn(async move {
+            WakeTools { config }
+                .serve(server_io)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut reader = BufReader::new(reader);
+        send(&mut writer, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await;
+        assert!(receive(&mut reader, 1).await.get("error").is_none());
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await;
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        )
+        .await;
+        let list = receive(&mut reader, 2).await;
+        assert!(
+            list["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "get_pr_notification_attention")
+        );
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"get_pr_notification_attention","arguments":{}}}),
+        )
+        .await;
+        let first_reply = receive(&mut reader, 3).await;
+        assert!(first_reply.get("error").is_none());
+        assert_ne!(first_reply["result"]["isError"], true);
+        let first = &first_reply["result"]["structuredContent"];
+        assert_eq!(first["items"].as_array().unwrap().len(), 50);
+        for (index, item) in first["items"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                item["queue_identity"].as_str().unwrap(),
+                format!("id-{index:02}")
+            );
+        }
+        assert_eq!(first["has_more"], true);
+        let cursor = first["next_cursor"].as_str().unwrap();
+        send(
+            &mut writer,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+            "name":"get_pr_notification_attention","arguments":{"cursor":cursor}}}),
+        )
+        .await;
+        let second_reply = receive(&mut reader, 4).await;
+        assert!(second_reply.get("error").is_none());
+        assert_ne!(second_reply["result"]["isError"], true);
+        let second = &second_reply["result"]["structuredContent"];
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second["items"][0]["queue_identity"], "id-50");
+        assert_eq!(second["has_more"], false);
+        assert!(second["next_cursor"].is_null());
+        assert!(!first_reply.to_string().contains("private-payload"));
+        assert!(!second_reply.to_string().contains("private-payload"));
+        drop(writer);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let db = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let after: String = db.query_row(snapshot_sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]
@@ -5015,6 +6080,387 @@ mod hook_output_tests {
 }
 
 #[cfg(test)]
+mod pr_hook_registration_integration_tests {
+    use super::*;
+    use std::{os::unix::fs::PermissionsExt, thread, time::Duration};
+
+    #[test]
+    fn failed_pr_observation_does_not_block_pending_steer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.plugin_base = None;
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        let db = database(&config).unwrap();
+        pr_observation::initialize(&db).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_candidate BEFORE INSERT ON pr_hook_candidates
+             BEGIN SELECT RAISE(FAIL, 'observation failed'); END;",
+        )
+        .unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        steer::enqueue(&db, thread, "Continue the existing task").unwrap();
+        drop(db);
+        let post = json!({
+            "hook_event_name":"PostToolUse", "session_id":thread, "turn_id":"turn-1",
+            "tool_use_id":"call-1", "tool_name":"Bash",
+            "tool_input":{"command":"gh pr create --repo owner/repo --title test"},
+            "tool_response":"https://github.com/owner/repo/pull/42"
+        });
+        let output = run_hook_inner(&config, &post).unwrap();
+        assert!(
+            output["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("Continue the existing task")
+        );
+        assert_eq!(run_hook_inner(&config, &post).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn pre_post_candidate_retries_and_reconcile_registers_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let db = state.join("state.sqlite3");
+        let gh = root.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'gh version 2.103.3\\n'; exit 0; fi\nif [ \"$1\" = config ]; then printf 'api_host=\\nhttp_unix_socket=\\n'; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nif [ ! -e \"$0.seen\" ]; then : > \"$0.seen\"; exit 1; fi\nprintf 'HTTP/2 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\"number\":42,\"html_url\":\"https://github.com/owner/repo/pull/42\",\"created_at\":\"'\nprintf '%s' \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\"\nprintf '\",\"base\":{\"ref\":\"main\",\"repo\":{\"full_name\":\"owner/repo\"}},\"head\":{\"ref\":\"feature\"},\"user\":{\"login\":\"alice\"}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state,
+            runtime: root.join("runtime"),
+            config: root.join("config"),
+            unit: root.join("unit"),
+            db,
+            codex: root.join("codex"),
+            gh,
+            webhooks_enabled: false,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let session = "11111111-1111-4111-8111-111111111111";
+        let command = "gh pr create --repo owner/repo --title test";
+        let pre = json!({
+            "hook_event_name":"PreToolUse", "session_id":session, "turn_id":"turn-1",
+            "tool_use_id":"call-1", "tool_name":"Bash", "tool_input":{"command":command}
+        });
+        let post = json!({
+            "hook_event_name":"PostToolUse", "session_id":session, "turn_id":"turn-1",
+            "tool_use_id":"call-1", "tool_name":"Bash", "tool_input":{"command":command},
+            "tool_response":"https://github.com/owner/repo/pull/42"
+        });
+
+        run_hook_inner(&config, &pre).unwrap();
+        thread::sleep(Duration::from_millis(2100));
+        run_hook_inner(&config, &post).unwrap();
+
+        let mut db = bridge::connect(&config.db).unwrap();
+        let first_state: String = db
+            .query_row("SELECT state FROM pr_hook_candidates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(first_state, "transport_error");
+        let pre_state: String = db
+            .query_row("SELECT state FROM pr_hook_pre_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pre_state, "linked");
+        db.execute("UPDATE pr_hook_candidates SET next_retry_at_ms=0", [])
+            .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        pr_registration::reconcile(&mut db, &config, now).unwrap();
+        let (candidate_state, candidate_reason): (String, Option<String>) = db
+            .query_row("SELECT state,reason FROM pr_hook_candidates", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            candidate_state, "verified",
+            "candidate reason: {candidate_reason:?}"
+        );
+
+        let after_recovery: (Option<i64>, i64, i64, i64, i64) = db
+            .query_row(
+                "SELECT consumed_at_ms,
+                    (SELECT count(*) FROM rules),
+                    (SELECT count(*) FROM automatic_pr_rules),
+                    (SELECT count(*) FROM automatic_pr_notification_listeners),
+                    (SELECT count(*) FROM pr_ci_trackers)
+                 FROM pr_hook_candidates",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(after_recovery.0.is_some());
+        assert_eq!(
+            (
+                after_recovery.1,
+                after_recovery.2,
+                after_recovery.3,
+                after_recovery.4
+            ),
+            (1, 1, 2, 1)
+        );
+
+        run_hook_inner(&config, &post).unwrap();
+        pr_registration::reconcile(&mut db, &config, now + 1).unwrap();
+        let repeats: (i64, i64, i64, i64, i64) = db
+            .query_row(
+                "SELECT count(*),
+                    (SELECT count(*) FROM rules),
+                    (SELECT count(*) FROM automatic_pr_notification_listeners WHERE kind='pull_request'),
+                    (SELECT count(*) FROM automatic_pr_notification_listeners WHERE kind='review'),
+                    (SELECT count(*) FROM pr_ci_trackers)
+                 FROM pr_hook_candidates",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(repeats, (1, 1, 1, 1, 1));
+        assert_eq!(
+            std::fs::read_to_string(config.gh.with_extension("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn recover_dispatches_pending_pr_ci_delivery_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state,
+            runtime: root.join("runtime"),
+            config: root.join("config"),
+            unit: root.join("unit"),
+            db: root.join("state/state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: false,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let thread = "11111111-1111-4111-8111-111111111111";
+        let db = database(&config).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',7,1,?1,'failure','{}')",
+            [thread],
+        )
+        .unwrap();
+        drop(db);
+
+        let mut delivered = Vec::new();
+        let first_attempts = recover_with_queue(&config, |thread, message, id, resume| {
+            delivered.push((thread.to_owned(), message.to_owned(), id.to_owned(), resume));
+            Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+        })
+        .unwrap();
+        let second_attempts = recover_with_queue(&config, |thread, message, id, resume| {
+            delivered.push((thread.to_owned(), message.to_owned(), id.to_owned(), resume));
+            Ok(("queued".into(), None))
+        })
+        .unwrap();
+
+        assert_eq!(first_attempts, 1);
+        assert_eq!(second_attempts, 0);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, thread);
+        assert!(delivered[0].1.contains("owner/repo"));
+        assert!(delivered[0].1.contains("PR #42"));
+        assert!(!delivered[0].2.is_empty());
+        assert!(delivered[0].3);
+        let db = bridge::connect(&config.db).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM pr_ci_deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "delivered");
+        let recovery: (String, String) = db
+            .query_row(
+                "SELECT thread,client_ids_json FROM native_wake_recovery",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery.0, thread);
+        let ids: Value = serde_json::from_str(&recovery.1).unwrap();
+        assert_eq!(ids["client_ids"], json!([delivered[0].2.as_str()]));
+        assert_eq!(ids["unattributed"], false);
+        db.execute("DELETE FROM native_wake_recovery", []).unwrap();
+        db.execute("INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',8,1,?1,'failure','{}')", [thread]).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER fail_ci_recovery BEFORE UPDATE ON native_wake_recovery
+            BEGIN SELECT RAISE(ABORT,'recovery unavailable'); END;",
+        )
+        .unwrap();
+        let mut second_id = None;
+        recover_with_queue(&config, |_, _, id, _| {
+            second_id = Some(id.to_owned());
+            Ok(("queued".into(), Some("native_queue_resume_warning".into())))
+        })
+        .unwrap();
+        assert!(second_id.is_some());
+        let state: String = db
+            .query_row(
+                "SELECT state FROM pr_ci_deliveries WHERE run_id=8",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "needs_attention");
+        db.execute_batch("DROP TRIGGER fail_ci_recovery").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(
+            codex_wake::pr_ci_runtime::recover_native_wake_intents(
+                &db,
+                now + codex_wake::pr_ci_runtime::NATIVE_WAKE_INTENT_LEASE_MS + 1,
+                |target, ids| {
+                    assert_eq!(target, thread);
+                    assert_eq!(ids, &[second_id.clone().unwrap()]);
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            1
+        );
+        let state: String = db
+            .query_row(
+                "SELECT state FROM pr_ci_deliveries WHERE run_id=8",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "delivered");
+        assert_eq!(
+            recover_with_queue(&config, |_, _, _, _| panic!("must not resend")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ci_queue_unavailable_retries_but_uncertain_result_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.plugin_base = None;
+        let mut db = database(&config).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        let thread = "11111111-1111-4111-8111-111111111111";
+        db.execute(
+            "INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',7,1,?1,'failure','{}')",
+            [thread],
+        ).unwrap();
+        let first = dispatch_ci_with_queue(&mut db, &config, 1_000, |_, _, _, _| {
+            Err(execution::TargetUnavailableBeforeSend.into())
+        })
+        .unwrap();
+        assert_eq!((first.retried_before_send, first.uncertain), (1, 0));
+        let second = dispatch_ci_with_queue(&mut db, &config, 120_000, |_, _, _, _| {
+            Ok(("needs_attention".into(), None))
+        })
+        .unwrap();
+        assert_eq!((second.retried_before_send, second.uncertain), (0, 1));
+        let third = dispatch_ci_with_queue(&mut db, &config, 240_000, |_, _, _, _| {
+            panic!("uncertain delivery must not be resent")
+        })
+        .unwrap();
+        assert_eq!(third.claimed, 0);
+    }
+
+    #[test]
+    fn recover_retries_pr_ci_when_evidence_cannot_be_prepared_before_queueing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = manager::Config {
+            state,
+            runtime: root.join("runtime"),
+            config: root.join("config"),
+            unit: root.join("unit"),
+            db: root.join("state/state.sqlite3"),
+            codex: root.join("codex"),
+            gh: root.join("gh"),
+            webhooks_enabled: false,
+            codex_home: root.join("codex-home"),
+            rpc_socket: root.join("app-server.sock"),
+            cache: root.join("cache"),
+            plugin_base: None,
+        };
+        let db = database(&config).unwrap();
+        codex_wake::pr_ci::initialize(&db).unwrap();
+        db.execute(
+            "INSERT INTO pr_ci_deliveries(repo,pull_number,sha,run_id,attempt,thread,conclusion,source_json)
+             VALUES('owner/repo',42,'abc123',8,1,'not-a-thread-uuid','failure','{}')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        assert_eq!(
+            recover_with_queue(&config, |_, _, _, _| panic!(
+                "evidence preparation failed before the queue call"
+            ))
+            .unwrap(),
+            1
+        );
+
+        let db = bridge::connect(&config.db).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM pr_ci_deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
+        let retry_after: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pr_ci_delivery_retry_after",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_after, 1);
+    }
+}
+
+#[cfg(test)]
 mod bounded_collision_tool_tests {
     use super::*;
 
@@ -5069,5 +6515,154 @@ mod bounded_collision_tool_tests {
             "fixture"
         );
         assert_eq!(value["diagnostics"][0]["preview_invalid"], false);
+    }
+
+    #[test]
+    fn pr_identity_tools_decide_only_the_selected_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = manager::Config::from_env().unwrap();
+        config.state = temp.path().join("state");
+        config.db = config.state.join("state.sqlite3");
+        config.plugin_base = None;
+        let tools = WakeTools { config };
+        let db = database(&tools.config).unwrap();
+        let selector = conditions::Selector {
+            kind: "pull_request".into(),
+            repo: "owner/repo".into(),
+            resource: "7".into(),
+            event: "synchronize".into(),
+            outcome: None,
+        };
+        let member = conditions::MemberRegistration::polling(selector, None);
+        let group = conditions::register_group_with_members(
+            &db,
+            conditions::Mode::Or,
+            std::slice::from_ref(&member),
+            "11111111-1111-4111-8111-111111111111",
+            None,
+            None,
+        )
+        .unwrap();
+        for (id, provenance) in [("candidate-a", "poll"), ("candidate-b", "publication")] {
+            db.execute("INSERT INTO condition_identity_candidates(group_id,kind,repo,resource,event,candidate_id,original_key,event_cursor,source_json,provenance)
+                VALUES(?1,'pull_request','owner/repo','7','synchronize',?2,'source','1','{}',?3)",
+                rusqlite::params![group,id,provenance]).unwrap();
+        }
+        db.execute("INSERT INTO condition_identity_candidates(group_id,kind,repo,resource,event,candidate_id,original_key,event_cursor,source_json,provenance,decision)
+            VALUES(?1,'pull_request','owner/repo','7','synchronize','candidate-c','source','1','{}','publication','observed')", [&group]).unwrap();
+        let pending =
+            tools.list_pr_condition_identity_pending(Parameters(PrConditionIdentityPendingInput {
+                cursor: None,
+            }));
+        assert_ne!(pending.is_error, Some(true));
+        let first = pending.structured_content.unwrap();
+        assert_eq!(first["candidates"][0]["candidate_id"], "candidate-a");
+        assert_eq!(first["has_more"], true);
+        let next_pending =
+            tools.list_pr_condition_identity_pending(Parameters(PrConditionIdentityPendingInput {
+                cursor: Some(first["next_cursor"].as_str().unwrap().to_owned()),
+            }));
+        assert_ne!(next_pending.is_error, Some(true));
+        let second = next_pending.structured_content.unwrap();
+        assert_eq!(second["candidates"][0]["candidate_id"], "candidate-b");
+        assert_eq!(second["has_more"], false);
+        let inspection =
+            tools.inspect_pr_condition_identity(Parameters(PrConditionIdentityInput {
+                group_id: group.clone(),
+                resource: "owner/repo#7".into(),
+                event: "synchronize".into(),
+                cursor: None,
+            }));
+        assert_ne!(inspection.is_error, Some(true));
+        let page = inspection.structured_content.unwrap();
+        assert_eq!(page["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(page["candidates"][0]["actionable"], true);
+        assert_eq!(page["has_more"], true);
+        let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        let next = tools.inspect_pr_condition_identity(Parameters(PrConditionIdentityInput {
+            group_id: group.clone(),
+            resource: "owner/repo#7".into(),
+            event: "synchronize".into(),
+            cursor: Some(cursor),
+        }));
+        assert_ne!(next.is_error, Some(true));
+        let page = next.structured_content.unwrap();
+        assert_eq!(page["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(page["has_more"], true);
+        let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        let last = tools.inspect_pr_condition_identity(Parameters(PrConditionIdentityInput {
+            group_id: group.clone(),
+            resource: "owner/repo#7".into(),
+            event: "synchronize".into(),
+            cursor: Some(cursor),
+        }));
+        assert_ne!(last.is_error, Some(true));
+        let page = last.structured_content.unwrap();
+        assert_eq!(page["candidates"][0]["decision"], "observed");
+        assert_eq!(page["candidates"][0]["actionable"], false);
+        assert_eq!(page["has_more"], false);
+        let observed =
+            tools.resolve_pr_condition_identity(Parameters(ResolvePrConditionIdentityInput {
+                group_id: group.clone(),
+                resource: "owner/repo#7".into(),
+                event: "synchronize".into(),
+                candidate_id: "candidate-c".into(),
+                accept: false,
+            }));
+        assert_eq!(observed.is_error, Some(true));
+        let decision =
+            tools.resolve_pr_condition_identity(Parameters(ResolvePrConditionIdentityInput {
+                group_id: group.clone(),
+                resource: "owner/repo#7".into(),
+                event: "synchronize".into(),
+                candidate_id: "candidate-a".into(),
+                accept: false,
+            }));
+        assert_ne!(decision.is_error, Some(true));
+        assert_eq!(decision.structured_content.unwrap()["resolved"], true);
+        let decisions: Vec<String> = db.prepare("SELECT decision FROM condition_identity_candidates WHERE group_id=?1 ORDER BY candidate_id")
+            .unwrap().query_map([&group], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(
+            decisions,
+            vec![
+                "rejected".to_owned(),
+                "pending".to_owned(),
+                "observed".to_owned()
+            ]
+        );
+        let first = polling::resolve_pr_condition_identity(
+            &db,
+            &group,
+            "owner/repo#7",
+            "synchronize",
+            "candidate-b",
+            true,
+        )
+        .unwrap();
+        let failed = pr_identity_resolution_result(first, true, || {
+            anyhow::bail!("injected recovery failure")
+        });
+        assert_eq!(failed["resolved"], true);
+        assert!(failed["delivery_error"].is_string());
+
+        let replay = polling::resolve_pr_condition_identity(
+            &db,
+            &group,
+            "owner/repo#7",
+            "synchronize",
+            "candidate-b",
+            true,
+        )
+        .unwrap();
+        assert!(!replay, "replay must not reapply the decision");
+        let recovered = pr_identity_resolution_result(replay, true, || Ok(1));
+        assert_eq!(recovered["resolved"], false);
+        assert_eq!(recovered["attempted"], 1, "replay must retry recovery");
+        let (matches, accepted): (i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM condition_members WHERE group_id=?1 AND matched=1),
+             (SELECT count(*) FROM condition_identity_candidates WHERE group_id=?1 AND decision='accepted')",
+            [&group], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!((matches, accepted), (1, 1));
     }
 }

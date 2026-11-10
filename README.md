@@ -28,7 +28,7 @@ codex plugin add codex-wake@codex-wake-local
 Release installs need no Rust toolchain. They require `codex`, `gh`, `curl`, GNU `tar`,
 `sha256sum`, `flock` and a working systemd user manager.
 
-Review and approve the bundled `SessionStart`, `Stop` and `SubagentStop` hooks
+Review and approve the bundled `PreToolUse`, `PostToolUse`, `SessionStart`, `Stop` and `SubagentStop` hooks
 in Codex. MCP startup automatically sets up one private receiver shared by all
 sessions. Tools describe their parameters directly; optional [command skills](skills/)
 provide shortcuts such as `$codex-wake:subscribe` and `$codex-wake:status`.
