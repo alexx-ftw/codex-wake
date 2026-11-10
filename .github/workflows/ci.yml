@@ -266,13 +266,15 @@ jobs:
           test "$PROBE" = "alpha2-vm-qualification:$GITHUB_SHA"
           node --test scripts/alpha2-vm/test.mjs scripts/alpha2-vm/workflow.test.mjs
       - name: Build pinned inputs and boot disposable guest
-        run: bash scripts/alpha2-vm/ci.sh "$EXPECTED_SHA" "$RUNNER_TEMP/alpha2-vm"
-      - name: Preserve evidence from this exact run
-        if: always()
+        run: bash scripts/alpha2-vm/ci.sh "$EXPECTED_SHA" "$RUNNER_TEMP/alpha2-vm" "$RUNNER_TEMP/alpha2-vm-export"
+      - name: Preserve verified sanitized receipt
+        if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: alpha2-vm-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/alpha2-vm/
-          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/alpha2-vm-export/receipt.json
+            ${{ runner.temp }}/alpha2-vm-export/SHA256SUMS
+          if-no-files-found: error
           retention-days: 7
           compression-level: 0

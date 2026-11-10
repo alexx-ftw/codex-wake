@@ -62,15 +62,33 @@ The receipt requires one accepted uncertain delivery, zero measured retries and
 two delivered positive controls. This measures the laboratory fixture and its
 synthetic server; it does not qualify production delivery semantics.
 
-After an authorized run, download its exact artifact and verify it using this
-script from the tested commit, in a repository containing that commit:
+The job verifies the full raw receipt, kernel/config/initramfs, package and
+guest-input inventories, source files against Git, console/stderr, nonce and
+guest result **before creating the export directory**. Raw files stay inside
+the job. A failed verification exports nothing and skips artifact upload.
+
+Only two explicitly listed files are uploaded: `receipt.json` (schema 2,
+`alpha2-vm-sanitized`) and its `SHA256SUMS`. The receipt contains allowlisted
+source/run identifiers and hashes, fixed verified check results, guest executable
+hashes and Debian package versions. Arbitrary guest results, RPC payloads, paths,
+logs and extra source metadata are omitted. No binary, rootfs, database or full
+console is uploaded. The package and guest-input data are also checked against
+their verified raw hashes before export.
+
+After an authorized run, download its exact sanitized artifact and verify it
+using this script in a repository containing the tested commit:
 
 ```sh
-node scripts/alpha2-vm/receipt.mjs verify /absolute/artifact-directory FULL_COMMIT_SHA
+node scripts/alpha2-vm/receipt.mjs verify-export /absolute/artifact-directory FULL_COMMIT_SHA
 ```
 
-Verification checks the checksum chain and compares all source hashes/tree to
-Git objects at that exact SHA. The receipt is an integrity record, not a signed
+This checks the export checksum, SHA/tree/source hashes against Git and the
+version/input inventories against their original verified hashes. It cannot
+rehash omitted binaries or console: that full verification occurs inside the
+job before selection. For retained local raw evidence, the original
+`receipt.mjs verify RAW_DIRECTORY FULL_COMMIT_SHA` command remains available.
+
+The receipt is an integrity record, not a signed
 attestation: authentication relies on obtaining the artifact from the matching
 GitHub repository/run/attempt. It does not prove that an untrusted runner behaved
 honestly or that initramfs generation is byte-reproducible.

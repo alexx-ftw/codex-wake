@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {test} from 'node:test';
-import {artifacts, digest, evidence, sourcePaths} from './receipt.mjs';
+import {artifacts, digest, evidence, sourcePaths, exportEvidence, verifyExport} from './receipt.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const sha = '1'.repeat(40);
@@ -133,4 +133,53 @@ test('actual build test commands run before packaging and a Rust test failure st
     assert.equal(run.status,status);
     assert.deepEqual(fs.readFileSync(calls,'utf8').trim().split('\n'),status?['test']:['test','build','rootfs']);
   }
+});
+test('export verifies all raw evidence first and emits only sanitized receipt, hashes and versions', t => {
+  const dir=fixture(t), repo=path.resolve(here,'../..');
+  const git=args=>execFileSync('git',args,{cwd:repo});
+  const exact=git(['rev-parse','HEAD']).toString().trim();
+  const files=git(['ls-tree','-rz','--name-only',exact,'--',...sourcePaths]).toString().split('\0').filter(Boolean);
+  const secret='PRIVATE_TEST_SENTINEL';
+  const source={sha:exact,tree:git(['rev-parse',`${exact}^{tree}`]).toString().trim(),private_context:secret,
+    repository:'alexx-ftw/codex-wake',run_id:'42846796586',run_attempt:'1',runner_image:{os:'ubuntu24',version:'20261110.1',private_context:secret},
+    files:Object.fromEntries(files.map(f=>[f,digest(git(['show',`${exact}:${f}`]))]))};
+  fs.writeFileSync(path.join(dir,'source.json'),JSON.stringify(source));
+  fs.writeFileSync(path.join(dir,'packages.tsv'),'libbpf1:amd64\t1:1.5.0-1\nnodejs\t20.0.0~test\n');
+  fs.writeFileSync(path.join(dir,'inputs.sha256'),['legacy','new-wake','codex','vm-probe','fence.bpf.o','source.json']
+    .map(name=>`${'a'.repeat(64)}  /guest/${name}\n`).join(''));
+  const privateResult={...result,private_context:secret};
+  fs.writeFileSync(path.join(dir,'console.log'),fs.readFileSync(path.join(dir,'console.log'),'utf8')
+    .replace(sha,exact).replace(JSON.stringify(result),JSON.stringify(privateResult))+secret+'\n');
+  fs.writeFileSync(path.join(dir,'qemu.stderr'),secret);
+  for(const name of ['database.db','binary','rootfs','review-home']) fs.writeFileSync(path.join(dir,name),secret);
+  const create=()=>{
+    fs.writeFileSync(path.join(dir,'SHA256SUMS'),artifacts.map(name=>`${digest(fs.readFileSync(path.join(dir,name)))}  ${name}\n`).join(''));
+    execFileSync(process.execPath,[path.join(here,'receipt.mjs'),'create',dir]);
+  };
+  create();
+  const destination=path.join(dir,'public');
+  const exported=exportEvidence(dir,exact,destination);
+  assert.deepEqual(fs.readdirSync(destination).sort(),['SHA256SUMS','receipt.json']);
+  assert(!fs.readFileSync(path.join(destination,'receipt.json'),'utf8').includes(secret));
+  assert.equal(exported.source.sha,exact);
+  assert.equal(exported.source.run_id,'42846796586');
+  assert.deepEqual(exported.versions,[['libbpf1:amd64','1:1.5.0-1'],['nodejs','20.0.0~test']]);
+  assert.deepEqual(verifyExport(destination,exact),exported);
+  for(const [i,name]of [...artifacts,'console.log','qemu.stderr','nonce.txt','accelerator.txt','receipt.json','receipt.sha256','SHA256SUMS'].entries()) {
+    const file=path.join(dir,name), original=fs.readFileSync(file), rejected=path.join(dir,`rejected-${i}`);
+    fs.appendFileSync(file,'corrupted');
+    assert.throws(()=>exportEvidence(dir,exact,rejected),name);
+    assert(!fs.existsSync(rejected),`export selected before verifying ${name}`);
+    fs.writeFileSync(file,original);
+  }
+  const altered=structuredClone(exported);
+  altered.versions[0][1]='99.0';
+  const bytes=JSON.stringify(altered)+'\n';
+  fs.writeFileSync(path.join(destination,'receipt.json'),bytes);
+  fs.writeFileSync(path.join(destination,'SHA256SUMS'),`${digest(bytes)}  receipt.json\n`);
+  assert.throws(()=>verifyExport(destination,exact),'version data must remain bound to verified raw hash');
+  fs.writeFileSync(path.join(dir,'source.json'),JSON.stringify({...source,files:{...source.files,[files[0]]:'0'.repeat(64)}}));
+  create();
+  assert.throws(()=>exportEvidence(dir,exact,path.join(dir,'forged-source')),/source mismatch/);
+  assert(!fs.existsSync(path.join(dir,'forged-source')));
 });

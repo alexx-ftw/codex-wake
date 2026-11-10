@@ -3,6 +3,7 @@ set -Eeuo pipefail
 cd -- "$(dirname -- "$0")/../.."
 expected=${1:?exact source SHA required}
 output=${2:?new output directory required}
+export_dir=${3:?new sanitized export directory required}
 [[ $expected =~ ^[a-f0-9]{40}$ && $(git rev-parse HEAD) == "$expected" ]]
 [[ -z $(git status --porcelain --untracked-files=normal) ]]
 git merge-base --is-ancestor 144e1b08bad400b33964265e22a87b6e49c57b32 "$expected"
@@ -50,4 +51,4 @@ docker cp "$container:/output/." "$output"
 [[ $status == 0 ]]
 [[ $(docker inspect --format '{{.State.Status}}' "$container") == exited ]]
 [[ $(docker inspect --format '{{.State.ExitCode}}' "$container") == 0 ]]
-node scripts/alpha2-vm/receipt.mjs verify "$output" "$expected"
+node scripts/alpha2-vm/receipt.mjs export "$output" "$expected" "$export_dir"

@@ -52,3 +52,15 @@ test('actual dispatch preflight rejects a moved ref or malformed SHA before buil
   assert(!workflow.includes('inputs.expected_sha'));
   assert(!fs.existsSync(new URL('../../.github/workflows/alpha2-vm.yml',import.meta.url)));
 });
+test('upload is success-only and explicitly lists the two sanitized files after full verification',()=>{
+  const job=jobs['alpha2-vm'].lines.join('\n');
+  const upload=job.slice(job.indexOf('      - name: Preserve verified sanitized receipt'));
+  assert(upload.includes('        if: success()'));
+  assert(!upload.includes('always()'));
+  assert.deepEqual(upload.split('\n').filter(line=>line.startsWith('            ${{ runner.temp }}')),
+    ['            ${{ runner.temp }}/alpha2-vm-export/receipt.json','            ${{ runner.temp }}/alpha2-vm-export/SHA256SUMS']);
+  assert(upload.includes('if-no-files-found: error'));
+  const ci=fs.readFileSync(new URL('./ci.sh',import.meta.url),'utf8');
+  assert(ci.indexOf('receipt.mjs export')>ci.indexOf('{{.State.ExitCode}}'));
+  assert(job.includes('"$RUNNER_TEMP/alpha2-vm" "$RUNNER_TEMP/alpha2-vm-export"'));
+});
