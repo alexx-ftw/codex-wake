@@ -654,6 +654,11 @@ where
     let mut trackers_with_generation = Vec::with_capacity(trackers.len());
     for (repo, number, thread, old_sha, backoff) in trackers {
         tx.execute(
+            "INSERT OR IGNORE INTO pr_ci_tracker_generations(repo,pull_number,thread)
+             VALUES(?1,?2,?3)",
+            params![repo, number, thread],
+        )?;
+        tx.execute(
             "UPDATE pr_ci_tracker_generations SET generation=generation+1,
                  closed_sweep_generation=NULL
              WHERE repo=?1 AND pull_number=?2 AND thread=?3",
@@ -1685,6 +1690,33 @@ mod tests {
             registered, 1,
             "registration still creates its generation row"
         );
+    }
+
+    #[test]
+    fn polling_repairs_tracker_added_by_legacy_process_after_backfill() {
+        let db = db();
+        db.execute(
+            "INSERT INTO pr_ci_trackers(repo,pull_number,thread,active) VALUES('owner/project',7,?1,1)",
+            [THREAD],
+        ).unwrap();
+        let report = poll(&db, 1, |route| {
+            Ok(ApiResponse {
+                status: 200,
+                body: if route.contains("/pulls/") {
+                    pull(7, "open", SHA)
+                } else {
+                    json!({"total_count":0,"workflow_runs":[]})
+                },
+            })
+        })
+        .unwrap();
+        assert_eq!(report.checked, 1);
+        assert!(report.errors.is_empty());
+        let generation: i64 = db.query_row(
+            "SELECT generation FROM pr_ci_tracker_generations WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+            [THREAD], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(generation, 1);
     }
 
     #[test]

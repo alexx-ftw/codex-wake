@@ -1046,7 +1046,7 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                         .context("Native wake recovery deadline expired")
                                 };
                                 let accepted_ids = accepted_ids.iter().cloned().collect();
-                                start_accepted_native_message(
+                                let result = start_accepted_native_message(
                                     &db,
                                     thread,
                                     &accepted_ids,
@@ -1058,7 +1058,18 @@ pub fn run_receiver(config: &Config) -> Result<()> {
                                             remaining()?,
                                         )
                                     },
-                                )
+                                );
+                                if result.is_err() {
+                                    crate::observability::emit(
+                                        "native_wake.recovery",
+                                        "needs_attention",
+                                        "queue_reconciliation_deferred",
+                                        None,
+                                        Duration::ZERO,
+                                        1,
+                                    );
+                                }
+                                result
                             };
                             let recovered = codex_wake::pr_ci_runtime::recover_native_wake_intents(
                                 &db, now, &mut wake,
@@ -1646,44 +1657,6 @@ fn list_thread_queue(
     bail!("Queue list exceeded the recovery page limit")
 }
 
-fn thread_status(
-    thread: &str,
-    call: &mut impl FnMut(&str, Value) -> Result<Value>,
-) -> Result<String> {
-    call(
-        "thread/read",
-        json!({"threadId":thread,"includeTurns":false}),
-    )?
-    .pointer("/thread/status/type")
-    .and_then(Value::as_str)
-    .map(str::to_owned)
-    .context("Thread read response has no status")
-}
-
-fn accepted_submission(
-    items: &[Value],
-    accepted_ids: &HashSet<String>,
-) -> Option<(String, String)> {
-    items.iter().find_map(|item| {
-        let client_id = item
-            .get("clientUserMessageId")
-            .and_then(Value::as_str)
-            .filter(|id| accepted_ids.contains(*id))?;
-        let submission_id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())?;
-        Some((submission_id.to_owned(), client_id.to_owned()))
-    })
-}
-
-fn contains_submission(items: &[Value], submission_id: &str, client_id: &str) -> bool {
-    items.iter().any(|item| {
-        item.get("id").and_then(Value::as_str) == Some(submission_id)
-            && item.get("clientUserMessageId").and_then(Value::as_str) == Some(client_id)
-    })
-}
-
 fn has_execution_evidence(
     db: &rusqlite::Connection,
     thread: &str,
@@ -1748,70 +1721,34 @@ fn start_accepted_native_message(
     call: &mut impl FnMut(&str, Value) -> Result<Value>,
 ) -> Result<()> {
     let initial_items = list_thread_queue(thread, call)?;
-    let Some((submission_id, client_id)) = accepted_submission(&initial_items, accepted_ids) else {
-        ensure!(
-            !accepted_ids.is_empty()
-                && accepted_ids.iter().try_fold(
-                    true,
-                    |all_observed, client_id| -> Result<bool> {
-                        Ok(all_observed && has_execution_evidence(db, thread, client_id, call)?)
-                    }
-                )?,
-            "Accepted notification is absent from the queue without exact execution evidence; preserving recovery uncertainty"
-        );
-        return Ok(());
-    };
-
-    let mut status = thread_status(thread, call)?;
-    if status == "notLoaded" {
-        call(
-            "thread/resume",
-            json!({"threadId":thread,"excludeTurns":true}),
-        )?;
-        status = thread_status(thread, call)?;
+    for item in &initial_items {
+        let client_id = item
+            .get("clientUserMessageId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context(
+                "Queue item has no attributable client identity; preserving recovery uncertainty",
+            )?;
+        if accepted_ids.contains(client_id) {
+            let observed = has_execution_evidence(db, thread, client_id, call)?;
+            if observed {
+                bail!(
+                    "Accepted queue item remains listed despite exact execution evidence; preserving recovery uncertainty"
+                );
+            }
+            bail!(
+                "Accepted queue item remains listed without atomic start evidence; preserving recovery uncertainty"
+            );
+        }
     }
     ensure!(
-        status == "idle",
-        "Accepted queue item remains pending while thread status is {status}"
-    );
-
-    let still_pending = contains_submission(
-        &list_thread_queue(thread, call)?,
-        &submission_id,
-        &client_id,
-    );
-    ensure!(
-        still_pending,
-        "Accepted queue item changed before explicit start; preserving recovery uncertainty"
-    );
-    let started = call(
-        "thread/queue/start",
-        json!({"threadId":thread,"queuedSubmissionId":submission_id}),
-    )?;
-    ensure!(
-        started.get("turn").is_some_and(Value::is_object),
-        "Queue start returned no turn; preserving recovery uncertainty"
-    );
-    let remaining_items = list_thread_queue(thread, call)?;
-    let remains_pending = remaining_items
-        .iter()
-        .any(|item| item.get("id").and_then(Value::as_str) == Some(&submission_id));
-    ensure!(
-        !remains_pending,
-        "Started queue item is still listed; preserving recovery uncertainty"
-    );
-    ensure!(
-        accepted_submission(&remaining_items, accepted_ids).is_none(),
-        "Other accepted notifications remain queued; preserving recovery"
-    );
-    ensure!(
-        accepted_ids
-            .iter()
-            .filter(|id| *id != &client_id)
-            .try_fold(true, |all_observed, client_id| -> Result<bool> {
-                Ok(all_observed && has_execution_evidence(db, thread, client_id, call)?)
-            })?,
-        "Other accepted notifications are absent without exact execution evidence; preserving recovery uncertainty"
+        !accepted_ids.is_empty()
+            && accepted_ids
+                .iter()
+                .try_fold(true, |all_observed, client_id| -> Result<bool> {
+                    Ok(all_observed && has_execution_evidence(db, thread, client_id, call)?)
+                })?,
+        "Accepted notification is absent from the queue without exact execution evidence; preserving recovery uncertainty"
     );
     Ok(())
 }
@@ -1888,8 +1825,6 @@ mod tests {
             rusqlite::params!["a".repeat(40), RECOVERY_THREAD],
         )
         .unwrap();
-        let mut list_calls = 0;
-        let mut starts = Vec::new();
         let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
             &db,
             1_001,
@@ -1900,21 +1835,9 @@ mod tests {
                     &db,
                     thread,
                     &accepted_ids,
-                    &mut |method, params| match method {
-                        "thread/queue/list" => {
-                            list_calls += 1;
-                            Ok(if list_calls < 3 {
-                                json!({"data":[{"id":"current-item","clientUserMessageId":current_id}],"nextCursor":null})
-                            } else {
-                                json!({"data":[],"nextCursor":null})
-                            })
-                        }
-                        "thread/read" => Ok(json!({"thread":{"status":{"type":"idle"}}})),
-                        "thread/queue/start" => {
-                            assert_eq!(params["queuedSubmissionId"], "current-item");
-                            starts.push(params["queuedSubmissionId"].as_str().unwrap().to_owned());
-                            Ok(json!({"turn":{"id":"current-turn"}}))
-                        }
+                    &mut |method, _| match method {
+                        "thread/queue/list" => Ok(json!({"data":[{"id":"current-item","clientUserMessageId":current_id}],"nextCursor":null})),
+                        "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
                         other => panic!("unexpected recovery RPC {other}"),
                     },
                 )
@@ -1922,8 +1845,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(recovered, 1);
-        assert_eq!(starts, ["current-item"]);
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
         let states: Vec<(i64, String)> = db
             .prepare("SELECT id,state FROM pr_ci_deliveries ORDER BY id")
             .unwrap()
@@ -2058,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn native_wake_recovery_starts_only_the_accepted_queued_item_once() {
+    fn native_wake_recovery_never_starts_or_resumes_a_listed_item() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         codex_wake::pr_ci_runtime::record_native_wake_recovery(
             &db,
@@ -2068,72 +1991,39 @@ mod tests {
         )
         .unwrap();
         let accepted_id = "10000000-0000-4000-8000-000000000031";
-        let mut list_calls = 0;
-        let mut read_calls = 0;
         let mut methods = Vec::new();
-        let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(
-            &db,
-            1_001,
-            |thread, ids| {
+        let recovered =
+            codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
                 assert_eq!(ids, &[accepted_id.to_owned()]);
                 let accepted_ids = ids.iter().cloned().collect();
-                start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, params| {
+                start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, _| {
                     methods.push(method.to_owned());
                     match method {
-                        "thread/queue/list" => {
-                            list_calls += 1;
-                            Ok(match list_calls {
-                                1 => json!({"data":[
-                                    {"id":"queue-item-1","clientUserMessageId":accepted_id,"input":[]},
-                                    {"id":"queue-item-2","clientUserMessageId":"unrelated-client-id","input":[]}
-                                ],"nextCursor":null}),
-                                2 => json!({"data":[
-                                    {"id":"queue-item-2","clientUserMessageId":"unrelated-client-id","input":[]},
-                                    {"id":"queue-item-1","clientUserMessageId":accepted_id,"input":[]}
-                                ],"nextCursor":null}),
-                                _ => json!({"data":[],"nextCursor":null}),
-                            })
-                        }
-                        "thread/read" => {
-                            read_calls += 1;
-                            Ok(json!({"thread":{"status":{"type":if read_calls == 1 { "notLoaded" } else { "idle" }}}}))
-                        }
-                        "thread/resume" => {
-                            assert_eq!(params["threadId"], RECOVERY_THREAD);
-                            assert!(params["excludeTurns"].as_bool().unwrap());
-                            Ok(json!({"thread":{"status":{"type":"resuming"}}}))
-                        }
-                        "thread/queue/start" => {
-                            assert_eq!(params["threadId"], RECOVERY_THREAD);
-                            assert_eq!(params["queuedSubmissionId"], "queue-item-1");
-                            Ok(json!({"turn":{"id":"started-turn"}}))
-                        }
+                        "thread/queue/list" => Ok(json!({"data":[
+                            {"id":"queue-item-1","clientUserMessageId":accepted_id},
+                            {"id":"queue-item-2","clientUserMessageId":"unrelated-client-id"}
+                        ],"nextCursor":null})),
+                        "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
                         other => panic!("unexpected recovery RPC {other}"),
                     }
                 })
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
-        assert_eq!(recovered, 1);
-        assert_eq!(recovery_row_count(&db), 0);
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
         assert_eq!(
             methods.iter().map(String::as_str).collect::<Vec<_>>(),
-            vec![
-                "thread/queue/list",
-                "thread/read",
-                "thread/resume",
-                "thread/read",
-                "thread/queue/list",
-                "thread/queue/start",
-                "thread/queue/list"
-            ]
+            vec!["thread/queue/list", "thread/turns/list"]
         );
-        assert!(!methods.iter().any(|method| method == "thread/queue/add"));
+        assert!(!methods.iter().any(|method| matches!(
+            method.as_str(),
+            "thread/queue/add" | "thread/queue/start" | "thread/resume"
+        )));
     }
 
     #[test]
-    fn native_wake_recovery_keeps_second_exact_pending_item_after_starting_first() {
+    fn native_wake_recovery_keeps_both_listed_items() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
         let first_id = "10000000-0000-4000-8000-000000000051";
         let second_id = "10000000-0000-4000-8000-000000000052";
@@ -2151,32 +2041,17 @@ mod tests {
             second_id,
         )
         .unwrap();
-        let mut list_calls = 0;
-        let mut starts = Vec::new();
         let recovered =
             codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
                 assert_eq!(ids, &[first_id.to_owned(), second_id.to_owned()]);
                 let accepted_ids = ids.iter().cloned().collect();
-                start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, params| {
+                start_accepted_native_message(&db, thread, &accepted_ids, &mut |method, _| {
                     match method {
-                        "thread/queue/list" => {
-                            list_calls += 1;
-                            Ok(if list_calls < 3 {
-                                json!({"data":[
-                                    {"id":"queue-first","clientUserMessageId":first_id},
-                                    {"id":"queue-second","clientUserMessageId":second_id}
-                                ],"nextCursor":null})
-                            } else {
-                                json!({"data":[
-                                    {"id":"queue-second","clientUserMessageId":second_id}
-                                ],"nextCursor":null})
-                            })
-                        }
-                        "thread/read" => Ok(json!({"thread":{"status":{"type":"idle"}}})),
-                        "thread/queue/start" => {
-                            starts.push(params["queuedSubmissionId"].as_str().unwrap().to_owned());
-                            Ok(json!({"turn":{"id":"first-turn"}}))
-                        }
+                        "thread/queue/list" => Ok(json!({"data":[
+                            {"id":"queue-first","clientUserMessageId":first_id},
+                            {"id":"queue-second","clientUserMessageId":second_id}
+                        ],"nextCursor":null})),
+                        "thread/turns/list" => Ok(json!({"data":[],"nextCursor":null})),
                         other => panic!("unexpected recovery RPC {other}"),
                     }
                 })
@@ -2185,7 +2060,72 @@ mod tests {
 
         assert_eq!(recovered, 0);
         assert_eq!(recovery_row_count(&db), 1);
-        assert_eq!(starts, ["queue-first"]);
+    }
+
+    #[test]
+    fn recovery_retains_executed_item_still_queued_across_overlapping_callbacks_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        let id = "10000000-0000-4000-8000-000000000061";
+        codex_wake::pr_ci_runtime::record_native_wake_recovery(
+            &db,
+            RECOVERY_THREAD,
+            "native_queue_resume_warning",
+            id,
+        )
+        .unwrap();
+        record_exact_user_message(&mut db, id);
+        let calls = std::cell::Cell::new(0);
+        let observe = |thread: &str, ids: &[String]| -> Result<()> {
+            let accepted = ids.iter().cloned().collect();
+            start_accepted_native_message(&db, thread, &accepted, &mut |method, _| {
+                assert_eq!(
+                    method, "thread/queue/list",
+                    "must not start, resume or resend"
+                );
+                calls.set(calls.get() + 1);
+                Ok(
+                    json!({"data":[{"id":"still-queued","clientUserMessageId":id}],"nextCursor":null}),
+                )
+            })
+        };
+        let recovered =
+            codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 1_001, |thread, ids| {
+                let nested =
+                    codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 2_002, &observe)?;
+                assert_eq!(nested, 0);
+                observe(thread, ids)
+            })
+            .unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(recovery_row_count(&db), 1);
+        drop(db);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let recovered = codex_wake::pr_ci_runtime::recover_native_wake_retries(&db, 5_000, |thread, ids| {
+            let accepted = ids.iter().cloned().collect();
+            start_accepted_native_message(&db, thread, &accepted, &mut |method, _| {
+                assert_eq!(method, "thread/queue/list");
+                Ok(json!({"data":[{"id":"still-queued","clientUserMessageId":id}],"nextCursor":null}))
+            })
+        }).unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(recovery_row_count(&db), 1);
+    }
+
+    #[test]
+    fn recovery_does_not_clear_when_queue_identity_is_missing() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        let id = "10000000-0000-4000-8000-000000000062";
+        record_exact_user_message(&mut db, id);
+        let accepted = HashSet::from([id.to_owned()]);
+        let result =
+            start_accepted_native_message(&db, RECOVERY_THREAD, &accepted, &mut |method, _| {
+                assert_eq!(method, "thread/queue/list");
+                Ok(json!({"data":[{"id":"unknown-identity"}],"nextCursor":null}))
+            });
+        assert!(result.is_err());
     }
 
     #[test]
