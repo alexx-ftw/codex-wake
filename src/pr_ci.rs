@@ -3128,6 +3128,76 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_open_observation_preserves_in_flight_ci_error_and_recovery() {
+        let mut db = db();
+        register(&mut db, "owner/project", "7", THREAD).unwrap();
+        assert!(observe_fixture(&db, "owner/project", "7", "open", 10).unwrap());
+
+        let tracker_state = || -> rusqlite::Result<(i64, i64, Option<String>)> {
+            db.query_row(
+                "SELECT next_poll_ms,backoff_ms,error FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+                [THREAD], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        };
+        let started = Instant::now();
+        let mut observed_failure = false;
+        let failed = poll(&db, 100, |route| {
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "open", SHA),
+                })
+            } else {
+                observed_failure = true;
+                observe_fixture(&db, "owner/project", "7", "open", 110)?;
+                assert_eq!(tracker_state()?, (60_100, 60_000, None));
+                anyhow::bail!("synthetic Actions failure")
+            }
+        })
+        .unwrap();
+        assert!(observed_failure);
+        assert_eq!(failed.errors.len(), 1);
+        let (next, backoff, error): (i64, i64, Option<String>) = db.query_row(
+            "SELECT next_poll_ms,backoff_ms,error FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+            [THREAD], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap();
+        assert!((60_100..=60_100 + elapsed).contains(&next));
+        assert_eq!(backoff, 120_000);
+        assert_eq!(error.as_deref(), Some("poll_failed"));
+
+        let mut observed_success = false;
+        let recovered = poll(&db, next, |route| {
+            if route.contains("/pulls/") {
+                Ok(ApiResponse {
+                    status: 200,
+                    body: pull(7, "open", SHA),
+                })
+            } else {
+                observed_success = true;
+                observe_fixture(&db, "owner/project", "7", "open", next + 10)?;
+                assert_eq!(
+                    tracker_state()?,
+                    (next + 60_000, 120_000, Some("poll_failed".into()))
+                );
+                Ok(ApiResponse {
+                    status: 200,
+                    body: json!({"total_count":0,"workflow_runs":[]}),
+                })
+            }
+        })
+        .unwrap();
+        assert!(observed_success);
+        assert!(recovered.errors.is_empty());
+        let (backoff, error): (i64, Option<String>) = db.query_row(
+            "SELECT backoff_ms,error FROM pr_ci_trackers WHERE repo='owner/project' AND pull_number=7 AND thread=?1",
+            [THREAD], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(backoff, 60_000);
+        assert!(error.is_none());
+    }
+
+    #[test]
     fn poll_reports_cleanup_uncertainty_without_exposing_transport_details() {
         for errno in [libc::ECHILD, libc::EPERM] {
             let mut db = db();
