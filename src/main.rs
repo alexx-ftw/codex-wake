@@ -54,6 +54,13 @@ struct WakeTools {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct PrCreationAttentionInput {
+    /// Optional next_cursor returned by the previous page.
+    cursor: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct Registration {
     /// Exact owner/repository in GitHub.
     repo: String,
@@ -531,6 +538,68 @@ fn database(config: &manager::Config) -> Result<rusqlite::Connection> {
     validation_obligations::initialize(&db)?;
     circular_waits::initialize(&db)?;
     Ok(db)
+}
+
+fn pr_creation_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("post provenance capture incomplete") => "capture_incomplete",
+        Some("creation host provenance is unavailable") => "creation_host_unverified",
+        Some(
+            "GitHub verification host provenance is unavailable"
+            | "GitHub verification host provenance changed",
+        ) => "verification_host_unverified",
+        Some("gh api output uses jq/template formatting") => "filtered_output",
+        Some(
+            "no PreToolUse matches session, turn, tool and input digest"
+            | "PostToolUse lacks session, turn, or input digest"
+            | "multiple PreToolUse entries match session and input digest"
+            | "tool_use_id matched but PreToolUse and PostToolUse input digests differ",
+        ) => "correlation_unavailable",
+        _ => "other",
+    }
+}
+
+// Read-only diagnostics: do not log payloads, credentials, or unfiltered errors.
+fn pr_creation_attention(db: &rusqlite::Connection, cursor: Option<i64>) -> Result<Value> {
+    anyhow::ensure!(cursor.is_none_or(|id| id > 0), "Invalid candidate cursor");
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pr_hook_candidates')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(json!({"count":0,"candidates":[],"next_cursor":null}));
+    }
+    let mut stmt = db.prepare(
+        "SELECT id,number,url,COUNT(*) OVER (),reason,session_id FROM pr_hook_candidates WHERE state='ambiguous' AND consumed_at_ms IS NULL AND (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT 21",
+    )?;
+    let rows = stmt.query_map([cursor], |row| {
+        let reason: Option<String> = row.get(4)?;
+        let session: Option<String> = row.get(5)?;
+        let thread_link = session.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(|id| format!("codex://threads/{id}"));
+        Ok((
+            json!({"id":row.get::<_, i64>(0)?,"number":row.get::<_, i64>(1)?,"url":row.get::<_, String>(2)?,"reason":pr_creation_reason(reason.as_deref()),"thread_link":thread_link}),
+            row.get::<_, i64>(3)?,
+        ))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let count = rows.first().map_or(0, |row| row.1);
+    let has_more = rows.len() > 20;
+    let candidates: Vec<_> = rows.into_iter().take(20).map(|row| row.0).collect();
+    let next_cursor = has_more
+        .then(|| candidates.last().and_then(|row| row["id"].as_i64()))
+        .flatten();
+    Ok(json!({"count":count,"next_cursor":next_cursor,"candidates":candidates}))
+}
+
+fn add_pr_creation_notice(actionable: &mut Value, attention: &Value) {
+    if attention["count"].as_i64().unwrap_or_default() > 0 {
+        actionable.as_array_mut().unwrap().push(json!({
+            "source":"pr_creation",
+            "evidence":{"state":"needs_attention","count":attention["count"]},
+            "next_action":"Inspect unverified PR creations in pr_creation_attention; use get_pr_creation_attention to read further pages. They were not registered automatically."
+        }));
+    }
 }
 
 fn verify_webhook_signature(config: &manager::Config, raw: &[u8], signature: &str) -> Result<()> {
@@ -2635,6 +2704,24 @@ impl WakeTools {
     }
 
     #[tool(
+        description = "Read a page of unverified PR creations. Pass next_cursor to inspect older candidates; count is remaining from the cursor, and this is a live view. Results contain PR URLs, not tool input or credentials.",
+        annotations(read_only_hint = true)
+    )]
+    fn get_pr_creation_attention(
+        &self,
+        Parameters(input): Parameters<PrCreationAttentionInput>,
+    ) -> CallToolResult {
+        tool_result((|| {
+            manager::require_installed(&self.config)?;
+            let db = rusqlite::Connection::open_with_flags(
+                &self.config.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            pr_creation_attention(&db, input.cursor)
+        })())
+    }
+
+    #[tool(
         description = "Read local receiver health, supported events and delivery states. Use get_pr_notification_attention to page through uncertain PR deliveries. Queued means acceptance, not verified execution. A coordinator alert whose sender is no longer verifiably alive appears as uncertain and is never replayed automatically.",
         annotations(read_only_hint = true)
     )]
@@ -2647,6 +2734,8 @@ impl WakeTools {
             let delivery_evidence = delivery_evidence::status(&db)?;
             let mut actionable = status_view::actionable(&waits, &subscriptions, &rules);
             let circular = circular_waits::status(&db)?;
+            let pr_creation_attention = pr_creation_attention(&db, None)?;
+            add_pr_creation_notice(&mut actionable, &pr_creation_attention);
             actionable
                 .as_array_mut()
                 .unwrap()
@@ -2658,6 +2747,7 @@ impl WakeTools {
                 "subscriptions":subscriptions,
                 "rules":rules,
                 "delivery_evidence":delivery_evidence,
+                "pr_creation_attention":pr_creation_attention,
                 "steers":steer::status(&db)?,
                 "circular_waits":circular,
                 "coordinator_alerts":obligations::coordinator_alerts_status(&db)?,
@@ -2680,6 +2770,50 @@ impl WakeTools {
     }
 }
 
+fn mcp_tool_operation(name: &str) -> &'static str {
+    match name {
+        "list_models" => "mcp.list_models",
+        "list_projects" => "mcp.list_projects",
+        "configure_rule" => "mcp.configure_rule",
+        "simulate_rule" => "mcp.simulate_rule",
+        "register_condition_group" => "mcp.register_condition_group",
+        "resolve_condition_order" => "mcp.resolve_condition_order",
+        "list_pr_condition_identity_pending" => "mcp.list_pr_condition_identity_pending",
+        "inspect_pr_condition_identity" => "mcp.inspect_pr_condition_identity",
+        "resolve_pr_condition_identity" => "mcp.resolve_pr_condition_identity",
+        "queue_thread" => "mcp.queue_thread",
+        "get_goal" => "mcp.get_goal",
+        "create_goal" => "mcp.create_goal",
+        "edit_goal" => "mcp.edit_goal",
+        "resume_goal" => "mcp.resume_goal",
+        "subscribe" => "mcp.subscribe",
+        "cancel_subscription" => "mcp.cancel_subscription",
+        "publish_result" => "mcp.publish_result",
+        "register_obligation" => "mcp.register_obligation",
+        "register_circular_wait" => "mcp.register_circular_wait",
+        "register_resource_wait" => "mcp.register_resource_wait",
+        "update_wait_continuation" => "mcp.update_wait_continuation",
+        "resolve_circular_wait" => "mcp.resolve_circular_wait",
+        "list_obligations" => "mcp.list_obligations",
+        "acknowledge_obligation_review" => "mcp.acknowledge_obligation_review",
+        "inspect_legacy_alert_collisions" => "mcp.inspect_legacy_alert_collisions",
+        "resolve_obligation" => "mcp.resolve_obligation",
+        "propose_obligation_transfer" => "mcp.propose_obligation_transfer",
+        "list_obligation_transfers" => "mcp.list_obligation_transfers",
+        "accept_obligation_transfer" => "mcp.accept_obligation_transfer",
+        "register_validation" => "mcp.register_validation",
+        "resolve_validation" => "mcp.resolve_validation",
+        "get_result_conflicts" => "mcp.get_result_conflicts",
+        "register_wait" => "mcp.register_wait",
+        "get_status" => "mcp.get_status",
+        "get_pr_notification_attention" => "mcp.get_pr_notification_attention",
+        "get_pr_creation_attention" => "mcp.get_pr_creation_attention",
+        "get_coordination" => "mcp.get_coordination",
+        "recover_ready" => "mcp.recover_ready",
+        _ => "mcp.unknown_tool",
+    }
+}
+
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl rmcp::ServerHandler for WakeTools {
     async fn call_tool(
@@ -2687,46 +2821,7 @@ impl rmcp::ServerHandler for WakeTools {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        let operation = match request.name.as_ref() {
-            "list_models" => "mcp.list_models",
-            "list_projects" => "mcp.list_projects",
-            "configure_rule" => "mcp.configure_rule",
-            "simulate_rule" => "mcp.simulate_rule",
-            "register_condition_group" => "mcp.register_condition_group",
-            "resolve_condition_order" => "mcp.resolve_condition_order",
-            "list_pr_condition_identity_pending" => "mcp.list_pr_condition_identity_pending",
-            "inspect_pr_condition_identity" => "mcp.inspect_pr_condition_identity",
-            "resolve_pr_condition_identity" => "mcp.resolve_pr_condition_identity",
-            "queue_thread" => "mcp.queue_thread",
-            "get_goal" => "mcp.get_goal",
-            "create_goal" => "mcp.create_goal",
-            "edit_goal" => "mcp.edit_goal",
-            "resume_goal" => "mcp.resume_goal",
-            "subscribe" => "mcp.subscribe",
-            "cancel_subscription" => "mcp.cancel_subscription",
-            "publish_result" => "mcp.publish_result",
-            "register_obligation" => "mcp.register_obligation",
-            "register_circular_wait" => "mcp.register_circular_wait",
-            "register_resource_wait" => "mcp.register_resource_wait",
-            "update_wait_continuation" => "mcp.update_wait_continuation",
-            "resolve_circular_wait" => "mcp.resolve_circular_wait",
-            "list_obligations" => "mcp.list_obligations",
-            "acknowledge_obligation_review" => "mcp.acknowledge_obligation_review",
-            "inspect_legacy_alert_collisions" => "mcp.inspect_legacy_alert_collisions",
-            "resolve_obligation" => "mcp.resolve_obligation",
-            "propose_obligation_transfer" => "mcp.propose_obligation_transfer",
-            "list_obligation_transfers" => "mcp.list_obligation_transfers",
-            "accept_obligation_transfer" => "mcp.accept_obligation_transfer",
-            "register_validation" => "mcp.register_validation",
-            "resolve_validation" => "mcp.resolve_validation",
-            "get_result_conflicts" => "mcp.get_result_conflicts",
-            "register_wait" => "mcp.register_wait",
-            "get_status" => "mcp.get_status",
-            "get_pr_notification_attention" => "mcp.get_pr_notification_attention",
-            "get_coordination" => "mcp.get_coordination",
-            "recover_ready" => "mcp.recover_ready",
-            _ => "mcp.unknown_tool",
-        };
+        let operation = mcp_tool_operation(request.name.as_ref());
         observability::TRACE
             .scope(uuid::Uuid::new_v4().to_string(), async {
                 let span = observability::Span::new(operation, None);
@@ -3206,6 +3301,110 @@ async fn run_command(
 #[cfg(test)]
 mod hook_output_tests {
     use super::*;
+
+    #[test]
+    fn creation_attention_tool_has_its_own_telemetry_operation() {
+        assert_eq!(
+            mcp_tool_operation("get_pr_creation_attention"),
+            "mcp.get_pr_creation_attention"
+        );
+        assert_eq!(mcp_tool_operation("unknown_tool"), "mcp.unknown_tool");
+    }
+
+    #[test]
+    fn creation_attention_supports_read_only_database_without_observation_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        drop(rusqlite::Connection::open(&path).unwrap());
+        let db = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(pr_creation_attention(&db, None).unwrap()["count"], 0);
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='pr_hook_candidates')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+    }
+
+    #[test]
+    fn ambiguous_observation_is_visible_in_creation_attention_status() {
+        struct NoNetwork;
+        impl pr_observation::PullRequestGetTransport for NoNetwork {
+            fn get_pull_request(
+                &self,
+                _: &str,
+                _: u64,
+                _: Duration,
+            ) -> std::result::Result<
+                pr_observation::GetPullRequestResponse,
+                pr_observation::TransportFailure,
+            > {
+                panic!("ambiguous candidate must not perform a GET")
+            }
+        }
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        assert_eq!(pr_creation_attention(&db, None).unwrap()["count"], 0);
+        let event = json!({
+            "hook_event_name":"PostToolUse",
+            "session_id":"11111111-1111-4111-8111-111111111111", "turn_id":"turn", "tool_use_id":"call",
+            "tool_name":"mcp__codex_apps__github_create_pull_request",
+            "tool_input":{"repository_full_name":"acme/widget","title":"private test payload"},
+            "tool_response":{"structuredContent":{"number":42,"html_url":"https://github.com/acme/widget/pull/42"}}
+        });
+        let result = pr_observation::handle_post_tool_use(
+            &mut db,
+            &event,
+            &NoNetwork,
+            Duration::from_secs(2),
+            60_000,
+        )
+        .unwrap();
+        let pr_observation::HandleResult::Candidate { record, .. } = result else {
+            panic!("candidate missing")
+        };
+        assert_eq!(record.state, pr_observation::CandidateState::Ambiguous);
+        let status = pr_creation_attention(&db, None).unwrap();
+        assert_eq!(status["count"], 1);
+        let mut actionable = json!([]);
+        add_pr_creation_notice(&mut actionable, &status);
+        assert_eq!(actionable[0]["source"], "pr_creation");
+        assert_eq!(actionable[0]["evidence"]["count"], 1);
+        assert_eq!(status["candidates"][0]["id"], record.id);
+        assert_eq!(status["candidates"][0]["reason"], "correlation_unavailable");
+        assert_eq!(
+            status["candidates"][0]["thread_link"],
+            "codex://threads/11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(pr_creation_reason(Some("sensitive unknown error")), "other");
+        assert_eq!(
+            status["candidates"][0]["url"],
+            "https://github.com/acme/widget/pull/42"
+        );
+        assert!(!status.to_string().contains("private test payload"));
+        assert!(status["next_cursor"].is_null());
+        for index in 0..21 {
+            db.execute("INSERT INTO pr_hook_candidates(session_id,turn_id,tool_use_id,tool_name,input_digest,number,url,invocation_key,state,created_at_ms,updated_at_ms) SELECT session_id,turn_id,tool_use_id,tool_name,input_digest,number,url,'copy-' || ?1,'ambiguous',created_at_ms,updated_at_ms FROM pr_hook_candidates WHERE id=?2", rusqlite::params![index, record.id]).unwrap();
+        }
+        let first = pr_creation_attention(&db, None).unwrap();
+        assert_eq!(first["count"], 22);
+        assert_eq!(first["candidates"].as_array().unwrap().len(), 20);
+        let second = pr_creation_attention(&db, first["next_cursor"].as_i64()).unwrap();
+        assert_eq!(second["candidates"].as_array().unwrap().len(), 2);
+        assert!(
+            second["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == record.id)
+        );
+        assert!(second["next_cursor"].is_null());
+    }
 
     #[test]
     fn automatic_capture_failure_does_not_skip_existing_subscription() {
