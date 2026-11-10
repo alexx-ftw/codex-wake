@@ -34,6 +34,23 @@ jq -e '.stage == "bootstrap" and .gate.bound == 1 and .gate.pid_matches_unit == 
 if rg -q 'PRIVATE_TEST_TOKEN|private/home' "$scratch/upgrade-diagnostic.json"; then exit 1; fi
 printf 'upgrade report preserves useful state and excludes private strings\n'
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+eval "$(sed -n '/^sqlite3() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
+coproc WRITER { exec sqlite3 -batch "$db"; }
+child=$WRITER_PID
+exec {writer_input}>&"${WRITER[1]}" {writer_output}<&"${WRITER[0]}"
+printf 'BEGIN EXCLUSIVE;\n.print writer-ready\n' >&"$writer_input"
+IFS= read -r -t 5 marker <&"$writer_output"
+[[ $marker == writer-ready ]]
+if command sqlite3 -readonly "$db" 'SELECT count(*) FROM wake_delivery_claim_gate' 2> "$scratch/busy-error"; then exit 1; fi
+grep -q 'database is locked' "$scratch/busy-error"
+(sleep .3; printf 'COMMIT;\n' >&"$writer_input") & release=$!
+[[ $(sqlite3 -readonly "$db" 'SELECT count(*) FROM wake_delivery_claim_gate') == 1 ]]
+wait "$release"
+kill "$child"
+wait "$child" 2>/dev/null || true
+child=
+exec {writer_input}>&- {writer_output}<&-
+printf 'fixture SQLite probes wait for concurrent receiver commits\n'
 eval "$(sed -n '/^freeze_receiver() {/,/^}/p' "$repo/scripts/qualify-cooperative-upgrade.sh")"
 touch "$state/telemetry-pending.lock"
 for lock in "$state/telemetry.sqlite3" "$state/telemetry-pending.lock"; do

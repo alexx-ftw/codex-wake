@@ -10,6 +10,10 @@ export TMPDIR="$root/t" XDG_STATE_HOME="$HOME/s" XDG_DATA_HOME="$HOME/d" XDG_CON
 export CODEX_WAKE_CODEX="$codex" CODEX_WAKE_GH=/usr/bin/false CODEX_WAKE_ENABLE_WEBHOOKS=0 CODEX_WAKE_RPC_SOCKET="$socket"
 ctl() { /usr/bin/systemctl --user "$@"; }
 receiver_journal() { /usr/bin/journalctl --user -u codex-wake.service -n 40 --no-pager -o cat; }
+sqlite3() {
+  # Receiver transactions may briefly exclude fixture readers as well as writers.
+  command sqlite3 -cmd '.timeout 10000' "$@"
+}
 freeze_receiver() {
   local pid=$1
   [[ $pid =~ ^[1-9][0-9]*$ ]]
@@ -229,7 +233,7 @@ stage=closure
 mkdir "$root/delayed"
 {
 printf '#!/bin/bash\nset -euo pipefail\n'
-declare -f freeze_receiver freeze_pending_receiver
+declare -f sqlite3 freeze_receiver freeze_pending_receiver
 cat <<'DELAY'
 root=${HOME%/h}
 state=$XDG_STATE_HOME/codex-wake

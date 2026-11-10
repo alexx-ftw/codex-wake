@@ -103,6 +103,10 @@ proves its health preflight passed, at the next manager query before gate closur
 Freezing before preflight could age its heartbeat or strand that read-only check.
 A local subprocess regression checks that ready state stays running and pending
 state freezes only once; production freshness checks remain unchanged.
+SQLite probes use a ten-second busy timeout so a concurrent receiver commit
+does not turn an empty failed query into a false state assertion. A local
+exclusive-writer regression reproduces the immediate read failure and verifies
+the bounded reader succeeds after the writer commits.
 
 The freshness tests cover old successful heartbeats, PID reuse across invocations,
 a newer heartbeat failure, and a worker error after a successful heartbeat.
