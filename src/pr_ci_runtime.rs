@@ -969,7 +969,8 @@ fn receive_group_handle(receiver: std::os::fd::OwnedFd, handshake_ms: libc::c_in
         if cmsg.is_null()
             || (*cmsg).cmsg_level != libc::SOL_SOCKET
             || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            || (*cmsg).cmsg_len != libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _
+            || (*cmsg).cmsg_len as u64
+                != u64::from(libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32))
         {
             return None;
         }
