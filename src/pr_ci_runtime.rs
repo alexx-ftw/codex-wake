@@ -2529,9 +2529,9 @@ esac
 
         let first = dispatch_at(&mut db, 1_000, |_, delivery, _| {
             assert_eq!(delivery.run_id, 101);
-            Err(anyhow::anyhow!(
+            Err(before_send_failure(anyhow::anyhow!(
                 "Target thread has an active writer; input was not sent"
-            ))
+            )))
         })
         .unwrap();
         assert_eq!(first.retried_before_send, 1);
@@ -2562,9 +2562,9 @@ esac
             1_000,
             |_, _, _| {
                 clock.set(8_000);
-                Err(anyhow::anyhow!(
+                Err(before_send_failure(anyhow::anyhow!(
                     "Target thread has an active writer; input was not sent"
-                ))
+                )))
             },
             || clock.get(),
         )
